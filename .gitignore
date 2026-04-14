@@ -10,3 +10,6 @@ dist-tsc/
 # Personal sessions saved at the repo root during testing
 *.dflou.json
 /Test*.json
+
+# Portable build dropped at the repo root by `npm run build:win`
+/dataFLOU_compositor.exe
