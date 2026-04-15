@@ -1,0 +1,75 @@
+name: Build installers
+
+# Triggers:
+#   - Manually from the Actions tab (workflow_dispatch — "Run workflow" button)
+#   - Automatically on pushing a version tag like v0.2.0, v1.0.0, etc.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  # Windows build — NSIS installer + portable single-file .exe.
+  windows:
+    name: Windows (NSIS + portable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows targets
+        run: npm run build:win
+        env:
+          # Skip code-signing (no certificate in CI).
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataFLOU_compositor-windows
+          path: |
+            release/*/*.exe
+            release/*/*.exe.blockmap
+          if-no-files-found: error
+          retention-days: 30
+
+  # macOS build — DMG for Intel + Apple Silicon (universal).
+  macos:
+    name: macOS (dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build macOS dmg
+        run: npm run build:mac
+        env:
+          # Unsigned build — fine for personal distribution. Users will need
+          # to ctrl-click → Open the first time because macOS Gatekeeper will
+          # warn about an unidentified developer.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataFLOU_compositor-macos
+          path: |
+            release/*/*.dmg
+            release/*/*.dmg.blockmap
+          if-no-files-found: error
+          retention-days: 30
