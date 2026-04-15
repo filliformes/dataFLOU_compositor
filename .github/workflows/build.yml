@@ -53,6 +53,13 @@ jobs:
           node-version: 20
           cache: npm
 
+      # node-gyp needs Python's distutils to rebuild native deps like
+      # @serialport/bindings-cpp (a transitive dep of `osc`). distutils was
+      # removed in Python 3.12; pin to 3.11 so the rebuild succeeds.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Install dependencies
         run: npm ci
 
