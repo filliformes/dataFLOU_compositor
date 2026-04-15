@@ -13,18 +13,32 @@
 //    triggers do NOT start the scene duration timer). After durationSec, nextMode
 //    picks the next scene (or off).
 
-import type { Cell, EngineState, LfoShape, Scene, Session } from '@shared/types'
-import { autoDetectOscArg, readNumber } from '@shared/factory'
+import type { Cell, EngineState, LfoShape, Modulation, Scene, Session } from '@shared/types'
+import {
+  autoDetectOscArg,
+  buildArpLadder,
+  buildArpPattern,
+  effectiveLfoHz,
+  hashSeedString,
+  mulberry32,
+  parseValueTokens,
+  readNumber
+} from '@shared/factory'
 import { OscSender } from './osc'
+
+type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
 
 const TWO_PI = Math.PI * 2
 
 interface TrackState {
-  // Always-running phase 0..1
+  // Phase in LFO cycles. Reset to 0 on each trigger so shapes restart cleanly.
   phase: number
-  // Center morph
-  fromCenter: number
-  toCenter: number
+  // hrtime ms when the current clip was last triggered (for envelope time math).
+  triggerTime: number
+  // Center morph — arrays so a multi-value cell morphs each slot independently.
+  // Lengths may differ between triggers; padding with zeros for missing slots.
+  fromCenter: number[]
+  toCenter: number[]
   morphStart: number // hrtime ms
   morphMs: number
   // Stepped-random helpers
@@ -35,6 +49,14 @@ interface TrackState {
   // Sequencer state
   seqStepIdx: number
   seqStepStart: number // hrtime ms when this step began
+  // Arpeggiator state
+  arpStepIdx: number        // current step index into the ladder (0..N-1)
+  arpPatternIdx: number     // current index into the pattern array (deterministic modes)
+  arpLastAdvanceAt: number  // hrtime ms — when the last arp step fired
+  // Random-Generator state
+  randRng: (() => number) | null // seeded PRNG; null until the clip is triggered
+  randLastAdvanceAt: number       // hrtime ms — when the last random sample fired
+  randCurrent: number[]           // last emitted sample (1 item for int/float, 3 for colour)
   // Active cell ref (source of params)
   activeSceneId: string | null
   stopping: boolean
@@ -50,8 +72,9 @@ interface TrackState {
 function makeTrackState(): TrackState {
   return {
     phase: 0,
-    fromCenter: 0,
-    toCenter: 0,
+    triggerTime: 0,
+    fromCenter: [],
+    toCenter: [],
     morphStart: 0,
     morphMs: 0,
     rndStepLastTick: -1,
@@ -60,6 +83,12 @@ function makeTrackState(): TrackState {
     rndSmoothNext: 0,
     seqStepIdx: 0,
     seqStepStart: 0,
+    arpStepIdx: 0,
+    arpPatternIdx: 0,
+    arpLastAdvanceAt: 0,
+    randRng: null,
+    randLastAdvanceAt: 0,
+    randCurrent: [],
     activeSceneId: null,
     stopping: false,
     armed: false,
@@ -168,6 +197,7 @@ export class SceneEngine {
   }
 
   updateSession(next: Session): void {
+    const prevTickRate = this.session?.tickRateHz
     this.session = next
     // Ensure per-track state exists for each track; drop stale.
     const keep = new Set(next.tracks.map((t) => t.id))
@@ -181,14 +211,17 @@ export class SceneEngine {
     for (const t of next.tracks) {
       if (!this.tracks.has(t.id)) this.tracks.set(t.id, makeTrackState())
     }
-    // Apply new tick rate
-    this.restartTicker()
-    this.emitState()
+    // Only restart the tick interval if the rate actually changed. Otherwise
+    // rapid session updates (e.g., the user typing in a text field) would
+    // tear down and recreate setInterval on every keystroke, which stalls the
+    // renderer under load. Don't emitState either — nothing engine-runtime
+    // related changed.
+    if (prevTickRate !== next.tickRateHz) this.restartTicker()
   }
 
   setTickRate(hz: number): void {
     if (!this.session) return
-    this.session.tickRateHz = clamp(hz, 10, 100)
+    this.session.tickRateHz = clamp(hz, 10, 300)
     this.restartTicker()
   }
 
@@ -207,22 +240,47 @@ export class SceneEngine {
     }
 
     const start = (): void => {
-      const curOut = this.computeCurrentOutput(trackId)
-      ts.fromCenter = curOut
-      // Target center: sequencer step 0 if sequencer enabled, else cell.value.
+      const curOut = this.computeCurrentOutputs(trackId)
+      // Target centers: sequencer step 0 if sequencer enabled, else cell.value.
       const baseRaw = cell.sequencer.enabled
         ? cell.sequencer.stepValues[0] ?? cell.value
         : cell.value
-      const target = readNumber(baseRaw)
-      ts.toCenter = target ?? 0
+      const rawTargets = numericBasesFromRaw(baseRaw)
+      const targets = cell.scaleToUnit ? rawTargets.map((v) => clamp01(v)) : rawTargets
+      // Pad from/to to the same length so element-wise interpolation is clean.
+      const len = Math.max(curOut.length, targets.length)
+      ts.fromCenter = pad(curOut, len, 0)
+      ts.toCenter = pad(targets, len, 0)
       ts.morphStart = now()
       ts.morphMs = cell.transitionMs
       ts.activeSceneId = sceneId
       ts.armed = true
       ts.stopping = false
+      // Reset LFO phase + envelope clock on every trigger so modulation shapes
+      // restart cleanly from their t=0 value.
+      ts.phase = 0
+      ts.triggerTime = now()
+      // Reset stepped-random state so a fresh random value fires at trigger.
+      ts.rndStepLastTick = -1
+      ts.rndStepValue = Math.random() * 2 - 1
+      ts.rndSmoothPrev = 0
+      ts.rndSmoothNext = Math.random() * 2 - 1
       // Reset sequencer to step 0 on trigger.
       ts.seqStepIdx = 0
       ts.seqStepStart = now()
+      // Reset arp: start index depends on mode (Down starts at the top, etc.).
+      ts.arpPatternIdx = 0
+      ts.arpStepIdx = arpStartStep(cell.modulation.arpeggiator)
+      ts.arpLastAdvanceAt = now()
+      // Seed the Random Generator's PRNG from the cell's Value so the same
+      // Value produces a reproducible stream. Fire the first sample now,
+      // with one draw per whitespace-separated entry (3 per entry for colour).
+      ts.randRng = mulberry32(hashSeedString(cell.value))
+      ts.randLastAdvanceAt = now()
+      {
+        const initCount = Math.max(1, parseValueTokens(cell.value).length)
+        ts.randCurrent = sampleRandom(ts.randRng, cell.modulation.random, initCount)
+      }
       ts.lastSentString = null
       ts.lastStringAtSceneId = null
       ts.lastStringAtStep = -1
@@ -255,9 +313,9 @@ export class SceneEngine {
       ts.delayTimer = null
     }
     const cell = this.getActiveCell(trackId)
-    const curOut = this.computeCurrentOutput(trackId)
-    ts.fromCenter = curOut
-    ts.toCenter = 0
+    const curOut = this.computeCurrentOutputs(trackId)
+    ts.fromCenter = [...curOut]
+    ts.toCenter = curOut.map(() => 0)
     ts.morphStart = now()
     ts.morphMs = cell?.transitionMs ?? 0
     ts.stopping = true
@@ -391,8 +449,8 @@ export class SceneEngine {
       ts.stopping = false
       ts.activeSceneId = null
       ts.morphMs = 0
-      ts.fromCenter = 0
-      ts.toCenter = 0
+      ts.fromCenter = []
+      ts.toCenter = []
     }
     this.clearSceneAdvance()
     this.activeSceneId = null
@@ -438,10 +496,11 @@ export class SceneEngine {
       const cell = this.getActiveCell(trackId)
       if (!cell) continue
 
-      // Advance LFO phase
-      if (cell.modulation.enabled) {
+      // Advance LFO phase (only for LFO modulation; envelope uses real time).
+      if (cell.modulation.enabled && cell.modulation.type === 'lfo') {
+        const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
         const prevPhase = ts.phase
-        ts.phase += cell.modulation.rateHz * dt
+        ts.phase += effHz * dt
         if (Math.floor(ts.phase) !== Math.floor(prevPhase)) {
           ts.rndSmoothPrev = ts.rndSmoothNext
           ts.rndSmoothNext = Math.random() * 2 - 1
@@ -450,12 +509,98 @@ export class SceneEngine {
         }
       }
 
+      // Random Generator path — bypasses the normal token logic. Emits
+      // a new OSC payload on its own rate, seeded from the cell's Value.
+      // Number of samples per tick scales with the number of whitespace-
+      // separated entries in the Value field (1 per entry for int/float,
+      // 3 per entry for colour — each entry becomes its own RGB triplet).
+      if (
+        cell.modulation.enabled &&
+        cell.modulation.type === 'random' &&
+        !ts.stopping &&
+        ts.randRng
+      ) {
+        const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
+        if (effHz > 0) {
+          const period = 1000 / effHz
+          const rawTokens = parseValueTokens(cell.value)
+          const tokenCount = Math.max(1, rawTokens.length)
+          let advanced = false
+          while (t - ts.randLastAdvanceAt >= period) {
+            ts.randLastAdvanceAt += period
+            ts.randCurrent = sampleRandom(
+              ts.randRng,
+              cell.modulation.random,
+              tokenCount
+            )
+            advanced = true
+          }
+          if (advanced) {
+            const rnd = cell.modulation.random
+            const args: Array<{
+              type: 'i' | 'f' | 's' | 'T' | 'F'
+              value: number | string | boolean
+            }> = ts.randCurrent.map((v) => {
+              if (rnd.valueType === 'float') {
+                // Quantize to 1e-11 for stable output.
+                const q = Math.round(v * 1e11) / 1e11
+                const final = cell.scaleToUnit ? clamp01(q) : q
+                return { type: 'f' as const, value: final }
+              }
+              // int or colour — integer output
+              const n = Math.round(v)
+              const final = cell.scaleToUnit ? clamp01(n) : n
+              return { type: 'i' as const, value: final }
+            })
+            this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, args)
+            this.recordLiveValue(
+              ts.activeSceneId ?? '',
+              trackId,
+              args
+                .map((a) =>
+                  typeof a.value === 'number' && a.type === 'f'
+                    ? (a.value as number).toFixed(4)
+                    : String(a.value)
+                )
+                .join(' ')
+            )
+          }
+        }
+        if (ts.stopping) this.disarm(ts)
+        continue
+      }
+
+      // Advance arpeggiator step (per the modulation's rate sync settings).
+      if (
+        cell.modulation.enabled &&
+        cell.modulation.type === 'arpeggiator' &&
+        !ts.stopping
+      ) {
+        const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
+        if (effHz > 0) {
+          const period = 1000 / effHz
+          // While-loop catches up if we missed multiple step boundaries
+          // (e.g., a tick took unusually long).
+          while (t - ts.arpLastAdvanceAt >= period) {
+            ts.arpLastAdvanceAt += period
+            advanceArpStep(ts, cell.modulation.arpeggiator)
+          }
+        }
+      }
+
       // Advance sequencer step
       if (cell.sequencer.enabled && !ts.stopping) {
+        // Resolve the step duration based on the sequencer's Sync mode.
+        //   'bpm'   — lock to the session's global BPM
+        //   'tempo' — use the sequencer's per-clip bpm slider
+        //   'free'  — use the per-clip stepMs
+        const syncMode = cell.sequencer.syncMode as 'bpm' | 'tempo' | 'free'
         const stepDurMs =
-          cell.sequencer.syncMode === 'sync'
-            ? 60000 / Math.max(1, cell.sequencer.bpm)
-            : Math.max(1, cell.sequencer.stepMs)
+          syncMode === 'bpm'
+            ? 60000 / Math.max(1, this.session.globalBpm)
+            : syncMode === 'tempo'
+              ? 60000 / Math.max(1, cell.sequencer.bpm)
+              : Math.max(1, cell.sequencer.stepMs)
         let stepChanged = false
         while (t - ts.seqStepStart >= stepDurMs) {
           ts.seqStepStart += stepDurMs
@@ -474,16 +619,30 @@ export class SceneEngine {
       // Morph progress (transition only applies on scene change, not step changes).
       const morphP = ts.morphMs > 0 ? clamp((t - ts.morphStart) / ts.morphMs, 0, 1) : 1
 
-      const arg = autoDetectOscArg(baseRaw)
+      // Parse tokens. Each token becomes one OSC arg; modulation & scaling
+      // apply per-token for numeric ones, strings/bools pass through.
+      const tokens = parseValueTokens(baseRaw)
+      if (tokens.length === 0) {
+        if (ts.stopping && morphP >= 1) this.disarm(ts)
+        continue
+      }
+      const perToken = tokens.map((t) => autoDetectOscArg(t))
+      const hasNumeric = perToken.some((a) => a.type === 'i' || a.type === 'f')
 
-      if (arg.type === 's' || arg.type === 'T' || arg.type === 'F') {
+      // Pure string/bool path — send on change, no morph math.
+      if (!hasNumeric) {
         const stepKey = cell.sequencer.enabled ? ts.seqStepIdx : -1
         const changed =
           ts.lastSentString !== baseRaw ||
           ts.lastStringAtSceneId !== ts.activeSceneId ||
           ts.lastStringAtStep !== stepKey
         if (morphP >= 1 && changed) {
-          this.sender.send(cell.destIp, cell.destPort, cell.oscAddress, arg)
+          this.sender.sendMany(
+            cell.destIp,
+            cell.destPort,
+            cell.oscAddress,
+            perToken.map((a) => ({ type: a.type, value: a.value }))
+          )
           ts.lastSentString = baseRaw
           ts.lastStringAtSceneId = ts.activeSceneId
           ts.lastStringAtStep = stepKey
@@ -493,41 +652,114 @@ export class SceneEngine {
         continue
       }
 
-      // Numeric path.
-      // If sequencer is active, the "center" jumps instantly to the step value.
-      // If not, it morphs from fromCenter→toCenter over morphMs.
-      let center: number
-      if (cell.sequencer.enabled) {
-        center = readNumber(baseRaw) ?? 0
-        // Still honor the initial morph-in on trigger: blend for the first morph.
-        if (morphP < 1) {
-          center = ts.fromCenter + (center - ts.fromCenter) * morphP
-        }
-      } else {
-        center = ts.fromCenter + (ts.toCenter - ts.fromCenter) * morphP
-      }
-
-      let out = center
+      // Mixed / numeric path.
+      // Compute the modulation signal. LFO uses an additive signal (modNorm
+      // in -1..1 or 0..1 depending on mode). Envelope is multiplicative —
+      // naturally 0..1 (a VCA-style gain). Multi-arg Value entries all share
+      // the same signal.
+      let modNorm = 0
+      let envGain = 1
       if (cell.modulation.enabled && !ts.stopping) {
-        const lfoVal = lfo(cell.modulation.shape, ts.phase, ts, this.tickIdx)
-        const magnitude = Math.max(Math.abs(center), 1) * (cell.modulation.depthPct / 100)
-        out = center + lfoVal * magnitude
+        if (cell.modulation.type === 'envelope') {
+          envGain = computeEnvelopeGain(
+            cell.modulation.envelope,
+            (t - ts.triggerTime) / 1000,
+            this.currentSceneDurationSec(ts.activeSceneId)
+          )
+        } else {
+          modNorm = computeModNorm(
+            cell.modulation,
+            ts,
+            this.tickIdx,
+            (t - ts.triggerTime) / 1000,
+            this.currentSceneDurationSec(ts.activeSceneId),
+            this.session.globalBpm
+          )
+        }
       }
 
-      const sendType: 'i' | 'f' =
-        arg.type === 'i' && !cell.modulation.enabled ? 'i' : 'f'
-      const finalVal = sendType === 'i' ? Math.round(out) : out
-      this.sender.send(cell.destIp, cell.destPort, cell.oscAddress, {
-        type: sendType,
-        value: finalVal
-      })
-
-      // Record for the renderer's live display.
-      this.recordLiveValue(
-        ts.activeSceneId ?? '',
-        trackId,
-        sendType === 'i' ? String(finalVal) : finalVal.toFixed(3)
+      // Per-token targets (numeric) — baseline for center computation.
+      const stepTargetsRaw = perToken.map((a) =>
+        a.type === 'i' || a.type === 'f' ? (a.value as number) : null
       )
+      const stepTargets = cell.scaleToUnit
+        ? stepTargetsRaw.map((v) => (v === null ? null : clamp01(v)))
+        : stepTargetsRaw
+
+      const outs: Array<{ type: 'i' | 'f' | 's' | 'T' | 'F'; value: unknown }> = []
+      const liveParts: string[] = []
+
+      for (let idx = 0; idx < perToken.length; idx++) {
+        const a = perToken[idx]
+        if (a.type === 's' || a.type === 'T' || a.type === 'F') {
+          outs.push({ type: a.type, value: a.value })
+          liveParts.push(String(a.value))
+          continue
+        }
+        const target = stepTargets[idx] ?? 0
+        // Center: with sequencer, center jumps to step value (still honoring
+        // the initial morph-in after trigger). Without sequencer, center
+        // follows the morph from fromCenter[idx] → toCenter[idx].
+        let center: number
+        if (cell.sequencer.enabled) {
+          const from = ts.fromCenter[idx] ?? 0
+          center = morphP < 1 ? from + (target - from) * morphP : target
+        } else {
+          const from = ts.fromCenter[idx] ?? 0
+          const to = ts.toCenter[idx] ?? target
+          center = from + (to - from) * morphP
+        }
+
+        let out = center
+        if (cell.modulation.enabled && !ts.stopping) {
+          if (cell.modulation.type === 'envelope') {
+            // Multiplicative envelope, depth-mixed. depth=0% → no effect
+            // (output = center); depth=100% → full VCA shape (out = center * env).
+            const depth01 = cell.modulation.depthPct / 100
+            out = center * (1 - depth01 + depth01 * envGain)
+          } else if (cell.modulation.type === 'arpeggiator') {
+            // Arp: ladder built fresh per token from this token's center so
+            // multi-arg Value ("10 20") arps each token independently.
+            const arp = cell.modulation.arpeggiator
+            const N = Math.max(1, Math.min(8, arp.steps))
+            let ladder = buildArpLadder(center, N, arp.multMode)
+            let dryCenter = center
+            // When Scale 0.0-1.0 is on with arp, NORMALIZE the ladder so the
+            // largest magnitude maps to 1.0. Keeps the proportional shape of
+            // Multiplication/Div/Mult mode intact instead of collapsing to a
+            // flat 1.000 when any ladder value > 1.
+            if (cell.scaleToUnit) {
+              const maxAbs = ladder.reduce(
+                (m, v) => (Math.abs(v) > m ? Math.abs(v) : m),
+                0
+              )
+              if (maxAbs > 0) {
+                ladder = ladder.map((v) => v / maxAbs)
+                dryCenter = center / maxAbs
+              }
+            }
+            const stepVal =
+              ladder[Math.max(0, Math.min(N - 1, ts.arpStepIdx))] ?? dryCenter
+            const depth01 = cell.modulation.depthPct / 100
+            // depth=100% replaces base with arp value; depth=0% leaves base.
+            out = dryCenter * (1 - depth01) + stepVal * depth01
+          } else {
+            const magnitude =
+              Math.max(Math.abs(center), 1) * (cell.modulation.depthPct / 100)
+            out = center + modNorm * magnitude
+          }
+        }
+        if (cell.scaleToUnit) out = clamp01(out)
+
+        const sendType: 'i' | 'f' =
+          a.type === 'i' && !cell.modulation.enabled && !cell.scaleToUnit ? 'i' : 'f'
+        const finalVal = sendType === 'i' ? Math.round(out) : out
+        outs.push({ type: sendType, value: finalVal })
+        liveParts.push(sendType === 'i' ? String(finalVal) : finalVal.toFixed(3))
+      }
+
+      this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, outs as OscArg[])
+      this.recordLiveValue(ts.activeSceneId ?? '', trackId, liveParts.join(' '))
 
       if (ts.stopping && morphP >= 1) this.disarm(ts)
     }
@@ -574,6 +806,12 @@ export class SceneEngine {
     this.emitState()
   }
 
+  private currentSceneDurationSec(sceneId: string | null): number {
+    if (!this.session || !sceneId) return 5
+    const sc = this.session.scenes.find((s) => s.id === sceneId)
+    return sc?.durationSec ?? 5
+  }
+
   private getActiveCell(trackId: string): Cell | null {
     const ts = this.tracks.get(trackId)
     if (!ts || !ts.activeSceneId || !this.session) return null
@@ -581,33 +819,250 @@ export class SceneEngine {
     return scene?.cells[trackId] ?? null
   }
 
-  private computeCurrentOutput(trackId: string): number {
+  private computeCurrentOutputs(trackId: string): number[] {
     const ts = this.tracks.get(trackId)
-    if (!ts || !this.session) return 0
+    if (!ts || !this.session) return []
     const cell = this.getActiveCell(trackId)
     const t = now()
-    let center: number
-    if (cell?.sequencer.enabled) {
-      const raw = cell.sequencer.stepValues[ts.seqStepIdx] ?? cell.value
-      center = readNumber(raw) ?? 0
-    } else {
-      const morphP = ts.morphMs > 0 ? clamp((t - ts.morphStart) / ts.morphMs, 0, 1) : 1
-      center = ts.fromCenter + (ts.toCenter - ts.fromCenter) * morphP
+    const morphP = ts.morphMs > 0 ? clamp((t - ts.morphStart) / ts.morphMs, 0, 1) : 1
+
+    if (!cell) {
+      // No active cell — interpolate existing fromCenter → toCenter.
+      return ts.fromCenter.map((from, i) => {
+        const to = ts.toCenter[i] ?? 0
+        return from + (to - from) * morphP
+      })
     }
-    if (!cell || !cell.modulation.enabled) return center
+
     const baseRaw = cell.sequencer.enabled
       ? cell.sequencer.stepValues[ts.seqStepIdx] ?? cell.value
       : cell.value
-    const arg = autoDetectOscArg(baseRaw)
-    if (arg.type === 's' || arg.type === 'T' || arg.type === 'F') return center
-    const lfoVal = lfo(cell.modulation.shape, ts.phase, ts, this.tickIdx)
-    const magnitude = Math.max(Math.abs(center), 1) * (cell.modulation.depthPct / 100)
-    return center + lfoVal * magnitude
-  }
+    const targetsRaw = numericBasesFromRaw(baseRaw)
+    const targets = cell.scaleToUnit ? targetsRaw.map(clamp01) : targetsRaw
 
+    let modNorm = 0
+    let envGain = 1
+    if (cell.modulation.enabled) {
+      if (cell.modulation.type === 'envelope') {
+        envGain = computeEnvelopeGain(
+          cell.modulation.envelope,
+          (t - ts.triggerTime) / 1000,
+          this.currentSceneDurationSec(ts.activeSceneId)
+        )
+      } else {
+        modNorm = computeModNorm(
+          cell.modulation,
+          ts,
+          this.tickIdx,
+          (t - ts.triggerTime) / 1000,
+          this.currentSceneDurationSec(ts.activeSceneId),
+          this.session.globalBpm
+        )
+      }
+    }
+    const depth = cell.modulation.depthPct / 100
+
+    const outs: number[] = []
+    for (let i = 0; i < targets.length; i++) {
+      let center: number
+      if (cell.sequencer.enabled) {
+        const from = ts.fromCenter[i] ?? 0
+        center = morphP < 1 ? from + (targets[i] - from) * morphP : targets[i]
+      } else {
+        const from = ts.fromCenter[i] ?? 0
+        const to = ts.toCenter[i] ?? targets[i]
+        center = from + (to - from) * morphP
+      }
+      let out = center
+      if (cell.modulation.enabled) {
+        if (cell.modulation.type === 'envelope') {
+          out = center * (1 - depth + depth * envGain)
+        } else if (cell.modulation.type === 'arpeggiator') {
+          const arp = cell.modulation.arpeggiator
+          const N = Math.max(1, Math.min(8, arp.steps))
+          let ladder = buildArpLadder(center, N, arp.multMode)
+          let dryCenter = center
+          if (cell.scaleToUnit) {
+            const maxAbs = ladder.reduce(
+              (m, v) => (Math.abs(v) > m ? Math.abs(v) : m),
+              0
+            )
+            if (maxAbs > 0) {
+              ladder = ladder.map((v) => v / maxAbs)
+              dryCenter = center / maxAbs
+            }
+          }
+          const stepVal =
+            ladder[Math.max(0, Math.min(N - 1, ts.arpStepIdx))] ?? dryCenter
+          out = dryCenter * (1 - depth) + stepVal * depth
+        } else {
+          const magnitude = Math.max(Math.abs(center), 1) * depth
+          out = center + modNorm * magnitude
+        }
+      }
+      if (cell.scaleToUnit) out = clamp01(out)
+      outs.push(out)
+    }
+    return outs
+  }
 }
 
 function now(): number {
   const t = process.hrtime()
   return t[0] * 1000 + t[1] / 1e6
+}
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0
+  return v < 0 ? 0 : v > 1 ? 1 : v
+}
+
+function pad(arr: number[], length: number, fill: number): number[] {
+  if (arr.length >= length) return arr.slice(0, length)
+  const out = arr.slice()
+  while (out.length < length) out.push(fill)
+  return out
+}
+
+function numericBasesFromRaw(raw: string): number[] {
+  return parseValueTokens(raw).map((t) => readNumber(t) ?? 0)
+}
+
+// ---- Random Generator ----
+
+/**
+ * Draw the next sample from a seeded PRNG.
+ *  - int / float: returns `tokenCount` numbers (one per space-separated entry
+ *    in the cell's Value field).
+ *  - colour: returns `3 * tokenCount` numbers — each entry becomes its own
+ *    r, g, b triplet.
+ *
+ * Values are in raw "rng-space" (pre-rounding / pre-scale); the caller rounds
+ * to int / quantizes to the OSC type + applies Scale 0.0-1.0 clamping.
+ */
+function sampleRandom(
+  rng: () => number,
+  rnd: { valueType: 'int' | 'float' | 'colour'; min: number; max: number },
+  tokenCount: number
+): number[] {
+  const lo = Math.min(rnd.min, rnd.max)
+  const hi = Math.max(rnd.min, rnd.max)
+  const range = hi - lo
+  const pick = (): number => lo + rng() * range
+  const total = rnd.valueType === 'colour' ? 3 * Math.max(1, tokenCount) : Math.max(1, tokenCount)
+  const out: number[] = new Array(total)
+  for (let i = 0; i < total; i++) out[i] = pick()
+  return out
+}
+
+// ---- Arpeggiator advance / init ----
+
+function arpStartStep(arp: {
+  steps: number
+  arpMode: import('@shared/types').ArpMode
+}): number {
+  const N = Math.max(1, Math.min(8, arp.steps))
+  if (arp.arpMode === 'random') return Math.floor(Math.random() * N)
+  if (arp.arpMode === 'walk' || arp.arpMode === 'drunk') return 0
+  // Deterministic: start at pattern[0].
+  const pat = buildArpPattern(arp.arpMode, N)
+  return pat[0] ?? 0
+}
+
+function advanceArpStep(
+  ts: TrackState,
+  arp: { steps: number; arpMode: import('@shared/types').ArpMode }
+): void {
+  const N = Math.max(1, Math.min(8, arp.steps))
+  if (arp.arpMode === 'random') {
+    ts.arpStepIdx = Math.floor(Math.random() * N)
+    return
+  }
+  if (arp.arpMode === 'walk') {
+    // ±1 with reflection at the edges.
+    const dir = Math.random() < 0.5 ? -1 : 1
+    let next = ts.arpStepIdx + dir
+    if (next < 0) next = 1 < N ? 1 : 0
+    else if (next >= N) next = N >= 2 ? N - 2 : 0
+    ts.arpStepIdx = next
+    return
+  }
+  if (arp.arpMode === 'drunk') {
+    // Jump by ±1..3, reflect within bounds.
+    const mag = 1 + Math.floor(Math.random() * 3)
+    const dir = Math.random() < 0.5 ? -1 : 1
+    let next = ts.arpStepIdx + mag * dir
+    while (next < 0 || next >= N) {
+      if (next < 0) next = -next
+      if (next >= N) next = 2 * (N - 1) - next
+    }
+    ts.arpStepIdx = Math.max(0, Math.min(N - 1, next))
+    return
+  }
+  // Deterministic pattern-based advance.
+  const pat = buildArpPattern(arp.arpMode, N)
+  if (pat.length === 0) return
+  ts.arpPatternIdx = (ts.arpPatternIdx + 1) % pat.length
+  ts.arpStepIdx = pat[ts.arpPatternIdx] ?? 0
+}
+
+// Combined modulation output, mapped to the cell's mode:
+//   unipolar → [0, 1]   → pushes output from `center` up to `center+magnitude`
+//   bipolar  → [-1, 1]  → pushes output within [center-magnitude, center+magnitude]
+function computeModNorm(
+  m: Modulation,
+  ts: TrackState,
+  tickIdx: number,
+  elapsedSec: number,
+  sceneDurSec: number,
+  _bpm: number
+): number {
+  if (m.type === 'envelope') {
+    // Envelope is naturally unipolar 0..1.
+    const g = computeEnvelopeGain(m.envelope, elapsedSec, sceneDurSec)
+    return m.mode === 'bipolar' ? 2 * g - 1 : g
+  }
+  // LFO
+  const raw = lfo(m.shape, ts.phase, ts, tickIdx) // -1..1
+  if (m.mode === 'bipolar') return raw
+  return (raw + 1) / 2 // 0..1
+}
+
+// ADSR with A, D, S (hold), R. Times in seconds (converted from ms or scene %).
+function computeEnvelopeGain(
+  env: { attackMs: number; decayMs: number; sustainMs: number; releaseMs: number;
+         attackPct: number; decayPct: number; sustainPct: number; releasePct: number;
+         sustainLevel: number; sync: 'synced' | 'free' },
+  elapsedSec: number,
+  sceneDurSec: number
+): number {
+  let a: number, d: number, s: number, r: number
+  if (env.sync === 'synced') {
+    // Fractions of scene duration. Normalize so they never exceed the scene.
+    const totalPct = Math.max(
+      0.0001,
+      env.attackPct + env.decayPct + env.sustainPct + env.releasePct
+    )
+    const scale = totalPct > 1 ? 1 / totalPct : 1
+    a = env.attackPct * scale * sceneDurSec
+    d = env.decayPct * scale * sceneDurSec
+    s = env.sustainPct * scale * sceneDurSec
+    r = env.releasePct * scale * sceneDurSec
+  } else {
+    a = env.attackMs / 1000
+    d = env.decayMs / 1000
+    s = env.sustainMs / 1000
+    r = env.releaseMs / 1000
+  }
+  const sl = Math.max(0, Math.min(1, env.sustainLevel))
+  const t = elapsedSec
+  if (t <= 0) return 0
+  if (t < a) return a > 0 ? t / a : 1 // attack 0→1
+  const tAfterA = t - a
+  if (tAfterA < d) return d > 0 ? 1 + (sl - 1) * (tAfterA / d) : sl // decay 1→sl
+  const tAfterD = tAfterA - d
+  if (tAfterD < s) return sl // sustain hold
+  const tAfterS = tAfterD - s
+  if (tAfterS < r) return r > 0 ? sl * (1 - tAfterS / r) : 0 // release sl→0
+  return 0
 }

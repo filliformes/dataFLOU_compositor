@@ -1,9 +1,8 @@
-import { useState } from 'react'
 import { useStore } from '../store'
-import { midi } from '../midi'
 import CellTile from './CellTile'
 import { useEffectiveRowHeight, useHeaderHeight } from './EditView'
 import { ResizeHandle } from './ResizeHandle'
+import { UncontrolledTextarea, UncontrolledTextInput } from './UncontrolledInput'
 
 export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Element {
   const scene = useStore((s) => s.session.scenes.find((sc) => sc.id === sceneId))
@@ -15,6 +14,9 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   const setSceneMidi = useStore((s) => s.setSceneMidi)
   const engineActiveScene = useStore((s) => s.engine.activeSceneId)
   const activeSceneStartedAt = useStore((s) => s.engine.activeSceneStartedAt)
+  const midiLearnMode = useStore((s) => s.midiLearnMode)
+  const midiLearnTarget = useStore((s) => s.midiLearnTarget)
+  const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
   const notesHeight = useStore((s) => s.editorNotesHeight)
   const setNotesHeight = useStore((s) => s.setEditorNotesHeight)
   const rowHeight = useEffectiveRowHeight()
@@ -23,7 +25,6 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   const scenesCollapsed = useStore((s) => s.scenesCollapsed)
   const headerH = useHeaderHeight()
 
-  const [learning, setLearning] = useState(false)
 
   // Defensive: during the render just after a delete, React may still call us
   // before the parent re-renders. Bail out cleanly.
@@ -32,23 +33,24 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   const isPlaying = engineActiveScene === sceneId
   const isFocused = focusedSceneId === sceneId
 
-  function beginLearn(): void {
-    if (learning) {
-      midi.cancelLearn()
-      setLearning(false)
+  async function trigger(): Promise<void> {
+    // In MIDI Learn mode, clicking the trigger selects it as the learn target
+    // instead of firing the scene. Binding happens on the next MIDI message.
+    if (midiLearnMode) {
+      setMidiLearnTarget({ kind: 'scene', id: sceneId })
       return
     }
-    setLearning(true)
-    midi.beginLearn((b) => {
-      setLearning(false)
-      setSceneMidi(sceneId, b)
-    })
-  }
-
-  async function trigger(): Promise<void> {
     if (isPlaying) await window.api.stopScene(sceneId)
     else await window.api.triggerScene(sceneId)
   }
+
+  const learnOverlayClass = !midiLearnMode
+    ? ''
+    : midiLearnTarget?.kind === 'scene' && midiLearnTarget.id === sceneId
+      ? 'midi-learn-selected'
+      : scene.midiTrigger
+        ? 'midi-learn-green'
+        : 'midi-learn-blue'
 
   // Column-wide tint using the scene color at low alpha.
   const tint = scene.color + '14'
@@ -72,7 +74,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         direction="col"
         value={sceneColumnWidth}
         onChange={setSceneColumnWidth}
-        min={140}
+        min={180}
         max={480}
         className="absolute top-0 right-0 bottom-0 w-[4px] z-10"
         title="Drag to resize all scene columns"
@@ -88,6 +90,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             isPlaying={isPlaying}
             durationSec={scene.durationSec}
             startedAt={isPlaying ? activeSceneStartedAt : null}
+            overlayClass={learnOverlayClass}
             onClick={(e) => {
               e.stopPropagation()
               trigger()
@@ -111,17 +114,18 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             isPlaying={isPlaying}
             durationSec={scene.durationSec}
             startedAt={isPlaying ? activeSceneStartedAt : null}
+            overlayClass={learnOverlayClass}
             onClick={(e) => {
               e.stopPropagation()
               trigger()
             }}
           />
-          <input
+          <UncontrolledTextInput
             className="input flex-1 text-[12px] font-semibold min-w-0"
             value={scene.name}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
-            onChange={(e) => updateScene(sceneId, { name: e.target.value })}
+            onChange={(v) => updateScene(sceneId, { name: v })}
           />
           <input
             type="color"
@@ -134,14 +138,14 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         </div>
 
         {/* Italic notes textarea — shared height across all scenes. */}
-        <textarea
+        <UncontrolledTextarea
           className="input italic text-[11px] leading-snug w-full"
           style={{ height: notesHeight, resize: 'none' }}
           placeholder="Notes…"
           value={scene.notes ?? ''}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
-          onChange={(e) => updateScene(sceneId, { notes: e.target.value })}
+          onChange={(v) => updateScene(sceneId, { notes: v })}
         />
 
         <div className="flex items-center gap-1 text-[10px]">
@@ -177,19 +181,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         </div>
 
         <div className="flex items-center gap-1">
-          <button
-            className={`btn text-[10px] px-1.5 py-0.5 ${
-              learning ? 'bg-accent/20 border-accent text-accent' : ''
-            }`}
-            onClick={(e) => {
-              e.stopPropagation()
-              beginLearn()
-            }}
-            title={learning ? 'Click again to cancel' : 'Start MIDI Learn'}
-          >
-            {learning ? '…waiting (click to cancel)' : 'MIDI Learn'}
-          </button>
-          {!learning && scene.midiTrigger && (
+          {scene.midiTrigger && (
             <span className="chip">
               {scene.midiTrigger.kind === 'note'
                 ? noteName(scene.midiTrigger.number)
@@ -201,6 +193,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                   e.stopPropagation()
                   setSceneMidi(sceneId, undefined)
                 }}
+                title="Clear MIDI binding"
               >
                 ✕
               </button>
@@ -259,16 +252,16 @@ function SceneTriggerButton({
   isPlaying,
   durationSec,
   startedAt,
+  overlayClass,
   onClick
 }: {
   isPlaying: boolean
   durationSec: number
   startedAt: number | null
+  overlayClass?: string
   onClick: (e: React.MouseEvent) => void
 }): JSX.Element {
   const elapsedSec = isPlaying && startedAt ? Math.max(0, (Date.now() - startedAt) / 1000) : 0
-  // Reset the animation whenever playback starts (startedAt changes) by using
-  // the timestamp as a React key on the sweep element.
   return (
     <button
       className={`relative w-6 h-6 rounded-sm border flex items-center justify-center shrink-0 overflow-hidden ${
@@ -299,6 +292,7 @@ function SceneTriggerButton({
           <polygon points="2,1 9,5 2,9" fill="currentColor" />
         </svg>
       )}
+      {overlayClass && <div className={`midi-learn-overlay ${overlayClass}`} aria-hidden />}
     </button>
   )
 }

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { createPortal } from 'react-dom'
+import { effectiveLfoHz } from '@shared/factory'
 
 const DRAG_MIME = 'application/x-dataflou-cell'
 
@@ -28,6 +29,10 @@ export default function CellTile({
   const compact = useStore((s) => s.tracksCollapsed)
   const templates = useStore((s) => s.clipTemplates)
   const applyClipTemplate = useStore((s) => s.applyClipTemplate)
+  const midiLearnMode = useStore((s) => s.midiLearnMode)
+  const midiLearnTarget = useStore((s) => s.midiLearnTarget)
+  const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
+  const globalBpm = useStore((s) => s.session.globalBpm)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   // Replay the blink keyframe on every step change by toggling the class.
   const pulseRef = useRef<HTMLDivElement>(null)
@@ -103,9 +108,27 @@ export default function CellTile({
 
   async function trigger(e: React.MouseEvent): Promise<void> {
     e.stopPropagation()
+    // In MIDI Learn mode, selecting the clip trigger makes it the learn
+    // target; the next MIDI message binds it. Normal firing resumes when
+    // learn mode is turned off.
+    if (midiLearnMode) {
+      setMidiLearnTarget({ kind: 'cell', sceneId, trackId })
+      return
+    }
     if (isPlaying) await window.api.stopCell(sceneId, trackId)
     else await window.api.triggerCell(sceneId, trackId)
   }
+
+  // Build the MIDI-learn overlay class for the clip's trigger square.
+  const learnOverlayClass = !midiLearnMode
+    ? ''
+    : midiLearnTarget?.kind === 'cell' &&
+        midiLearnTarget.sceneId === sceneId &&
+        midiLearnTarget.trackId === trackId
+      ? 'midi-learn-selected'
+      : cell.midiTrigger
+        ? 'midi-learn-green'
+        : 'midi-learn-blue'
 
   // HTML5 drag — only proceeds if Ctrl was held at dragstart.
   function onDragStart(e: React.DragEvent): void {
@@ -119,13 +142,30 @@ export default function CellTile({
 
   const modOn = cell.modulation.enabled
   const seqOn = cell.sequencer.enabled
-  const showSweep = isPlaying && (modOn || seqOn)
-  const sweepPeriod = modOn
-    ? Math.max(0.2, 1 / Math.max(0.01, cell.modulation.rateHz))
-    : seqOn
-      ? (cell.sequencer.syncMode === 'sync'
+  const isLfo = modOn && cell.modulation.type === 'lfo'
+  const isArp = modOn && cell.modulation.type === 'arpeggiator'
+  const isRnd = modOn && cell.modulation.type === 'random'
+  // Envelope doesn't loop, so don't animate the sweep for it.
+  const showSweep = isPlaying && (isLfo || isArp || isRnd || seqOn)
+  // Use the effective rate (respects BPM sync, dotted, triplet) so the visual
+  // matches what the engine actually runs. Clamp minimum period to 30 ms
+  // (~33 Hz visual) so very fast LFOs/arps are still visible as motion.
+  const effHz = isLfo || isArp || isRnd ? effectiveLfoHz(cell.modulation, globalBpm) : 0
+  // Arp sweep represents the FULL ladder cycle (N steps), so one sweep = the
+  // time to traverse all steps. LFO/Random still sweep per cycle/tick.
+  const arpCycleSec = isArp
+    ? Math.max(1, cell.modulation.arpeggiator.steps) / Math.max(0.01, effHz)
+    : 0
+  const sweepPeriod = isArp
+    ? Math.max(0.03, arpCycleSec)
+    : isLfo || isRnd
+      ? Math.max(0.03, 1 / Math.max(0.01, effHz))
+      : seqOn
+      ? cell.sequencer.syncMode === 'bpm'
+        ? (60 / Math.max(1, globalBpm)) * Math.max(1, cell.sequencer.steps)
+        : cell.sequencer.syncMode === 'tempo'
           ? (60 / Math.max(1, cell.sequencer.bpm)) * Math.max(1, cell.sequencer.steps)
-          : (cell.sequencer.stepMs / 1000) * Math.max(1, cell.sequencer.steps))
+          : (cell.sequencer.stepMs / 1000) * Math.max(1, cell.sequencer.steps)
       : 1
 
   const triggerBtn = (
@@ -155,6 +195,9 @@ export default function CellTile({
           <polygon points="2,1 9,5 2,9" fill="currentColor" />
         </svg>
       )}
+      {learnOverlayClass && (
+        <div className={`midi-learn-overlay ${learnOverlayClass}`} aria-hidden />
+      )}
     </button>
   )
 
@@ -174,7 +217,7 @@ export default function CellTile({
           ref={pulseRef}
           aria-hidden
           className="absolute inset-0 pointer-events-none"
-          style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell) : undefined }}
+          style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell, globalBpm) : undefined }}
         />
         {triggerBtn}
         <span className="text-[10px] text-muted truncate flex-1 min-w-0">
@@ -205,7 +248,7 @@ export default function CellTile({
         ref={pulseRef}
         aria-hidden
         className="absolute inset-0 pointer-events-none"
-        style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell) : undefined }}
+        style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell, globalBpm) : undefined }}
       />
       <div className="flex items-center gap-1.5">
         {triggerBtn}
@@ -237,9 +280,22 @@ export default function CellTile({
         </span>
       </div>
       <div className="flex items-center gap-1 text-[9px] text-muted">
-        {modOn && (
+        {modOn && cell.modulation.type === 'lfo' && (
           <span className="text-accent2">
             {shapeLabel(cell.modulation.shape)} {cell.modulation.depthPct}%
+          </span>
+        )}
+        {modOn && cell.modulation.type === 'envelope' && (
+          <span className="text-accent2">ENV {cell.modulation.depthPct}%</span>
+        )}
+        {modOn && cell.modulation.type === 'arpeggiator' && (
+          <span className="text-accent2">
+            ARP{cell.modulation.arpeggiator.steps}
+          </span>
+        )}
+        {modOn && cell.modulation.type === 'random' && (
+          <span className="text-accent2">
+            RND {cell.modulation.random.valueType === 'colour' ? 'rgb' : cell.modulation.random.valueType}
           </span>
         )}
         {seqOn && <span className="text-accent">SEQ{cell.sequencer.steps}</span>}
@@ -313,13 +369,18 @@ function shapeLabel(s: string): string {
   return { sine: '∿', triangle: '△', sawtooth: '⩘', square: '⊓', rndStep: '⋯', rndSmooth: '∽' }[s] || s
 }
 
-function pulseDurationMs(cell: {
-  sequencer: { syncMode: 'sync' | 'free'; bpm: number; stepMs: number }
-}): string {
+function pulseDurationMs(
+  cell: {
+    sequencer: { syncMode: 'bpm' | 'tempo' | 'free'; bpm: number; stepMs: number }
+  },
+  globalBpm: number
+): string {
   const ms =
-    cell.sequencer.syncMode === 'sync'
-      ? 60000 / Math.max(1, cell.sequencer.bpm)
-      : Math.max(1, cell.sequencer.stepMs)
+    cell.sequencer.syncMode === 'bpm'
+      ? 60000 / Math.max(1, globalBpm)
+      : cell.sequencer.syncMode === 'tempo'
+        ? 60000 / Math.max(1, cell.sequencer.bpm)
+        : Math.max(1, cell.sequencer.stepMs)
   // Cap blink animation to the step length but clamp so it's visible.
   return `${Math.min(600, Math.max(120, ms))}ms`
 }

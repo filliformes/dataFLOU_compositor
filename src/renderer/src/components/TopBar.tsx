@@ -62,14 +62,6 @@ export default function TopBar(): JSX.Element {
     el.classList.add(cls)
   }
 
-  const editActiveStyle =
-    view === 'edit'
-      ? { background: 'rgb(var(--c-accent))', color: '#000', borderColor: 'rgb(var(--c-accent))' }
-      : undefined
-  const seqActiveStyle =
-    view === 'sequence'
-      ? { background: 'rgb(var(--c-accent))', color: '#000', borderColor: 'rgb(var(--c-accent))' }
-      : undefined
 
   return (
     <div className="flex items-center gap-2 px-2 py-2 bg-panel border-b border-border">
@@ -121,10 +113,10 @@ export default function TopBar(): JSX.Element {
       <div className="flex items-center gap-1.5">
         <span className="label">Tick</span>
         <BoundedNumberInput
-          className="input w-11"
+          className="input w-12"
           integer
           min={10}
-          max={100}
+          max={300}
           value={session.tickRateHz}
           onChange={(hz) => {
             setTickRate(hz)
@@ -159,26 +151,18 @@ export default function TopBar(): JSX.Element {
             </option>
           ))}
         </select>
+        <MidiLearnButton />
       </div>
 
       <div className="flex-1" />
 
-      <div className="flex items-center gap-1">
-        <button
-          className="btn"
-          style={editActiveStyle}
-          onClick={() => setView('edit')}
-        >
-          Edit
-        </button>
-        <button
-          className="btn"
-          style={seqActiveStyle}
-          onClick={() => setView('sequence')}
-        >
-          Sequence
-        </button>
-      </div>
+      <button
+        className="btn"
+        onClick={() => setView(view === 'edit' ? 'sequence' : 'edit')}
+        title={`Go to ${view === 'edit' ? 'Sequence' : 'Edit'} view`}
+      >
+        {view === 'edit' ? 'Sequence' : 'Edit'}
+      </button>
 
       <button
         ref={stopAllRef}
@@ -207,6 +191,36 @@ export default function TopBar(): JSX.Element {
         Panic
       </button>
     </div>
+  )
+}
+
+// Global MIDI Learn button. Pressed state = learn mode on (Ableton-style:
+// blue overlays appear on all learnable elements, click one and hit a MIDI
+// control to bind; green overlay confirms). Press again to exit.
+function MidiLearnButton(): JSX.Element {
+  const on = useStore((s) => s.midiLearnMode)
+  const setMode = useStore((s) => s.setMidiLearnMode)
+  return (
+    <button
+      className="btn"
+      onClick={() => setMode(!on)}
+      style={
+        on
+          ? {
+              background: 'rgba(90, 150, 255, 0.6)',
+              color: '#fff',
+              borderColor: 'rgba(90, 150, 255, 1)'
+            }
+          : undefined
+      }
+      title={
+        on
+          ? 'MIDI Learn ON — click a scene/message trigger, then move a control. Click again to exit.'
+          : 'Enter MIDI Learn mode'
+      }
+    >
+      MIDI Learn
+    </button>
   )
 }
 

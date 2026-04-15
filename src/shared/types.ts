@@ -3,14 +3,82 @@
 export type LfoShape = 'sine' | 'triangle' | 'sawtooth' | 'square' | 'rndStep' | 'rndSmooth'
 export type NextMode = 'off' | 'next' | 'random'
 
-export interface Modulation {
-  enabled: boolean
-  depthPct: number // 0..100
-  rateHz: number // 0.01..5 (originally labeled "ms" in spec but values are Hz)
-  shape: LfoShape
+export type ModType = 'lfo' | 'envelope' | 'arpeggiator' | 'random'
+export type LfoMode = 'unipolar' | 'bipolar'
+export type LfoSync = 'free' | 'bpm'
+export type EnvSync = 'synced' | 'free'
+
+// Arpeggiator — walks through a computed "ladder" of N steps derived from
+// the user's Value, at the modulation rate.
+export type ArpMode =
+  | 'up'
+  | 'down'
+  | 'upDown'
+  | 'downUp'
+  | 'exclusion'
+  | 'walk'
+  | 'drunk'
+  | 'random'
+export type MultMode = 'div' | 'mult' | 'divMult'
+
+export interface ArpeggiatorParams {
+  steps: number // 1..8
+  arpMode: ArpMode
+  multMode: MultMode
 }
 
-export type SeqSyncMode = 'sync' | 'free'
+// Random Generator — seeded PRNG that emits random values at the modulation
+// rate. Seed is derived from the cell's Value string (so the same Value gives
+// a reproducible stream).
+export type RandomValueType = 'int' | 'float' | 'colour'
+export interface RandomParams {
+  valueType: RandomValueType
+  min: number // inclusive
+  max: number // inclusive (applies per channel for 'colour')
+}
+
+export interface EnvelopeParams {
+  // Free-mode times (ms); each max 10 000.
+  attackMs: number
+  decayMs: number
+  sustainMs: number
+  releaseMs: number
+  // Synced-mode fractions of scene duration; A+D+S+R should sum to <= 1.
+  attackPct: number
+  decayPct: number
+  sustainPct: number
+  releasePct: number
+  // Held value between decay and release (0..1).
+  sustainLevel: number
+  sync: EnvSync
+}
+
+export interface Modulation {
+  enabled: boolean
+  type: ModType
+  // LFO params
+  shape: LfoShape
+  mode: LfoMode
+  depthPct: number // 0..100
+  rateHz: number // 0.01..10 (used when sync='free')
+  sync: LfoSync
+  divisionIdx: number // 0..11 index into the BPM-synced time division table
+  dotted: boolean
+  triplet: boolean
+  // Envelope params (used when type='envelope')
+  envelope: EnvelopeParams
+  // Arpeggiator params (used when type='arpeggiator').
+  // Rate is shared with the LFO (rateHz/sync/divisionIdx/dotted/triplet).
+  arpeggiator: ArpeggiatorParams
+  // Random Generator params (used when type='random'). Rate also shared.
+  random: RandomParams
+}
+
+// Sequencer tempo source:
+//   'bpm'   — lock step rate to the session's global BPM
+//   'tempo' — use the sequencer's own per-clip bpm slider
+//   'free'  — use the per-clip stepMs value (independent of any BPM)
+export type SeqSyncMode = 'bpm' | 'tempo' | 'free'
 
 export interface SequencerParams {
   enabled: boolean
@@ -35,7 +103,15 @@ export interface Cell {
   transitionMs: number // 0..10000
   modulation: Modulation
   sequencer: SequencerParams
+  // If true, each numeric output (post-modulation) is clamped to [0, 1].
+  // Applies to each token when `value` contains space-separated values.
+  scaleToUnit: boolean
+  // MIDI binding that triggers/stops just this clip (one per cell).
+  midiTrigger?: MidiBinding
 }
+
+/** Max number of space-separated values allowed in a single Value box. */
+export const MAX_VALUE_TOKENS = 16
 
 export interface Track {
   id: string

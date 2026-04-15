@@ -1,6 +1,10 @@
 import { create } from 'zustand'
 import type { Cell, EngineState, Scene, Session, Track } from '@shared/types'
 import {
+  DEFAULT_ARPEGGIATOR,
+  DEFAULT_ENVELOPE,
+  DEFAULT_MODULATION,
+  DEFAULT_RANDOM,
   DEFAULT_SEQUENCER,
   makeCell,
   makeEmptySession,
@@ -61,6 +65,13 @@ interface UiState {
   inspectorWidth: number // 280..640
   // Sequence transport pause state (local — just UI; engine has its own flag).
   sequencePaused: boolean
+  // Global MIDI Learn mode. When on, scene/track trigger clicks select that
+  // element as the learn target; the next incoming MIDI message binds it.
+  midiLearnMode: boolean
+  midiLearnTarget:
+    | { kind: 'scene'; id: string }
+    | { kind: 'cell'; sceneId: string; trackId: string }
+    | null
   // Theme is a UI preference, not saved in the session file.
   theme: ThemeName
   scenesCollapsed: boolean
@@ -134,6 +145,13 @@ interface Actions {
   setTrackColumnWidth: (w: number) => void
   setInspectorWidth: (w: number) => void
   setSequencePaused: (paused: boolean) => void
+  setMidiLearnMode: (on: boolean) => void
+  setMidiLearnTarget: (
+    t:
+      | { kind: 'scene'; id: string }
+      | { kind: 'cell'; sceneId: string; trackId: string }
+      | null
+  ) => void
   setTheme: (t: ThemeName) => void
   setScenesCollapsed: (v: boolean) => void
   setTracksCollapsed: (v: boolean) => void
@@ -173,6 +191,8 @@ export const useStore = create<State>((set, get) => ({
   trackColumnWidth: 240,
   inspectorWidth: 340,
   sequencePaused: false,
+  midiLearnMode: false,
+  midiLearnTarget: null,
   theme: 'dark',
   scenesCollapsed: false,
   tracksCollapsed: false,
@@ -187,7 +207,7 @@ export const useStore = create<State>((set, get) => ({
     }),
   setCurrentFilePath: (p) => set({ currentFilePath: p }),
   setName: (name) => set((st) => ({ session: { ...st.session, name } })),
-  setTickRate: (hz) => set((st) => ({ session: { ...st.session, tickRateHz: clampInt(hz, 10, 100) } })),
+  setTickRate: (hz) => set((st) => ({ session: { ...st.session, tickRateHz: clampInt(hz, 10, 300) } })),
   setDefaults: (fields) =>
     set((st) => ({
       session: propagateDefaults({
@@ -246,13 +266,31 @@ export const useStore = create<State>((set, get) => ({
       const addr = track.defaultOscAddress
       const ip = track.defaultDestIp
       const port = track.defaultDestPort
+      // Fall back to session defaults for anything the Message didn't specify,
+      // so newly-created cells still have valid destinations.
+      const effIp = ip && ip !== '' ? ip : st.session.defaultDestIp
+      const effPort = port && port > 0 ? port : st.session.defaultDestPort
+      const effAddr = addr && addr !== '' ? addr : st.session.defaultOscAddress
       return {
         session: {
           ...st.session,
           scenes: st.session.scenes.map((s) => {
-            const cell = s.cells[id]
-            if (!cell) return s
-            const next: Cell = { ...cell }
+            const existing = s.cells[id]
+            if (!existing) {
+              // Auto-create a new clip on this scene using the Message defaults.
+              const created = makeCell({
+                destIp: effIp,
+                destPort: effPort,
+                oscAddress: effAddr
+              })
+              // Mark fields as unlinked if the Message specified them explicitly,
+              // so they don't silently re-link to the session defaults.
+              if (ip) created.destLinkedToDefault = false
+              if (port) created.destLinkedToDefault = false
+              if (addr) created.addressLinkedToDefault = false
+              return { ...s, cells: { ...s.cells, [id]: created } }
+            }
+            const next: Cell = { ...existing }
             if (addr !== undefined && addr !== '') {
               next.oscAddress = addr
               next.addressLinkedToDefault = false
@@ -435,10 +473,13 @@ export const useStore = create<State>((set, get) => ({
   selectTrack: (id) => set({ selectedTrack: id, selectedCell: null }),
   setEditorNotesHeight: (h) => set({ editorNotesHeight: clampInt(h, 0, 240) }),
   setRowHeight: (h) => set({ rowHeight: clampInt(h, 30, 220) }),
-  setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 140, 480) }),
+  setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 180, 480) }),
   setTrackColumnWidth: (w) => set({ trackColumnWidth: clampInt(w, 160, 400) }),
-  setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 280, 640) }),
+  setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 320, 640) }),
   setSequencePaused: (paused) => set({ sequencePaused: paused }),
+  setMidiLearnMode: (on) =>
+    set({ midiLearnMode: on, midiLearnTarget: on ? null : null }),
+  setMidiLearnTarget: (t) => set({ midiLearnTarget: t }),
   setTheme: (t) => set({ theme: t }),
   setScenesCollapsed: (v) => set({ scenesCollapsed: v }),
   setTracksCollapsed: (v) => set({ tracksCollapsed: v }),
@@ -521,12 +562,70 @@ function propagateDefaults(s: Session): Session {
       notes: sc.notes ?? '',
       cells: Object.fromEntries(
         Object.entries(sc.cells).map(([tid, c]) => {
+          const m = c.modulation as Partial<typeof DEFAULT_MODULATION> | undefined
+          const env = m?.envelope as Partial<typeof DEFAULT_ENVELOPE> | undefined
           const out: Cell = {
             ...c,
             // Soft-migrate sequencer for sessions saved before this feature existed.
             sequencer: c.sequencer
-              ? { ...c.sequencer, stepValues: [...c.sequencer.stepValues] }
-              : { ...DEFAULT_SEQUENCER, stepValues: [...DEFAULT_SEQUENCER.stepValues] }
+              ? {
+                  ...c.sequencer,
+                  // Legacy 'sync' value used the per-clip bpm slider — that's
+                  // now 'tempo'. Preserve old behavior for existing sessions.
+                  syncMode:
+                    (c.sequencer.syncMode as string) === 'sync'
+                      ? 'tempo'
+                      : c.sequencer.syncMode,
+                  stepValues: [...c.sequencer.stepValues]
+                }
+              : { ...DEFAULT_SEQUENCER, stepValues: [...DEFAULT_SEQUENCER.stepValues] },
+            scaleToUnit: typeof c.scaleToUnit === 'boolean' ? c.scaleToUnit : false,
+            // Migrate modulation fields — older sessions lack type/mode/sync/etc.
+            modulation: {
+              enabled: !!m?.enabled,
+              type: m?.type ?? 'lfo',
+              shape: m?.shape ?? DEFAULT_MODULATION.shape,
+              mode: m?.mode ?? DEFAULT_MODULATION.mode,
+              depthPct: typeof m?.depthPct === 'number' ? m.depthPct : DEFAULT_MODULATION.depthPct,
+              rateHz: typeof m?.rateHz === 'number' ? m.rateHz : DEFAULT_MODULATION.rateHz,
+              sync: m?.sync ?? DEFAULT_MODULATION.sync,
+              divisionIdx:
+                typeof m?.divisionIdx === 'number' ? m.divisionIdx : DEFAULT_MODULATION.divisionIdx,
+              dotted: !!m?.dotted,
+              triplet: !!m?.triplet,
+              envelope: {
+                attackMs: env?.attackMs ?? DEFAULT_ENVELOPE.attackMs,
+                decayMs: env?.decayMs ?? DEFAULT_ENVELOPE.decayMs,
+                sustainMs: env?.sustainMs ?? DEFAULT_ENVELOPE.sustainMs,
+                releaseMs: env?.releaseMs ?? DEFAULT_ENVELOPE.releaseMs,
+                attackPct: env?.attackPct ?? DEFAULT_ENVELOPE.attackPct,
+                decayPct: env?.decayPct ?? DEFAULT_ENVELOPE.decayPct,
+                sustainPct: env?.sustainPct ?? DEFAULT_ENVELOPE.sustainPct,
+                releasePct: env?.releasePct ?? DEFAULT_ENVELOPE.releasePct,
+                sustainLevel: env?.sustainLevel ?? DEFAULT_ENVELOPE.sustainLevel,
+                sync: env?.sync ?? DEFAULT_ENVELOPE.sync
+              },
+              arpeggiator: {
+                steps: (m?.arpeggiator as Partial<typeof DEFAULT_ARPEGGIATOR> | undefined)?.steps ?? DEFAULT_ARPEGGIATOR.steps,
+                arpMode:
+                  (m?.arpeggiator as Partial<typeof DEFAULT_ARPEGGIATOR> | undefined)?.arpMode ??
+                  DEFAULT_ARPEGGIATOR.arpMode,
+                multMode:
+                  (m?.arpeggiator as Partial<typeof DEFAULT_ARPEGGIATOR> | undefined)?.multMode ??
+                  DEFAULT_ARPEGGIATOR.multMode
+              },
+              random: {
+                valueType:
+                  (m?.random as Partial<typeof DEFAULT_RANDOM> | undefined)?.valueType ??
+                  DEFAULT_RANDOM.valueType,
+                min:
+                  (m?.random as Partial<typeof DEFAULT_RANDOM> | undefined)?.min ??
+                  DEFAULT_RANDOM.min,
+                max:
+                  (m?.random as Partial<typeof DEFAULT_RANDOM> | undefined)?.max ??
+                  DEFAULT_RANDOM.max
+              }
+            }
           }
           if (c.addressLinkedToDefault) out.oscAddress = s.defaultOscAddress
           if (c.destLinkedToDefault) {

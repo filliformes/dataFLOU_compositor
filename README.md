@@ -12,13 +12,15 @@ You build a grid of **Messages** (rows — each row is one OSC message destinati
 
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑clip triggers** let you fire individual messages without launching the whole scene.
-- **Modulation (LFO)** continuously animates the value while the clip is active, around a center value at a chosen rate, depth, and shape.
-- **Sequencer (1–16 steps)** cycles through per‑step values at BPM (synced) or ms (free) rate. With Modulation also on, the LFO oscillates around the current step value.
+- **Multi‑value OSC** — space‑separated entries in a clip's Value field become multiple OSC args in a single message. Every modulator treats each entry independently.
+- **Scale 0.0–1.0** — clamps each output channel to `[0, 1]`; with the Arpeggiator it proportionally normalizes the ladder instead of clipping.
+- **Four modulation types** — pick per clip: **LFO**, **Envelope (ADSR)**, **Arpeggiator**, **Random Generator**.
+- **Sequencer (1–16 steps)** — cycles through per‑step values at BPM (session‑locked), Tempo (per‑clip slider), or Free (ms). With Modulation also on, the modulator operates on the current step value.
 - **Transitions** morph the previous clip's value into the new one over a configurable time, even while the LFO keeps running.
 - **Scene auto‑advance** (Off / Next / Random) drives a 1–128‑step sequence grid drag‑laid in the Sequence view.
-- **Templates** save your favorite clip configurations and apply them to empty cells with a right‑click.
-- **MIDI Learn** binds any controller note or CC to a clip trigger or a scene trigger.
-- **Live value display** shows the modulated/sequenced output of every active clip in real time.
+- **Clip Templates** — save full clip configs and apply them to empty cells via the right‑click menu or the Template dropdown. Persisted in localStorage, survive app restarts.
+- **Global MIDI Learn** (Ableton‑style, one button) — enter learn mode, click a scene or clip trigger, wiggle a MIDI control. Blue overlays show learnables, green = bound.
+- **Live value display** — every active clip's current output shows in real time inside its cell tile.
 
 OSC is sent over UDP. The engine runs in the Electron main process at a configurable tick rate (10–100 Hz) so timing stays stable even if the UI is busy.
 
@@ -101,16 +103,40 @@ Each clip carries the full per‑scene settings for one Message. Open a clip in 
   - number with dot or exponent → OSC float32
   - anything else → OSC string
 - **Timing** — **Delay** (0–10 000 ms before the trigger fires) and **Transition** (0–10 000 ms morph time from previous value to this one).
-- **Modulation** (collapsed by default — click the checkbox to expand)
-  - Shape: Sine / Triangle / Sawtooth / Square / Random Stepped / Random Smoothed
-  - Depth: 0 – 100% (around the center value)
-  - Rate: 0.01 – 10 Hz
-  - LFO phase is preserved across scenes — only the center value morphs over `Transition`. So restarting a clip doesn't reset the wobble.
-- **Sequencer** (collapsed by default — click the checkbox to expand)
+- **Modulation** (collapsed by default — tick the checkbox to expand; pick a **Type** from the dropdown on the title line):
+
+  **LFO** — cycles a chosen waveform:
+  - **Shape**: Sine / Triangle / Sawtooth / Square / Random Stepped / Random Smoothed
+  - **Mode**: Unipolar (one‑sided sweep, 0–depth) or Bipolar (±depth around center)
+  - **Depth**: 0–100%
+  - **Rate**: Free (0.01–100 Hz, log‑mapped slider) **or** BPM‑synced to division ticks from `1/128` up to `128/1`, with optional Dotted / Triplet
+  - Phase resets on every trigger so shapes start cleanly.
+
+  **Envelope (ADSR)** — multiplicative VCA shape:
+  - Attack, Decay, Sustain time, Release + Sustain level
+  - **Sync**: Synced (each stage a % of the scene duration, 0.01–100%, auto‑normalized if they overflow) **or** Free (each stage 0–10 000 ms)
+  - **Depth**: 0–100% wet/dry mix. 100% = full VCA shape (0 → center → 0); 0% = no effect.
+
+  **Arpeggiator** — walks a ladder derived from the Value:
+  - **Steps**: 1–8
+  - **Mult Mode**: Division (Value is max; even fractions below), Multiplication (Value is min; doublings above), or Div/Mult (halvings below + doublings above, Value in the middle).
+  - **Arp Mode**: Up / Down / Up/Down / Down/Up / Exclusion (neither end repeated) / Walk / Drunk / Random.
+  - **Rate**: same Free/BPM/dotted/triplet controls as LFO.
+  - **Depth** = how much the ladder replaces the base value.
+  - With **Scale 0.0–1.0** on, the ladder is proportionally normalized (max → 1.0) rather than clamped, so Multiplication mode actually sweeps across the unit range.
+  - The clip trigger square sweeps clockwise once per full N‑step cycle.
+
+  **Random Generator** — seeded PRNG, outputs reproducibly from the Value as seed:
+  - **Type**: Int / Float (1e‑11 precision) / Colour (r,g,b as three int OSC args per token).
+  - **Min / Max** range per channel.
+  - **Rate**: same Free/BPM/dotted/triplet as LFO.
+  - Multi‑value Value fields emit one random per entry (3 per entry in Colour mode).
+
+- **Sequencer** (collapsed by default — tick the checkbox to expand)
   - Steps: 1 – 16 (default 8)
-  - Mode: **Sync (BPM 10–500)** or **Free (ms per step)**. Switching modes preserves the perceived step duration.
+  - **Sync mode**: **Sync (BPM)** — lock to session global BPM; **Sync (Tempo)** — use the clip's own tempo slider; **Free (ms)** — independent step duration.
   - Per‑step values, auto‑detected like the main Value field
-  - The currently playing step is highlighted in the inspector and pulses orange. With Modulation also on, the LFO oscillates around the current step's value.
+  - The currently playing step is highlighted in the inspector and pulses orange. With Modulation also on, the modulator operates on the current step's value.
 
 #### Visual cues
 

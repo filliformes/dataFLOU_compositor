@@ -84,7 +84,7 @@ export default function EditView(): JSX.Element {
           direction="col"
           value={inspectorWidth}
           onChange={setInspectorWidth}
-          min={280}
+          min={320}
           max={640}
           inverse
           className="absolute top-0 left-0 bottom-0 w-[4px] z-30"

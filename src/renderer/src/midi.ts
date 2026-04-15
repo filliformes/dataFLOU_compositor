@@ -100,7 +100,7 @@ class MidiManager {
     }
     if (!binding) return
 
-    // Learn mode wins
+    // Explicit per-element learn (legacy) wins first.
     if (this.learnCb) {
       const cb = this.learnCb
       this.learnCb = null
@@ -108,13 +108,40 @@ class MidiManager {
       return
     }
 
-    // Match against bindings in current session.
     const st = useStore.getState()
+
+    // Global Ableton-style MIDI Learn: if a target is selected, bind it and
+    // stay in learn mode so the user can immediately map the next control.
+    if (st.midiLearnMode && st.midiLearnTarget) {
+      const target = st.midiLearnTarget
+      if (target.kind === 'scene') {
+        st.setSceneMidi(target.id, binding)
+      } else {
+        st.updateCell(target.sceneId, target.trackId, { midiTrigger: binding })
+      }
+      st.setMidiLearnTarget(null)
+      return
+    }
+    // While in learn mode with no target selected, ignore normal triggers so
+    // the user's controller doesn't fire scenes unexpectedly.
+    if (st.midiLearnMode) return
+
+    // Normal mode — match against bindings in current session.
     const session = st.session
+    // Cell triggers first (per-clip binding).
+    for (const sc of session.scenes) {
+      for (const [trackId, cell] of Object.entries(sc.cells)) {
+        if (matches(cell.midiTrigger, binding)) {
+          const active = !!st.engine.activeBySceneAndTrack[sc.id]?.[trackId]
+          if (active) window.api.stopCell(sc.id, trackId)
+          else window.api.triggerCell(sc.id, trackId)
+          return
+        }
+      }
+    }
     // Scene triggers
     for (const s of session.scenes) {
       if (matches(s.midiTrigger, binding)) {
-        // Scene trigger toggles: if it's the active scene, stop; else trigger.
         if (st.engine.activeSceneId === s.id) {
           window.api.stopAll()
         } else {
@@ -123,17 +150,8 @@ class MidiManager {
         return
       }
     }
-    // Track triggers — fire that track's cell in the focused scene.
-    for (const t of session.tracks) {
-      if (matches(t.midiTrigger, binding)) {
-        const sceneId = session.focusedSceneId
-        if (!sceneId) return
-        const active = !!st.engine.activeBySceneAndTrack[sceneId]?.[t.id]
-        if (active) window.api.stopCell(sceneId, t.id)
-        else window.api.triggerCell(sceneId, t.id)
-        return
-      }
-    }
+    // (Message rows are NOT routable via MIDI — per the app spec, only scene
+    // triggers and individual clip triggers are MIDI-bindable.)
   }
 }
 

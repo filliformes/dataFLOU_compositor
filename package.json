@@ -1,6 +1,6 @@
 {
   "name": "dataflou-compositor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OSC scene compositor — multi-destination OSC scene sequencer",
   "main": "out/main/index.js",
   "author": "Vincent Fillion",

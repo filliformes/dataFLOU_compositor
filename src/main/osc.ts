@@ -49,14 +49,17 @@ export class OscSender {
   }
 
   send(ip: string, port: number, address: string, arg: Arg): void {
+    this.sendMany(ip, port, address, [arg])
+  }
+
+  /** Send an OSC message with multiple typed arguments. */
+  sendMany(ip: string, port: number, address: string, args: Arg[]): void {
     const doSend = (): void => {
       if (!this.udp) return
-      // osc.js uses `args` with typed metadata when metadata=true
-      const args = [{ type: arg.type, value: arg.value }]
+      const osc_args = args.map((a) => ({ type: a.type, value: a.value }))
       try {
-        this.udp.send({ address, args }, ip, port)
+        this.udp.send({ address, args: osc_args }, ip, port)
       } catch (e) {
-        // Resolving hostnames can fail; swallow to keep the tick loop alive.
         console.error('[OSC] send failed', ip, port, (e as Error).message)
       }
     }
