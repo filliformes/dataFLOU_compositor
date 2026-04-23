@@ -8,6 +8,7 @@ import type {
   MetaKnob,
   MidiBinding,
   NextMode,
+  RampParams,
   Scene,
   Session,
   Track
@@ -17,6 +18,7 @@ import {
   DEFAULT_ARPEGGIATOR,
   DEFAULT_ENVELOPE,
   DEFAULT_MODULATION,
+  DEFAULT_RAMP,
   DEFAULT_RANDOM,
   DEFAULT_SEQUENCER,
   META_DEFAULT_SMOOTH_MS,
@@ -143,11 +145,42 @@ interface UiState {
     | { kind: 'scene'; id: string }
     | { kind: 'cell'; sceneId: string; trackId: string }
     | { kind: 'metaKnob'; index: number }
+    // Global transport-level learn targets. Bindings live on the Session
+    // itself (goMidi, morphTimeMidi) so they travel with the project file.
+    | { kind: 'go' }
+    | { kind: 'morphTime' }
     | null
   // Theme is a UI preference, not saved in the session file.
   theme: ThemeName
   scenesCollapsed: boolean
   tracksCollapsed: boolean
+  showMode: boolean
+  // OSC monitor drawer — bottom-of-app panel that streams outgoing OSC
+  // messages (address, ip:port, args) for debugging. Off by default; when
+  // closed the monitor component unmounts so no state accumulates.
+  oscMonitorOpen: boolean
+  // Live-performance "cue" — the scene primed to fire on the next GO. UI-
+  // only (not saved in the session) because arming is a concern of the
+  // current run, not of the composition. Re-opening a session the next day
+  // should leave nothing armed.
+  armedSceneId: string | null
+  // When true, firing the armed scene automatically arms the next non-empty
+  // slot in the sequence. Turns a linear show into Space-Space-Space.
+  autoAdvanceArm: boolean
+  // Transport-level Morph — when enabled, every scene trigger glides each
+  // cell's output over this many milliseconds instead of snapping. Scene-
+  // level `morphInMs` (per-scene) takes precedence if set. UI-only (not
+  // persisted in the session — it's a performance setting). The enabled
+  // flag separates "off / no morph" from "0 ms" (an intentional snap).
+  morphEnabled: boolean
+  morphMs: number
+  // Transport time counter (bottom-right of the StatusBar). Play starts /
+  // resumes the counter; Pause freezes it; Stop resets to 0. Stored as
+  // (startedAt, accumulatedMs) — when running, current elapsed is
+  // accumulatedMs + (now - startedAt). When paused/stopped, startedAt is
+  // null and elapsed is just accumulatedMs (or 0 after Stop).
+  transportStartedAt: number | null
+  transportAccumulatedMs: number
 }
 
 // Height (px) assigned to the scene-notes textarea when the Notes toggle
@@ -263,11 +296,44 @@ interface Actions {
       | { kind: 'scene'; id: string }
       | { kind: 'cell'; sceneId: string; trackId: string }
       | { kind: 'metaKnob'; index: number }
+      | { kind: 'go' }
+      | { kind: 'morphTime' }
       | null
   ) => void
+  // Write/clear transport-level MIDI bindings (stored on the session so
+  // they persist with the project).
+  setGoMidi: (b: MidiBinding | undefined) => void
+  setMorphTimeMidi: (b: MidiBinding | undefined) => void
   setTheme: (t: ThemeName) => void
   setScenesCollapsed: (v: boolean) => void
   setTracksCollapsed: (v: boolean) => void
+  setShowMode: (v: boolean) => void
+  setOscMonitorOpen: (v: boolean) => void
+  // Arm a scene for the next GO. Pass null to clear.
+  setArmedSceneId: (id: string | null) => void
+  setAutoAdvanceArm: (v: boolean) => void
+  setMorphEnabled: (v: boolean) => void
+  setMorphMs: (ms: number) => void
+  // Resolve the morph-ms that should apply when triggering `sceneId` right
+  // now: per-scene override > transport > undefined. Exposed so call sites
+  // (fireArmed, keyboard triggers, click triggers) all follow the same
+  // precedence rules.
+  resolveMorphMs: (sceneId: string) => number | undefined
+  // Fire-and-forget scene trigger that always applies the current morph
+  // resolution. Every scene-firing call site (Space, 1-0 keys, GO button,
+  // scene-column play button, palette play, MIDI-triggered scene, etc.)
+  // should go through this so users get consistent morph behavior.
+  triggerSceneWithMorph: (sceneId: string) => void
+  // Fire the armed scene (if any) and clear the arm. If autoAdvanceArm is
+  // on, find the next non-empty sequence slot after the one we just fired
+  // and arm it immediately. Returns the scene id that was fired, or null.
+  fireArmed: () => string | null
+  // Transport-time control. Each corresponds to the Play/Pause/Stop button
+  // in the StatusBar. `transportPlay` is idempotent — a second Play while
+  // already running is a no-op (doesn't reset the clock).
+  transportPlay: () => void
+  transportPause: () => void
+  transportStop: () => void
   setGlobalBpm: (bpm: number) => void
   setSequenceLength: (n: number) => void
 
@@ -341,6 +407,18 @@ export const useStore = create<State>((set, get) => ({
   theme: 'studio-dark',
   scenesCollapsed: false,
   tracksCollapsed: false,
+  // Show / kiosk mode — hides all editing chrome and forces the Sequence
+  // view + transport so the app can't be accidentally edited mid-show.
+  // Toggled via F11 (global hotkey) or the Show button in prefs.
+  // Exit: hold Escape for ~1 second while in show mode.
+  showMode: false,
+  oscMonitorOpen: false,
+  armedSceneId: null,
+  autoAdvanceArm: false,
+  morphEnabled: false,
+  morphMs: 2000,
+  transportStartedAt: null,
+  transportAccumulatedMs: 0,
   // Ephemeral per-knob display values, interpolated by metaSmooth.ts. Not
   // persisted — on session load we reset these to each knob's `value`
   // (see setSession below).
@@ -353,14 +431,44 @@ export const useStore = create<State>((set, get) => ({
     // Reset display values to each knob's persisted value so the UI opens
     // at the right position after loading a session.
     const display = next.metaController.knobs.map((k) => k.value)
-    set({ session: next, metaKnobDisplayValues: display })
+    // Reset EVERY piece of ephemeral UI state so stale IDs from the
+    // previous session (selection, armed cue, multi-selection arrays,
+    // transport counter) can't point at objects that no longer exist —
+    // those dangling refs were causing Inspector / GO / morph features
+    // to act on a mix of old and new data after an Open / restore.
+    set({
+      session: next,
+      metaKnobDisplayValues: display,
+      selectedCell: null,
+      selectedCells: [],
+      selectedSceneIds: [],
+      selectedTrackIds: [],
+      selectedTrack: null,
+      armedSceneId: null,
+      sequencePaused: false,
+      transportStartedAt: null,
+      transportAccumulatedMs: 0,
+      // Leave midiLearnMode alone — it's a performer-facing toggle that
+      // shouldn't flip unexpectedly mid-session-load.
+      midiLearnTarget: null
+    })
   },
   newSession: () =>
     set({
       session: makeEmptySession(),
-      selectedCell: null,
       currentFilePath: null,
-      metaKnobDisplayValues: Array.from({ length: META_KNOB_COUNT }, () => 0)
+      metaKnobDisplayValues: Array.from({ length: META_KNOB_COUNT }, () => 0),
+      // Same ephemeral reset as setSession — see comment there.
+      selectedCell: null,
+      selectedCells: [],
+      selectedSceneIds: [],
+      selectedTrackIds: [],
+      selectedTrack: null,
+      armedSceneId: null,
+      sequencePaused: false,
+      transportStartedAt: null,
+      transportAccumulatedMs: 0,
+      midiLearnTarget: null
     }),
   setCurrentFilePath: (p) => set({ currentFilePath: p }),
   setName: (name) => set((st) => ({ session: { ...st.session, name } })),
@@ -472,7 +580,12 @@ export const useStore = create<State>((set, get) => ({
         // Clear cell selection if it pointed at one of the deleted scenes.
         selectedCell:
           st.selectedCell && idSet.has(st.selectedCell.sceneId) ? null : st.selectedCell,
-        selectedCells: st.selectedCells.filter((r) => !idSet.has(r.sceneId))
+        selectedCells: st.selectedCells.filter((r) => !idSet.has(r.sceneId)),
+        // Clear the cue if the armed scene was deleted — firing a dead id
+        // would be a no-op and leaving the chevron on a missing scene is
+        // confusing.
+        armedSceneId:
+          st.armedSceneId && idSet.has(st.armedSceneId) ? null : st.armedSceneId
       }
     }),
   setView: (v) => set({ view: v }),
@@ -588,7 +701,9 @@ export const useStore = create<State>((set, get) => ({
       selectedSceneIds: st.selectedSceneIds.filter((sid) => sid !== id),
       // Clear selection if it pointed at this scene — otherwise Inspector crashes.
       selectedCell: st.selectedCell?.sceneId === id ? null : st.selectedCell,
-      selectedCells: st.selectedCells.filter((r) => r.sceneId !== id)
+      selectedCells: st.selectedCells.filter((r) => r.sceneId !== id),
+      // Drop arm if the armed scene is the one being deleted.
+      armedSceneId: st.armedSceneId === id ? null : st.armedSceneId
     })),
   updateScene: (id, patch) =>
     set((st) => ({
@@ -854,7 +969,112 @@ export const useStore = create<State>((set, get) => ({
   // The "linked compact mode" (both at once) is surfaced via a right-click
   // on either toggle in EditView, which calls both setters together.
   setScenesCollapsed: (v) => set({ scenesCollapsed: v }),
+  setShowMode: (v) =>
+    set((st) =>
+      v
+        ? // Entering show mode:
+          //  - force Sequence view as the default landing pane (Tab still
+          //    flips to Edit in show mode, see App.tsx keyboard router);
+          //  - force the Meta Controller bar visible — in show mode knobs
+          //    are the only live-tweakable thing, so hiding them would
+          //    strip the performer of their most useful control.
+          {
+            showMode: true,
+            view: 'sequence',
+            session: {
+              ...st.session,
+              metaController: { ...st.session.metaController, visible: true }
+            }
+          }
+        : { showMode: false }
+    ),
   setTracksCollapsed: (v) => set({ tracksCollapsed: v }),
+  setOscMonitorOpen: (v) => set({ oscMonitorOpen: v }),
+  setArmedSceneId: (id) =>
+    set((st) => {
+      // Defensive — don't arm a scene that doesn't exist.
+      if (id && !st.session.scenes.some((s) => s.id === id)) return { armedSceneId: null }
+      return { armedSceneId: id }
+    }),
+  setAutoAdvanceArm: (v) => set({ autoAdvanceArm: v }),
+  setMorphEnabled: (v) => set({ morphEnabled: v }),
+  setGoMidi: (b) =>
+    set((st) => ({
+      session: { ...st.session, goMidi: b }
+    })),
+  setMorphTimeMidi: (b) =>
+    set((st) => ({
+      session: { ...st.session, morphTimeMidi: b }
+    })),
+  setMorphMs: (ms) => {
+    if (!Number.isFinite(ms)) return
+    set({ morphMs: Math.max(0, Math.min(300000, ms)) })
+  },
+  resolveMorphMs: (sceneId) => {
+    const st = get()
+    const scene = st.session.scenes.find((s) => s.id === sceneId)
+    // Per-scene override wins if set (and ≥ 0).
+    if (scene && typeof scene.morphInMs === 'number' && scene.morphInMs >= 0) {
+      return scene.morphInMs
+    }
+    if (st.morphEnabled) return st.morphMs
+    return undefined
+  },
+  triggerSceneWithMorph: (sceneId) => {
+    const morphMs = get().resolveMorphMs(sceneId)
+    void window.api.triggerScene(
+      sceneId,
+      morphMs !== undefined ? { morphMs } : undefined
+    )
+  },
+  fireArmed: () => {
+    const st = get()
+    const id = st.armedSceneId
+    if (!id) return null
+    // Trigger via the morph-aware helper so GO goes through the same
+    // precedence rules as Space / click / MIDI.
+    st.triggerSceneWithMorph(id)
+    // Optionally arm the next non-empty slot so Space-Space-Space walks
+    // the sequence. Uses the slot the fired scene was in (or slot 0 if
+    // it isn't in the current sequence) as the starting point.
+    let nextArm: string | null = null
+    if (st.autoAdvanceArm) {
+      const seq = st.session.sequence
+      const len = Math.min(seq.length, st.session.sequenceLength)
+      const here = seq.findIndex((sid) => sid === id)
+      const start = here >= 0 ? here : -1
+      for (let i = 1; i <= len; i++) {
+        const idx = (start + i + len) % len
+        const candidate = seq[idx]
+        if (candidate && candidate !== id) {
+          nextArm = candidate
+          break
+        }
+      }
+    }
+    set({ armedSceneId: nextArm })
+    return id
+  },
+  transportPlay: () =>
+    set((st) =>
+      // Already running? Leave state alone — second Play should feel like
+      // a no-op on the timer (real play-scene logic is handled separately
+      // by the caller via window.api.triggerScene / resumeSequence).
+      st.transportStartedAt !== null
+        ? st
+        : { transportStartedAt: Date.now() }
+    ),
+  transportPause: () =>
+    set((st) => {
+      if (st.transportStartedAt === null) return st
+      const dt = Date.now() - st.transportStartedAt
+      return {
+        transportStartedAt: null,
+        transportAccumulatedMs: st.transportAccumulatedMs + dt
+      }
+    }),
+  transportStop: () =>
+    set({ transportStartedAt: null, transportAccumulatedMs: 0 }),
   setGlobalBpm: (bpm) =>
     set((st) => ({
       session: { ...st.session, globalBpm: clampFloat(bpm, 10, 500) }
@@ -903,6 +1123,11 @@ export const useStore = create<State>((set, get) => ({
           ...base.modulation,
           ...(tm ?? {}),
           envelope: { ...base.modulation.envelope, ...(tm?.envelope ?? {}) },
+          // Ramp was added later; always deep-clone so the new cell never
+          // shares a reference with either the factory default or the
+          // template's own ramp object. Without this, editing the new
+          // clip's ramp mutates whichever object the spread kept alive.
+          ramp: { ...base.modulation.ramp, ...(tm?.ramp ?? {}) },
           arpeggiator: { ...base.modulation.arpeggiator, ...(tm?.arpeggiator ?? {}) },
           random: { ...base.modulation.random, ...(tm?.random ?? {}) }
         },
@@ -1115,6 +1340,12 @@ function propagateDefaults(s: Session): Session {
       })),
     focusedSceneId: typeof s.focusedSceneId === 'string' ? s.focusedSceneId : null,
     midiInputName: typeof s.midiInputName === 'string' ? s.midiInputName : null,
+    // Transport-level bindings — optional and CC/note shape-validated
+    // through the same sanitizer used for scene/cell/track bindings. Older
+    // sessions simply don't have the field; default to undefined (no
+    // binding) so no routing happens.
+    goMidi: sanitizeMidiBinding(s.goMidi),
+    morphTimeMidi: sanitizeMidiBinding(s.morphTimeMidi),
     sequence:
       Array.isArray(s.sequence) && s.sequence.length === SEQUENCE_LEN
         ? s.sequence
@@ -1133,6 +1364,13 @@ function propagateDefaults(s: Session): Session {
         typeof sc.multiplicator === 'number' && Number.isFinite(sc.multiplicator)
           ? Math.max(1, Math.min(128, Math.floor(sc.multiplicator)))
           : 1,
+      // Morph-in is optional and brand-new. Keep undefined in old sessions
+      // rather than forcing a default so "no per-scene override" still
+      // behaves as "follow transport".
+      morphInMs:
+        typeof sc.morphInMs === 'number' && Number.isFinite(sc.morphInMs)
+          ? Math.max(0, Math.min(300000, Math.floor(sc.morphInMs)))
+          : undefined,
       midiTrigger: sanitizeMidiBinding(sc.midiTrigger),
       cells: Object.fromEntries(
         Object.entries(sc.cells).map(([tid, c]) => {
@@ -1181,7 +1419,29 @@ function propagateDefaults(s: Session): Session {
                 sustainPct: env?.sustainPct ?? DEFAULT_ENVELOPE.sustainPct,
                 releasePct: env?.releasePct ?? DEFAULT_ENVELOPE.releasePct,
                 sustainLevel: env?.sustainLevel ?? DEFAULT_ENVELOPE.sustainLevel,
-                sync: env?.sync ?? DEFAULT_ENVELOPE.sync
+                sync: env?.sync ?? DEFAULT_ENVELOPE.sync,
+                // New field for the Free(synced) mode. Back-fill to the
+                // default so older sessions don't send NaN through the math.
+                totalMs: typeof env?.totalMs === 'number' ? env.totalMs : DEFAULT_ENVELOPE.totalMs
+              },
+              // Ramp is a NEW modulator type; older sessions lack this field
+              // entirely. Default to the factory ramp so the engine + UI
+              // always have valid numbers to work with.
+              ramp: {
+                rampMs:
+                  typeof (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.rampMs === 'number'
+                    ? (m!.ramp as RampParams).rampMs
+                    : DEFAULT_RAMP.rampMs,
+                curvePct:
+                  typeof (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.curvePct === 'number'
+                    ? (m!.ramp as RampParams).curvePct
+                    : DEFAULT_RAMP.curvePct,
+                sync:
+                  (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.sync ?? DEFAULT_RAMP.sync,
+                totalMs:
+                  typeof (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.totalMs === 'number'
+                    ? (m!.ramp as RampParams).totalMs
+                    : DEFAULT_RAMP.totalMs
               },
               arpeggiator: {
                 steps: (m?.arpeggiator as Partial<typeof DEFAULT_ARPEGGIATOR> | undefined)?.steps ?? DEFAULT_ARPEGGIATOR.steps,

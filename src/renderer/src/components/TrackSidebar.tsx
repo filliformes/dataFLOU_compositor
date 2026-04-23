@@ -19,8 +19,14 @@ export default function TrackSidebar(): JSX.Element {
   const setRowHeight = useStore((s) => s.setRowHeight)
   const notesHeight = useStore((s) => s.editorNotesHeight)
   const setNotesHeight = useStore((s) => s.setEditorNotesHeight)
-  const tracksCollapsed = useStore((s) => s.tracksCollapsed)
-  const scenesCollapsed = useStore((s) => s.scenesCollapsed)
+  const tracksCollapsedRaw = useStore((s) => s.tracksCollapsed)
+  const scenesCollapsedRaw = useStore((s) => s.scenesCollapsed)
+  const showMode = useStore((s) => s.showMode)
+  // Show mode forces the compact layout even when the user had the bar
+  // expanded pre-entry — performers see more rows/scenes at once and the
+  // sprawling +Scene / +Message row is hidden anyway.
+  const tracksCollapsed = tracksCollapsedRaw || showMode
+  const scenesCollapsed = scenesCollapsedRaw || showMode
   const headerH = useHeaderHeight()
 
   // Right-click context menu — a single instance shared across all rows.
@@ -70,6 +76,7 @@ export default function TrackSidebar(): JSX.Element {
             </span>
             <div className="flex items-center gap-1">
               <button
+                data-hide-in-show="true"
                 className="btn"
                 disabled={sceneFull}
                 onClick={addScene}
@@ -78,6 +85,7 @@ export default function TrackSidebar(): JSX.Element {
                 +S
               </button>
               <button
+                data-hide-in-show="true"
                 className="btn"
                 disabled={msgFull}
                 onClick={addTrack}
@@ -93,6 +101,7 @@ export default function TrackSidebar(): JSX.Element {
             <div className="flex items-center justify-between gap-2">
               <span className="label truncate">Scenes ({scenes.length}/128)</span>
               <button
+                data-hide-in-show="true"
                 className="btn shrink-0"
                 disabled={sceneFull}
                 onClick={addScene}
@@ -105,6 +114,7 @@ export default function TrackSidebar(): JSX.Element {
             <div className="flex items-center justify-between gap-2">
               <span className="label truncate">Messages ({tracks.length}/128)</span>
               <button
+                data-hide-in-show="true"
                 className="btn shrink-0"
                 disabled={msgFull}
                 onClick={addTrack}

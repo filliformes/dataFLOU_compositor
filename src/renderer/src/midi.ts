@@ -130,6 +130,14 @@ class MidiManager {
         // is the learn target we ignore it so they can keep trying.
         if (binding.kind !== 'cc') return
         st.setMetaKnobMidi(target.index, binding)
+      } else if (target.kind === 'go') {
+        // GO can be fired by either a pad (note) or a button/CC — accept both.
+        st.setGoMidi(binding)
+      } else if (target.kind === 'morphTime') {
+        // Morph time is a continuous value — only CCs make sense. Ignore
+        // notes so the user can keep trying with a knob/slider.
+        if (binding.kind !== 'cc') return
+        st.setMorphTimeMidi(binding)
       }
       st.setMidiLearnTarget(null)
       return
@@ -160,11 +168,32 @@ class MidiManager {
           return
         }
       }
+      // Morph-time CC — continuous mapping from 0..127 to 0..10 000 ms.
+      // 10 seconds is a sensible live-performance maximum. Users wanting
+      // longer glides set the time manually in the transport. (Could
+      // become a curve/range setting later if someone asks.)
+      if (session.morphTimeMidi && matches(session.morphTimeMidi, binding)) {
+        const ms = Math.round((value / 127) * 10000)
+        st.setMorphMs(ms)
+        // Auto-enable Morph so twisting the mapped CC actually has effect
+        // the first time. Users can still disable manually; we only flip
+        // ON, never OFF, on a CC event.
+        if (!st.morphEnabled) st.setMorphEnabled(true)
+        return
+      }
     }
 
     // Triggers (scenes/cells) only fire on value > 0 so a CC's release edge
     // (or zero-velocity note-off smuggled through) doesn't double-fire.
     if (value <= 0) return
+
+    // Transport GO — a bound note/CC fires the armed cue (if any) via the
+    // same path as clicking the button. No-op when nothing's armed so a
+    // footswitch press with no cue doesn't do anything surprising.
+    if (session.goMidi && matches(session.goMidi, binding)) {
+      if (st.armedSceneId) st.fireArmed()
+      return
+    }
 
     // Cell triggers first (per-clip binding).
     for (const sc of session.scenes) {
@@ -183,7 +212,9 @@ class MidiManager {
         if (st.engine.activeSceneId === s.id) {
           window.api.stopAll()
         } else {
-          window.api.triggerScene(s.id)
+          // Go through the morph-aware helper so MIDI-triggered scenes
+          // honor the transport-level / per-scene Morph settings too.
+          useStore.getState().triggerSceneWithMorph(s.id)
         }
         return
       }

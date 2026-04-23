@@ -134,7 +134,7 @@ export default function SequenceView(): JSX.Element {
 
           {/* Grid */}
           <div className="flex-1 overflow-auto bg-bg p-4">
-            <div className="flex items-center gap-2 mb-3">
+            <div data-hide-in-show="true" className="flex items-center gap-2 mb-3">
               <span className="label">Scene steps</span>
               <BoundedNumberInput
                 className="input w-16 text-[12px] py-0.5"
@@ -170,7 +170,8 @@ export default function SequenceView(): JSX.Element {
           </div>
         </div>
 
-        <StatusBar />
+        {/* StatusBar removed — transport now lives globally at the bottom
+            of App.tsx (see TransportBar) so it's also visible in Edit view. */}
       </div>
 
       {/* Drag preview — floats with the cursor during drag, so the user
@@ -225,7 +226,7 @@ function StatusBar(): JSX.Element {
       startId = first
     }
     if (startId) {
-      await window.api.triggerScene(startId)
+      useStore.getState().triggerSceneWithMorph(startId)
       setPaused(false)
     }
   }
@@ -309,6 +310,7 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
   const setFocusedScene = useStore((s) => s.setFocusedScene)
   const selectSceneRange = useStore((s) => s.selectSceneRange)
   const selectedSceneIds = useStore((s) => s.selectedSceneIds)
+  const isArmed = useStore((s) => s.armedSceneId === scene.id)
   // Highlight if part of the multi-selection (same logic as SceneColumn).
   const inMulti = selectedSceneIds.length > 0 && selectedSceneIds.includes(scene.id)
   const highlighted = inMulti || (selectedSceneIds.length === 0 && focused)
@@ -318,11 +320,22 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
       {...attributes}
       {...listeners}
       onClick={(e) => {
+        // Alt-click arms this scene as the next cue (toggle).
+        if (e.altKey) {
+          const cur = useStore.getState().armedSceneId
+          useStore.getState().setArmedSceneId(cur === scene.id ? null : scene.id)
+          return
+        }
         // Shift-click extends the multi-selection from the current anchor.
         if (e.shiftKey) selectSceneRange(scene.id)
         else setFocusedScene(scene.id)
       }}
-      className={`px-2 py-1.5 rounded border cursor-pointer text-[12px] ${
+      onContextMenu={(e) => {
+        e.preventDefault()
+        const cur = useStore.getState().armedSceneId
+        useStore.getState().setArmedSceneId(cur === scene.id ? null : scene.id)
+      }}
+      className={`relative px-2 py-1.5 rounded border cursor-pointer text-[12px] ${
         isDragging ? 'opacity-50 cursor-grab' : ''
       } ${highlighted ? 'ring-2 ring-accent' : ''}`}
       // A scene inside the multi-selection gets a deeper tint so the set
@@ -331,7 +344,10 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
         borderColor: scene.color,
         background: scene.color + (highlighted ? '33' : '1a')
       }}
+      title="Click: select · Shift-click: extend · Alt-click / right-click: arm as next cue"
     >
+      {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none" />}
+      {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
       <span className="font-medium">{scene.name}</span>
     </div>
   )
@@ -347,6 +363,7 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
 function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
   const updateScene = useStore((s) => s.updateScene)
   const removeScene = useStore((s) => s.removeScene)
+  const showMode = useStore((s) => s.showMode)
   const messageCount = Object.keys(scene.cells).length
   const nextModes: { id: NextMode; label: string }[] = [
     { id: 'stop', label: 'Stop' },
@@ -359,21 +376,26 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
     { id: 'other', label: 'Other' }
   ]
   return (
-    <div className="p-3 flex flex-col gap-3 text-[12px]">
+    <fieldset
+      disabled={showMode}
+      className="p-3 flex flex-col gap-3 text-[12px] border-0 m-0 min-w-0"
+    >
       <div className="flex items-center justify-between">
         <span className="label">Scene</span>
-        <button
-          className="btn text-[11px] py-0.5"
-          style={{ borderColor: 'rgb(var(--c-danger))', color: 'rgb(var(--c-danger))' }}
-          onClick={() => {
-            if (confirm(`Delete scene "${scene.name}"? This cannot be undone.`)) {
-              removeScene(scene.id)
-            }
-          }}
-          title="Delete scene (or press Delete key)"
-        >
-          Delete
-        </button>
+        {!showMode && (
+          <button
+            className="btn text-[11px] py-0.5"
+            style={{ borderColor: 'rgb(var(--c-danger))', color: 'rgb(var(--c-danger))' }}
+            onClick={() => {
+              if (confirm(`Delete scene "${scene.name}"? This cannot be undone.`)) {
+                removeScene(scene.id)
+              }
+            }}
+            title="Delete scene (or press Delete key)"
+          >
+            Delete
+          </button>
+        )}
       </div>
 
       <div className="flex items-center gap-2">
@@ -450,6 +472,38 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
         </div>
       </div>
 
+      {/* Per-scene Morph-in override. Leave blank (empty field) to fall
+          back to the transport-level Morph; set a number (incl. 0) to
+          pin THIS scene's glide-in duration regardless of transport. */}
+      <div className="flex items-center gap-2">
+        <span
+          className="label"
+          title="Morph-in: when this scene is triggered, glide every cell over this duration. Overrides the transport Morph setting. Leave blank to follow transport."
+        >
+          Morph-in
+        </span>
+        <input
+          className="input w-20 text-[12px] py-0.5"
+          type="text"
+          inputMode="numeric"
+          placeholder="(transport)"
+          value={scene.morphInMs !== undefined ? String(scene.morphInMs) : ''}
+          onChange={(e) => {
+            const raw = e.target.value.trim()
+            if (raw === '') {
+              updateScene(scene.id, { morphInMs: undefined })
+              return
+            }
+            const n = Number(raw)
+            if (!Number.isFinite(n)) return
+            updateScene(scene.id, {
+              morphInMs: Math.max(0, Math.min(300000, Math.floor(n)))
+            })
+          }}
+        />
+        <span className="text-muted text-[11px]">ms</span>
+      </div>
+
       <div className="flex items-center gap-2">
         <span className="label">Messages</span>
         <span className="text-muted">
@@ -460,7 +514,7 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
       <div className="flex items-center gap-2 text-[11px] text-muted">
         <span>Tip: switch to the Edit view (Tab) to edit this scene's clips.</span>
       </div>
-    </div>
+    </fieldset>
   )
 }
 
@@ -484,6 +538,7 @@ function SlotCell({
   } = useDraggable({ id: `slot-${index}`, disabled: !scene })
   const setFocusedScene = useStore((s) => s.setFocusedScene)
   const selectSceneRange = useStore((s) => s.selectSceneRange)
+  const isArmed = useStore((s) => !!scene && s.armedSceneId === scene.id)
 
   function setRef(n: HTMLDivElement | null): void {
     setDropRef(n)
@@ -500,11 +555,31 @@ function SlotCell({
           ? onClear
             ? onClear
             : (e) => {
+                // Alt-click arms the scene occupying this slot.
+                if (e.altKey) {
+                  const cur = useStore.getState().armedSceneId
+                  useStore.getState().setArmedSceneId(cur === scene.id ? null : scene.id)
+                  return
+                }
                 // Shift-click extends the scene multi-selection from the
                 // anchor — handy for bulk operations from the grid too.
                 if (e.shiftKey) selectSceneRange(scene.id)
                 else setFocusedScene(scene.id)
               }
+          : undefined
+      }
+      onContextMenu={
+        scene
+          ? (e) => {
+              e.preventDefault()
+              const cur = useStore.getState().armedSceneId
+              useStore.getState().setArmedSceneId(cur === scene.id ? null : scene.id)
+            }
+          : undefined
+      }
+      title={
+        scene
+          ? 'Click: focus · Shift-click: extend selection · Alt-click / right-click: arm as next cue'
           : undefined
       }
       className={`relative h-12 rounded border text-[10px] flex flex-col items-center justify-center ${
@@ -514,6 +589,8 @@ function SlotCell({
       }`}
       style={scene ? { background: scene.color + '33', borderColor: scene.color } : undefined}
     >
+      {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none" />}
+      {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
       <div className="absolute top-0 left-0.5 text-[8px] text-muted">{index + 1}</div>
       {scene && <div className="font-medium truncate max-w-full px-1">{scene.name}</div>}
     </div>

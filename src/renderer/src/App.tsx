@@ -1,10 +1,13 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useStore, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_STEP } from './store'
 import { midi } from './midi'
 import TopBar from './components/TopBar'
 import EditView from './components/EditView'
 import MetaControllerBar from './components/MetaControllerBar'
 import SequenceView from './components/SequenceView'
+import OscMonitor from './components/OscMonitor'
+import CrashRecoveryPrompt from './components/CrashRecoveryPrompt'
+import TransportBar from './components/TransportBar'
 
 export default function App(): JSX.Element {
   const session = useStore((s) => s.session)
@@ -18,9 +21,30 @@ export default function App(): JSX.Element {
     document.documentElement.setAttribute('data-theme', theme)
   }, [theme])
 
-  // Push session to engine whenever it changes.
+  // Mirror show-mode to <html data-show-mode> so CSS can hide edit chrome
+  // selectively. Styling lives in styles.css under [data-show-mode='true'].
+  const showMode = useStore((s) => s.showMode)
   useEffect(() => {
-    window.api.updateSession(session)
+    document.documentElement.setAttribute('data-show-mode', String(showMode))
+  }, [showMode])
+
+  // Push session to engine whenever it changes. Coalesced on one paint
+  // frame so a burst of session mutations (typing into a field, default-
+  // link migration, the new-scene-plus-re-render storm, etc.) produces
+  // ONE IPC call per frame carrying the latest session snapshot. Prior
+  // behavior was one IPC per mutation — under certain scene additions
+  // with many cells we saw Electron's IPC pipe back-pressure and freeze
+  // the main process (and with it, anything reading its stdout).
+  const sessionIpcPendingRef = useRef(false)
+  useEffect(() => {
+    if (sessionIpcPendingRef.current) return
+    sessionIpcPendingRef.current = true
+    requestAnimationFrame(() => {
+      sessionIpcPendingRef.current = false
+      // Always read the freshest session at flush time, not the one
+      // captured in this effect's closure.
+      window.api.updateSession(useStore.getState().session)
+    })
   }, [session])
 
   // Subscribe to engine state events.
@@ -56,13 +80,25 @@ export default function App(): JSX.Element {
   }, [])
 
   // Global keyboard shortcuts.
+  //
+  // Authoring (suppressed inside text fields):
   //   Tab           → toggle Edit ↔ Sequence
-  //   Ctrl+T        → add a Message (track row)
+  //   Ctrl+T        → add a Message
   //   Alt+S         → add a Scene
-  //   Delete / Del  → (Sequence view only) remove the focused scene
-  // Shortcuts are suppressed inside text fields so typing/form-tab behave
-  // normally. The other shortcuts always fire (preventDefault to override
-  // browser/menu).
+  //   Delete        → (Sequence view only) remove focused scene
+  //
+  // Performance (always active, even in show mode):
+  //   1–9           → trigger scenes 1–9 in the sequence (sequenceLength slots)
+  //   0             → trigger scene 10
+  //   Space         → trigger next non-empty slot after the currently-active
+  //                   scene (or the first non-empty slot if none is active)
+  //   .             → Stop All (graceful morph to 0)
+  //   Shift+.       → Panic (instant kill)
+  //
+  // Show mode:
+  //   F11           → toggle show / edit mode
+  //   Escape (hold) → exit show mode (press and hold ~800 ms). Short taps
+  //                   of Escape still close modals / menus etc.
   const addTrack = useStore((s) => s.addTrack)
   const addScene = useStore((s) => s.addScene)
   const removeScene = useStore((s) => s.removeScene)
@@ -77,25 +113,156 @@ export default function App(): JSX.Element {
         el?.isContentEditable === true
       )
     }
+    // Figure out which scene id lives at slot N (0-based) in the current
+    // sequence. Returns null if the slot is empty or beyond sequenceLength.
+    function sceneIdAtSlot(idx: number): string | null {
+      const st = useStore.getState()
+      const len = st.session.sequenceLength
+      if (idx < 0 || idx >= len) return null
+      return st.session.sequence[idx] ?? null
+    }
+    // Next non-empty slot after the currently-playing scene, wrapping. Used
+    // by Space bar.
+    function nextSceneId(): string | null {
+      const st = useStore.getState()
+      const len = st.session.sequenceLength
+      const seq = st.session.sequence.slice(0, len)
+      const active = st.engine.activeSceneId
+      const start = active ? seq.findIndex((id) => id === active) : -1
+      for (let i = 1; i <= seq.length; i++) {
+        const id = seq[(start + i + seq.length) % seq.length]
+        if (id) return id
+      }
+      return null
+    }
+
+    // Hold-to-exit state for Escape in show mode.
+    let escDownAt = 0
+    let escTimer: ReturnType<typeof setTimeout> | null = null
+
     function onKey(e: KeyboardEvent): void {
+      // ------- F11: toggle show mode (always, even inside inputs so a
+      //             performer tapping into a field can still flip it)
+      if (e.key === 'F11') {
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setShowMode(!st.showMode)
+        return
+      }
+
+      // ------- CapsLock: toggle OSC monitor drawer. Works everywhere
+      //             (including show mode and inside text inputs) so the
+      //             performer can peek at outgoing OSC traffic without
+      //             taking their hands off the keyboard.
+      if (e.key === 'CapsLock') {
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setOscMonitorOpen(!st.oscMonitorOpen)
+        return
+      }
+
+      // ------- Escape hold-to-exit show mode. Short taps still propagate
+      //             to menus/modals (they own their own Esc handlers).
+      if (e.key === 'Escape') {
+        const st = useStore.getState()
+        if (!st.showMode) return
+        if (e.repeat) return // only arm once per physical press
+        escDownAt = Date.now()
+        if (escTimer) clearTimeout(escTimer)
+        escTimer = setTimeout(() => {
+          // Still pressed ~800 ms later? Exit show mode.
+          const stillHeld = Date.now() - escDownAt >= 750
+          if (stillHeld) useStore.getState().setShowMode(false)
+        }, 800)
+        return
+      }
+
+      // ------- Performance hotkeys — active everywhere, including inside
+      //             text fields (musicians' typing habits notwithstanding,
+      //             these are live-fire keys). Guarded only against typing
+      //             spaces in a text field.
+      //
+      // Space → GO. If a scene is armed, fire it (and optionally
+      // auto-arm the next non-empty slot). Otherwise fall back to the
+      // legacy behavior: trigger the next non-empty sequence slot.
+      // Never fires inside text fields so normal space-in-text still works.
+      if (e.key === ' ' || e.code === 'Space') {
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        const st = useStore.getState()
+        if (st.armedSceneId) {
+          st.fireArmed()
+        } else {
+          const id = nextSceneId()
+          if (id) st.triggerSceneWithMorph(id)
+        }
+        return
+      }
+      // "." → Stop All; Shift+"." → Panic.
+      if (e.key === '.' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        if (e.shiftKey) window.api.panic()
+        else window.api.stopAll()
+        return
+      }
+      // 1–9 → fire scenes 1–9 in the sequence; 0 → scene 10.
+      if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        if (isEditableTarget(e.target)) return
+        if (e.key >= '1' && e.key <= '9') {
+          e.preventDefault()
+          const id = sceneIdAtSlot(Number(e.key) - 1)
+          if (id) useStore.getState().triggerSceneWithMorph(id)
+          return
+        }
+        if (e.key === '0') {
+          e.preventDefault()
+          const id = sceneIdAtSlot(9)
+          if (id) useStore.getState().triggerSceneWithMorph(id)
+          return
+        }
+      }
+
+      // ------- Authoring hotkeys (suppressed in show mode)
+      const showMode = useStore.getState().showMode
+
       // Ctrl/Cmd + T → add Message
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 't') {
+        if (showMode) return
         e.preventDefault()
         addTrack()
         return
       }
+      // `A` → arm the focused scene as the next cue (or clear if it's
+      // already armed). Works everywhere except inside text inputs.
+      // Intentionally allowed in show mode — arming is a performance op.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'a'
+      ) {
+        if (isEditableTarget(e.target)) return
+        const st = useStore.getState()
+        const focusedId = st.session.focusedSceneId
+        if (!focusedId) return
+        e.preventDefault()
+        st.setArmedSceneId(st.armedSceneId === focusedId ? null : focusedId)
+        return
+      }
       // Alt + S → add Scene
       if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+        if (showMode) return
         e.preventDefault()
         addScene()
         return
       }
-      // Delete / Del in Sequence view → remove focused scene. Guarded against
-      // firing while the user is editing text (Delete in an input must act
-      // on the text cursor, not the scene).
+      // Delete → remove focused scene in Sequence view.
       if (e.key === 'Delete' || e.key === 'Del') {
         if (isEditableTarget(e.target)) return
         const st = useStore.getState()
+        if (st.showMode) return
         if (st.view !== 'sequence') return
         const focusedId = st.session.focusedSceneId
         if (!focusedId) return
@@ -103,15 +270,32 @@ export default function App(): JSX.Element {
         removeScene(focusedId)
         return
       }
-      // Tab → toggle view
+      // Tab → toggle view. Active in both authoring and show mode — in
+      // show mode the Edit view renders as a read-only browser (no
+      // inspector, no clip editing) so flipping between Sequence and Edit
+      // is still safe for a performer who wants to see what's patched.
       if (e.key === 'Tab') {
         if (isEditableTarget(e.target)) return
         e.preventDefault()
         setView(useStore.getState().view === 'edit' ? 'sequence' : 'edit')
       }
     }
+    function onKeyUp(e: KeyboardEvent): void {
+      if (e.key === 'Escape') {
+        // Short Esc tap — clear the pending hold-timer so we don't exit.
+        if (escTimer) {
+          clearTimeout(escTimer)
+          escTimer = null
+        }
+      }
+    }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keyup', onKeyUp)
+      if (escTimer) clearTimeout(escTimer)
+    }
   }, [setView, addTrack, addScene, removeScene])
 
   const uiScale = useStore((s) => s.uiScale)
@@ -133,7 +317,18 @@ export default function App(): JSX.Element {
         <div className="flex-1 min-h-0">
           {view === 'edit' ? <EditView /> : <SequenceView />}
         </div>
+        {/* Global transport bar — play/pause/stop, view toggle, selected
+            scene readout, and running time counter. Sits inside the zoom
+            wrapper so Ctrl+wheel scales it alongside the rest of the app. */}
+        <TransportBar />
       </div>
+      {/* Optional OSC monitor drawer — renders null when closed, so there
+          is no subscription / memory cost while off. Outside the zoom
+          wrapper so the log stays crisp at 100 % regardless of UI scale. */}
+      <OscMonitor />
+      {/* Shown once at startup if we detect the previous run crashed
+          (autosave sentinel file was left behind). No-op otherwise. */}
+      <CrashRecoveryPrompt />
     </div>
   )
 }

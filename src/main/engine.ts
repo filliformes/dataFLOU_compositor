@@ -26,7 +26,7 @@ import {
   readNumber,
   scaleMetaValue
 } from '@shared/factory'
-import { OscSender } from './osc'
+import { OscSender, type OscSendEvent } from './osc'
 
 type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
 
@@ -114,12 +114,9 @@ function lfo(shape: LfoShape, phase: number, state: TrackState, tickIdx: number)
     case 'square':
       return p < 0.5 ? 1 : -1
     case 'rndStep': {
-      // One new value per LFO period. "Period" is measured in ticks because
-      // rate is already incorporated into phase; a new step fires when phase wraps.
-      // Tracked via tick index the last time we wrapped.
-      if (state.rndStepLastTick !== tickIdx) {
-        // This check is not perfect but good enough; reset on phase wrap.
-      }
+      // One new value per LFO period. The actual sample-and-hold update
+      // happens in tick() when phase wraps (see `rndStepValue` assignment
+      // there). Here we just return the held value.
       return state.rndStepValue
     }
     case 'rndSmooth': {
@@ -172,6 +169,11 @@ export class SceneEngine {
 
   setOnStateChange(cb: (s: EngineState) => void): void {
     this.onStateChange = cb
+  }
+
+  /** Forward every successful OSC send to `cb`. Pass null to detach. */
+  setOnOscSend(cb: ((e: OscSendEvent) => void) | null): void {
+    this.sender.setOnSent(cb)
   }
 
   private emitState(): void {
@@ -255,7 +257,18 @@ export class SceneEngine {
     }
   }
 
-  triggerCell(sceneId: string, trackId: string): void {
+  // `morphMsOverride` — when set, this transition uses the given duration
+  // in milliseconds instead of the cell's own `transitionMs`. Lets the
+  // scene-to-scene Morph feature glide every track in a scene over the
+  // same time. null / undefined = use cell's transitionMs as before.
+  // `silent` — skip emitState. Callers batching many triggers (scene
+  // fire) can emit once at the end instead of N times.
+  triggerCell(
+    sceneId: string,
+    trackId: string,
+    morphMsOverride?: number | null,
+    silent?: boolean
+  ): void {
     if (!this.session) return
     const scene = this.session.scenes.find((s) => s.id === sceneId)
     if (!scene) return
@@ -282,7 +295,10 @@ export class SceneEngine {
       ts.fromCenter = pad(curOut, len, 0)
       ts.toCenter = pad(targets, len, 0)
       ts.morphStart = now()
-      ts.morphMs = cell.transitionMs
+      ts.morphMs =
+        typeof morphMsOverride === 'number' && morphMsOverride >= 0
+          ? morphMsOverride
+          : cell.transitionMs
       ts.activeSceneId = sceneId
       ts.armed = true
       ts.stopping = false
@@ -314,7 +330,7 @@ export class SceneEngine {
       ts.lastSentString = null
       ts.lastStringAtSceneId = null
       ts.lastStringAtStep = -1
-      this.emitState()
+      if (!silent) this.emitState()
     }
 
     if (cell.delayMs > 0) {
@@ -335,7 +351,15 @@ export class SceneEngine {
     this.beginStop(trackId)
   }
 
-  private beginStop(trackId: string): void {
+  // `silent` suppresses the per-call emitState() — the caller is
+  // responsible for emitting once after batching multiple beginStops
+  // (e.g. scene-level orphan fade). Keeps IPC volume bounded no matter
+  // how many tracks are involved in the morph.
+  private beginStop(
+    trackId: string,
+    morphMsOverride?: number,
+    silent?: boolean
+  ): void {
     const ts = this.tracks.get(trackId)
     if (!ts || !this.session) return
     if (ts.delayTimer) {
@@ -347,16 +371,24 @@ export class SceneEngine {
     ts.fromCenter = [...curOut]
     ts.toCenter = curOut.map(() => 0)
     ts.morphStart = now()
-    ts.morphMs = cell?.transitionMs ?? 0
+    // Morph override lets the scene-to-scene Morph feature fade orphan
+    // tracks out over the same duration the new tracks fade in.
+    ts.morphMs =
+      typeof morphMsOverride === 'number' && morphMsOverride >= 0
+        ? morphMsOverride
+        : cell?.transitionMs ?? 0
     ts.stopping = true
-    this.emitState()
+    if (!silent) this.emitState()
   }
 
   stopScene(sceneId: string): void {
     if (!this.session) return
-    // Stop any track whose active cell is currently in this scene.
+    // Stop any track whose active cell is currently in this scene — silent
+    // per-track, single emit at the end.
     for (const [tid, ts] of this.tracks.entries()) {
-      if (ts.armed && ts.activeSceneId === sceneId) this.beginStop(tid)
+      if (ts.armed && ts.activeSceneId === sceneId) {
+        this.beginStop(tid, undefined, /* silent */ true)
+      }
     }
     if (this.activeSceneId === sceneId) {
       this.activeSceneId = null
@@ -379,17 +411,50 @@ export class SceneEngine {
     if (scene) this.armSceneAdvance(scene)
   }
 
-  triggerScene(sceneId: string): void {
+  // `opts.morphMs` — when set, every cell in the scene morphs over this
+  // duration (ms) instead of its own transitionMs. Tracks that were active
+  // in the previous scene but have no cell in this new scene will ALSO
+  // fade out over the same duration, so the whole sonic picture glides
+  // from scene-A's state into scene-B's state in lockstep.
+  triggerScene(sceneId: string, opts?: { morphMs?: number }): void {
     if (!this.session) return
     const scene = this.session.scenes.find((s) => s.id === sceneId)
     if (!scene) return
+    const morphMs = opts?.morphMs
+    const useMorph = typeof morphMs === 'number' && morphMs >= 0
+
+    // Orphan fade — tracks that were playing a cell from the PREVIOUS
+    // scene but have no cell in the new scene. Fade them to 0 over the
+    // same morph duration so orphans don't just keep droning on.
+    // Only relevant when morphMs is provided (the "glide" op). We suppress
+    // the per-track emitState and rely on the single emit at the end of
+    // this method — otherwise a big scene with N orphans fires N+M IPC
+    // messages back-to-back, each triggering a full React reconciliation
+    // on the renderer side. That cascade was what froze the app when
+    // many tracks were in flight at once.
+    if (useMorph) {
+      const newTrackIds = new Set(Object.keys(scene.cells))
+      for (const [trackId, ts] of this.tracks.entries()) {
+        if (ts.armed && !newTrackIds.has(trackId)) {
+          this.beginStop(trackId, morphMs, /* silent */ true)
+        }
+      }
+    }
+
     // If this is the SAME scene as what's already active, we're here via a
     // loop follow-action or a multiplicator-driven internal repeat — bump
     // the repeat counter. Otherwise reset to 1 (fresh play).
     if (this.activeSceneId === sceneId) this.activeSceneRepeatCount += 1
     else this.activeSceneRepeatCount = 1
     for (const trackId of Object.keys(scene.cells)) {
-      this.triggerCell(sceneId, trackId)
+      // Silent per-cell emits — one coalesced emit happens after the
+      // loop. Keeps IPC volume + renderer reconciliation bounded.
+      this.triggerCell(
+        sceneId,
+        trackId,
+        useMorph ? morphMs : undefined,
+        /* silent */ true
+      )
     }
     this.activeSceneId = sceneId
     this.activeSceneStartedAt = Date.now()
@@ -522,7 +587,7 @@ export class SceneEngine {
 
   stopAll(): void {
     for (const [tid, ts] of this.tracks.entries()) {
-      if (ts.armed || ts.delayTimer) this.beginStop(tid)
+      if (ts.armed || ts.delayTimer) this.beginStop(tid, undefined, /* silent */ true)
     }
     this.clearSceneAdvance()
     this.activeSceneId = null
@@ -756,10 +821,17 @@ export class SceneEngine {
       // the same signal.
       let modNorm = 0
       let envGain = 1
+      let rampGain = 1
       if (cell.modulation.enabled && !ts.stopping) {
         if (cell.modulation.type === 'envelope') {
           envGain = computeEnvelopeGain(
             cell.modulation.envelope,
+            (t - ts.triggerTime) / 1000,
+            this.currentSceneDurationSec(ts.activeSceneId)
+          )
+        } else if (cell.modulation.type === 'ramp') {
+          rampGain = computeRampGain(
+            cell.modulation.ramp,
             (t - ts.triggerTime) / 1000,
             this.currentSceneDurationSec(ts.activeSceneId)
           )
@@ -814,6 +886,12 @@ export class SceneEngine {
             // (output = center); depth=100% → full VCA shape (out = center * env).
             const depth01 = cell.modulation.depthPct / 100
             out = center * (1 - depth01 + depth01 * envGain)
+          } else if (cell.modulation.type === 'ramp') {
+            // One-shot 0→1 ramp, depth-mixed identically to envelope. Once
+            // the ramp completes, rampGain stays at 1 so the output settles
+            // at `center` (modulator becomes neutral, as requested).
+            const depth01 = cell.modulation.depthPct / 100
+            out = center * (1 - depth01 + depth01 * rampGain)
           } else if (cell.modulation.type === 'arpeggiator') {
             // Arp: ladder built fresh per token from this token's center so
             // multi-arg Value ("10 20") arps each token independently.
@@ -939,10 +1017,17 @@ export class SceneEngine {
 
     let modNorm = 0
     let envGain = 1
+    let rampGain = 1
     if (cell.modulation.enabled) {
       if (cell.modulation.type === 'envelope') {
         envGain = computeEnvelopeGain(
           cell.modulation.envelope,
+          (t - ts.triggerTime) / 1000,
+          this.currentSceneDurationSec(ts.activeSceneId)
+        )
+      } else if (cell.modulation.type === 'ramp') {
+        rampGain = computeRampGain(
+          cell.modulation.ramp,
           (t - ts.triggerTime) / 1000,
           this.currentSceneDurationSec(ts.activeSceneId)
         )
@@ -974,6 +1059,8 @@ export class SceneEngine {
       if (cell.modulation.enabled) {
         if (cell.modulation.type === 'envelope') {
           out = center * (1 - depth + depth * envGain)
+        } else if (cell.modulation.type === 'ramp') {
+          out = center * (1 - depth + depth * rampGain)
         } else if (cell.modulation.type === 'arpeggiator') {
           const arp = cell.modulation.arpeggiator
           const N = Math.max(1, Math.min(8, arp.steps))
@@ -1129,22 +1216,27 @@ function computeModNorm(
 function computeEnvelopeGain(
   env: { attackMs: number; decayMs: number; sustainMs: number; releaseMs: number;
          attackPct: number; decayPct: number; sustainPct: number; releasePct: number;
-         sustainLevel: number; sync: 'synced' | 'free' },
+         sustainLevel: number; sync: 'synced' | 'free' | 'freeSync'; totalMs: number },
   elapsedSec: number,
   sceneDurSec: number
 ): number {
   let a: number, d: number, s: number, r: number
-  if (env.sync === 'synced') {
-    // Fractions of scene duration. Normalize so they never exceed the scene.
+  if (env.sync === 'synced' || env.sync === 'freeSync') {
+    // Fractions of a reference duration — scene for 'synced', a user-picked
+    // Total(ms) for 'freeSync'. Same math, different base.
+    const baseSec =
+      env.sync === 'synced'
+        ? sceneDurSec
+        : Math.max(0.0001, (env.totalMs ?? 0) / 1000)
     const totalPct = Math.max(
       0.0001,
       env.attackPct + env.decayPct + env.sustainPct + env.releasePct
     )
     const scale = totalPct > 1 ? 1 / totalPct : 1
-    a = env.attackPct * scale * sceneDurSec
-    d = env.decayPct * scale * sceneDurSec
-    s = env.sustainPct * scale * sceneDurSec
-    r = env.releasePct * scale * sceneDurSec
+    a = env.attackPct * scale * baseSec
+    d = env.decayPct * scale * baseSec
+    s = env.sustainPct * scale * baseSec
+    r = env.releasePct * scale * baseSec
   } else {
     a = env.attackMs / 1000
     d = env.decayMs / 1000
@@ -1162,4 +1254,39 @@ function computeEnvelopeGain(
   const tAfterS = tAfterD - s
   if (tAfterS < r) return r > 0 ? sl * (1 - tAfterS / r) : 0 // release sl→0
   return 0
+}
+
+// One-shot ramp modulator. 0 → 1 over the configured ramp length, then
+// holds at 1 forever. `curvePct` bends the interpolation via a power curve:
+//    curve = 1                 → linear (curvePct = 0)
+//    curve = 1 + curvePct/100  → ease-in / ease-out shaped pow
+//  positive curvePct = ease-out (fast start, slow finish)
+//  negative curvePct = ease-in (slow start, fast finish)
+// The caller multiplies the result by the cell's depth % (see main tick).
+function computeRampGain(
+  ramp: { rampMs: number; curvePct: number; sync: 'synced' | 'free' | 'freeSync'; totalMs: number },
+  elapsedSec: number,
+  sceneDurSec: number
+): number {
+  let lenSec: number
+  if (ramp.sync === 'synced') {
+    lenSec = Math.max(0.0001, sceneDurSec)
+  } else if (ramp.sync === 'freeSync') {
+    lenSec = Math.max(0.0001, (ramp.totalMs ?? 0) / 1000)
+  } else {
+    lenSec = Math.max(0.0001, (ramp.rampMs ?? 0) / 1000)
+  }
+  if (elapsedSec <= 0) return 0
+  if (elapsedSec >= lenSec) return 1
+  const lin = elapsedSec / lenSec
+  const curve = ramp.curvePct ?? 0
+  if (curve === 0) return lin
+  // Classic power-curve pair — rotationally symmetric around (0.5, 0.5):
+  //   curve > 0 → ease-out  y = 1 - (1-t)^k   (fast start, slow tail)
+  //   curve < 0 → ease-in   y = t^k           (slow start, fast finish)
+  // Both grow the exponent the same way (k = 1..5) so ±curve magnitudes
+  // produce mirror-image shapes, not mathematical inverses (which looked
+  // lopsided when rendered next to each other in the visualizer).
+  const k = 1 + (Math.abs(curve) / 100) * 4
+  return curve > 0 ? 1 - Math.pow(1 - lin, k) : Math.pow(lin, k)
 }

@@ -21,6 +21,9 @@ dist-tsc/
 # Claude Code workspace — local scratch, not part of the project.
 .claude/
 
+# Local clone of the dataflou library repo for reference reading only.
+/124_dataflou-main/
+
 # Theme / typography design exploration. The real app-bundled fonts live
 # in src/renderer/src/fonts; these root-level copies + the mockup HTML +
 # the font-embedding helper script are design-time artifacts only.

@@ -10,7 +10,7 @@
 
 import { useLayoutEffect, useRef } from 'react'
 import { useStore } from '../store'
-import { META_MAX_DESTS } from '@shared/types'
+import { META_BANK_COUNT, META_KNOBS_PER_BANK, META_MAX_DESTS } from '@shared/types'
 import type { MetaCurve, MetaKnob as MetaKnobModel } from '@shared/types'
 import { META_MAX_HEIGHT, META_MAX_SMOOTH_MS, META_MIN_HEIGHT } from '@shared/factory'
 import { BoundedNumberInput } from './BoundedNumberInput'
@@ -62,11 +62,27 @@ export default function MetaControllerBar(): JSX.Element | null {
   const selectedIdx = useStore((s) => s.session.metaController.selectedKnob)
   const height = useStore((s) => s.session.metaController.height)
   const setHeight = useStore((s) => s.setMetaControllerHeight)
+  const setMetaVisible = useStore((s) => s.setMetaControllerVisible)
+  const setSelectedKnob = useStore((s) => s.setMetaSelectedKnob)
+  const showMode = useStore((s) => s.showMode)
 
   const detailsRef = useRef<HTMLDivElement>(null)
 
   const selected = knobs[selectedIdx] ?? knobs[0]
   const destCount = selected?.destinations.length ?? 0
+
+  // Derive the current bank from the globally-selected knob — clicking a
+  // bank letter just jumps `selectedKnob` to the equivalent slot in that
+  // bank (preserving the within-bank position). This keeps all persistence
+  // in the session (no ephemeral UI state needed) and means the selector
+  // "follows" the user when they click a specific knob across banks.
+  const bankIdx = Math.floor(selectedIdx / META_KNOBS_PER_BANK)
+  const bankStart = bankIdx * META_KNOBS_PER_BANK
+  const visibleKnobs = knobs.slice(bankStart, bankStart + META_KNOBS_PER_BANK)
+  function switchBank(newBank: number): void {
+    const within = selectedIdx % META_KNOBS_PER_BANK
+    setSelectedKnob(newBank * META_KNOBS_PER_BANK + within)
+  }
 
   // Measurement-based auto-grow. After the details panel renders with the
   // new content, compare scrollHeight (total needed) to clientHeight
@@ -95,23 +111,76 @@ export default function MetaControllerBar(): JSX.Element | null {
       style={{ height }}
     >
       {/* Left: knob bank — tight horizontal padding, zero vertical so the
-          knobs + labels + values fill the bar height without dead space. */}
+          knobs + labels + values fill the bar height without dead space.
+          Only the currently-selected bank's 8 knobs are rendered; the
+          bank selector to the right flips between A..D. */}
       <div className="flex items-center gap-0.5 px-2 py-1 overflow-x-auto">
-        {knobs.map((k, i) => (
-          <MetaKnob key={i} knob={k} index={i} selected={i === selectedIdx} />
-        ))}
+        {visibleKnobs.map((k, i) => {
+          const globalIdx = bankStart + i
+          return (
+            <MetaKnob
+              key={globalIdx}
+              knob={k}
+              index={globalIdx}
+              selected={globalIdx === selectedIdx}
+            />
+          )
+        })}
+      </div>
+
+      {/* Bank selector — 4 letters (A/B/C/D) stacked vertically. Each knob
+          bank holds 8 knobs, so 32 total. Click a letter to swap the bank
+          shown to the left while keeping the within-bank position. */}
+      <div
+        data-hide-in-show="true"
+        className="flex flex-col items-stretch justify-start gap-0.5 px-1.5 py-1 border-l border-border shrink-0"
+      >
+        <span className="label text-[9px] text-center leading-none mb-0.5">BANKS</span>
+        <div className="grid grid-cols-2 grid-rows-2 gap-0.5">
+          {Array.from({ length: META_BANK_COUNT }, (_, i) => {
+            const letter = String.fromCharCode(65 + i)
+            const active = i === bankIdx
+            return (
+              <button
+                key={i}
+                className={`btn text-[10px] px-1.5 py-0 leading-tight ${
+                  active ? 'bg-accent text-black border-accent' : ''
+                }`}
+                onClick={() => switchBank(i)}
+                title={`Knobs ${i * META_KNOBS_PER_BANK + 1}–${(i + 1) * META_KNOBS_PER_BANK}`}
+              >
+                {letter}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       <div className="w-px bg-border shrink-0" />
 
       {/* Right: details panel — compact padding; rows still breathe via
-          their own gap-2 inside KnobDetails. */}
+          their own gap-2 inside KnobDetails. Extra right padding leaves
+          room for the Hide button floating in the corner. */}
       <div
         ref={detailsRef}
-        className="flex-1 min-w-0 overflow-y-auto px-3 py-2"
+        className="flex-1 min-w-0 overflow-y-auto px-3 py-2 pr-16"
       >
-        <KnobDetails knobIndex={selectedIdx} knob={selected} />
+        <KnobDetails knobIndex={selectedIdx} knob={selected} readOnly={showMode} />
       </div>
+
+      {/* Hide button — floats in the lower-right of the bar, just above the
+          "Meta Controller" toggle in the prefs sub-toolbar. Click to hide
+          the bar without removing state. Hidden in show mode (performers
+          can't toggle chrome — they just turn knobs). */}
+      {!showMode && (
+        <button
+          className="btn text-[10px] py-0.5 px-2 absolute bottom-2 right-2"
+          onClick={() => setMetaVisible(false)}
+          title="Hide the Meta Controller bar"
+        >
+          Hide
+        </button>
+      )}
 
       {/* Drag strip along the bottom edge — grab-and-drag to resize the
           whole Meta Controller bar. Height persists with the session. */}
@@ -130,10 +199,15 @@ export default function MetaControllerBar(): JSX.Element | null {
 
 function KnobDetails({
   knobIndex,
-  knob
+  knob,
+  readOnly = false
 }: {
   knobIndex: number
   knob: MetaKnobModel
+  // Show mode: all inputs disabled, destination add/remove hidden, MIDI
+  // clear hidden. The knob itself stays interactive (rotatable) — that's
+  // the whole point of keeping the Meta Controller visible during a show.
+  readOnly?: boolean
 }): JSX.Element {
   const updateMetaKnob = useStore((s) => s.updateMetaKnob)
   const addMetaDestination = useStore((s) => s.addMetaDestination)
@@ -143,8 +217,17 @@ function KnobDetails({
 
   const destFull = knob.destinations.length >= META_MAX_DESTS
 
+  // fieldset[disabled] cascades disabled=true to every nested input/select/
+  // button — cheap way to lock the whole panel without threading a prop
+  // through each field. `min-w-0` fights fieldset's default min-content
+  // sizing so flex children still ellipsize correctly.
   return (
-    <div className="flex flex-col gap-2 text-[12px]">
+    <fieldset
+      disabled={readOnly}
+      className={`flex flex-col gap-2 text-[12px] min-w-0 border-0 p-0 m-0 ${
+        readOnly ? 'opacity-90' : ''
+      }`}
+    >
       {/* Row 1 — name + min/max + smooth + curve + MIDI binding readout.
           MIDI Learn itself lives on the main toolbar (global learn mode),
           so we don't duplicate the Learn button here — only the readout +
@@ -306,7 +389,7 @@ function KnobDetails({
           ))}
         </div>
       )}
-    </div>
+    </fieldset>
   )
 }
 

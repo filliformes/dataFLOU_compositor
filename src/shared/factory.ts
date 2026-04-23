@@ -8,6 +8,7 @@ import type {
   MetaKnob,
   Modulation,
   MultMode,
+  RampParams,
   RandomParams,
   Scene,
   SequencerParams,
@@ -89,7 +90,16 @@ export const DEFAULT_ENVELOPE: EnvelopeParams = {
   sustainPct: 0.5,
   releasePct: 0.2,
   sustainLevel: 0.7,
-  sync: 'synced'
+  sync: 'synced',
+  // Used only in sync='freeSync' mode; safe fallback for other modes.
+  totalMs: 2000
+}
+
+export const DEFAULT_RAMP: RampParams = {
+  rampMs: 1000,
+  curvePct: 0, // linear
+  sync: 'free',
+  totalMs: 1000
 }
 
 export const DEFAULT_ARPEGGIATOR: ArpeggiatorParams = {
@@ -116,6 +126,7 @@ export const DEFAULT_MODULATION: Modulation = {
   dotted: false,
   triplet: false,
   envelope: { ...DEFAULT_ENVELOPE },
+  ramp: { ...DEFAULT_RAMP },
   arpeggiator: { ...DEFAULT_ARPEGGIATOR },
   random: { ...DEFAULT_RANDOM }
 }
@@ -243,6 +254,7 @@ export function makeCell(defaults: {
     modulation: {
       ...DEFAULT_MODULATION,
       envelope: { ...DEFAULT_ENVELOPE },
+      ramp: { ...DEFAULT_RAMP },
       arpeggiator: { ...DEFAULT_ARPEGGIATOR },
       random: { ...DEFAULT_RANDOM }
     },

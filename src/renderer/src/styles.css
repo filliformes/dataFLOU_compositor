@@ -376,6 +376,67 @@ button {
   cursor: pointer;
 }
 
+/* ======== Show / kiosk mode ========
+   When [data-show-mode='true'] is set on <html>, every element tagged with
+   `data-hide-in-show="true"` disappears. This lets components opt individual
+   pieces of their own UI out of show mode without centralizing a big switch
+   here. Use it on edit-only controls: Inspector, Buttons box, sub-toolbars,
+   scene/message edit chrome, etc.
+
+   The app root also gains a faint pulsing dot in the top-right corner so
+   performers always have a visible "yes you're locked" indicator. */
+html[data-show-mode='true'] [data-hide-in-show='true'] {
+  display: none !important;
+}
+/* Show-mode badge now lives inside the TopBar React tree so it sits
+   naturally in the toolbar's flex row, centered both axes. See
+   TopBar.tsx. Animation class below is applied to that element. */
+.show-badge {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: rgb(var(--c-danger));
+  background: rgb(var(--c-panel) / 0.8);
+  padding: 2px 8px;
+  border: 1px solid rgb(var(--c-danger));
+  border-radius: 3px;
+  pointer-events: none;
+  animation: show-pulse 2s ease-in-out infinite;
+  white-space: nowrap;
+}
+@keyframes show-pulse {
+  0%, 100% { opacity: 0.65; }
+  50%      { opacity: 1.0; }
+}
+
+/* Armed-scene marker — applied to palette pills, sequence slots, and
+   scene column headers when a scene is primed to fire on the next GO.
+   accent2 (blue) ring + soft glow so it never reads as "currently
+   playing" (which uses accent / orange). */
+.armed-ring {
+  box-shadow:
+    0 0 0 2px rgb(var(--c-accent2)),
+    0 0 10px 0 rgb(var(--c-accent2) / 0.6);
+  animation: armed-pulse 1.4s ease-in-out infinite;
+  border-radius: inherit;
+}
+@keyframes armed-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgb(var(--c-accent2) / 0.9), 0 0 6px 0 rgb(var(--c-accent2) / 0.5); }
+  50%      { box-shadow: 0 0 0 2px rgb(var(--c-accent2)), 0 0 14px 2px rgb(var(--c-accent2) / 0.8); }
+}
+.armed-chevron {
+  position: absolute;
+  top: 1px;
+  right: 2px;
+  z-index: 5;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  color: rgb(var(--c-accent2));
+  pointer-events: none;
+  text-shadow: 0 0 3px rgb(var(--c-panel));
+}
+
 /* ======== LFO/Sequencer clockwise sweep on the trigger square ======== */
 
 @property --lfo-angle {

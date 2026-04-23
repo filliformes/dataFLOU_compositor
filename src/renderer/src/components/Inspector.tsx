@@ -205,6 +205,29 @@ function CellInspector(): JSX.Element {
             className="input flex-1 font-mono"
             value={cell.value}
             onChange={(v) => u({ value: capTokens(v, 16) })}
+            onKeyDown={(e) => {
+              // Enter commits + re-triggers the clip. Engine.triggerCell
+              // is a full restart — it resets LFO phase, envelope clock,
+              // sequencer step, arp index, and the random-generator seed,
+              // so the new value plays cleanly from the beginning of its
+              // modulation/sequence cycle. Falling edge of the keystroke
+              // (keyDown → blur → onChange will have run for the final
+              // character); call triggerCell on a micro-delay so the
+              // updateSession IPC flushes to main first.
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                // Force onChange to fire before we trigger — native input
+                // only dispatches onChange on value change, so if the
+                // user types then hits Enter without losing focus the
+                // last keystroke IS already committed; we just need the
+                // session push to land in main. setTimeout(0) defers the
+                // trigger past this tick so updateSession wins the race.
+                const { sceneId, trackId } = sel
+                setTimeout(() => {
+                  window.api.triggerCell(sceneId, trackId)
+                }, 0)
+              }
+            }}
             placeholder="0"
             disabled={cell.sequencer.enabled}
           />
@@ -272,12 +295,26 @@ function CellInspector(): JSX.Element {
               className="input text-[11px] py-0.5"
               style={{ width: 120 }}
               value={cell.modulation.type}
-              onChange={(e) =>
-                u({ modulation: { ...cell.modulation, type: e.target.value as ModType } })
-              }
+              onChange={(e) => {
+                const nextType = e.target.value as ModType
+                // Ramp is a "full-range" modulator by design — at
+                // depth < 100% only part of the 0→target travel happens.
+                // Default the user into 100% the first time they pick
+                // Ramp so the visualizer + audible behavior match the
+                // intuitive "goes from 0 to the value" expectation.
+                // Leaves depth alone on re-selection so manual tweaks
+                // stick.
+                const wasRamp = cell.modulation.type === 'ramp'
+                const depthPct =
+                  nextType === 'ramp' && !wasRamp ? 100 : cell.modulation.depthPct
+                u({
+                  modulation: { ...cell.modulation, type: nextType, depthPct }
+                })
+              }}
               onClick={(e) => e.stopPropagation()}
             >
               <option value="lfo">LFO</option>
+              <option value="ramp">Ramp</option>
               <option value="envelope">Envelope</option>
               <option value="arpeggiator">Arpeggiator</option>
               <option value="random">Random</option>
@@ -287,6 +324,8 @@ function CellInspector(): JSX.Element {
       >
         {cell.modulation.type === 'lfo' ? (
           <LfoEditor cell={c} u={u} />
+        ) : cell.modulation.type === 'ramp' ? (
+          <RampEditor cell={c} u={u} />
         ) : cell.modulation.type === 'envelope' ? (
           <EnvelopeEditor cell={c} u={u} />
         ) : cell.modulation.type === 'arpeggiator' ? (
@@ -943,6 +982,284 @@ function RandomEditor({
   )
 }
 
+// One-shot ramp modulator editor. Layout mirrors the Envelope editor so
+// the two feel like siblings: sync picker on top, then the time field,
+// curve, depth, and a small live visualizer.
+function RampEditor({
+  cell,
+  u
+}: {
+  cell: import('@shared/types').Cell
+  u: CellUpdate
+}): JSX.Element {
+  const m = cell.modulation
+  // Defensive fallback — if a session predating the Ramp feature somehow
+  // slips past sanitizeMetaController without a `ramp` field, use factory
+  // defaults for display so the editor renders instead of blanking the app.
+  const ramp = m.ramp ?? {
+    rampMs: 1000,
+    curvePct: 0,
+    sync: 'free' as const,
+    totalMs: 1000
+  }
+  function uRamp(patch: Partial<typeof ramp>): void {
+    u({ modulation: { ...m, ramp: { ...ramp, ...patch } } })
+  }
+  function uMod(patch: Partial<typeof m>): void {
+    u({ modulation: { ...m, ...patch } })
+  }
+
+  // Live-progress tracking.
+  //
+  // We subscribe directly to `selectedCell` + the active map so the dot
+  // repaints the instant the user's selected clip becomes (or stops
+  // being) active. Can't rely on engine.activeSceneStartedAt because it
+  // only updates for whole-scene triggers — clicking a single clip's
+  // play button leaves that value stale. Instead, stamp Date.now() the
+  // frame isPlaying flips on.
+  const selectedCell = useStore((s) => s.selectedCell)
+  const isPlaying = useStore(
+    (s) =>
+      !!selectedCell &&
+      !!s.engine.activeBySceneAndTrack?.[selectedCell.sceneId]?.[selectedCell.trackId]
+  )
+  const triggerAtRef = useRef<number | null>(null)
+  const wasPlayingRef = useRef(false)
+  if (isPlaying && !wasPlayingRef.current) {
+    triggerAtRef.current = Date.now()
+  }
+  if (!isPlaying && wasPlayingRef.current) {
+    triggerAtRef.current = null
+  }
+  wasPlayingRef.current = isPlaying
+
+  const rampLenMs =
+    ramp.sync === 'free'
+      ? ramp.rampMs
+      : ramp.sync === 'freeSync'
+        ? ramp.totalMs
+        : 0 // synced — we don't have scene duration here, visualizer uses rampMs as proxy
+  const lenForVis = Math.max(1, rampLenMs > 0 ? rampLenMs : ramp.rampMs)
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
+  // Stop the interval once the ramp is visually complete — otherwise it
+  // would keep re-rendering the dot at 30 Hz forever while the cell stays
+  // armed (engine keeps the cell active after the ramp; zustand no longer
+  // pushes state after the output stabilizes, so our timer is the only
+  // thing driving renders). Left running = pure waste.
+  const triggerAtVal = triggerAtRef.current
+  const rampDoneByTime =
+    isPlaying &&
+    triggerAtVal !== null &&
+    lenForVis > 0 &&
+    nowMs - triggerAtVal >= lenForVis
+  const needsTimer = isPlaying && !rampDoneByTime
+  useEffect(() => {
+    if (!needsTimer) return
+    const id = setInterval(() => setNowMs(Date.now()), 33)
+    return () => clearInterval(id)
+  }, [needsTimer])
+
+  const progress =
+    isPlaying && triggerAtRef.current !== null
+      ? clamp01((nowMs - triggerAtRef.current) / lenForVis)
+      : 0
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="grid grid-cols-[64px_1fr_88px] gap-x-2 gap-y-1 items-center">
+        <span className="label">Sync</span>
+        <select
+          className="input text-[11px] py-0.5"
+          value={ramp.sync}
+          onChange={(e) => uRamp({ sync: e.target.value as EnvSync })}
+          title={
+            ramp.sync === 'synced'
+              ? 'Ramp lasts the full scene duration.'
+              : ramp.sync === 'freeSync'
+                ? 'Ramp length = Total (ms) — independent of scene.'
+                : 'Ramp length in milliseconds (Ramp time).'
+          }
+        >
+          <option value="synced">Synced (scene)</option>
+          <option value="free">Free (ms)</option>
+          <option value="freeSync">Free (synced)</option>
+        </select>
+        <span />
+
+        {ramp.sync === 'free' && (
+          <>
+            <span className="label">Ramp time</span>
+            <input
+              type="range"
+              min={0.1}
+              max={300000}
+              step={0.1}
+              value={ramp.rampMs}
+              onChange={(e) =>
+                uRamp({ rampMs: clamp(Number(e.target.value), 0.1, 300000) })
+              }
+            />
+            <div className="flex items-center gap-1 justify-end">
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                min={0.1}
+                max={300000}
+                value={ramp.rampMs}
+                onChange={(v) => uRamp({ rampMs: v })}
+              />
+              <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
+            </div>
+          </>
+        )}
+        {ramp.sync === 'freeSync' && (
+          <>
+            <span className="label">Total</span>
+            <input
+              type="range"
+              min={0.1}
+              max={300000}
+              step={0.1}
+              value={ramp.totalMs}
+              onChange={(e) =>
+                uRamp({ totalMs: clamp(Number(e.target.value), 0.1, 300000) })
+              }
+            />
+            <div className="flex items-center gap-1 justify-end">
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                min={0.1}
+                max={300000}
+                value={ramp.totalMs}
+                onChange={(v) => uRamp({ totalMs: v })}
+              />
+              <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
+            </div>
+          </>
+        )}
+
+        <span className="label">Curve</span>
+        <input
+          type="range"
+          min={-100}
+          max={100}
+          step={1}
+          value={ramp.curvePct}
+          onChange={(e) => uRamp({ curvePct: clamp(Number(e.target.value), -100, 100) })}
+          title="-100 = ease-in (slow start) · 0 = linear · +100 = ease-out (fast start)"
+        />
+        <div className="flex items-center gap-1 justify-end">
+          <BoundedNumberInput
+            className="input w-14 text-right"
+            min={-100}
+            max={100}
+            value={ramp.curvePct}
+            onChange={(v) => uRamp({ curvePct: v })}
+          />
+          <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+        </div>
+
+        <span className="label">Depth</span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={m.depthPct}
+          onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+        />
+        <div className="flex items-center gap-1 justify-end">
+          <BoundedNumberInput
+            className="input w-14 text-right"
+            min={0}
+            max={100}
+            value={m.depthPct}
+            onChange={(v) => uMod({ depthPct: v })}
+          />
+          <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+        </div>
+      </div>
+
+      {/* Visualizer — shows the curve shape, and a live dot tracing the
+          ramp while the cell is playing. Height is tight so the editor
+          still fits in the typical inspector width. */}
+      <RampVisualizer curvePct={ramp.curvePct} progress={progress} />
+
+      <div className="text-[10px] text-muted italic">
+        Ramp goes 0 → target in the configured time, then holds. Once the
+        ramp completes the modulator becomes neutral (output = value).
+      </div>
+    </div>
+  )
+}
+
+// Tiny SVG visualizer. Draws the chosen power curve from (0,0) → (1,1) and
+// a playhead dot at `progress ∈ [0, 1]` on that curve. Purely presentational.
+function RampVisualizer({
+  curvePct,
+  progress
+}: {
+  curvePct: number
+  progress: number
+}): JSX.Element {
+  // Mirror engine.ts's computeRampGain — rotationally-symmetric ease-in /
+  // ease-out pair so ±curve produce mirror-image shapes in the view.
+  const k = 1 + (Math.abs(curvePct) / 100) * 4
+  function gain(t: number): number {
+    if (curvePct === 0) return t
+    return curvePct > 0 ? 1 - Math.pow(1 - t, k) : Math.pow(t, k)
+  }
+  const W = 200
+  const H = 50
+  const pad = 4
+  const innerW = W - pad * 2
+  const innerH = H - pad * 2
+  const N = 40
+  const pts: string[] = []
+  for (let i = 0; i <= N; i++) {
+    const x = i / N
+    const y = gain(x)
+    pts.push(`${pad + x * innerW},${pad + (1 - y) * innerH}`)
+  }
+  const dotX = pad + progress * innerW
+  const dotY = pad + (1 - gain(progress)) * innerH
+  return (
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      className="w-full border border-border rounded-sm bg-panel2"
+      style={{ height: H }}
+      aria-label="Ramp curve visualizer"
+    >
+      {/* 0/1 gridlines */}
+      <line x1={pad} y1={pad + innerH} x2={pad + innerW} y2={pad + innerH}
+        stroke="rgb(var(--c-border))" strokeWidth={0.5} />
+      <line x1={pad} y1={pad} x2={pad + innerW} y2={pad}
+        stroke="rgb(var(--c-border))" strokeWidth={0.5} strokeDasharray="2 3" />
+      <polyline
+        points={pts.join(' ')}
+        fill="none"
+        stroke="rgb(var(--c-accent2))"
+        strokeWidth={1.5}
+      />
+      {progress > 0 && (
+        <>
+          {/* Soft glow ring so the dot is easy to track against the curve. */}
+          <circle
+            cx={dotX}
+            cy={dotY}
+            r={6}
+            fill="rgb(var(--c-accent) / 0.25)"
+          />
+          <circle cx={dotX} cy={dotY} r={3.5} fill="rgb(var(--c-accent))" />
+        </>
+      )}
+    </svg>
+  )
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v
+}
+
 function EnvelopeEditor({
   cell,
   u
@@ -958,15 +1275,16 @@ function EnvelopeEditor({
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
-  const synced = env.sync === 'synced'
-  // Display values: synced shows 0.01..100 (%), free shows 0..10000 (ms).
-  // Internal storage keeps synced values as 0..1 fractions.
-  const displayMin = synced ? 0.01 : 0
-  const displayMax = synced ? 100 : 10000
-  const displayStep = synced ? 0.01 : 10
-  const unit = synced ? '%' : 'ms'
-  const scaleToDisplay = (v: number): number => (synced ? v * 100 : v)
-  const displayToScale = (v: number): number => (synced ? v / 100 : v)
+  // Percentage modes (synced, freeSync) edit stages as 0.01..100 %; free
+  // mode uses absolute ms 0..10 000. Internally the Pct fields always live
+  // as 0..1 fractions, Ms fields as ms.
+  const pctMode = env.sync === 'synced' || env.sync === 'freeSync'
+  const displayMin = pctMode ? 0.01 : 0
+  const displayMax = pctMode ? 100 : 10000
+  const displayStep = pctMode ? 0.01 : 10
+  const unit = pctMode ? '%' : 'ms'
+  const scaleToDisplay = (v: number): number => (pctMode ? v * 100 : v)
+  const displayToScale = (v: number): number => (pctMode ? v / 100 : v)
 
   return (
     <div className="flex flex-col gap-2">
@@ -977,15 +1295,44 @@ function EnvelopeEditor({
           value={env.sync}
           onChange={(e) => uEnv({ sync: e.target.value as EnvSync })}
           title={
-            synced
+            env.sync === 'synced'
               ? 'Times are fractions of scene duration (A+D+S+R ≤ 100%).'
-              : 'Times in milliseconds (each max 10000ms).'
+              : env.sync === 'freeSync'
+                ? 'Times are fractions of Total (ms) — independent of scene.'
+                : 'Times in milliseconds (each max 10000ms).'
           }
         >
           <option value="synced">Synced (scene)</option>
           <option value="free">Free (ms)</option>
+          <option value="freeSync">Free (synced)</option>
         </select>
         <span />
+
+        {env.sync === 'freeSync' && (
+          <>
+            <span className="label">Total</span>
+            <input
+              type="range"
+              min={0.1}
+              max={300000}
+              step={0.1}
+              value={env.totalMs}
+              onChange={(e) =>
+                uEnv({ totalMs: clamp(Number(e.target.value), 0.1, 300000) })
+              }
+            />
+            <div className="flex items-center gap-1 justify-end">
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                min={0.1}
+                max={300000}
+                value={env.totalMs}
+                onChange={(v) => uEnv({ totalMs: v })}
+              />
+              <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
+            </div>
+          </>
+        )}
 
         <span className="label">Depth</span>
         <input
@@ -1009,7 +1356,7 @@ function EnvelopeEditor({
       </div>
 
       {(['attack', 'decay', 'sustain', 'release'] as const).map((seg) => {
-        const key = synced ? (`${seg}Pct` as const) : (`${seg}Ms` as const)
+        const key = pctMode ? (`${seg}Pct` as const) : (`${seg}Ms` as const)
         const val = env[key] as number
         const disp = scaleToDisplay(val)
         return (
@@ -1070,8 +1417,10 @@ function EnvelopeEditor({
       </div>
 
       <div className="text-[10px] text-muted">
-        {synced
-          ? 'A+D+S+R fractions are auto-normalized if they exceed 100% of scene duration.'
+        {pctMode
+          ? env.sync === 'freeSync'
+            ? 'A+D+S+R fractions auto-normalize to Total (ms).'
+            : 'A+D+S+R fractions are auto-normalized if they exceed 100% of scene duration.'
           : 'Each stage in milliseconds (0–10 000).'}{' '}
         Envelope applies to every space-separated value in the clip.
       </div>

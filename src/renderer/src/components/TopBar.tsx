@@ -90,7 +90,18 @@ export default function TopBar(): JSX.Element {
 
   return (
     <>
-    <div className={`flex items-center gap-2 px-2 py-2 bg-panel ${prefsOpen ? '' : 'border-b border-border'}`}>
+    <div className={`relative flex items-center gap-2 px-2 py-2 bg-panel ${prefsOpen ? '' : 'border-b border-border'}`}>
+      {/* Show-mode banner — absolute so it doesn't shift the flex layout,
+          centered both axes inside the toolbar band. Only rendered in
+          show mode; the CSS `show-badge` class handles colors + pulse. */}
+      {useStore((s) => s.showMode) && (
+        <div
+          className="show-badge absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none z-10"
+          aria-hidden
+        >
+          SHOW — hold Esc to exit
+        </div>
+      )}
       <div className="flex items-center gap-1.5">
         <button
           className={`text-accent font-semibold tracking-tight px-1 rounded-sm hover:bg-panel2 transition-colors ${prefsOpen ? 'bg-panel2' : ''}`}
@@ -100,26 +111,30 @@ export default function TopBar(): JSX.Element {
         >
           dataFLOU
         </button>
+        {/* OSC Monitor lives on the main toolbar — useful mid-performance,
+            so it stays visible in show mode (no data-hide-in-show). */}
+        <OscMonitorToggle />
         <input
-          className="input w-32"
+          data-hide-in-show="true"
+          className="input w-24"
           value={session.name}
           onChange={(e) => setName(e.target.value)}
           placeholder="Session"
         />
       </div>
 
-      <div className="h-6 w-px bg-border" />
+      <div data-hide-in-show="true" className="h-6 w-px bg-border" />
 
-      <div className="flex items-center gap-1">
+      <div data-hide-in-show="true" className="flex items-center gap-1">
         <button className="btn" onClick={newSession}>New</button>
         <button className="btn" onClick={onOpen}>Open</button>
         <button ref={saveRef} className="btn" onClick={onSave}>Save</button>
         <button className="btn" onClick={onSaveAs}>Save As</button>
       </div>
 
-      <div className="h-6 w-px bg-border" />
+      <div data-hide-in-show="true" className="h-6 w-px bg-border" />
 
-      <div className="flex items-center gap-1.5">
+      <div data-hide-in-show="true" className="flex items-center gap-1.5">
         <span className="label">Default OSC</span>
         <input
           className="input w-36"
@@ -141,12 +156,12 @@ export default function TopBar(): JSX.Element {
         />
       </div>
 
-      <div className="h-6 w-px bg-border" />
+      <div data-hide-in-show="true" className="h-6 w-px bg-border" />
 
-      <div className="flex items-center gap-1.5">
+      <div data-hide-in-show="true" className="flex items-center gap-1">
         <span className="label">Tick</span>
         <BoundedNumberInput
-          className="input w-12"
+          className="input w-10"
           integer
           min={10}
           max={300}
@@ -156,10 +171,10 @@ export default function TopBar(): JSX.Element {
             window.api.setTickRate(hz)
           }}
         />
-        <span className="text-muted text-[11px]">Hz</span>
-        <span className="label ml-1">BPM</span>
+        <span className="text-muted text-[10px]">Hz</span>
+        <span className="label ml-0.5">BPM</span>
         <BoundedNumberInput
-          className="input w-16"
+          className="input w-12"
           min={10}
           max={500}
           value={session.globalBpm}
@@ -168,9 +183,9 @@ export default function TopBar(): JSX.Element {
         />
       </div>
 
-      <div className="h-6 w-px bg-border" />
+      <div data-hide-in-show="true" className="h-6 w-px bg-border" />
 
-      <div className="flex items-center gap-1.5">
+      <div data-hide-in-show="true" className="flex items-center gap-1.5">
         <span className="label">MIDI</span>
         <select
           className="input w-32"
@@ -229,7 +244,10 @@ export default function TopBar(): JSX.Element {
         label. Sits immediately below the main toolbar and pushes the rest
         of the app down (normal flex-column flow in App.tsx). */}
     {prefsOpen && (
-      <div className="flex items-center gap-2 px-2 py-2 bg-panel border-b border-border">
+      <div
+        data-hide-in-show="true"
+        className="flex items-center gap-2 px-2 py-2 bg-panel border-b border-border"
+      >
         <span className="label shrink-0 ml-1">Theme</span>
         <select
           className="input w-44"
@@ -248,6 +266,25 @@ export default function TopBar(): JSX.Element {
           ))}
         </select>
 
+        <span className="h-5 w-px bg-border mx-1" />
+
+        {/* Show mode — locks the UI into a performance-only view. Exit with
+            F11 or by holding Escape for ~800 ms (see App.tsx keyboard router). */}
+        <button
+          className="btn"
+          style={{
+            borderColor: 'rgb(var(--c-danger))',
+            color: 'rgb(var(--c-danger))'
+          }}
+          onClick={() => {
+            useStore.getState().setShowMode(true)
+            setPrefsOpen(false)
+          }}
+          title="Enter Show Mode — hides all edit controls. Hold Escape or press F11 to exit."
+        >
+          Enter Show Mode
+        </button>
+
         <span className="flex-1" />
         <button
           className="btn"
@@ -259,6 +296,22 @@ export default function TopBar(): JSX.Element {
       </div>
     )}
     </>
+  )
+}
+
+// Toggle for the OSC monitor drawer (bottom-of-app scrollable log of
+// outgoing OSC traffic). Default off; lit when open.
+function OscMonitorToggle(): JSX.Element {
+  const open = useStore((s) => s.oscMonitorOpen)
+  const setOpen = useStore((s) => s.setOscMonitorOpen)
+  return (
+    <button
+      className={`btn text-[10px] py-0.5 ${open ? 'bg-accent text-black border-accent' : ''}`}
+      onClick={() => setOpen(!open)}
+      title="Toggle OSC monitor drawer"
+    >
+      OSC
+    </button>
   )
 }
 

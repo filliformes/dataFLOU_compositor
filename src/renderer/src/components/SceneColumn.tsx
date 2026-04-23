@@ -28,9 +28,34 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   const rowHeight = useEffectiveRowHeight()
   const sceneColumnWidth = useStore((s) => s.sceneColumnWidth)
   const setSceneColumnWidth = useStore((s) => s.setSceneColumnWidth)
-  const scenesCollapsed = useStore((s) => s.scenesCollapsed)
+  const scenesCollapsedRaw = useStore((s) => s.scenesCollapsed)
+  const showMode = useStore((s) => s.showMode)
+  const isArmed = useStore((s) => s.armedSceneId === sceneId)
+  // Show mode forces collapsed-header layout regardless of the user's pref.
+  const scenesCollapsed = scenesCollapsedRaw || showMode
   const headerH = useHeaderHeight()
 
+  // Right-click context menu state. HOISTED above the defensive early
+  // return below so the hook order stays stable across the scene-exists
+  // vs scene-just-deleted branches — otherwise React throws "Rendered
+  // fewer hooks than during the previous render" the frame a scene gets
+  // removed while its column is still being rendered by the parent.
+  const [menu, setMenu] = useState<{ x: number; y: number; targets: string[] } | null>(
+    null
+  )
+  useEffect(() => {
+    if (!menu) return
+    const close = (): void => setMenu(null)
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setMenu(null)
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
 
   // Defensive: during the render just after a delete, React may still call us
   // before the parent re-renders. Bail out cleanly.
@@ -53,7 +78,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
       return
     }
     if (isPlaying) await window.api.stopScene(sceneId)
-    else await window.api.triggerScene(sceneId)
+    else useStore.getState().triggerSceneWithMorph(sceneId)
   }
 
   const learnOverlayClass = !midiLearnMode
@@ -67,31 +92,20 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   // Column-wide tint using the scene color at low alpha.
   const tint = scene.color + '14'
 
-  // Right-click context menu — the targets array is what the menu will
-  // actually act on: either the current multi-selection (if this scene is
-  // already part of it) or just this scene (in which case the right-click
-  // replaces the selection with it).
-  const [menu, setMenu] = useState<{ x: number; y: number; targets: string[] } | null>(
-    null
-  )
-  useEffect(() => {
-    if (!menu) return
-    const close = (): void => setMenu(null)
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') setMenu(null)
-    }
-    window.addEventListener('mousedown', close)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', close)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [menu])
+  // (Menu state hooks live at the top of the component so hook order
+  // stays stable across scene-exists vs scene-just-deleted branches.)
 
   // Plain click = single select + new anchor. Shift-click = extend range
   // from anchor (focusedSceneId) through this scene inclusive. Matches the
   // Shift-click convention used for message rows.
+  // Alt-click (or Option on Mac) = arm as next cue — fast-access path for
+  // performers. Right-click menu + `A` key do the same thing.
   function onHeaderClick(e: React.MouseEvent): void {
+    if (e.altKey) {
+      const current = useStore.getState().armedSceneId
+      useStore.getState().setArmedSceneId(current === sceneId ? null : sceneId)
+      return
+    }
     if (e.shiftKey) selectSceneRange(sceneId)
     else setFocusedScene(sceneId)
   }
@@ -157,6 +171,8 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           style={{ height: headerH }}
           onContextMenu={onContextMenu}
         >
+          {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none z-0" />}
+          {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
           <SceneTriggerButton
             isPlaying={isPlaying}
             durationSec={scene.durationSec}
@@ -176,6 +192,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             size={Math.max(3, scene.name.length + 1)}
             className="input text-[11px] font-semibold py-0.5"
             value={scene.name}
+            disabled={showMode}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
             onChange={(e) => updateScene(sceneId, { name: e.target.value })}
@@ -187,6 +204,8 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         style={{ height: headerH }}
         onContextMenu={onContextMenu}
       >
+        {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none z-0" />}
+        {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
         <div className="flex items-center gap-1.5">
           <SceneTriggerButton
             isPlaying={isPlaying}
@@ -336,12 +355,40 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
       {menu &&
         createPortal(
           <div
-            className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[160px]"
+            className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[180px]"
             style={{ left: menu.x, top: menu.y }}
             // Stop the window-level mousedown listener from closing before
             // the menu button's click fires.
             onMouseDown={(e) => e.stopPropagation()}
           >
+            {/* Arm / clear cue — single-scene action (greyed out when a
+                multi-selection is active to avoid ambiguity). */}
+            {menu.targets.length === 1 && (
+              <>
+                {useStore.getState().armedSceneId === sceneId ? (
+                  <button
+                    className="w-full text-left px-3 py-1 hover:bg-panel2"
+                    onClick={() => {
+                      useStore.getState().setArmedSceneId(null)
+                      setMenu(null)
+                    }}
+                  >
+                    Clear arm
+                  </button>
+                ) : (
+                  <button
+                    className="w-full text-left px-3 py-1 hover:bg-panel2"
+                    onClick={() => {
+                      useStore.getState().setArmedSceneId(sceneId)
+                      setMenu(null)
+                    }}
+                  >
+                    Arm as next ▶▶
+                  </button>
+                )}
+                <div className="border-t border-border my-1" />
+              </>
+            )}
             <button
               className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"
               onClick={() => {

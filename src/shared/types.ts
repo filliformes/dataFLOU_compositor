@@ -26,10 +26,17 @@ export type NextMode =
   | 'any'
   | 'other'
 
-export type ModType = 'lfo' | 'envelope' | 'arpeggiator' | 'random'
+// Order here matters for the Inspector dropdown order: Ramp sits second,
+// right before Envelope, so the "one-shot" options are grouped.
+export type ModType = 'lfo' | 'ramp' | 'envelope' | 'arpeggiator' | 'random'
 export type LfoMode = 'unipolar' | 'bipolar'
 export type LfoSync = 'free' | 'bpm'
-export type EnvSync = 'synced' | 'free'
+// Envelope / Ramp sync:
+//   'synced'   — stages are fractions of scene duration (A+D+S+R ≤ 100%).
+//   'free'     — stages are absolute milliseconds (each max 10 000 ms).
+//   'freeSync' — stages are fractions of a user-specified Total (ms). Same
+//                feel as 'synced' (stages as %) but decoupled from the scene.
+export type EnvSync = 'synced' | 'free' | 'freeSync'
 
 // Arpeggiator — walks through a computed "ladder" of N steps derived from
 // the user's Value, at the modulation rate.
@@ -67,6 +74,7 @@ export interface EnvelopeParams {
   sustainMs: number
   releaseMs: number
   // Synced-mode fractions of scene duration; A+D+S+R should sum to <= 1.
+  // Also used as the fraction of `totalMs` when sync='freeSync'.
   attackPct: number
   decayPct: number
   sustainPct: number
@@ -74,6 +82,22 @@ export interface EnvelopeParams {
   // Held value between decay and release (0..1).
   sustainLevel: number
   sync: EnvSync
+  // Total envelope length (ms) in sync='freeSync' mode. 0.1..300 000. The
+  // Pct fields scale by this instead of the scene duration — gives a
+  // synced-feel envelope whose length is independent of the scene.
+  totalMs: number
+}
+
+// Ramp modulator — one-shot 0→target ramp over `rampMs` (or scene fraction
+// when synced). Curve bends the interpolation: 0% = linear, +100% = strong
+// ease-out (fast rise, long tail), -100% = strong ease-in (slow rise,
+// sharp finish). When the ramp completes, modulation is effectively done
+// and the clip's play-button sweep stops animating.
+export interface RampParams {
+  rampMs: number      // free-mode ramp length (ms), 0.1..300 000
+  curvePct: number    // -100..100, linear at 0
+  sync: EnvSync       // reuses envelope sync modes: synced / free / freeSync
+  totalMs: number     // length (ms) used when sync='freeSync'. Same range as rampMs.
 }
 
 export interface Modulation {
@@ -90,6 +114,8 @@ export interface Modulation {
   triplet: boolean
   // Envelope params (used when type='envelope')
   envelope: EnvelopeParams
+  // Ramp params (used when type='ramp')
+  ramp: RampParams
   // Arpeggiator params (used when type='arpeggiator').
   // Rate is shared with the LFO (rateHz/sync/divisionIdx/dotted/triplet).
   arpeggiator: ArpeggiatorParams
@@ -159,6 +185,13 @@ export interface Scene {
   // Setting >1 with nextMode='loop' is effectively redundant (still loops
   // forever), but harmless.
   multiplicator: number
+  // Optional per-scene Morph-in duration (ms). When this scene is
+  // triggered by the user via GO / Space / trigger button, every cell
+  // glides to its new target over this duration instead of using the
+  // cell's own transitionMs. Overridden by an explicit transport-level
+  // morph time if one is set at trigger time. Omitted = no per-scene
+  // preference.
+  morphInMs?: number
   // Sparse: key is trackId. Missing = empty cell.
   cells: Record<string, Cell>
   // MIDI binding for triggering the whole scene.
@@ -234,7 +267,12 @@ export interface MetaController {
   knobs: MetaKnob[] // fixed length META_KNOB_COUNT
 }
 
-export const META_KNOB_COUNT = 8
+// 32 knobs arranged as 4 banks of 8 (A/B/C/D). Only one bank is shown in
+// the Meta Controller bar at a time; the bank selector lives to the right of
+// the knob row. `selectedKnob` is a GLOBAL index (0..31).
+export const META_KNOB_COUNT = 32
+export const META_BANK_COUNT = 4
+export const META_KNOBS_PER_BANK = 8
 export const META_MAX_DESTS = 8
 
 export interface Session {
@@ -251,6 +289,12 @@ export interface Session {
   sequence: (string | null)[] // 128-length array; only first `sequenceLength` are used
   focusedSceneId: string | null
   midiInputName: string | null
+  // Transport-level MIDI bindings. These fire the cue GO (identical to
+  // clicking the GO button / hitting Space) and set the transport-level
+  // morph time (CC value 0..127 → 0..10 000 ms, linear). Both are
+  // optional and CC/note-bindable via the global MIDI Learn workflow.
+  goMidi?: MidiBinding
+  morphTimeMidi?: MidiBinding
   // Global Meta Controller bank — 8 user-assignable knobs that broadcast a
   // scaled value to up to 8 OSC destinations each. Persisted with the session.
   metaController: MetaController
@@ -270,13 +314,35 @@ export interface EngineState {
   tickRateHz: number
 }
 
+// One outgoing OSC message as surfaced to the renderer (OSC monitor panel).
+// Batched in main on a 50ms timer to keep IPC cheap — the monitor may see
+// thousands of sends per second at 120Hz ticks × multiple active cells.
+export interface AutosaveEntry {
+  path: string
+  mtimeMs: number
+  sessionName: string
+  sizeBytes: number
+}
+
+export interface OscEvent {
+  timestamp: number // Date.now() ms
+  ip: string
+  port: number
+  address: string
+  args: { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }[]
+}
+
 // Window.api signature — consumed by renderer.
 // MIDI is handled via Web MIDI in the renderer (not through IPC).
 export interface ExposedApi {
   // Engine
   triggerCell: (sceneId: string, trackId: string) => Promise<void>
   stopCell: (sceneId: string, trackId: string) => Promise<void>
-  triggerScene: (sceneId: string) => Promise<void>
+  // `opts.morphMs` — optional scene-to-scene morph duration in ms. When
+  // set, every cell in the scene glides over this time, and any tracks
+  // active from the previous scene that don't exist in this one fade
+  // out over the same duration.
+  triggerScene: (sceneId: string, opts?: { morphMs?: number }) => Promise<void>
   stopScene: (sceneId: string) => Promise<void>
   stopAll: () => Promise<void>
   panic: () => Promise<void>
@@ -293,6 +359,13 @@ export interface ExposedApi {
   sessionSaveAs: (session: Session) => Promise<string | null> // returns filepath
   sessionSave: (session: Session, path: string) => Promise<boolean>
   sessionOpen: () => Promise<{ session: Session; path: string } | null>
+  // Autosave / crash recovery
+  autosaveCrashCheck: () => Promise<{ crashed: boolean; entries: AutosaveEntry[] }>
+  autosaveList: () => Promise<AutosaveEntry[]>
+  autosaveLoad: (path: string) => Promise<Session>
   // Events from main
   onEngineState: (cb: (s: EngineState) => void) => () => void
+  // Batched outgoing OSC events (for the OSC monitor panel). Each callback
+  // fire delivers a batch of messages accumulated on the main side.
+  onOscEvents: (cb: (batch: OscEvent[]) => void) => () => void
 }

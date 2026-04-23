@@ -19,6 +19,10 @@ export const HEADER_COLLAPSED = 32
 export function useHeaderHeight(): number {
   const notesH = useStore((s) => s.editorNotesHeight)
   const collapsed = useStore((s) => s.scenesCollapsed)
+  const showMode = useStore((s) => s.showMode)
+  // Show mode forces the tightest layout so performers see more scenes /
+  // tracks on screen at once without editing chrome getting in the way.
+  if (showMode) return HEADER_COLLAPSED
   return collapsed ? HEADER_COLLAPSED : HEADER_BASE + notesH
 }
 
@@ -32,6 +36,8 @@ export const SCENE_COL_COLLAPSED_MIN_W = 56
 export function useEffectiveRowHeight(): number {
   const rowH = useStore((s) => s.rowHeight)
   const collapsed = useStore((s) => s.tracksCollapsed)
+  const showMode = useStore((s) => s.showMode)
+  if (showMode) return 32
   return collapsed ? 32 : rowH
 }
 
@@ -46,6 +52,10 @@ export default function EditView(): JSX.Element {
   const inspectorWidth = useStore((s) => s.inspectorWidth)
   const setInspectorWidth = useStore((s) => s.setInspectorWidth)
   const headerH = useHeaderHeight()
+  // Show mode strips the Inspector + SettingsBox entirely so the scene
+  // grid gets the full width for triggers. Edit chrome (delete, edit
+  // parameters) is not a performance affordance.
+  const showMode = useStore((s) => s.showMode)
 
   const gridHeight = headerH + tracks.length * rowHeight
 
@@ -80,31 +90,33 @@ export default function EditView(): JSX.Element {
         </div>
       </div>
 
-      <div
-        className="relative bg-panel border-l border-border shrink-0 flex flex-col"
-        style={{ width: inspectorWidth }}
-      >
-        <ResizeHandle
-          direction="col"
-          value={inspectorWidth}
-          onChange={setInspectorWidth}
-          min={320}
-          max={640}
-          inverse
-          className="absolute top-0 left-0 bottom-0 w-[4px] z-30"
-          title="Drag to resize inspector"
-        />
-        <SettingsBox />
-        <div className="flex-1 min-h-0 overflow-y-auto">
-          {selectedCell ? (
-            <Inspector mode="cell" />
-          ) : selectedTrack ? (
-            <Inspector mode="track" />
-          ) : (
-            <InspectorEmpty />
-          )}
+      {!showMode && (
+        <div
+          className="relative bg-panel border-l border-border shrink-0 flex flex-col"
+          style={{ width: inspectorWidth }}
+        >
+          <ResizeHandle
+            direction="col"
+            value={inspectorWidth}
+            onChange={setInspectorWidth}
+            min={320}
+            max={640}
+            inverse
+            className="absolute top-0 left-0 bottom-0 w-[4px] z-30"
+            title="Drag to resize inspector"
+          />
+          <SettingsBox />
+          <div className="flex-1 min-h-0 overflow-y-auto">
+            {selectedCell ? (
+              <Inspector mode="cell" />
+            ) : selectedTrack ? (
+              <Inspector mode="track" />
+            ) : (
+              <InspectorEmpty />
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }

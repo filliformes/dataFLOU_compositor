@@ -34,13 +34,65 @@ export default function CellTile({
     (s) => s.engine.seqStepBySceneAndTrack[sceneId]?.[trackId]
   )
   const liveValue = useStore((s) => s.engine.currentValueBySceneAndTrack[sceneId]?.[trackId])
-  const compact = useStore((s) => s.tracksCollapsed)
+  const tracksCollapsedRaw = useStore((s) => s.tracksCollapsed)
+  const showMode = useStore((s) => s.showMode)
+  // Show mode always uses the compact single-line tile — no "expanded"
+  // variant exists in show mode so we never paint the oversized card.
+  const compact = tracksCollapsedRaw || showMode
   const templates = useStore((s) => s.clipTemplates)
   const applyClipTemplate = useStore((s) => s.applyClipTemplate)
   const midiLearnMode = useStore((s) => s.midiLearnMode)
   const midiLearnTarget = useStore((s) => s.midiLearnTarget)
   const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
   const globalBpm = useStore((s) => s.session.globalBpm)
+
+  // ---- Ramp-timing state (hoisted above the early return so hook order
+  // stays stable across empty-cell vs filled-cell renders). We record
+  // Date.now() the instant isPlaying flips on for this cell — can't rely
+  // on engine.activeSceneStartedAt because that only updates for full-
+  // scene triggers and stays stale when a single clip is fired. A 30 Hz
+  // interval keeps us re-rendering during the ramp so the completion
+  // moment is detected even after the engine output stabilizes (at which
+  // point zustand would otherwise stop pushing updates).
+  const triggerAtRef = useRef<number | null>(null)
+  const wasPlayingRef = useRef(false)
+  if (isPlaying && !wasPlayingRef.current) {
+    triggerAtRef.current = Date.now()
+  }
+  if (!isPlaying && wasPlayingRef.current) {
+    triggerAtRef.current = null
+  }
+  wasPlayingRef.current = isPlaying
+
+  const isRampCell = cell?.modulation.enabled && cell.modulation.type === 'ramp'
+  // Compute an upper bound on the ramp length here (at the top of the
+  // component, above the early return) so we can auto-terminate the
+  // timer as soon as we're clearly past the ramp finish line. Prevents
+  // the interval from burning indefinitely on a completed-but-still-
+  // playing ramp cell.
+  const rampBoundMs = (() => {
+    if (!cell || !isRampCell) return 0
+    const r = cell.modulation.ramp
+    if (!r) return 0
+    if (r.sync === 'free') return r.rampMs
+    if (r.sync === 'freeSync') return r.totalMs
+    return (scene?.durationSec ?? 0) * 1000
+  })()
+  const [rampNowMs, setRampNowMs] = useState<number>(() => Date.now())
+  const triggerAt = triggerAtRef.current
+  const rampDoneByTime =
+    isRampCell &&
+    isPlaying &&
+    triggerAt !== null &&
+    rampBoundMs > 0 &&
+    rampNowMs - triggerAt >= rampBoundMs
+  const needsRampTimer = !!(isRampCell && isPlaying && !rampDoneByTime)
+  useEffect(() => {
+    if (!needsRampTimer) return
+    const id = setInterval(() => setRampNowMs(Date.now()), 33)
+    return () => clearInterval(id)
+  }, [needsRampTimer])
+
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   // Separate context menu for FILLED cells (the `menu` state above is for
   // the empty-cell + clip picker). Targets either this single cell or the
@@ -208,8 +260,32 @@ export default function CellTile({
   const isLfo = modOn && cell.modulation.type === 'lfo'
   const isArp = modOn && cell.modulation.type === 'arpeggiator'
   const isRnd = modOn && cell.modulation.type === 'random'
+  const isRamp = modOn && cell.modulation.type === 'ramp'
+  // Defensive `?.` on `.ramp` — a freshly-loaded session migrated from an
+  // older version without the ramp field should have been back-filled by
+  // sanitizeMetaController, but if something sneaks through we'd rather
+  // read 0 than crash the whole tree.
+  const rampRef = cell.modulation.ramp
+  const rampLenMs =
+    isRamp && rampRef
+      ? rampRef.sync === 'free'
+        ? rampRef.rampMs
+        : rampRef.sync === 'freeSync'
+          ? rampRef.totalMs
+          : (scene?.durationSec ?? 0) * 1000
+      : 0
+
+  // Timer state + trigger-at ref are hoisted to the top of the component
+  // (see above) so hook order stays stable across branches. Here we just
+  // read the derived values.
+  const rampElapsedMs =
+    isRamp && isPlaying && triggerAtRef.current !== null
+      ? rampNowMs - triggerAtRef.current
+      : 0
+  const rampComplete = isRamp && rampElapsedMs >= rampLenMs && rampLenMs > 0
   // Envelope doesn't loop, so don't animate the sweep for it.
-  const showSweep = isPlaying && (isLfo || isArp || isRnd || seqOn)
+  const showSweep =
+    isPlaying && (isLfo || isArp || isRnd || seqOn || (isRamp && !rampComplete))
   // Use the effective rate (respects BPM sync, dotted, triplet) so the visual
   // matches what the engine actually runs. Clamp minimum period to 30 ms
   // (~33 Hz visual) so very fast LFOs/arps are still visible as motion.
@@ -223,13 +299,17 @@ export default function CellTile({
     ? Math.max(0.03, arpCycleSec)
     : isLfo || isRnd
       ? Math.max(0.03, 1 / Math.max(0.01, effHz))
-      : seqOn
-      ? cell.sequencer.syncMode === 'bpm'
-        ? (60 / Math.max(1, globalBpm)) * Math.max(1, cell.sequencer.steps)
-        : cell.sequencer.syncMode === 'tempo'
-          ? (60 / Math.max(1, cell.sequencer.bpm)) * Math.max(1, cell.sequencer.steps)
-          : (cell.sequencer.stepMs / 1000) * Math.max(1, cell.sequencer.steps)
-      : 1
+      : isRamp
+        ? // One sweep = the full ramp length. showSweep flips off when the
+          // ramp finishes, so the animation truncates at the settled state.
+          Math.max(0.03, rampLenMs / 1000)
+        : seqOn
+        ? cell.sequencer.syncMode === 'bpm'
+          ? (60 / Math.max(1, globalBpm)) * Math.max(1, cell.sequencer.steps)
+          : cell.sequencer.syncMode === 'tempo'
+            ? (60 / Math.max(1, cell.sequencer.bpm)) * Math.max(1, cell.sequencer.steps)
+            : (cell.sequencer.stepMs / 1000) * Math.max(1, cell.sequencer.steps)
+        : 1
 
   const triggerBtn = (
     <button
@@ -343,13 +423,21 @@ export default function CellTile({
         style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell, globalBpm) : undefined }}
       />
       <div className="clip-top-bar" aria-hidden />
-      <div className="flex items-center gap-1.5">
+      {/* Row 1: trigger + OSC address (the primary debugging identifier,
+          promoted here so it never clips at the min column width). */}
+      <div className="flex items-center gap-1.5 min-w-0">
         {triggerBtn}
-        <span className="text-[10px] text-muted truncate flex-1">
-          {cell.destIp}:{cell.destPort}
+        <span
+          className="text-[10px] truncate flex-1 min-w-0"
+          title={cell.oscAddress + (cell.addressLinkedToDefault ? ' (linked to default)' : '')}
+        >
+          {cell.oscAddress}
+          {cell.addressLinkedToDefault && (
+            <span className="text-accent2 ml-1">~def~</span>
+          )}
         </span>
         <button
-          className="text-muted hover:text-danger text-[10px]"
+          className="text-muted hover:text-danger text-[10px] shrink-0"
           onClick={(e) => {
             e.stopPropagation()
             removeCell(sceneId, trackId)
@@ -359,9 +447,12 @@ export default function CellTile({
           ✕
         </button>
       </div>
-      <div className="text-[10px] text-muted truncate mt-0.5">
-        {cell.oscAddress}
-        {cell.addressLinkedToDefault && <span className="text-accent2 ml-1">~def~</span>}
+      {/* Row 2: ip:port — secondary info, smaller, allowed to truncate. */}
+      <div
+        className="text-[10px] text-muted truncate mt-0.5"
+        title={`${cell.destIp}:${cell.destPort}`}
+      >
+        {cell.destIp}:{cell.destPort}
       </div>
       <div className="flex-1 flex items-center">
         <span
@@ -381,6 +472,11 @@ export default function CellTile({
         {modOn && cell.modulation.type === 'envelope' && (
           <span className="text-accent2">ENV {cell.modulation.depthPct}%</span>
         )}
+        {modOn && cell.modulation.type === 'ramp' && (
+          <span className="text-accent2">
+            RAMP {cell.modulation.depthPct}%
+          </span>
+        )}
         {modOn && cell.modulation.type === 'arpeggiator' && (
           <span className="text-accent2">
             ARP{cell.modulation.arpeggiator.steps}
@@ -392,8 +488,14 @@ export default function CellTile({
           </span>
         )}
         {seqOn && <span className="text-accent">SEQ{cell.sequencer.steps}</span>}
-        {cell.delayMs > 0 && <span>⟲{cell.delayMs}ms</span>}
-        {cell.transitionMs > 0 && <span>~{cell.transitionMs}ms</span>}
+        {cell.delayMs > 0 && (
+          <span title="Delay before trigger (ms)">⟲{cell.delayMs}ms</span>
+        )}
+        {cell.transitionMs > 0 && (
+          <span title="Trigger transition — morph time from current output to the clip's value when the clip is triggered. Unrelated to the modulator; change it in the inspector's Transition field.">
+            ~{cell.transitionMs}ms
+          </span>
+        )}
       </div>
     </div>
     {filledMenu && (

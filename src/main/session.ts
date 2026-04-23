@@ -36,7 +36,21 @@ export async function open(
   if (result.canceled || result.filePaths.length === 0) return null
   const path = result.filePaths[0]
   const text = await fs.readFile(path, 'utf8')
-  const session = JSON.parse(text) as Session
-  if (session.version !== 1) throw new Error(`Unsupported session version: ${session.version}`)
+  // Parse defensively — a hand-edited or truncated file would otherwise
+  // throw a raw SyntaxError back across IPC with no helpful context.
+  let session: Session
+  try {
+    session = JSON.parse(text) as Session
+  } catch (e) {
+    throw new Error(`Session file could not be parsed: ${(e as Error).message}`)
+  }
+  if (!session || typeof session !== 'object') {
+    throw new Error('Session file is not a JSON object')
+  }
+  if (session.version !== 1) {
+    throw new Error(
+      `Unsupported session version: ${session.version}. Expected 1.`
+    )
+  }
   return { session, path }
 }

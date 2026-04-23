@@ -14,12 +14,18 @@ You build a grid of **Messages** (rows — each row is one OSC message destinati
 - **Per‑clip triggers** let you fire individual messages without launching the whole scene.
 - **Multi‑value OSC** — space‑separated entries in a clip's Value field become multiple OSC args in a single message. Every modulator treats each entry independently.
 - **Scale 0.0–1.0** — clamps each output channel to `[0, 1]`; with the Arpeggiator it proportionally normalizes the ladder instead of clipping.
-- **Four modulation types** — pick per clip: **LFO**, **Envelope (ADSR)**, **Arpeggiator**, **Random Generator**.
+- **Five modulation types** — pick per clip: **LFO**, **Ramp**, **Envelope (ADSR)**, **Arpeggiator**, **Random Generator**.
 - **Sequencer (1–16 steps)** — cycles through per‑step values at BPM (session‑locked), Tempo (per‑clip slider), or Free (ms). With Modulation also on, the modulator operates on the current step value.
 - **Transitions** morph the previous clip's value into the new one over a configurable time, even while the LFO keeps running.
 - **Ableton‑style follow actions** — Stop / Loop / Next / Previous / First / Last / Any / Other, plus a per‑scene **×Multiplicator** (how many times the scene plays before the follow action fires).
 - **Sequence grid** — 1–128‑step drag‑laid sequence in the Sequence view, with a floating drag preview while you drop scenes into slots.
-- **Meta Controller** — a global bank of **8 circular knobs**, each with a user name, min/max range, a **Smooth (ms)** time to interpolate between values, one of **14 output curves** (linear, log, exp, geom, ease‑in, ease‑out, cubic, sqrt, sigmoid, smoothstep, dB taper, gamma, step, invert), up to **8 OSC destinations** broadcasting simultaneously, and MIDI CC learn. Dial position = what leaves the socket — smoothing is visible, not just sent.
+- **Meta Controller** — **32 knobs across 4 banks** (A B C D). Each knob has a user name, min/max range, a **Smooth (ms)** time to interpolate between values, one of **14 output curves** (linear, log, exp, geom, ease‑in, ease‑out, cubic, sqrt, sigmoid, smoothstep, dB taper, gamma, step, invert), up to **8 OSC destinations** broadcasting simultaneously, and MIDI CC learn. Dial position = what leaves the socket — smoothing is visible, not just sent.
+- **Cue system** — arm a scene as "next", fire it with **GO** / **Space** / MIDI. Optional auto‑advance to the next sequence slot after each GO; turns a linear show into Space‑Space‑Space.
+- **Scene‑to‑scene Morph** — one knob in the transport glides every cell from scene A to scene B over N ms, fading orphan tracks out at the same rate. Per‑scene override plus MIDI CC control (0..127 → 0..10 000 ms).
+- **Show / Kiosk mode** — locks the UI into a performance view (F11, hold Escape to exit). Hides all editing chrome, pulses a discreet banner, keeps transport + GO + Tab visible.
+- **Autosave + crash recovery** — silent snapshot every 60 s to `~/AppData/Roaming/dataFLOU/autosave/`, keeps 30 rolling copies. On next launch after an unclean shutdown, offers to restore.
+- **OSC monitor drawer** — optional bottom panel streams outgoing OSC in real time (ip:port · address · args), filterable, pausable. Toggle with **Caps Lock** or the **OSC** button next to the brand.
+- **Transport bar** — always visible at the bottom: Play / Pause / Stop (colored by active state), cue GO, Morph enable + ms, selected scene readout, **live HH:MM:SS:MS time counter** (starts on Play, freezes on Pause, resets on Stop).
 - **Clip Templates** — save full clip configs and apply them to empty cells via the right‑click menu or the Template dropdown. Persisted in localStorage, survive app restarts.
 - **Multi‑select clips** — Ctrl+click adds clips to a disjoint selection; right‑click the selection to bulk‑apply a template or re‑sync every selected clip's OSC to the session defaults.
 - **Global MIDI Learn** (Ableton‑style, one button) — enter learn mode, click a scene, clip trigger, or Meta knob, wiggle a MIDI control. Blue overlays show learnables, green = bound.
@@ -66,7 +72,8 @@ The window is split into three regions:
 
 | Region | What it holds |
 | --- | --- |
-| **Top toolbar** | **dataFLOU** brand button (click to reveal the preferences sub‑toolbar with **Theme** picker), session name, file actions (New / Open / Save / Save As), default OSC address & destination, Tick rate, Global BPM, MIDI input picker, **MIDI Learn**, **Edit ↔ Sequence** view toggle, **Stop All**, **Panic** |
+| **Top toolbar** | **dataFLOU** brand button (click to reveal the preferences sub‑toolbar: **Theme** picker + **Enter Show Mode**), **OSC** monitor toggle, session name, file actions (New / Open / Save / Save As), default OSC address & destination, Tick rate, Global BPM, MIDI input picker, **MIDI Learn**, **Edit ↔ Sequence** view toggle, **Stop All**, **Panic**. Shows a pulsing *SHOW — hold Esc to exit* banner when in Show mode. |
+| **Transport bar (bottom)** | Play / Pause / Stop (colored by active state), **GO** (cue fire) + auto‑advance toggle, **Morph** enable + ms, selected scene readout, live HH:MM:SS:MS time counter. Always visible in both Edit and Sequence views. |
 | **Meta Controller bar** | Toggled via the Inspector's top "Meta Controller" button — sits below the main toolbar, resizable via the handle on its bottom edge. 8 circular knobs + a details pane for the selected knob |
 | **Editor** (Edit view) | Left: "Buttons box" (Scenes/Messages counts + add buttons) and Messages sidebar (rows). Center: Scene columns. Right: Inspector panel (top toggles for Notes / Meta Controller / Collapse Scenes / Collapse Messages, then Clip Template dropdown when a cell is selected, then the clip's full parameters) |
 | **Sequence view** (the other tab) | Left: resizable palette column holding the scene list (pills auto‑size to their names) + a per‑scene inspector (name / color / notes / duration / Next follow‑action / ×Multiplicator / Delete). Center: 128‑slot drag‑drop sequence grid with floating drag preview. Bottom: status/transport bar (Play / Pause / Stop, focused scene name, message count) |
@@ -124,9 +131,15 @@ Each clip carries the full per‑scene settings for one Message. Open a clip in 
   - **Rate**: Free (0.01–100 Hz, log‑mapped slider) **or** BPM‑synced to division ticks from `1/128` up to `128/1`, with optional Dotted / Triplet
   - Phase resets on every trigger so shapes start cleanly.
 
+  **Ramp** — one‑shot 0 → target glide, then holds:
+  - **Ramp time** (Free ms 0.1 – 300 000) **or** scene‑synced **or** Free (synced) with a user‑picked Total (ms).
+  - **Curve** (−100 → +100 %): point‑symmetric easing pair. Negative = ease‑in (slow start, fast finish); positive = ease‑out (fast start, slow tail). 0 = linear.
+  - **Depth**: 0–100 %; defaults to 100 % the first time Ramp is selected.
+  - Inline visualizer draws the curve and animates a live orange dot along it while the clip is playing. After the ramp completes, the clip's sweep icon stops and the trigger square settles into solid orange (still armed, no longer updating).
+
   **Envelope (ADSR)** — multiplicative VCA shape:
   - Attack, Decay, Sustain time, Release + Sustain level
-  - **Sync**: Synced (each stage a % of the scene duration, 0.01–100%, auto‑normalized if they overflow) **or** Free (each stage 0–10 000 ms)
+  - **Sync**: Synced (each stage a % of scene duration), Free (each stage 0–10 000 ms), or **Free (synced)** — stages as % of a user‑picked **Total (ms)**, independent of the scene duration.
   - **Depth**: 0–100% wet/dry mix. 100% = full VCA shape (0 → center → 0); 0% = no effect.
 
   **Arpeggiator** — walks a ladder derived from the Value:
@@ -167,9 +180,54 @@ Each clip carries the full per‑scene settings for one Message. Open a clip in 
 
 Templates are stored in **localStorage** under `dataflou:clipTemplates:v1`, so they survive app restarts (per‑install — dev mode and the packaged build keep separate stores).
 
+### Cue system
+
+Live‑performance convention: pre‑arm a scene as the "next" moment, then fire it instantly on a single gesture.
+
+- **Arm a scene** three ways: **right‑click** a scene header / palette pill / sequence slot and pick *Arm as next ▶▶*; **Alt‑click** any of the same; or press **A** with the scene focused.
+- An armed scene shows a pulsing blue ring + `▶▶` chevron on both the palette pill and the sequence slot.
+- **Fire it** with the **GO** button in the transport bar, with **Space**, or with a MIDI note / CC bound to GO via global MIDI Learn.
+- **Next (auto‑advance arm)** — tick the `Next` checkbox next to GO to automatically arm the next non‑empty sequence slot after each fire. Turns a linear show into Space‑Space‑Space.
+- State is ephemeral — arming doesn't save with the session, since "what's armed next" is a current‑run concern, not a compositional one.
+
+### Scene‑to‑scene Morph
+
+A single transport knob that turns every scene trigger from a snap into a glide.
+
+- **Enable + duration** live at the bottom of the screen (`[Morph] [____] ms`).
+- When on, every scene trigger (click, Space, GO, 1–9/0 hotkeys, MIDI) morphs every cell over the configured time, AND fades any tracks that were active in the previous scene but have no cell in this one (orphans) out over the same time. So A → B in 8 s converges the whole sonic picture onto B's state.
+- **Per‑scene override** — each scene has a **Morph‑in (ms)** field in the Sequence view's scene inspector. Leave blank to follow the transport; set a value (including 0 for a hard snap) to pin THIS scene's glide regardless of transport.
+- **MIDI‑learnable** — bind a CC to the Morph time; sweeping the knob maps 0..127 → 0..10 000 ms and auto‑enables Morph.
+- A thin blue progress strip along the top of the transport bar shows the morph in flight.
+
+### Show / Kiosk mode
+
+Locks the UI into a performance view. Enabled from the preferences sub‑toolbar (*Enter Show Mode* button) or with **F11**.
+
+- **Hides** all authoring chrome: Messages sidebar, scene add buttons, clip inspectors, file menu, modulation inspectors. Keeps: transport, GO button, scene palette, sequence grid, Meta Controller knobs (read‑only, still twistable), OSC Monitor toggle.
+- A pulsing red *SHOW — hold Esc to exit* banner lives centered in the top toolbar so you always know you're in show mode.
+- **Exit**: hold Escape for ≥ 800 ms, or press **F11** again. Short Esc taps still close menus.
+- **Tab** works to switch Edit ↔ Sequence views so you can hide the grid vs. show the message‑level detail mid‑performance.
+
+### OSC monitor
+
+A bottom drawer that streams outgoing OSC traffic for debugging.
+
+- Toggle with **Caps Lock** or the compact `OSC` button next to the **dataFLOU** brand label in the top toolbar.
+- Rolling log of the last 1000 messages: timestamp · `ip:port` · address · args.
+- Filter by substring (any match on address or `ip:port`), pause capture, clear, auto‑scroll sticks to the bottom until you scroll up.
+- Main‑process batches sends every 50 ms to keep IPC volume bounded even at 120 Hz tick rate.
+
+### Autosave + crash recovery
+
+- Every 60 s (while the session has changed), a silent snapshot is written to `~/AppData/Roaming/dataFLOU/autosave/<name>-<timestamp>.dflou.json` (on macOS: `~/Library/Application Support/dataFLOU/autosave/`).
+- Keeps the most recent **30** copies; older ones are pruned automatically.
+- A `.running` sentinel file is written on app.ready and deleted on quit. If it's still there on the next launch, the previous run didn't exit cleanly — the app pops a **Restore from autosave?** modal listing the newest snapshots.
+- One final autosave fires on quit to catch last‑second edits.
+
 ### Meta Controller
 
-A global bank of 8 circular knobs, toggled from the Inspector's top **Meta Controller** button. Lives as a resizable strip immediately below the main toolbar.
+**32 knobs across 4 banks (A, B, C, D)** — 8 per bank. Toggled from the Inspector's top **Meta Controller** button. Lives as a resizable strip immediately below the main toolbar, with a vertical **Banks** selector between the knob row and the details panel.
 
 Per‑knob parameters:
 
@@ -199,7 +257,7 @@ A 1 – 128 slot grid (configurable via the **Scene steps** input at the top) fo
 - **Drag slots** to swap their contents.
 - **Click "Clear mode"** then click slots to empty them.
 - **Click a filled slot** (outside Clear mode) to focus that scene.
-- **Bottom transport** — Play (start the focused scene or the first slot), Pause (freeze auto‑advance — clips keep playing), Stop (morph everything to 0).
+- **Bottom transport** (now global — visible in BOTH Edit and Sequence views): Play / Pause / Stop buttons (colored by active state), Cue **GO** + Next‑auto toggle, **Morph** enable + ms, selected scene readout, live **HH:MM:SS:MS time counter** (starts on Play, freezes on Pause, resets on Stop).
 
 ### MIDI
 
@@ -267,18 +325,26 @@ The Save button **flashes blue** on a successful write.
 
 | Shortcut | Action |
 | --- | --- |
-| **Tab** | Toggle Edit ↔ Sequence (suppressed inside text fields) |
+| **Space** | **GO** — fire the armed scene; if none, trigger the next non‑empty slot. Suppressed inside text fields. |
+| **A** | Arm / unarm the focused scene as the next cue |
+| **1 – 9 / 0** | Trigger scenes 1–10 in the sequence directly |
+| **Enter** (in a clip's Value field) | Commit the new value AND re‑trigger the clip (modulation + sequencer restart from 0) |
+| **. / Shift + .** | Stop All (graceful) / Panic (instant) |
+| **F11** | Toggle Show / Kiosk mode |
+| **Esc** (hold ≥ 800 ms) | Exit Show mode. Short taps still close menus / cancel MIDI Learn. |
+| **Caps Lock** | Toggle the OSC monitor drawer |
+| **Tab** | Toggle Edit ↔ Sequence (suppressed inside text fields, stays active in Show mode) |
 | **Ctrl + T** *(Cmd + T on macOS)* | Add a Message |
 | **Alt + S** | Add a Scene |
 | **Delete** | In Sequence view, delete the focused scene |
-| **Esc** | Close any open modal / cancel MIDI Learn / close context menu |
 | **Ctrl + wheel** | Zoom the whole app (except the main toolbar), 0.5×–2× |
 | **Ctrl + drag** *(Cmd + drag on macOS)* a clip onto an empty cell | Duplicate that clip |
 | **Ctrl + click** a clip | Add / remove it from the disjoint multi‑selection |
 | **Shift + click** a scene or message | Extend range selection from the anchor |
+| **Alt + click** a scene / palette pill / sequence slot | Arm that scene as the next cue (toggle) |
 | **Right‑click** an empty cell | Open the Clip Template picker |
 | **Right‑click** a filled clip (or multi‑selection) | Apply template / Use Default OSC menu |
-| **Right‑click** a scene header | Delete scene menu (bulk if multi‑selected) |
+| **Right‑click** a scene header / palette pill / sequence slot | Arm as next ▶▶ · Delete (bulk if multi‑selected) |
 | **Right‑click** a message row | Delete message menu (bulk if multi‑selected) |
 | **Right‑click** a Collapse toggle | Flip BOTH Collapse Scenes + Collapse Messages together |
 | **Shift + drag** a knob | Fine adjustment (×4 slower) |
@@ -295,17 +361,67 @@ The Save button **flashes blue** on a successful write.
 
 ```
 src/
-├── main/         # Electron main: UDP, scene engine, MIDI, file I/O, IPC
-├── preload/      # window.api bridge
+├── main/         # Electron main: UDP (osc.ts), scene engine, file I/O, autosave, IPC
+│   ├── engine.ts        # fixed-tick scene engine + OSC output (20–120 Hz)
+│   ├── osc.ts           # UDP sender + rate-limited error logging
+│   ├── session.ts       # Save / Save As / Open dialogs + JSON I/O
+│   ├── autosave.ts      # 60 s rolling snapshots + crash-recovery sentinel
+│   └── index.ts         # window creation, IPC handler wiring
+├── preload/      # window.api bridge (contextIsolation + typed ExposedApi)
 ├── shared/       # types & factories used by main and renderer
 └── renderer/
-    ├── components/    # React UI (CellTile, Inspector, MetaKnob, MetaControllerBar, …)
+    ├── components/    # React UI
+    │   ├── TopBar / TransportBar / OscMonitor / CrashRecoveryPrompt / ErrorBoundary
+    │   ├── EditView / TrackSidebar / SceneColumn / CellTile / Inspector
+    │   └── SequenceView / MetaControllerBar / MetaKnob / Modal / ResizeHandle
     ├── fonts/         # bundled woff2 for themes (Inter, Roboto, Work Sans, IBM Plex Sans)
     ├── store.ts       # Zustand global state (session + ephemeral UI state)
     ├── metaSmooth.ts  # renderer-side knob-value tweener (rAF-driven, fires OSC)
     ├── midi.ts        # Web MIDI manager
     └── styles.css     # Tailwind + theme CSS variables + @font-face declarations
 ```
+
+---
+
+## Release notes — 0.3.5
+
+Live‑performance polish + new modulator + scene gliding.
+
+### Performance workflow
+- **Cue system** — arm a scene as next (right‑click / `A` key / Alt‑click), fire with **GO** / **Space** / MIDI. Auto‑advance arm turns a linear show into a single‑finger walkthrough.
+- **Scene‑to‑scene Morph** — transport‑level knob glides every cell over N ms on scene change, fading orphan tracks out synchronously. Per‑scene override + MIDI CC mapping (0..127 → 0..10 000 ms).
+- **Show / Kiosk mode** — F11 toggle, hold‑Esc exit, hides all edit chrome while keeping transport + GO + Tab + Meta knobs live.
+- **Global transport bar** — always visible in both Edit and Sequence views. Play / Pause buttons now colored by state (grey → accent while playing, grey → blue while paused). Added GO, Morph, and a live **HH:MM:SS:MS time counter**.
+- **Performance hotkeys** — `1–9/0` direct scene fire, `Space` GO, `A` arm, `.` / `Shift+.` Stop All / Panic, `Caps Lock` OSC monitor, `Enter` in a clip's Value re‑triggers the clip.
+
+### New modulator
+- **Ramp** — one‑shot 0 → target glide, then hold. Free (ms) / Synced (scene) / Free (synced) modes; `Curve` (−100..+100 %) for ease‑in / linear / ease‑out; live SVG visualizer with orange progress dot; depth defaults to 100 %.
+- **Envelope — Free (synced)** — third sync option: stages as % of a user‑picked Total (ms), independent of scene duration.
+
+### Autosave + recovery
+- Silent snapshot every 60 s to `~/AppData/Roaming/dataFLOU/autosave/` (30 rolling copies). Sentinel file detects unclean shutdowns and prompts to restore on next launch.
+
+### OSC monitor
+- Bottom‑drawer log of outgoing OSC traffic; filterable, pausable, auto‑scrolled. Toggle with **Caps Lock** or the `OSC` button next to the brand label. Main‑process batches sends every 50 ms to keep IPC bounded.
+
+### Meta Controller expansion
+- **32 knobs across 4 banks (A / B / C / D)**. Vertical bank selector between the knob row and the details pane. Each bank is a separate 8‑knob page.
+
+### Stability + safety
+- **Windows freeze fix** — rate‑limited main‑process `console.error` on hot paths; previously a failing OSC destination at 120 Hz × N cells could flood stderr fast enough to block Node's stdout pipe and freeze both the app AND the dev‑server terminal simultaneously.
+- **Session updateSession IPC coalesced** on `requestAnimationFrame` — bursts of state mutations produce ONE IPC per frame instead of one per change.
+- **SceneColumn hook‑order fix** — useState / useEffect for the context menu were living below a defensive early return; hoisted above to prevent rules‑of‑hooks failures on scene deletion.
+- **OSC pre‑ready queue bounded** to 1024 entries and drained on port error, so a UDP socket that fails to bind can't leak memory.
+- **`session.ts` `JSON.parse` wrapped** — malformed session files now surface a friendly error instead of a raw SyntaxError across IPC.
+- **`applyClipTemplate`** — new ramp field now deep‑cloned on template apply so edits never mutate shared state.
+- **`newSession` / `setSession`** — ephemeral UI state (armed cue, selection arrays, transport timer, MIDI learn target) now properly reset on Open / New.
+- **Root‑level ErrorBoundary** — renderer throws show an in‑place error panel with message + stack instead of a blank window.
+
+### Misc
+- **Minimum‑width clip tile** now shows the OSC address on the primary row (not cropped). `ip:port` demoted to secondary.
+- **Session name / Tick / BPM inputs shrunk** so Panic stays on‑screen at narrow widths.
+- **Ramp / Morph progress dots** re‑subscribe reliably to per‑cell play state (fixed stale‑selector bug that hid the live dot).
+- **View‑toggle button** (Edit ↔ Sequence) returned to the top toolbar; visible in Show mode too.
 
 ---
 
@@ -335,8 +451,7 @@ This is a personal tool by [Vincent Fillion](https://vincentfillion.com). It run
 - No undo / redo
 - No MIDI output (MIDI is input‑only for triggering)
 - No OSC bundles with timestamps (each tick sends individual messages)
-- No quantized scene changes
-- No auto‑save / crash recovery
+- No quantized scene changes (cue firing is immediate; beat‑locked GO is a future feature)
 
 Issues and PRs welcome.
 
