@@ -46,7 +46,7 @@ OSC is sent over UDP. The engine runs in the Electron main process at a configur
 Requires [Node.js](https://nodejs.org) (LTS or newer).
 
 ```bash
-git clone https://github.com/fillioning/dataFLOU_compositor.git
+git clone https://github.com/filliformes/dataFLOU_compositor.git
 cd dataFLOU_compositor
 npm install
 npm run dev          # launch in dev mode with hot reload

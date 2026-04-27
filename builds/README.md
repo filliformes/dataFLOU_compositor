@@ -4,9 +4,9 @@ Binary installers for each version are attached to that version's **GitHub Relea
 
 ## Download
 
-Latest release: https://github.com/fillioning/dataFLOU_compositor/releases/latest
+Latest release: https://github.com/filliformes/dataFLOU_compositor/releases/latest
 
-All releases: https://github.com/fillioning/dataFLOU_compositor/releases
+All releases: https://github.com/filliformes/dataFLOU_compositor/releases
 
 Each release page has:
 
