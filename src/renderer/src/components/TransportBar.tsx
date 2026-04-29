@@ -37,14 +37,44 @@ export default function TransportBar(): JSX.Element {
       transportPlay()
       return
     }
-    // Start from focused scene if present, else first non-empty sequence slot.
+    const st = useStore.getState()
+    // In the Sequence view, Play is a SEQUENCE TRANSPORT button, not
+    // a scene trigger. The selected sequence slot (set by clicking a
+    // slot or Timeline segment) becomes the start point; otherwise
+    // the sequence starts from the first non-empty slot. The
+    // currently-focused scene is no longer used as a start point —
+    // Play in Sequence view should never fire whatever the inspector
+    // happens to be displaying.
+    if (st.view === 'sequence') {
+      const seq = session.sequence
+      const seqLen = session.sequenceLength
+      const sel = st.selectedSequenceSlot
+      let startSlot: number | null = null
+      if (sel !== null && sel >= 0 && sel < seqLen && seq[sel]) {
+        startSlot = sel
+      } else {
+        const idx = seq.findIndex((id, i) => i < seqLen && !!id)
+        startSlot = idx >= 0 ? idx : null
+      }
+      if (startSlot !== null) {
+        const sceneId = seq[startSlot]
+        if (sceneId) {
+          st.triggerSceneWithMorph(sceneId, startSlot)
+          setPaused(false)
+          transportPlay()
+        }
+      }
+      return
+    }
+    // Edit view — keep the legacy "play focused scene" behavior so
+    // the user can audition a single scene without leaving Edit.
     let startId = focusedSceneId
     if (!startId) {
       const first = session.sequence.find((id) => !!id) ?? null
       startId = first
     }
     if (startId) {
-      useStore.getState().triggerSceneWithMorph(startId)
+      st.triggerSceneWithMorph(startId)
       setPaused(false)
       transportPlay()
     }
@@ -60,6 +90,10 @@ export default function TransportBar(): JSX.Element {
     await window.api.stopAll()
     setPaused(false)
     transportStop()
+    // Drop the slot selection on Stop so the next Play starts from
+    // the beginning, matching the user's "transport reset" mental
+    // model. The focused scene (inspector) is left alone.
+    useStore.getState().setSelectedSequenceSlot(null)
   }
 
   return (
@@ -84,7 +118,11 @@ export default function TransportBar(): JSX.Element {
                   : 'bg-panel2 border-border text-muted hover:text-text'
               }`}
               onClick={onPlay}
-              title={paused ? 'Resume' : 'Play focused scene'}
+              title={
+                paused
+                  ? 'Resume'
+                  : 'Play sequence (from selected slot, or from the start)'
+              }
             >
               <svg width="10" height="10" viewBox="0 0 10 10">
                 <polygon points="2,1 9,5 2,9" fill="currentColor" />
@@ -172,12 +210,16 @@ export default function TransportBar(): JSX.Element {
   )
 }
 
-// Running HH:MM:SS:MS counter. Pulls state from the store on every ~50 ms
-// tick while running so the millisecond field actually animates; otherwise
-// only re-renders when play/pause/stop mutate the store.
+// Running HH:MM:SS:MS counter + live remaining-time-in-scene readout.
+// Pulls transport state from the store on every ~50 ms tick while
+// running so the millisecond field actually animates; otherwise only
+// re-renders when play/pause/stop mutate the store. The scene-time
+// readout sits right next to the main Time so the performer can see
+// both together without hunting around the bar.
 function TransportTime(): JSX.Element {
   const startedAt = useStore((s) => s.transportStartedAt)
   const accumulated = useStore((s) => s.transportAccumulatedMs)
+  const activeSceneId = useStore((s) => s.engine.activeSceneId)
   const running = startedAt !== null
   // Local "now" bumped on a timer while running. Not stored in the global
   // store because it'd trigger a 20Hz re-render of everything subscribed.
@@ -190,15 +232,48 @@ function TransportTime(): JSX.Element {
 
   const elapsed = running ? accumulated + (now - (startedAt as number)) : accumulated
   return (
-    <div className="flex items-center gap-1.5 shrink-0">
-      <span className="label">Time</span>
+    <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-1.5">
+        <span className="label">Time</span>
+        <span
+          className={`font-mono tabular-nums text-[12px] ${
+            running ? 'text-accent' : 'text-muted'
+          }`}
+          title="HH:MM:SS:MS — runs on Play, pauses on Pause, resets on Stop"
+        >
+          {formatHHMMSSMS(elapsed)}
+        </span>
+      </div>
+      {activeSceneId && <ActiveSceneRemaining sceneId={activeSceneId} />}
+    </div>
+  )
+}
+
+// Live remaining-time on the currently-playing scene, rendered as
+// "Scene 1.2s left". Uses the shared useSceneCountdown which reads
+// engine.pausedAt — when pause is on, the countdown freezes at the
+// pause moment instead of continuing to tick.
+function ActiveSceneRemaining({ sceneId }: { sceneId: string }): JSX.Element | null {
+  const scene = useStore((s) => s.session.scenes.find((sc) => sc.id === sceneId))
+  const durationSec = scene?.durationSec ?? 0
+  const { active, remainingMs } = useSceneCountdown(sceneId, durationSec)
+  if (!active || !scene) return null
+  return (
+    <div
+      className="flex items-center gap-1.5 px-2 py-0.5 rounded border"
+      style={{
+        borderColor: scene.color,
+        background: scene.color + '22'
+      }}
+      title={`Scene "${scene.name}" — time remaining in its duration`}
+    >
       <span
-        className={`font-mono tabular-nums text-[12px] ${
-          running ? 'text-accent' : 'text-muted'
-        }`}
-        title="HH:MM:SS:MS — runs on Play, pauses on Pause, resets on Stop"
-      >
-        {formatHHMMSSMS(elapsed)}
+        className="w-2 h-2 rounded-full shrink-0"
+        style={{ background: scene.color }}
+        aria-hidden
+      />
+      <span className="font-mono tabular-nums text-[12px] text-accent">
+        {formatRemaining(remainingMs)}
       </span>
     </div>
   )

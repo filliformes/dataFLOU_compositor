@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
+import type { NextMode } from '@shared/types'
 import { useStore } from '../store'
 import CellTile from './CellTile'
 import { SCENE_COL_COLLAPSED_MIN_W, useEffectiveRowHeight, useHeaderHeight } from './EditView'
@@ -344,18 +345,19 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
       )}
 
       {/* Cells — one per track, same height as track rows. Template
-          rows are visual-only group headers (carried in tracks for the
-          sidebar's nesting); they don't have clips, so we render an
-          empty matching-height band that keeps every scene column aligned
-          with the sidebar row-by-row. */}
+          rows are visual-only group headers (no clips of their own),
+          but we render a centered group-trigger button at their
+          intersection: clicking fires every child Parameter's clip
+          on this scene at once. Stopping toggles them all off. */}
       {tracks.map((t) =>
         t.kind === 'template' ? (
           <div
             key={t.id}
             className="border-b border-border shrink-0 bg-panel/40"
             style={{ height: rowHeight }}
-            aria-hidden
-          />
+          >
+            <InstrumentTriggerCell sceneId={sceneId} templateRowId={t.id} />
+          </div>
         ) : (
           <div
             key={t.id}
@@ -407,6 +409,51 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                 <div className="border-t border-border my-1" />
               </>
             )}
+            {/* Follow Action submenu — applies to ALL targets (the
+                whole multi-selection when one is active, otherwise
+                this scene). Inline list keeps the menu shallow; on
+                small monitors a fly-out submenu would clip. */}
+            <div className="px-3 py-1 text-[10px] text-muted">
+              {menu.targets.length > 1
+                ? `Set Follow Action (${menu.targets.length} scenes)`
+                : 'Set Follow Action'}
+            </div>
+            <div className="grid grid-cols-2 gap-px px-2 pb-1">
+              {[
+                { id: 'stop', label: 'Stop' },
+                { id: 'loop', label: 'Loop' },
+                { id: 'next', label: 'Next' },
+                { id: 'prev', label: 'Prev' },
+                { id: 'first', label: 'First' },
+                { id: 'last', label: 'Last' },
+                { id: 'any', label: 'Any' },
+                { id: 'other', label: 'Other' }
+              ].map((m) => {
+                const current =
+                  menu.targets.length === 1 ? scene.nextMode : null
+                const active = current === m.id
+                return (
+                  <button
+                    key={m.id}
+                    className={`text-[11px] px-2 py-0.5 rounded border ${
+                      active
+                        ? 'bg-accent text-black border-accent'
+                        : 'border-border hover:bg-panel2'
+                    }`}
+                    onClick={() => {
+                      const ids = menu.targets
+                      setMenu(null)
+                      ids.forEach((id) =>
+                        useStore.getState().updateScene(id, { nextMode: m.id as NextMode })
+                      )
+                    }}
+                  >
+                    {m.label}
+                  </button>
+                )
+              })}
+            </div>
+            <div className="border-t border-border my-1" />
             <button
               className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"
               onClick={() => {
@@ -495,4 +542,117 @@ function SceneTriggerButton({
 function noteName(n: number): string {
   const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
   return names[n % 12] + (Math.floor(n / 12) - 1)
+}
+
+// Group-trigger cell rendered at the intersection of a Template
+// (Instrument) header row and a Scene column. Templates carry no
+// clips of their own; this button fires every child Parameter's
+// clip in this scene at once. State logic:
+//   • Any child active   → button shows STOP, click stops all children.
+//   • No children active → button shows PLAY, click triggers every
+//                          child that has a cell on this scene.
+// Sizing follows the row: full 36px in normal view, ~22px when the
+// Instruments column is collapsed (so the row stays at its 32px
+// height without overflow).
+function InstrumentTriggerCell({
+  sceneId,
+  templateRowId
+}: {
+  sceneId: string
+  templateRowId: string
+}): JSX.Element {
+  const tracks = useStore((s) => s.session.tracks)
+  const cellsOnScene = useStore(
+    (s) => s.session.scenes.find((sc) => sc.id === sceneId)?.cells ?? {}
+  )
+  const groupMidi = useStore(
+    (s) => s.session.scenes.find((sc) => sc.id === sceneId)?.instrumentTriggers?.[templateRowId]
+  )
+  const activeBySceneAndTrack = useStore((s) => s.engine.activeBySceneAndTrack)
+  const tracksCollapsed = useStore((s) => s.tracksCollapsed)
+  const showMode = useStore((s) => s.showMode)
+  const compact = tracksCollapsed || showMode
+  const midiLearnMode = useStore((s) => s.midiLearnMode)
+  const midiLearnTarget = useStore((s) => s.midiLearnTarget)
+  const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
+  const childTrackIds = tracks
+    .filter((t) => t.parentTrackId === templateRowId)
+    .map((t) => t.id)
+  const childrenWithCells = childTrackIds.filter((id) => !!cellsOnScene[id])
+  const sceneActive = activeBySceneAndTrack[sceneId] ?? {}
+  const anyChildActive = childTrackIds.some((id) => !!sceneActive[id])
+  const empty = childrenWithCells.length === 0
+  // MIDI learn overlay class — same vocabulary as CellTile uses for
+  // its own trigger square. Selected = orange ring, bound = green,
+  // available = blue.
+  const learnSelected =
+    midiLearnTarget?.kind === 'instrument' &&
+    midiLearnTarget.sceneId === sceneId &&
+    midiLearnTarget.templateRowId === templateRowId
+  const learnOverlayClass = !midiLearnMode
+    ? ''
+    : learnSelected
+      ? 'midi-learn-selected'
+      : groupMidi
+        ? 'midi-learn-green'
+        : 'midi-learn-blue'
+  async function onClick(e: React.MouseEvent): Promise<void> {
+    e.stopPropagation()
+    if (midiLearnMode) {
+      setMidiLearnTarget({ kind: 'instrument', sceneId, templateRowId })
+      return
+    }
+    if (empty) return
+    if (anyChildActive) {
+      await Promise.all(
+        childTrackIds
+          .filter((id) => !!sceneActive[id])
+          .map((id) => window.api.stopCell(sceneId, id))
+      )
+    } else {
+      await Promise.all(
+        childrenWithCells.map((id) => window.api.triggerCell(sceneId, id))
+      )
+    }
+  }
+  const sizeClass = compact ? 'w-5 h-5 rounded' : 'w-9 h-9 rounded-md'
+  const iconPx = compact ? 8 : 14
+  return (
+    <div className="w-full h-full flex items-center justify-center">
+      <button
+        className={`relative border-2 flex items-center justify-center transition-colors ${sizeClass} ${
+          empty
+            ? 'border-border/50 bg-panel2/40 text-muted/40 cursor-not-allowed'
+            : anyChildActive
+              ? 'border-accent bg-accent text-black hover:brightness-110'
+              : 'border-border bg-panel2 text-text hover:border-accent hover:text-accent'
+        }`}
+        onClick={onClick}
+        title={
+          midiLearnMode
+            ? groupMidi
+              ? 'Bound — click to re-learn this Instrument trigger'
+              : 'Click then send a MIDI message to bind this Instrument trigger'
+            : empty
+              ? 'No Parameters on this scene yet — add cells under this Instrument first'
+              : anyChildActive
+                ? `Stop ${childrenWithCells.length} Parameter${childrenWithCells.length === 1 ? '' : 's'} of this Instrument`
+                : `Trigger ${childrenWithCells.length} Parameter${childrenWithCells.length === 1 ? '' : 's'} of this Instrument`
+        }
+      >
+        {anyChildActive ? (
+          <svg width={iconPx} height={iconPx} viewBox="0 0 10 10">
+            <rect x="1" y="1" width="8" height="8" fill="currentColor" />
+          </svg>
+        ) : (
+          <svg width={iconPx} height={iconPx} viewBox="0 0 10 10">
+            <polygon points="2,1 9,5 2,9" fill="currentColor" />
+          </svg>
+        )}
+        {learnOverlayClass && (
+          <div className={`midi-learn-overlay ${learnOverlayClass}`} aria-hidden />
+        )}
+      </button>
+    </div>
+  )
 }

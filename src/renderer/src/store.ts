@@ -13,6 +13,7 @@ import type {
   MetaKnob,
   MidiBinding,
   NextMode,
+  ParameterTemplate,
   Pool,
   RampParams,
   Scene,
@@ -42,6 +43,7 @@ import {
   makeFunctionTrack,
   makeMetaController,
   makeMetaKnob,
+  makeParameterSpec,
   makeScene,
   makeTemplateSpec,
   makeTemplateTrack,
@@ -160,6 +162,7 @@ interface UiState {
     | { kind: 'scene'; id: string }
     | { kind: 'cell'; sceneId: string; trackId: string }
     | { kind: 'metaKnob'; index: number }
+    | { kind: 'instrument'; sceneId: string; templateRowId: string }
     // Global transport-level learn targets. Bindings live on the Session
     // itself (goMidi, morphTimeMidi) so they travel with the project file.
     | { kind: 'go' }
@@ -174,6 +177,46 @@ interface UiState {
   // messages (address, ip:port, args) for debugging. Off by default; when
   // closed the monitor component unmounts so no state accumulates.
   oscMonitorOpen: boolean
+  // Drawer height (px). User-resizable via the handle on top edge,
+  // 120..600 (clamped). Persisted as part of the in-session UI prefs so
+  // the height survives a drawer toggle.
+  oscMonitorHeight: number
+  // Hide the Pool pane within the OSC drawer. When true, the OSC log
+  // takes the full drawer width and a "Show Pool" button appears in
+  // the log toolbar so the user can bring it back.
+  poolHidden: boolean
+  // Inspector visibility — UI-only, not persisted with the session.
+  // `editInspectorVisible` controls the right-side Inspector panel in
+  // the Edit view; `sceneInspectorVisible` controls the SceneInfoPanel
+  // strip below the palette in the Sequence view. I / S keyboard
+  // shortcuts toggle each. Both default ON so first-time users see
+  // the editing affordances without hunting.
+  editInspectorVisible: boolean
+  sceneInspectorVisible: boolean
+  // Sequence view's "Timeline" alternate visualisation. Persisted on
+  // the store (not session) so toggling Tab → Edit → Tab → Sequence
+  // returns the user to whichever mode they had selected. Off by
+  // default — the grid is the editing surface.
+  timelineMode: boolean
+  // Increment-only counter — bumping it asks the SceneInfoPanel's
+  // Duration input to focus + select. Used after a drop into a
+  // Scene Step so the user can immediately type a new duration.
+  // Token semantics (not a boolean) so consecutive drops re-fire
+  // the focus even when nothing else changed.
+  focusDurationToken: number
+  // Currently-clicked sequence slot — shared between the Scene Steps
+  // grid and the Timeline visualisation. Drives:
+  //   • the highlight ring around the picked slot,
+  //   • the Transport Play button's "start from here" behavior, and
+  //   • the inspector focus (focusedSceneId is set in lockstep).
+  // Null when no slot is picked; cleared on transport Stop.
+  selectedSequenceSlot: number | null
+  // Multi-slot selection — shift-click extends a contiguous range
+  // from `selectedSequenceSlot` (the anchor). Drives the right-click
+  // "Set Follow Action" path's bulk apply across slots. Always
+  // contains `selectedSequenceSlot` when non-empty. Drops to empty
+  // when the slot anchor is cleared.
+  selectedSequenceSlots: number[]
   // Pool drawer pane selection. The drawer hosts three panes side-by-side
   // (OSC log | Pool | Instruments Inspector). The selection drives what
   // the inspector pane renders: a Template-level form, a Function-level
@@ -181,6 +224,7 @@ interface UiState {
   poolSelection:
     | { kind: 'template'; templateId: string }
     | { kind: 'function'; templateId: string; functionId: string }
+    | { kind: 'parameter'; parameterId: string }
     | null
   // Integrity-check hand-off. When the user triggers Open or restores
   // from autosave, the incoming session is scanned; if issues turn up,
@@ -300,6 +344,21 @@ interface Actions {
   // so the Pool drawer surfaces it for re-use across scenes / sessions.
   saveAsTemplate: (templateRowId: string, name: string) => void
 
+  // ParameterTemplate CRUD — single-Parameter blueprints in the Pool.
+  // Mirrors the Template CRUD shape so the PoolPane can use the same
+  // patterns (built-in entries are read-only, user entries editable).
+  addParameter: () => string
+  updateParameter: (id: string, patch: Partial<ParameterTemplate>) => void
+  duplicateParameter: (id: string) => string | null
+  removeParameter: (id: string) => void
+  // Drag a Parameter blueprint into the Edit-view sidebar — adds one
+  // orphan Function row whose defaults come from the blueprint.
+  instantiateParameterTemplate: (
+    parameterId: string,
+    insertAfterTrackId: string | null,
+    parentTrackId?: string | null
+  ) => void
+
   // Tracks
   addTrack: () => void
   removeTrack: (id: string) => void
@@ -310,6 +369,16 @@ interface Actions {
     fields: Partial<Pick<Track, 'defaultOscAddress' | 'defaultDestIp' | 'defaultDestPort'>>
   ) => void
   sendTrackDefaultsToClips: (id: string) => void
+  // Reorder a track. `dragId` is dropped immediately AFTER `targetId` (or
+  // at the very top of the list when `targetId` is null). When `dragId`
+  // is a Template-header, every child Function row tagged with
+  // parentTrackId === dragId is moved as a contiguous block so the visual
+  // group stays intact. When `dragId` is a Function row that has a parent
+  // Template, the move is constrained to within that Template's group
+  // (drops outside the group are clamped to the group's range) so we
+  // can't accidentally orphan a Function by dragging it across a Template
+  // boundary.
+  moveTrack: (dragId: string, targetId: string | null) => void
 
   // Scenes
   addScene: () => void
@@ -376,9 +445,17 @@ interface Actions {
       | { kind: 'scene'; id: string }
       | { kind: 'cell'; sceneId: string; trackId: string }
       | { kind: 'metaKnob'; index: number }
+      | { kind: 'instrument'; sceneId: string; templateRowId: string }
       | { kind: 'go' }
       | { kind: 'morphTime' }
       | null
+  ) => void
+  // Bind / clear an Instrument-group MIDI trigger on a specific
+  // (sceneId, templateRowId). Pass undefined to clear.
+  setInstrumentTriggerMidi: (
+    sceneId: string,
+    templateRowId: string,
+    binding: MidiBinding | undefined
   ) => void
   // Write/clear transport-level MIDI bindings (stored on the session so
   // they persist with the project).
@@ -389,6 +466,24 @@ interface Actions {
   setTracksCollapsed: (v: boolean) => void
   setShowMode: (v: boolean) => void
   setOscMonitorOpen: (v: boolean) => void
+  setOscMonitorHeight: (h: number) => void
+  setPoolHidden: (v: boolean) => void
+  setEditInspectorVisible: (v: boolean) => void
+  setSceneInspectorVisible: (v: boolean) => void
+  setTimelineMode: (v: boolean) => void
+  setSelectedSequenceSlot: (i: number | null) => void
+  // Shift-click range pick. Extends from the current anchor through
+  // `i` inclusive (any direction). With no anchor, behaves like a
+  // plain selectedSequenceSlot pick.
+  selectSequenceSlotRange: (i: number) => void
+  requestFocusDuration: () => void
+  // Convenience: create a "Silence" scene (blank cells, gray color) so
+  // the user can use it as a delay between scenes in the sequence.
+  addSilenceScene: () => void
+  // Add N scenes at once (clamped against the 128-scene cap). Used by
+  // the right-click "Add Scenes…" prompt in the Sequence view's
+  // palette area.
+  addScenes: (count: number) => void
   // Entry point for any code path that wants to load a session (Open
   // dialog, crash recovery, future: drag-and-drop). Runs the integrity
   // check synchronously; commits immediately if clean, otherwise stages
@@ -467,6 +562,7 @@ const emptyEngineState: EngineState = {
   activeSceneId: null,
   activeSceneStartedAt: null,
   activeSequenceSlotIdx: null,
+  pausedAt: null,
   tickRateHz: 30
 }
 
@@ -485,7 +581,11 @@ export const useStore = create<State>((set, get) => ({
   // NOTES_ONE_LINE_HEIGHT so the user sees exactly one line of text when
   // they turn notes on. They can drag the in-editor handle to grow it further.
   editorNotesHeight: 0,
-  rowHeight: 76,
+  // Defaults to the smallest non-collapsed size (matches the
+  // ResizeHandle's `min` of 60 px). User can drag taller; the
+  // collapsed view uses a separate 32 px constant. Keeps a fresh
+  // session compact so more rows fit on screen by default.
+  rowHeight: 60,
   sceneColumnWidth: 200,
   // 360 px default — wide enough for DUR + NEXT + × multiplicator inputs
   // to all fit on one row in the Sequence-tab scene inspector. Users can
@@ -505,6 +605,14 @@ export const useStore = create<State>((set, get) => ({
   // Exit: hold Escape for ~1 second while in show mode.
   showMode: false,
   oscMonitorOpen: false,
+  oscMonitorHeight: 220,
+  poolHidden: false,
+  editInspectorVisible: true,
+  sceneInspectorVisible: true,
+  timelineMode: false,
+  selectedSequenceSlot: null,
+  selectedSequenceSlots: [],
+  focusDurationToken: 0,
   poolSelection: null,
   pendingIntegrityLoad: null,
   armedSceneId: null,
@@ -693,7 +801,7 @@ export const useStore = create<State>((set, get) => ({
       return {
         session: {
           ...st.session,
-          pool: { templates: [...st.session.pool.templates, tpl] }
+          pool: { ...st.session.pool, templates: [...st.session.pool.templates, tpl] }
         },
         poolSelection: { kind: 'template', templateId: id }
       }
@@ -708,6 +816,7 @@ export const useStore = create<State>((set, get) => ({
         session: {
           ...st.session,
           pool: {
+            ...st.session.pool,
             templates: st.session.pool.templates.map((tt) =>
               tt.id === id ? { ...tt, ...patch } : tt
             )
@@ -735,7 +844,7 @@ export const useStore = create<State>((set, get) => ({
     set((st) => ({
       session: {
         ...st.session,
-        pool: { templates: [...st.session.pool.templates, cloned] }
+        pool: { ...st.session.pool, templates: [...st.session.pool.templates, cloned] }
       },
       poolSelection: { kind: 'template', templateId: newId }
     }))
@@ -748,7 +857,10 @@ export const useStore = create<State>((set, get) => ({
       return {
         session: {
           ...st.session,
-          pool: { templates: st.session.pool.templates.filter((tt) => tt.id !== id) }
+          pool: {
+            ...st.session.pool,
+            templates: st.session.pool.templates.filter((tt) => tt.id !== id)
+          }
         },
         poolSelection:
           st.poolSelection &&
@@ -766,6 +878,7 @@ export const useStore = create<State>((set, get) => ({
       session: {
         ...st.session,
         pool: {
+          ...st.session.pool,
           templates: st.session.pool.templates.map((tt) =>
             tt.id === templateId ? { ...tt, functions: [...tt.functions, fn] } : tt
           )
@@ -783,6 +896,7 @@ export const useStore = create<State>((set, get) => ({
         session: {
           ...st.session,
           pool: {
+            ...st.session.pool,
             templates: st.session.pool.templates.map((tt) =>
               tt.id === templateId
                 ? {
@@ -805,6 +919,7 @@ export const useStore = create<State>((set, get) => ({
         session: {
           ...st.session,
           pool: {
+            ...st.session.pool,
             templates: st.session.pool.templates.map((tt) =>
               tt.id === templateId
                 ? { ...tt, functions: tt.functions.filter((f) => f.id !== functionId) }
@@ -897,26 +1012,30 @@ export const useStore = create<State>((set, get) => ({
     const tplId = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
     const rowId = `t_${Math.random().toString(36).slice(2, 9)}`
     set((st) => {
-      // 1 row added — guard against the 128 cap before we mutate either
-      // the Pool or the tracks list.
+      // We add 2 rows (header + 1 child Parameter) so check for the
+      // 128 cap with that headroom, not 1. If there's only room for
+      // one we still create the header — the user can deal with it
+      // explicitly by removing other rows before adding the param.
       if (st.session.tracks.length >= 128) return st
+      const headRoom = 128 - st.session.tracks.length
       // How many user (non-builtin) Templates exist? Used for the
       // default "Instrument N" name. Drafts count too so the numbering
       // matches what the user sees in the sidebar.
       const userIdx = st.session.pool.templates.filter((t) => !t.builtin).length
       const tplSpec = makeTemplateSpec(userIdx)
+      // Seed one child Parameter so the new Instrument arrives in a
+      // useful state — the user gets a sendable row immediately
+      // instead of an empty Template header. Numbered "Parameter 1"
+      // (matches makeFunctionSpec's default).
+      const seedFn = makeFunctionSpec(0)
       const tpl: InstrumentTemplate = {
         ...tplSpec,
         id: tplId,
         name: `Instrument ${userIdx + 1}`,
-        // Empty by default — the user will right-click "Add Function"
-        // to populate. Otherwise makeTemplateSpec would seed one stub
-        // function which would surprise the user when they expand the
-        // row.
-        functions: [],
+        functions: headRoom >= 2 ? [seedFn] : [],
         draft: true
       }
-      const row: Track = {
+      const headerRow: Track = {
         id: rowId,
         name: tpl.name,
         kind: 'template',
@@ -925,6 +1044,10 @@ export const useStore = create<State>((set, get) => ({
         defaultDestIp: tpl.destIp,
         defaultDestPort: tpl.destPort
       }
+      const newRows: Track[] = [headerRow]
+      if (headRoom >= 2) {
+        newRows.push(makeFunctionTrack(tpl, seedFn, rowId))
+      }
       const idx = insertAfterTrackId
         ? st.session.tracks.findIndex((t) => t.id === insertAfterTrackId)
         : -1
@@ -932,15 +1055,15 @@ export const useStore = create<State>((set, get) => ({
         idx >= 0
           ? [
               ...st.session.tracks.slice(0, idx + 1),
-              row,
+              ...newRows,
               ...st.session.tracks.slice(idx + 1)
             ]
-          : [...st.session.tracks, row]
+          : [...st.session.tracks, ...newRows]
       return {
         session: {
           ...st.session,
           tracks,
-          pool: { templates: [...st.session.pool.templates, tpl] }
+          pool: { ...st.session.pool, templates: [...st.session.pool.templates, tpl] }
         }
       }
     })
@@ -976,7 +1099,11 @@ export const useStore = create<State>((set, get) => ({
         t.id === tpl.id ? { ...t, functions: [...t.functions, fn] } : t
       )
       return {
-        session: { ...st.session, tracks: newTracks, pool: { templates: newTemplates } }
+        session: {
+          ...st.session,
+          tracks: newTracks,
+          pool: { ...st.session.pool, templates: newTemplates }
+        }
       }
     }),
   saveAsTemplate: (templateRowId, name) =>
@@ -997,8 +1124,107 @@ export const useStore = create<State>((set, get) => ({
         t.id === templateRowId ? { ...t, name: trimmed } : t
       )
       return {
-        session: { ...st.session, tracks: newTracks, pool: { templates: newTemplates } }
+        session: {
+          ...st.session,
+          tracks: newTracks,
+          pool: { ...st.session.pool, templates: newTemplates }
+        }
       }
+    }),
+
+  addParameter: () => {
+    const id = `par_user_${Math.random().toString(36).slice(2, 9)}`
+    set((st) => {
+      const idx = st.session.pool.parameters.filter((p) => !p.builtin).length
+      const param: ParameterTemplate = { ...makeParameterSpec(idx), id, builtin: false }
+      return {
+        session: {
+          ...st.session,
+          pool: { ...st.session.pool, parameters: [...st.session.pool.parameters, param] }
+        },
+        poolSelection: { kind: 'parameter', parameterId: id }
+      }
+    })
+    return id
+  },
+  updateParameter: (id, patch) =>
+    set((st) => {
+      const p = st.session.pool.parameters.find((pp) => pp.id === id)
+      if (!p || p.builtin) return st
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            ...st.session.pool,
+            parameters: st.session.pool.parameters.map((pp) =>
+              pp.id === id ? { ...pp, ...patch } : pp
+            )
+          }
+        }
+      }
+    }),
+  duplicateParameter: (id) => {
+    const src = get().session.pool.parameters.find((p) => p.id === id)
+    if (!src) return null
+    const newId = `par_user_${Math.random().toString(36).slice(2, 9)}`
+    const cloned: ParameterTemplate = {
+      ...src,
+      id: newId,
+      name: `${src.name} (copy)`,
+      builtin: false
+    }
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: { ...st.session.pool, parameters: [...st.session.pool.parameters, cloned] }
+      },
+      poolSelection: { kind: 'parameter', parameterId: newId }
+    }))
+    return newId
+  },
+  removeParameter: (id) =>
+    set((st) => {
+      const p = st.session.pool.parameters.find((pp) => pp.id === id)
+      if (!p || p.builtin) return st
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            ...st.session.pool,
+            parameters: st.session.pool.parameters.filter((pp) => pp.id !== id)
+          }
+        },
+        poolSelection:
+          st.poolSelection &&
+          st.poolSelection.kind === 'parameter' &&
+          st.poolSelection.parameterId === id
+            ? null
+            : st.poolSelection
+      }
+    }),
+  instantiateParameterTemplate: (parameterId, insertAfterTrackId, parentTrackId) =>
+    set((st) => {
+      const p = st.session.pool.parameters.find((pp) => pp.id === parameterId)
+      if (!p) return st
+      if (st.session.tracks.length >= 128) return st
+      // A Parameter blueprint becomes an orphan-Function track row (or a
+      // child-Function row if dropped into an existing Template group).
+      const row: Track = {
+        id: `t_${Math.random().toString(36).slice(2, 9)}`,
+        name: p.name,
+        kind: 'function',
+        parentTrackId: parentTrackId || undefined,
+        defaultOscAddress: p.oscPath.startsWith('/') ? p.oscPath : `/${p.oscPath}`,
+        defaultDestIp: p.destIp,
+        defaultDestPort: p.destPort
+      }
+      const tracks = st.session.tracks
+      const idx = insertAfterTrackId
+        ? tracks.findIndex((t) => t.id === insertAfterTrackId)
+        : -1
+      const insertAt = idx < 0 ? tracks.length : idx + 1
+      const newTracks = [...tracks.slice(0, insertAt), row, ...tracks.slice(insertAt)]
+      return { session: { ...st.session, tracks: newTracks } }
     }),
 
   addTrack: () =>
@@ -1006,6 +1232,59 @@ export const useStore = create<State>((set, get) => ({
       if (st.session.tracks.length >= 128) return st
       const track = makeTrack(st.session.tracks.length)
       return { session: { ...st.session, tracks: [...st.session.tracks, track] } }
+    }),
+  moveTrack: (dragId, targetId) =>
+    set((st) => {
+      const tracks = st.session.tracks
+      const dragIdx = tracks.findIndex((t) => t.id === dragId)
+      if (dragIdx < 0 || dragId === targetId) return st
+      const dragged = tracks[dragIdx]
+      // Build the contiguous block being moved. A Template carries all its
+      // child Function rows along; everything else moves as a single row.
+      const blockIds: string[] = [dragId]
+      if (dragged.kind === 'template') {
+        for (let i = dragIdx + 1; i < tracks.length; i++) {
+          if (tracks[i].parentTrackId === dragId) blockIds.push(tracks[i].id)
+          else break
+        }
+      }
+      const blockSet = new Set(blockIds)
+      const without = tracks.filter((t) => !blockSet.has(t.id))
+      const block = tracks.filter((t) => blockSet.has(t.id))
+      // Translate `targetId` (id in the original list) to an insertion
+      // index in `without`. null = top of list.
+      let insertIdx: number
+      if (targetId === null) {
+        insertIdx = 0
+      } else {
+        const tIdx = without.findIndex((t) => t.id === targetId)
+        // If target was inside the block (shouldn't happen because the
+        // block's own ids are excluded from `without`), fall back to end.
+        insertIdx = tIdx < 0 ? without.length : tIdx + 1
+      }
+      // If the dragged row is a child Function with a parent, clamp the
+      // insertion so the row stays inside its Template group. Otherwise
+      // dragging a Function out of a Template can leave it dangling above
+      // a Template header it doesn't belong to.
+      if (dragged.kind === 'function' && dragged.parentTrackId) {
+        const parentId = dragged.parentTrackId
+        const parentIdx = without.findIndex((t) => t.id === parentId)
+        if (parentIdx >= 0) {
+          // Group spans [parentIdx + 1 .. parentIdx + 1 + childCount - 1].
+          let groupEnd = parentIdx
+          for (let i = parentIdx + 1; i < without.length; i++) {
+            if (without[i].parentTrackId === parentId) groupEnd = i
+            else break
+          }
+          // Allow insertion at any position within [parentIdx + 1 .. groupEnd + 1].
+          const minInsert = parentIdx + 1
+          const maxInsert = groupEnd + 1
+          if (insertIdx < minInsert) insertIdx = minInsert
+          if (insertIdx > maxInsert) insertIdx = maxInsert
+        }
+      }
+      const next = [...without.slice(0, insertIdx), ...block, ...without.slice(insertIdx)]
+      return { session: { ...st.session, tracks: next } }
     }),
   removeTrack: (id) =>
     set((st) => {
@@ -1119,6 +1398,36 @@ export const useStore = create<State>((set, get) => ({
       // the sequencer when they're ready.
       return { session: { ...st.session, scenes: [...st.session.scenes, scene] } }
     }),
+  addSilenceScene: () =>
+    set((st) => {
+      if (st.session.scenes.length >= 128) return st
+      // A "Silence" scene is just a regular scene with no cells (so the
+      // engine sends nothing) and a recognisable name + gray color.
+      // nextMode defaults to 'next' because a Silence is almost
+      // always a delay between two playable scenes — sticking on
+      // 'stop' would silently break the sequence flow on first use.
+      const base = makeScene(st.session.scenes.length)
+      const scene: Scene = {
+        ...base,
+        name: 'Silence',
+        color: '#666666',
+        nextMode: 'next'
+      }
+      return { session: { ...st.session, scenes: [...st.session.scenes, scene] } }
+    }),
+  addScenes: (count) =>
+    set((st) => {
+      const room = 128 - st.session.scenes.length
+      const n = Math.max(0, Math.min(room, Math.floor(count)))
+      if (n === 0) return st
+      const created: Scene[] = []
+      for (let i = 0; i < n; i++) {
+        created.push(makeScene(st.session.scenes.length + i))
+      }
+      return {
+        session: { ...st.session, scenes: [...st.session.scenes, ...created] }
+      }
+    }),
   removeScene: (id) =>
     set((st) => ({
       session: {
@@ -1148,6 +1457,22 @@ export const useStore = create<State>((set, get) => ({
         scenes: st.session.scenes.map((s) =>
           s.id === id ? { ...s, midiTrigger: binding } : s
         )
+      }
+    })),
+  setInstrumentTriggerMidi: (sceneId, templateRowId, binding) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        scenes: st.session.scenes.map((s) => {
+          if (s.id !== sceneId) return s
+          const map = { ...(s.instrumentTriggers ?? {}) }
+          if (binding) map[templateRowId] = binding
+          else delete map[templateRowId]
+          // Drop the field entirely when empty so save files stay
+          // tidy / round-trip cleanly through propagateDefaults.
+          const next = Object.keys(map).length > 0 ? map : undefined
+          return { ...s, instrumentTriggers: next }
+        })
       }
     })),
 
@@ -1405,7 +1730,7 @@ export const useStore = create<State>((set, get) => ({
   setEditorNotesHeight: (h) => set({ editorNotesHeight: clampInt(h, 0, 240) }),
   setRowHeight: (h) => set({ rowHeight: clampInt(h, 30, 220) }),
   setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 180, 480) }),
-  setScenePaletteWidth: (w) => set({ scenePaletteWidth: clampInt(w, 200, 480) }),
+  setScenePaletteWidth: (w) => set({ scenePaletteWidth: clampInt(w, 200, 1200) }),
   setTrackColumnWidth: (w) => set({ trackColumnWidth: clampInt(w, 160, 400) }),
   setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 320, 640) }),
   setSequencePaused: (paused) => set({ sequencePaused: paused }),
@@ -1438,6 +1763,26 @@ export const useStore = create<State>((set, get) => ({
     ),
   setTracksCollapsed: (v) => set({ tracksCollapsed: v }),
   setOscMonitorOpen: (v) => set({ oscMonitorOpen: v }),
+  setOscMonitorHeight: (h) => set({ oscMonitorHeight: clampInt(h, 120, 600) }),
+  setPoolHidden: (v) => set({ poolHidden: v }),
+  setEditInspectorVisible: (v) => set({ editInspectorVisible: v }),
+  setSceneInspectorVisible: (v) => set({ sceneInspectorVisible: v }),
+  setTimelineMode: (v) => set({ timelineMode: v }),
+  setSelectedSequenceSlot: (i) =>
+    set({ selectedSequenceSlot: i, selectedSequenceSlots: i === null ? [] : [i] }),
+  selectSequenceSlotRange: (i) =>
+    set((st) => {
+      const anchor = st.selectedSequenceSlot
+      if (anchor === null) {
+        return { selectedSequenceSlot: i, selectedSequenceSlots: [i] }
+      }
+      const lo = Math.min(anchor, i)
+      const hi = Math.max(anchor, i)
+      const range: number[] = []
+      for (let k = lo; k <= hi; k++) range.push(k)
+      return { selectedSequenceSlot: anchor, selectedSequenceSlots: range }
+    }),
+  requestFocusDuration: () => set((s) => ({ focusDurationToken: s.focusDurationToken + 1 })),
   requestSessionLoad: (session, path) => {
     // Lazy-import to avoid a circular dep (sessionIntegrity is a hook
     // module that might reference store types in the future).
@@ -2203,7 +2548,54 @@ function sanitizePool(raw: unknown): Pool {
     seen.add(t.id)
     merged.push({ ...t, builtin: false })
   }
-  return { templates: merged }
+  // Same merge strategy for Parameter blueprints. Pre-Parameters
+  // sessions don't have the field — `parameters` is undefined and we
+  // fall back to just the builtin set.
+  const userParameters =
+    raw && typeof raw === 'object' && Array.isArray((raw as Pool).parameters)
+      ? (raw as Pool).parameters
+          .map((p) => sanitizeParameter(p))
+          .filter((p): p is ParameterTemplate => p !== null)
+      : []
+  const seenP = new Set<string>(builtin.parameters.map((p) => p.id))
+  const mergedParams: ParameterTemplate[] = [...builtin.parameters]
+  for (const p of userParameters) {
+    if (seenP.has(p.id)) continue
+    seenP.add(p.id)
+    mergedParams.push({ ...p, builtin: false })
+  }
+  return { templates: merged, parameters: mergedParams }
+}
+
+function sanitizeParameter(raw: unknown): ParameterTemplate | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Partial<ParameterTemplate>
+  if (typeof r.id !== 'string' || typeof r.name !== 'string') return null
+  return {
+    id: r.id,
+    name: r.name,
+    description: typeof r.description === 'string' ? r.description : undefined,
+    color: typeof r.color === 'string' ? r.color : '#888888',
+    oscPath: typeof r.oscPath === 'string' ? r.oscPath : 'param',
+    destIp: typeof r.destIp === 'string' ? r.destIp : '127.0.0.1',
+    destPort: typeof r.destPort === 'number' ? r.destPort : 9000,
+    paramType:
+      typeof r.paramType === 'string' && VALID_PARAM_TYPES.has(r.paramType as FunctionParamType)
+        ? (r.paramType as FunctionParamType)
+        : 'float',
+    nature: r.nature === 'log' || r.nature === 'exp' ? r.nature : 'lin',
+    streamMode:
+      r.streamMode === 'discrete' || r.streamMode === 'polling'
+        ? r.streamMode
+        : 'streaming',
+    min: typeof r.min === 'number' ? r.min : undefined,
+    max: typeof r.max === 'number' ? r.max : undefined,
+    init: typeof r.init === 'number' ? r.init : undefined,
+    unit: typeof r.unit === 'string' ? r.unit : undefined,
+    smoothMs: typeof r.smoothMs === 'number' ? r.smoothMs : undefined,
+    notes: typeof r.notes === 'string' ? r.notes : undefined,
+    builtin: r.builtin === true
+  }
 }
 
 function sanitizeMetaController(mc: MetaController | undefined): MetaController {

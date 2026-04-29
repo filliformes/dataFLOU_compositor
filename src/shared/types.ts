@@ -347,8 +347,45 @@ export interface InstrumentTemplate {
   draft?: boolean
 }
 
+// Standalone Parameter template — a single-Function blueprint that lives
+// directly in the Pool, separate from the Instrument Templates. Useful
+// for catch-all building blocks ("RGB light", "Knob", "Motor speed")
+// that the user wants to drag straight onto the Edit-view sidebar as an
+// orphan Function row without first wrapping them in an Instrument.
+//
+// Shape mirrors InstrumentFunction (same paramType / nature / streamMode
+// vocabulary) plus a few presentation hints — `color` for the row stripe
+// in the Edit sidebar after instantiation, and `builtin` so the shipped
+// blueprints render read-only in the inspector. Unlike InstrumentFunction,
+// `oscPath` here is a default (the user can override at instantiation
+// time), and `destIp` / `destPort` give the parameter its own destination
+// when there's no parent Template to inherit from.
+export interface ParameterTemplate {
+  id: string
+  name: string                  // e.g. "RGB Light", "Knob", "Motor"
+  description?: string
+  color: string                 // hex; used for the orphan row's tint
+  oscPath: string               // default OSC path when instantiated
+  destIp: string
+  destPort: number
+  paramType: FunctionParamType
+  nature: FunctionParamNature
+  streamMode: FunctionStreamMode
+  min?: number
+  max?: number
+  init?: number
+  unit?: string
+  smoothMs?: number
+  notes?: string
+  builtin?: boolean
+}
+
 export interface Pool {
   templates: InstrumentTemplate[]
+  // Standalone single-parameter blueprints. Sourced from the builtin
+  // library + user-authored entries. Persisted with the session for
+  // self-containment.
+  parameters: ParameterTemplate[]
 }
 
 export interface Scene {
@@ -374,6 +411,11 @@ export interface Scene {
   cells: Record<string, Cell>
   // MIDI binding for triggering the whole scene.
   midiTrigger?: MidiBinding
+  // MIDI bindings for the per-Instrument group-trigger button shown
+  // at each Template-row × Scene-column intersection. Key is the
+  // Template (Instrument header) track id. Optional / sparse — the
+  // engine only reacts to a binding when one is present.
+  instrumentTriggers?: Record<string, MidiBinding>
 }
 
 export interface MidiBinding {
@@ -501,6 +543,11 @@ export interface EngineState {
   // was triggered from the palette / column header / MIDI / cue and
   // didn't originate from a specific sequence slot.
   activeSequenceSlotIdx: number | null
+  // Wall-clock ms when pause was entered (Date.now()), or null if
+  // running. Renderer countdowns use this to freeze their elapsed
+  // calculation at this timestamp instead of Date.now() so the
+  // visual display also pauses.
+  pausedAt: number | null
   tickRateHz: number
 }
 

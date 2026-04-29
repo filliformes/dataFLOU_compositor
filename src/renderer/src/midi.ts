@@ -125,6 +125,8 @@ class MidiManager {
         st.setSceneMidi(target.id, binding)
       } else if (target.kind === 'cell') {
         st.updateCell(target.sceneId, target.trackId, { midiTrigger: binding })
+      } else if (target.kind === 'instrument') {
+        st.setInstrumentTriggerMidi(target.sceneId, target.templateRowId, binding)
       } else if (target.kind === 'metaKnob') {
         // Knobs are CC-only in practice. If someone hits a note while a knob
         // is the learn target we ignore it so they can keep trying.
@@ -204,6 +206,35 @@ class MidiManager {
           else window.api.triggerCell(sc.id, trackId)
           return
         }
+      }
+    }
+    // Instrument-group triggers — fire every child Parameter cell on
+    // the scene at once. Mirrors the click handler in
+    // InstrumentTriggerCell. Stops if any child is active, otherwise
+    // triggers every child that has a clip on this scene.
+    for (const sc of session.scenes) {
+      const groupMap = sc.instrumentTriggers
+      if (!groupMap) continue
+      for (const [templateRowId, b] of Object.entries(groupMap)) {
+        if (!matches(b, binding)) continue
+        const childIds = session.tracks
+          .filter((t) => t.parentTrackId === templateRowId)
+          .map((t) => t.id)
+        const active = childIds.some(
+          (id) => !!st.engine.activeBySceneAndTrack[sc.id]?.[id]
+        )
+        if (active) {
+          for (const id of childIds) {
+            if (st.engine.activeBySceneAndTrack[sc.id]?.[id]) {
+              window.api.stopCell(sc.id, id)
+            }
+          }
+        } else {
+          for (const id of childIds) {
+            if (sc.cells[id]) window.api.triggerCell(sc.id, id)
+          }
+        }
+        return
       }
     }
     // Scene triggers

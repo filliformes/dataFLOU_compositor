@@ -25,11 +25,17 @@ import { ResizeHandle } from './ResizeHandle'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import {
   POOL_FUNCTION_DRAG_MIME,
+  POOL_PARAMETER_DRAG_MIME,
   POOL_TEMPLATE_DRAG_MIME,
   type PoolFunctionDragPayload,
+  type PoolParameterDragPayload,
   type PoolTemplateDragPayload
 } from './PoolPane'
 import type { InstrumentTemplate } from '@shared/types'
+
+// MIME for in-sidebar row reorder drags. Keeps row drags from being
+// mistaken for Pool drags (different shape, different drop target).
+const TRACK_REORDER_DRAG_MIME = 'application/x-dataflou-track-reorder'
 
 export default function TrackSidebar(): JSX.Element {
   const tracks = useStore((s) => s.session.tracks)
@@ -55,7 +61,9 @@ export default function TrackSidebar(): JSX.Element {
   const addFunctionToInstrumentRow = useStore((s) => s.addFunctionToInstrumentRow)
   const saveAsTemplate = useStore((s) => s.saveAsTemplate)
   const oscMonitorOpen = useStore((s) => s.oscMonitorOpen)
-  const setOscMonitorOpen = useStore((s) => s.setOscMonitorOpen)
+  const poolHidden = useStore((s) => s.poolHidden)
+  const moveTrack = useStore((s) => s.moveTrack)
+  const instantiateParameterTemplate = useStore((s) => s.instantiateParameterTemplate)
   // Show mode forces the compact layout even when the user had the bar
   // expanded pre-entry — performers see more rows/scenes at once and the
   // sprawling +Scene / +Instrument row is hidden anyway.
@@ -101,18 +109,20 @@ export default function TrackSidebar(): JSX.Element {
   const instrFull = tracks.length >= 128
   const sceneFull = scenes.length >= 128
 
-  // ─── Drag-and-drop from the Pool ───────────────────────────────────
-  // Accept Pool drags. Hover state lights the sidebar's outline so the
-  // user knows it's a valid drop target.
+  // ─── Drag-and-drop from the Pool + in-sidebar row reorder ──────────
+  // Accept Pool drags AND row-reorder drags. Hover state lights the
+  // sidebar's outline so the user knows it's a valid drop target.
   const [dragHover, setDragHover] = useState(false)
   function onDragOverSidebar(e: React.DragEvent): void {
-    if (
-      !e.dataTransfer.types.includes(POOL_TEMPLATE_DRAG_MIME) &&
-      !e.dataTransfer.types.includes(POOL_FUNCTION_DRAG_MIME)
-    )
-      return
+    const types = e.dataTransfer.types
+    const isPool =
+      types.includes(POOL_TEMPLATE_DRAG_MIME) ||
+      types.includes(POOL_FUNCTION_DRAG_MIME) ||
+      types.includes(POOL_PARAMETER_DRAG_MIME)
+    const isReorder = types.includes(TRACK_REORDER_DRAG_MIME)
+    if (!isPool && !isReorder) return
     e.preventDefault()
-    e.dataTransfer.dropEffect = 'copy'
+    e.dataTransfer.dropEffect = isReorder ? 'move' : 'copy'
     setDragHover(true)
   }
   function onDragLeaveSidebar(): void {
@@ -134,10 +144,37 @@ export default function TrackSidebar(): JSX.Element {
     setDragHover(false)
     const tplRaw = e.dataTransfer.getData(POOL_TEMPLATE_DRAG_MIME)
     const fnRaw = e.dataTransfer.getData(POOL_FUNCTION_DRAG_MIME)
-    if (!tplRaw && !fnRaw) return
+    const paramRaw = e.dataTransfer.getData(POOL_PARAMETER_DRAG_MIME)
+    const reorderRaw = e.dataTransfer.getData(TRACK_REORDER_DRAG_MIME)
+    if (!tplRaw && !fnRaw && !paramRaw && !reorderRaw) return
     e.preventDefault()
     const container = e.currentTarget as HTMLElement
     const insertAfter = trackIdAt(e.clientY, container)
+    if (reorderRaw) {
+      // In-sidebar row reorder. moveTrack handles all the cascade /
+      // group-stay-together rules.
+      const dragId = reorderRaw
+      if (dragId !== insertAfter) moveTrack(dragId, insertAfter)
+      return
+    }
+    if (paramRaw) {
+      try {
+        const p = JSON.parse(paramRaw) as PoolParameterDragPayload
+        // Same parent-resolution rule as Function drops: dropping into a
+        // Template group nests under it; otherwise create an orphan row.
+        let parentTrackId: string | null = null
+        if (insertAfter) {
+          const here = tracks.find((t) => t.id === insertAfter)
+          if (here?.kind === 'template') parentTrackId = here.id
+          else if (here?.kind === 'function' && here.parentTrackId)
+            parentTrackId = here.parentTrackId
+        }
+        instantiateParameterTemplate(p.parameterId, insertAfter, parentTrackId)
+      } catch {
+        /* ignore */
+      }
+      return
+    }
     if (tplRaw) {
       try {
         const p = JSON.parse(tplRaw) as PoolTemplateDragPayload
@@ -204,8 +241,8 @@ export default function TrackSidebar(): JSX.Element {
                 data-hide-in-show="true"
                 className="btn"
                 disabled={instrFull}
-                onClick={addTrack}
-                title={instrFull ? 'Max 128 instruments' : 'Add Instrument (orphan Function)'}
+                onClick={() => addInstrumentRow(null)}
+                title={instrFull ? 'Max 128 instruments' : 'Add Instrument (template header row)'}
               >
                 +I
               </button>
@@ -227,9 +264,11 @@ export default function TrackSidebar(): JSX.Element {
               </button>
             </div>
             {/* Row 2 — Instruments counter + Add. The "+ Instrument"
-                button creates an orphan Function (the old "+ Message"
-                behavior). Templates land here via the Pool drawer
-                (drag-drop) or the right-click menu. */}
+                button creates a fresh draft Template (header row +
+                Pool entry) the user can populate with Parameters.
+                Pool drawer drag-drop and the right-click menu offer
+                the alternate paths (orphan Parameter, instantiate
+                existing Template). */}
             <div className="flex items-center justify-between gap-2">
               <span className="label truncate">Instruments ({tracks.length}/128)</span>
               <div className="flex items-center gap-1 shrink-0">
@@ -237,18 +276,10 @@ export default function TrackSidebar(): JSX.Element {
                   data-hide-in-show="true"
                   className="btn"
                   disabled={instrFull}
-                  onClick={addTrack}
-                  title={instrFull ? 'Max 128 instruments' : 'Add an orphan Function row'}
+                  onClick={() => addInstrumentRow(null)}
+                  title={instrFull ? 'Max 128 instruments' : 'Add a new Instrument (Ctrl+T)'}
                 >
                   + Instrument
-                </button>
-                <button
-                  data-hide-in-show="true"
-                  className={`btn ${oscMonitorOpen ? 'bg-accent text-black border-accent' : ''}`}
-                  onClick={() => setOscMonitorOpen(!oscMonitorOpen)}
-                  title="Toggle the OSC monitor + Pool drawer"
-                >
-                  Pool
                 </button>
               </div>
             </div>
@@ -288,7 +319,23 @@ export default function TrackSidebar(): JSX.Element {
           <div
             key={t.id}
             data-track-id={t.id}
-            className={`relative border-b border-border flex shrink-0 cursor-pointer overflow-hidden ${
+            draggable
+            onDragStart={(e) => {
+              // Don't intercept drags that start inside the inline rename
+              // input — let the user select text without snatching the
+              // mouse for a row reorder.
+              const tag = (e.target as HTMLElement | null)?.tagName
+              if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                e.preventDefault()
+                return
+              }
+              // Sidebar rows are also drag SOURCES for reordering. We set
+              // a row-reorder MIME so the sidebar drop handler can
+              // distinguish reorders from Pool drops.
+              e.dataTransfer.setData(TRACK_REORDER_DRAG_MIME, t.id)
+              e.dataTransfer.effectAllowed = 'move'
+            }}
+            className={`relative border-b border-border flex shrink-0 cursor-grab overflow-hidden ${
               tracksCollapsed
                 ? 'flex-row items-center px-2 gap-2'
                 : 'flex-col justify-center gap-1 px-3'
@@ -332,10 +379,29 @@ export default function TrackSidebar(): JSX.Element {
               onClick={(e) => e.stopPropagation()}
               onMouseDown={(e) => e.stopPropagation()}
               onChange={(v) => renameTrack(t.id, v)}
-              placeholder={isTemplate ? 'Template name' : 'Function name'}
+              placeholder={isTemplate ? 'Template name' : 'Parameter name'}
             />
+            {/* TEMPLATE label + +PARAM trigger share the baseline
+                row under the name input. Both use text-[9px] so they
+                read as one strip. The trigger keeps a button outline
+                (1 px border + tiny padding) so it reads as
+                clickable, but stays the same height as the label. */}
             {isTemplate && !tracksCollapsed && (
-              <span className="text-[9px] text-muted">TEMPLATE</span>
+              <div className="flex items-center justify-between text-[9px] text-muted leading-none -mt-0.5">
+                <span>TEMPLATE</span>
+                <button
+                  data-hide-in-show="true"
+                  className="text-[9px] leading-none px-1 py-[1px] rounded-sm border border-border text-muted hover:text-text hover:border-text"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    addFunctionToInstrumentRow(t.id)
+                  }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  title="Add a Parameter to this Instrument (Ctrl+P)"
+                >
+                  +PARAM
+                </button>
+              </div>
             )}
             {!tracksCollapsed && (
               <ResizeHandle
@@ -391,8 +457,8 @@ export default function TrackSidebar(): JSX.Element {
                     Add Instrument
                   </button>
 
-                  {/* 2. Add orphan Function — the old "+ Message" path,
-                         creates a no-parent Function row. */}
+                  {/* 2. Add orphan Parameter — the old "+ Message" path,
+                         creates a no-parent Parameter row. */}
                   <button
                     className="w-full text-left px-3 py-1 hover:bg-panel2"
                     onClick={() => {
@@ -400,10 +466,10 @@ export default function TrackSidebar(): JSX.Element {
                       addTrack()
                     }}
                   >
-                    Add orphan Function
+                    Add orphan Parameter
                   </button>
 
-                  {/* 3. Add Function to <Instrument> — only when right-
+                  {/* 3. Add Parameter to <Instrument> — only when right-
                          clicked inside an Instrument group. */}
                   {groupTpl && (
                     <button
@@ -412,9 +478,9 @@ export default function TrackSidebar(): JSX.Element {
                         setMenu(null)
                         addFunctionToInstrumentRow(groupTpl.id)
                       }}
-                      title={`Add a new Function to "${groupTplName}"`}
+                      title={`Add a new Parameter to "${groupTplName}"`}
                     >
-                      Add Function to "{groupTplName}"
+                      Add Parameter to "{groupTplName}"
                     </button>
                   )}
 
@@ -438,12 +504,37 @@ export default function TrackSidebar(): JSX.Element {
                             saveAsTemplate(anchor.id, name.trim())
                           }
                         }}
-                        title="Save this Instrument + all its Functions as a reusable Template in the Pool"
+                        title="Save this Instrument + all its Parameters as a reusable Template in the Pool"
                       >
                         Save as Template…
                       </button>
                     </>
                   )}
+
+                  {/* Show / Hide Pool — replaces the old top-bar Pool
+                      button. Toggles the OSC monitor drawer (and
+                      ensures the Pool pane inside it is visible) so
+                      the user can drag Templates / Parameters from
+                      the Pool onto the sidebar. P keyboard shortcut
+                      does the same thing. */}
+                  <div className="border-t border-border my-1" />
+                  <button
+                    className="w-full text-left px-3 py-1 hover:bg-panel2"
+                    onClick={() => {
+                      setMenu(null)
+                      const st = useStore.getState()
+                      const poolVisible = st.oscMonitorOpen && !st.poolHidden
+                      if (poolVisible) {
+                        st.setPoolHidden(true)
+                      } else {
+                        if (!st.oscMonitorOpen) st.setOscMonitorOpen(true)
+                        if (st.poolHidden) st.setPoolHidden(false)
+                      }
+                    }}
+                    title="Toggle the Pool drawer (P)"
+                  >
+                    {oscMonitorOpen && !poolHidden ? 'Hide Pool' : 'Show Pool'}
+                  </button>
 
                   {/* 5. Delete (existing). */}
                   {menu.targets.length > 0 && (
@@ -461,7 +552,7 @@ export default function TrackSidebar(): JSX.Element {
                             n === 1
                               ? `Delete "${target?.name ?? ''}"?` +
                                 (target?.kind === 'template'
-                                  ? ' (Will also delete its Function children.)'
+                                  ? ' (Will also delete its Parameter children.)'
                                   : '')
                               : `Delete ${n} instruments?`
                           if (confirm(label)) removeTracks(ids)

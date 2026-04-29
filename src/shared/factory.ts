@@ -392,7 +392,7 @@ export function makeScene(index: number): Scene {
 export function makeTrack(index: number): Track {
   return {
     id: uid('t_'),
-    name: `Instrument ${index + 1}`,
+    name: `Parameter ${index + 1}`,
     kind: 'function'
   }
 }
@@ -438,14 +438,16 @@ export function makeFunctionTrack(
   }
 }
 
-// Default for "Add Function" inside a Template authoring flow.
+// Default for "Add Parameter" inside a Template authoring flow. Name
+// reads as "Parameter N" so newly-added child rows match the renamed
+// vocabulary in the UI.
 export function makeFunctionSpec(
   index: number,
   paramType: InstrumentFunction['paramType'] = 'float'
 ): InstrumentFunction {
   return {
     id: uid('fn_'),
-    name: `Function ${index + 1}`,
+    name: `Parameter ${index + 1}`,
     oscPath: `param${index + 1}`,
     paramType,
     nature: 'lin',
@@ -472,11 +474,123 @@ export function makeTemplateSpec(index: number): InstrumentTemplate {
   }
 }
 
+// Default for "New Parameter" in the Pool's Parameters tab.
+export function makeParameterSpec(
+  index: number,
+  paramType: InstrumentFunction['paramType'] = 'float'
+): import('./types').ParameterTemplate {
+  return {
+    id: uid('par_'),
+    name: `Parameter ${index + 1}`,
+    color: randomSceneColor(),
+    oscPath: `param${index + 1}`,
+    destIp: '127.0.0.1',
+    destPort: 9000,
+    paramType,
+    nature: 'lin',
+    streamMode: 'streaming',
+    min: paramType === 'bool' ? 0 : 0,
+    max: paramType === 'bool' ? 1 : 1,
+    init: 0
+  }
+}
+
+// Pre-shipped Parameter templates — small palette of common building
+// blocks the user can drag onto the sidebar as orphan Parameter rows
+// without authoring a full Instrument first.
+export function makeBuiltinParameters(): import('./types').ParameterTemplate[] {
+  return [
+    {
+      id: 'par_rgb_light',
+      name: 'RGB Light',
+      description: 'Single RGB lamp / LED — three 0..255 channels.',
+      color: '#ff5d6c',
+      oscPath: 'rgb',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'v3',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: 0,
+      max: 255,
+      init: 0,
+      unit: 'RGB',
+      builtin: true
+    },
+    {
+      id: 'par_knob',
+      name: 'Knob',
+      description: 'Generic continuous controller, 0..1 float.',
+      color: '#5dd6c4',
+      oscPath: 'knob',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'float',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: 0,
+      max: 1,
+      init: 0,
+      builtin: true
+    },
+    {
+      id: 'par_motor',
+      name: 'Motor',
+      description: 'Bipolar motor speed, -1..1.',
+      color: '#9b6dff',
+      oscPath: 'motor',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'float',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: -1,
+      max: 1,
+      init: 0,
+      unit: 'rev/s',
+      builtin: true
+    },
+    {
+      id: 'par_button',
+      name: 'Button',
+      description: 'Discrete on/off — sends bool / int events.',
+      color: '#f7c948',
+      oscPath: 'button',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'bool',
+      nature: 'lin',
+      streamMode: 'discrete',
+      min: 0,
+      max: 1,
+      init: 0,
+      builtin: true
+    },
+    {
+      id: 'par_xy',
+      name: 'XY Pad',
+      description: 'Two-axis pad as a v2.',
+      color: '#7ec8e3',
+      oscPath: 'xy',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'v2',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: 0,
+      max: 1,
+      init: 0.5,
+      builtin: true
+    }
+  ]
+}
+
 // Pre-shipped templates. Deliberately small + concrete — these
 // double as documentation of the Pool concept. `builtin: true` makes
 // them read-only in the Inspector but still cloneable.
 export function makeBuiltinPool(): Pool {
   return {
+    parameters: makeBuiltinParameters(),
     templates: [
       {
         id: 'tpl_octocosme',
@@ -593,8 +707,37 @@ export function makeBuiltinPool(): Pool {
 }
 
 export function makeEmptySession(): Session {
-  const track = makeTrack(0)
+  // Default new session — one Scene + one Instrument with one child
+  // Parameter. The Instrument is a draft Template (not surfaced in the
+  // Pool until the user runs Save as Template); the Parameter is its
+  // sole child Function row. Mirrors what `addInstrumentRow` produces
+  // so the empty-session shape is identical to what the user gets by
+  // pressing Ctrl+T on a blank app.
   const scene = makeScene(0)
+  const draftTpl: InstrumentTemplate = {
+    id: 'tpl_user_default',
+    name: 'Instrument 1',
+    description: '',
+    color: randomSceneColor(),
+    destIp: '127.0.0.1',
+    destPort: 9000,
+    oscAddressBase: '/instr1',
+    voices: 1,
+    builtin: false,
+    draft: true,
+    functions: [makeFunctionSpec(0)]
+  }
+  const headerRow: Track = {
+    id: 't_default_header',
+    name: draftTpl.name,
+    kind: 'template',
+    sourceTemplateId: draftTpl.id,
+    defaultOscAddress: draftTpl.oscAddressBase,
+    defaultDestIp: draftTpl.destIp,
+    defaultDestPort: draftTpl.destPort
+  }
+  const childRow = makeFunctionTrack(draftTpl, draftTpl.functions[0], headerRow.id)
+  const builtinPool = makeBuiltinPool()
   const session: Session = {
     version: 1,
     name: 'Untitled',
@@ -604,19 +747,18 @@ export function makeEmptySession(): Session {
     defaultOscAddress: '/dataflou/value',
     defaultDestIp: '127.0.0.1',
     defaultDestPort: 9000,
-    tracks: [track],
+    tracks: [headerRow, childRow],
     scenes: [scene],
     sequence: new Array(128).fill(null),
     focusedSceneId: scene.id,
     midiInputName: null,
     metaController: makeMetaController(),
-    pool: makeBuiltinPool()
+    pool: { ...builtinPool, templates: [...builtinPool.templates, draftTpl] }
   }
-  // Default sequence is empty — users drag scenes into slots explicitly.
-  // Previously slot 0 was pre-filled with the default scene, which was
-  // confusing when experimenting in Edit view (the Transport's Next /
-  // Any / etc. would fire from a slot the user never placed).
-  scene.cells[track.id] = makeCell({
+  // Pre-populate a clip on the default scene for the child Parameter
+  // row so the user has something to trigger immediately. The
+  // sequence array stays empty — slots are filled explicitly.
+  scene.cells[childRow.id] = makeCell({
     destIp: session.defaultDestIp,
     destPort: session.defaultDestPort,
     oscAddress: session.defaultOscAddress

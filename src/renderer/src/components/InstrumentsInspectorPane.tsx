@@ -18,7 +18,8 @@ import type {
   FunctionParamType,
   FunctionStreamMode,
   InstrumentFunction,
-  InstrumentTemplate
+  InstrumentTemplate,
+  ParameterTemplate
 } from '@shared/types'
 
 const PARAM_TYPES: { id: FunctionParamType; label: string }[] = [
@@ -50,11 +51,16 @@ export default function InstrumentsInspectorPane(): JSX.Element {
       <div className="flex flex-col h-full min-h-0">
         <Header title="Instrument Inspector" />
         <div className="p-3 text-muted text-[11px]">
-          Select a Template or Function in the Pool to edit it. Drag any item
+          Select a Template or Parameter in the Pool to edit it. Drag any item
           onto the Edit-view sidebar to instantiate it as an Instrument row.
         </div>
       </div>
     )
+  }
+  // ParameterTemplate selections handled below; Template / Function selections
+  // both reference a template by templateId.
+  if (sel.kind === 'parameter') {
+    return <ParameterTemplateInspector parameterId={sel.parameterId} />
   }
   const template = templates.find((t) => t.id === sel.templateId)
   if (!template) {
@@ -73,7 +79,7 @@ export default function InstrumentsInspectorPane(): JSX.Element {
     return (
       <div className="flex flex-col h-full min-h-0">
         <Header title="Instrument Inspector" />
-        <div className="p-3 text-muted text-[11px]">Function no longer exists.</div>
+        <div className="p-3 text-muted text-[11px]">Parameter no longer exists.</div>
       </div>
     )
   }
@@ -203,11 +209,11 @@ function FunctionInspector({
   }
   return (
     <div className="flex flex-col h-full min-h-0">
-      <Header title={`Function — ${template.name} ▸ ${fn.name}${readonly ? ' (built-in)' : ''}`} />
+      <Header title={`Parameter — ${template.name} ▸ ${fn.name}${readonly ? ' (built-in)' : ''}`} />
       <div className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-col gap-2 text-[11px]">
         {readonly && (
           <div className="text-[10px] text-muted italic">
-            Built-in functions are read-only. Clone the parent Template to edit.
+            Built-in parameters are read-only. Clone the parent Template to edit.
           </div>
         )}
 
@@ -328,7 +334,214 @@ function FunctionInspector({
             value={fn.notes ?? ''}
             onChange={(v) => patch({ notes: v || undefined })}
             disabled={readonly}
-            placeholder="Free-form note about this function"
+            placeholder="Free-form note about this parameter"
+          />
+        </Field>
+      </div>
+    </div>
+  )
+}
+
+// Editor for a standalone Parameter blueprint (user-authored or built-
+// in). Mirrors the field set of FunctionInspector — the two share the
+// same ParamMeta-derived vocabulary (paramType, nature, streamMode,
+// range, unit, smooth) — plus the destination IP/port and color that
+// only matter when a ParameterTemplate stands alone (no parent
+// Instrument to inherit from).
+function ParameterTemplateInspector({
+  parameterId
+}: {
+  parameterId: string
+}): JSX.Element {
+  const parameter = useStore((s) =>
+    s.session.pool.parameters.find((p) => p.id === parameterId)
+  )
+  const updateParameter = useStore((s) => s.updateParameter)
+  if (!parameter) {
+    return (
+      <div className="flex flex-col h-full min-h-0">
+        <Header title="Parameter Inspector" />
+        <div className="p-3 text-muted text-[11px]">
+          Parameter no longer exists — pick another item.
+        </div>
+      </div>
+    )
+  }
+  const readonly = !!parameter.builtin
+  function patch(p: Partial<ParameterTemplate>): void {
+    updateParameter(parameterId, p)
+  }
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <Header
+        title={`Parameter — ${parameter.name}${readonly ? ' (built-in)' : ''}`}
+      />
+      <div className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-col gap-2 text-[11px]">
+        {readonly && (
+          <div className="text-[10px] text-muted italic">
+            Built-in parameters are read-only. Use the{' '}
+            <span className="label">Dupl</span> button in the Pool to clone
+            this into an editable user parameter.
+          </div>
+        )}
+
+        <Field label="Name">
+          <UncontrolledTextInput
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.name}
+            onChange={(v) => patch({ name: v })}
+            disabled={readonly}
+          />
+        </Field>
+
+        <Field label="Description">
+          <UncontrolledTextInput
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.description ?? ''}
+            onChange={(v) => patch({ description: v || undefined })}
+            disabled={readonly}
+            placeholder="What is this parameter for?"
+          />
+        </Field>
+
+        <Field label="Color">
+          <input
+            type="color"
+            className="w-full h-6 rounded border border-border bg-transparent cursor-pointer disabled:cursor-default"
+            value={parameter.color}
+            onChange={(e) => patch({ color: e.target.value })}
+            disabled={readonly}
+          />
+        </Field>
+
+        <Field label="Default IP : Port">
+          <div className="flex items-center gap-1">
+            <UncontrolledTextInput
+              className="input text-[11px] py-0.5 flex-1 min-w-0"
+              value={parameter.destIp}
+              onChange={(v) => patch({ destIp: v })}
+              disabled={readonly}
+              placeholder="127.0.0.1"
+            />
+            <span className="text-muted">:</span>
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-16"
+              value={parameter.destPort}
+              onChange={(v) => patch({ destPort: v })}
+              min={1}
+              max={65535}
+              integer
+              disabled={readonly}
+            />
+          </div>
+        </Field>
+
+        <Field label="OSC path">
+          <UncontrolledTextInput
+            className="input text-[11px] py-0.5 w-full font-mono"
+            value={parameter.oscPath}
+            onChange={(v) => patch({ oscPath: v })}
+            disabled={readonly}
+            placeholder="param"
+          />
+        </Field>
+
+        <Field label="Type">
+          <select
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.paramType}
+            onChange={(e) => patch({ paramType: e.target.value as FunctionParamType })}
+            disabled={readonly}
+          >
+            {PARAM_TYPES.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+
+        <div className="grid grid-cols-3 gap-1">
+          <Field label="Min">
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-full"
+              value={parameter.min ?? 0}
+              onChange={(v) => patch({ min: v })}
+              min={-1e9}
+              max={1e9}
+              disabled={readonly}
+            />
+          </Field>
+          <Field label="Max">
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-full"
+              value={parameter.max ?? 1}
+              onChange={(v) => patch({ max: v })}
+              min={-1e9}
+              max={1e9}
+              disabled={readonly}
+            />
+          </Field>
+          <Field label="Init">
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-full"
+              value={parameter.init ?? 0}
+              onChange={(v) => patch({ init: v })}
+              min={-1e9}
+              max={1e9}
+              disabled={readonly}
+            />
+          </Field>
+        </div>
+
+        <Field label="Nature">
+          <select
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.nature}
+            onChange={(e) => patch({ nature: e.target.value as FunctionParamNature })}
+            disabled={readonly}
+          >
+            {NATURES.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+
+        <Field label="Stream mode">
+          <select
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.streamMode}
+            onChange={(e) => patch({ streamMode: e.target.value as FunctionStreamMode })}
+            disabled={readonly}
+            title="Streaming = continuous (e.g. position). Discrete = events. Polling = read-on-demand."
+          >
+            {STREAM_MODES.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+
+        <Field label="Unit">
+          <UncontrolledTextInput
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.unit ?? ''}
+            onChange={(v) => patch({ unit: v || undefined })}
+            disabled={readonly}
+            placeholder="Hz, dB, °, RGBA…"
+          />
+        </Field>
+
+        <Field label="Notes">
+          <UncontrolledTextInput
+            className="input text-[11px] py-0.5 w-full"
+            value={parameter.notes ?? ''}
+            onChange={(v) => patch({ notes: v || undefined })}
+            disabled={readonly}
+            placeholder="Free-form note about this parameter"
           />
         </Field>
       </div>

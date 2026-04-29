@@ -12,9 +12,11 @@
 // no memory cost.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { OscErrorEvent, OscEvent } from '@shared/types'
 import { useStore } from '../store'
 import PoolPane from './PoolPane'
+import { ResizeHandle } from './ResizeHandle'
 
 // Discriminated-union row so the log can interleave successful sends
 // with failures. Kind is the only distinguishing field; everything else
@@ -40,6 +42,18 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   const [paused, setPaused] = useState(false)
   // Free-form substring filter applied to address; empty = pass-through.
   const [filter, setFilter] = useState('')
+  // Pop the Pool out into a centered window. While popped, the drawer
+  // shows a placeholder where the Pool used to be so the OSC log keeps
+  // its layout. Toggled from PoolPane's title-bar double-click + ⤢
+  // button.
+  const [poolPoppedOut, setPoolPoppedOut] = useState(false)
+  // Drawer height + Pool visibility live in the store so the keyboard
+  // shortcut handler in App.tsx can flip them, and so the height
+  // survives a drawer toggle.
+  const drawerHeight = useStore((s) => s.oscMonitorHeight)
+  const setDrawerHeight = useStore((s) => s.setOscMonitorHeight)
+  const poolHidden = useStore((s) => s.poolHidden)
+  const setPoolHidden = useStore((s) => s.setPoolHidden)
   // Store raw events in a ref so the subscriber doesn't trigger a re-render
   // per batch (would stall the UI at high send rates). We bump `tick` on each
   // flush to force a render, throttled to ~10Hz.
@@ -118,34 +132,63 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   return (
     <div
       // Two-pane drawer: OSC log + Pool. Inspector for Pool selection
-      // lives in the Edit-view Inspector instead. 220 px is tall enough
-      // for ~10 OSC log rows + a couple of expanded Templates without
-      // taking over the whole window.
-      className="border-t border-border bg-panel flex flex-col shrink-0"
-      style={{ height: 220 }}
+      // lives in the Edit-view Inspector instead. Default 220 px tall
+      // (~10 log rows + a couple of expanded Templates). User can grab
+      // the top edge handle to grow the drawer up to 600 px.
+      className="relative border-t border-border bg-panel flex flex-col shrink-0"
+      style={{ height: drawerHeight }}
     >
-      {/* Top header strip — close button on the right; per-pane controls
-          live inside each pane's own header so each is self-contained. */}
-      <div className="flex items-center gap-2 px-2 py-1 border-b border-border">
-        <span className="label shrink-0">OSC Monitor + Pool</span>
-        <div className="flex-1" />
-        <button className="btn text-[11px] py-0.5" onClick={onClose} title="Close drawer">
-          ×
-        </button>
-      </div>
-
+      {/* Top edge resize handle — drag UP to grow the drawer, DOWN to
+          shrink. Inverted so the visual move matches the value change
+          (drawer pinned to bottom, height = container.bottom -
+          drag.y). */}
+      <ResizeHandle
+        direction="row"
+        value={drawerHeight}
+        onChange={setDrawerHeight}
+        min={120}
+        max={600}
+        inverse
+        className="absolute top-0 left-0 right-0 h-[4px] z-20 cursor-row-resize"
+        title="Drag to resize the OSC monitor drawer"
+      />
       {/* Two-pane body. Border between panes gives the user a clear read
           on "this is one widget with two sections." Each pane owns its
-          own scroll. */}
+          own scroll. The previous "OSC Monitor + Pool" wrapper title bar
+          has been folded into the log toolbar to save vertical space:
+          close button → OSC Monitor label → counters → filter → Live →
+          Clear. */}
       <div className="flex-1 min-h-0 flex">
         {/* Pane 1 — OSC log (left, ~65%). */}
         <div className="flex flex-col min-h-0 border-r border-border" style={{ flex: '2 1 0' }}>
-          {/* Log toolbar */}
+          {/* Log toolbar — single strip carrying everything that used to
+              live in two stacked title bars. Order: ✕ close, OSC Monitor
+              label, "Log N/M" counter, filter input, Live, Clear. The
+              filter shrinks to fit (min-w-0) so all the trailing buttons
+              still have room on a narrow window. */}
           <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0">
-            <span className="label">Log</span>
-            <span className="text-muted text-[10px]">
-              {rows.length} / {bufferRef.current.length}
+            <button
+              className="btn text-[11px] py-0 leading-tight px-1.5 shrink-0"
+              onClick={onClose}
+              title="Close drawer"
+            >
+              ×
+            </button>
+            <span className="label shrink-0">OSC Monitor</span>
+            <span className="text-muted text-[10px] shrink-0">
+              Log {rows.length}/{bufferRef.current.length}
             </span>
+            {poolHidden && (
+              // Mini-toggle to bring the Pool back. Lives in the log
+              // toolbar so it's always visible while the Pool is dismissed.
+              <button
+                className="btn text-[10px] py-0.5 shrink-0"
+                onClick={() => setPoolHidden(false)}
+                title="Show the Pool (P)"
+              >
+                Show Pool
+              </button>
+            )}
             <input
               className="input flex-1 min-w-0 text-[11px] py-0.5"
               placeholder="Filter by address or ip:port"
@@ -153,13 +196,13 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
               onChange={(e) => setFilter(e.target.value)}
             />
             <button
-              className={`btn text-[10px] py-0.5 ${paused ? 'bg-accent text-black border-accent' : ''}`}
+              className={`btn text-[10px] py-0.5 shrink-0 ${paused ? 'bg-accent text-black border-accent' : ''}`}
               onClick={() => setPaused((v) => !v)}
               title={paused ? 'Resume capture' : 'Pause capture (events still flow, just not displayed)'}
             >
               {paused ? 'Paused' : 'Live'}
             </button>
-            <button className="btn text-[10px] py-0.5" onClick={clearLog}>
+            <button className="btn text-[10px] py-0.5 shrink-0" onClick={clearLog}>
               Clear
             </button>
           </div>
@@ -217,12 +260,154 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
           </div>
         </div>
 
-        {/* Pane 2 — Pool (right). Lists Templates + Functions, drag
+        {/* Pane 2 — Pool (right). Lists Templates + Parameters, drag
             sources for the Edit-view sidebar. Selecting an item here
-            re-points the Edit-view's right-side Inspector at it. */}
-        <div className="flex flex-col min-h-0" style={{ flex: '1 1 0', minWidth: 240 }}>
-          <PoolPane />
-        </div>
+            re-points the Edit-view's right-side Inspector at it. When
+            popped out, the embedded slot shows a placeholder so the
+            drawer layout stays stable. When poolHidden is true, the
+            entire pane is removed from the layout — the OSC log gets
+            the full drawer width. */}
+        {!poolHidden && (
+          <div className="flex flex-col min-h-0" style={{ flex: '1 1 0', minWidth: 240 }}>
+            {poolPoppedOut ? (
+              <PoolPoppedOutPlaceholder onDock={() => setPoolPoppedOut(false)} />
+            ) : (
+              <PoolPane
+                onTogglePopOut={() => setPoolPoppedOut(true)}
+                onHide={() => setPoolHidden(true)}
+              />
+            )}
+          </div>
+        )}
+      </div>
+      {poolPoppedOut && !poolHidden && (
+        <PoolPopOut
+          onClose={() => setPoolPoppedOut(false)}
+          onHide={() => {
+            setPoolPoppedOut(false)
+            setPoolHidden(true)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+// Floating Pool window — opens centered at ~30% of the viewport and
+// the user can drag it anywhere by its title bar. Backdrop is fully
+// click-through (pointer-events-none on the overlay, restored on the
+// card) so it doesn't block editing the rest of the app.
+function PoolPopOut({
+  onClose,
+  onHide
+}: {
+  onClose: () => void
+  onHide: () => void
+}): JSX.Element {
+  // Initial geometry — computed once on mount so window resize after
+  // pop-out doesn't yank the box around. State is { x, y, w, h } in
+  // CSS pixels relative to the viewport top-left.
+  const [box, setBox] = useState(() => {
+    const w = clamp(window.innerWidth * 0.3, 420, window.innerWidth * 0.9)
+    const h = clamp(window.innerHeight * 0.3, 360, window.innerHeight * 0.9)
+    return {
+      x: Math.round((window.innerWidth - w) / 2),
+      y: Math.round((window.innerHeight - h) / 2),
+      w: Math.round(w),
+      h: Math.round(h)
+    }
+  })
+  // Pointer-driven drag. Snapshot the offset between cursor and the
+  // box's top-left at pointerdown so the drag tracks the cursor
+  // smoothly (no jump even if the user grabs the bar at the right
+  // edge).
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null)
+  function onTitleBarPointerDown(e: React.PointerEvent): void {
+    // Don't start a drag from buttons / inputs inside the bar (Pop-out
+    // toggle, Add buttons). They should keep their normal click path.
+    const tag = (e.target as HTMLElement | null)?.tagName
+    if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA') return
+    e.preventDefault()
+    dragRef.current = { dx: e.clientX - box.x, dy: e.clientY - box.y }
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  }
+  function onTitleBarPointerMove(e: React.PointerEvent): void {
+    const d = dragRef.current
+    if (!d) return
+    // Clamp so at least 40 px of the title bar stays on-screen — the
+    // user can still grab it back.
+    const minX = 40 - box.w
+    const maxX = window.innerWidth - 40
+    const minY = 0
+    const maxY = window.innerHeight - 28
+    setBox((b) => ({
+      ...b,
+      x: clamp(e.clientX - d.dx, minX, maxX),
+      y: clamp(e.clientY - d.dy, minY, maxY)
+    }))
+  }
+  function onTitleBarPointerUp(e: React.PointerEvent): void {
+    dragRef.current = null
+    try {
+      ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore — pointer wasn't captured */
+    }
+  }
+
+  return createPortal(
+    <div className="fixed inset-0 z-[90] pointer-events-none">
+      <div
+        className="absolute bg-panel border border-border rounded shadow-2xl flex flex-col pointer-events-auto overflow-hidden"
+        style={{ left: box.x, top: box.y, width: box.w, height: box.h }}
+      >
+        {/* Drag handle is the PoolPane's own title bar. We pass the
+            pointer event handlers through as props so PoolPane stays
+            otherwise unchanged in either context (drawer / popped). */}
+        <PoolPane
+          poppedOut
+          onTogglePopOut={onClose}
+          onHide={onHide}
+          titleBarHandlers={{
+            onPointerDown: onTitleBarPointerDown,
+            onPointerMove: onTitleBarPointerMove,
+            onPointerUp: onTitleBarPointerUp,
+            onPointerCancel: onTitleBarPointerUp,
+            style: { cursor: 'grab' }
+          }}
+        />
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v))
+}
+
+function PoolPoppedOutPlaceholder({
+  onDock
+}: {
+  onDock: () => void
+}): JSX.Element {
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0">
+        <span className="label">Pool</span>
+        <span className="text-muted text-[10px]">popped out</span>
+        <div className="flex-1" />
+        <button
+          className="btn text-[10px] py-0 px-1.5 leading-tight"
+          onClick={onDock}
+          title="Dock the Pool back into the drawer"
+        >
+          ⤓ Dock
+        </button>
+      </div>
+      <div className="p-3 text-muted text-[11px]">
+        The Pool is open in a floating window. Close it (or click{' '}
+        <span className="label">⤓ Dock</span>) to return it here.
       </div>
     </div>
   )

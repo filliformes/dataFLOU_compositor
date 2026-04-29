@@ -23,20 +23,26 @@ export interface SceneCountdown {
 export function useSceneCountdown(sceneId: string, durationSec: number): SceneCountdown {
   const activeSceneId = useStore((s) => s.engine.activeSceneId)
   const startedAt = useStore((s) => s.engine.activeSceneStartedAt)
+  // Engine reports the wall-clock at which pause was entered, or null
+  // when running. Using it as the "now" reference while paused makes
+  // the visual countdown freeze at the moment of pause without the
+  // hook's interval having to know about pause itself.
+  const pausedAt = useStore((s) => s.engine.pausedAt)
   const active = activeSceneId === sceneId && startedAt !== null
 
-  // Self-ticking local "now" — only runs while this specific scene is the
-  // active one. Each active component keeps its own interval; React's
-  // effect dedup keeps this cheap (one interval per mounted active pill).
+  // Self-ticking local "now" — only runs while active AND not
+  // paused. While paused we don't need to re-render; the pausedAt
+  // freeze handles the math.
   const [now, setNow] = useState<number>(() => Date.now())
   useEffect(() => {
-    if (!active) return
+    if (!active || pausedAt !== null) return
     const id = setInterval(() => setNow(Date.now()), 50)
     return () => clearInterval(id)
-  }, [active])
+  }, [active, pausedAt])
 
+  const refNow = pausedAt !== null ? pausedAt : now
   const durationMs = Math.max(1, durationSec * 1000)
-  const elapsedMs = active && startedAt !== null ? Math.max(0, now - startedAt) : 0
+  const elapsedMs = active && startedAt !== null ? Math.max(0, refNow - startedAt) : 0
   const remainingMs = active ? Math.max(0, durationMs - elapsedMs) : 0
   const progress = active ? Math.min(1, elapsedMs / durationMs) : 0
 

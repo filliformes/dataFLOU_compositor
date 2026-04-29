@@ -98,34 +98,64 @@ export default function EditView(): JSX.Element {
       </div>
 
       {!showMode && (
-        <div
-          className="relative bg-panel border-l border-border shrink-0 flex flex-col"
-          style={{ width: inspectorWidth }}
-        >
-          <ResizeHandle
-            direction="col"
-            value={inspectorWidth}
-            onChange={setInspectorWidth}
-            min={320}
-            max={640}
-            inverse
-            className="absolute top-0 left-0 bottom-0 w-[4px] z-30"
-            title="Drag to resize inspector"
-          />
-          <SettingsBox />
-          <div className="flex-1 min-h-0 overflow-y-auto">
-            {poolSelection ? (
-              <InstrumentsInspectorPane />
-            ) : selectedCell ? (
-              <Inspector mode="cell" />
-            ) : selectedTrack ? (
-              <Inspector mode="track" />
-            ) : (
-              <InspectorEmpty />
-            )}
-          </div>
-        </div>
+        <EditInspector
+          inspectorWidth={inspectorWidth}
+          setInspectorWidth={setInspectorWidth}
+          poolSelection={poolSelection}
+          selectedCell={selectedCell}
+          selectedTrack={selectedTrack}
+        />
       )}
+    </div>
+  )
+}
+
+// Right-side Inspector panel for the Edit view. Wraps the existing
+// inner pieces (SettingsBox + Inspector / InstrumentsInspectorPane /
+// Empty) in a visibility gate so the I keyboard shortcut can hide
+// the whole panel without touching the grid layout.
+function EditInspector({
+  inspectorWidth,
+  setInspectorWidth,
+  poolSelection,
+  selectedCell,
+  selectedTrack
+}: {
+  inspectorWidth: number
+  setInspectorWidth: (w: number) => void
+  poolSelection: ReturnType<typeof useStore.getState>['poolSelection']
+  selectedCell: ReturnType<typeof useStore.getState>['selectedCell']
+  selectedTrack: ReturnType<typeof useStore.getState>['selectedTrack']
+}): JSX.Element | null {
+  const visible = useStore((s) => s.editInspectorVisible)
+  if (!visible) return null
+  return (
+    <div
+      className="relative bg-panel border-l border-border shrink-0 flex flex-col"
+      style={{ width: inspectorWidth }}
+    >
+      <ResizeHandle
+        direction="col"
+        value={inspectorWidth}
+        onChange={setInspectorWidth}
+        min={320}
+        max={640}
+        inverse
+        className="absolute top-0 left-0 bottom-0 w-[4px] z-30"
+        title="Drag to resize inspector"
+      />
+      <SettingsBox />
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {poolSelection ? (
+          <InstrumentsInspectorPane />
+        ) : selectedCell ? (
+          <Inspector mode="cell" />
+        ) : selectedTrack ? (
+          <Inspector mode="track" />
+        ) : (
+          <InspectorEmpty />
+        )}
+      </div>
     </div>
   )
 }
@@ -228,7 +258,7 @@ function SettingsBox(): JSX.Element {
             setScenesCollapsed(next)
             setTracksCollapsed(next)
           }}
-          title="Click: toggle scenes only · Right-click: toggle both scenes + messages"
+          title="Click: toggle scenes only · Right-click: toggle both scenes + instruments"
         >
           {scenesCollapsed ? '⇲ Scenes' : '⇱ Collapse Scenes'}
         </button>
@@ -243,9 +273,9 @@ function SettingsBox(): JSX.Element {
             setScenesCollapsed(next)
             setTracksCollapsed(next)
           }}
-          title="Click: toggle messages only · Right-click: toggle both scenes + messages"
+          title="Click: toggle instruments only · Right-click: toggle both scenes + instruments"
         >
-          {tracksCollapsed ? '⇲ Messages' : '⇱ Collapse Messages'}
+          {tracksCollapsed ? '⇲ Instruments' : '⇱ Collapse Instruments'}
         </button>
       </div>
 

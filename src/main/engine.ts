@@ -182,6 +182,11 @@ export class SceneEngine {
   // action to a different scene). Increments when the active scene re-triggers
   // itself (loop mode OR a multiplicator-driven internal repeat).
   private activeSceneRepeatCount = 0
+  // While paused (sequence advance frozen), this is the wall-clock
+  // timestamp pause was entered. On resume we shift activeSceneStartedAt
+  // forward by the pause duration so the elapsed time picks up where it
+  // left off rather than jumping ahead.
+  private pauseStartedAt: number | null = null
   private sceneAdvanceTimer: NodeJS.Timeout | null = null
   private onStateChange: ((s: EngineState) => void) | null = null
   // Latest computed output per (sceneId, trackId). Populated every tick by the
@@ -242,6 +247,7 @@ export class SceneEngine {
       activeSceneId: this.activeSceneId,
       activeSceneStartedAt: this.activeSceneStartedAt,
       activeSequenceSlotIdx: this.activeSequenceSlotIdx,
+      pausedAt: this.pauseStartedAt,
       tickRateHz: this.session.tickRateHz
     })
   }
@@ -484,17 +490,38 @@ export class SceneEngine {
   }
 
   pauseSequence(): void {
-    // Freeze auto-advance without stopping cells. Cells keep playing/modulating.
+    // Freeze auto-advance without stopping cells. Cells keep
+    // playing/modulating, but the active scene's elapsed time stops
+    // accumulating (we mark pauseStartedAt; on resume we offset
+    // activeSceneStartedAt by the pause duration). The renderer's
+    // countdown reads activeSceneStartedAt and the pause flag, so
+    // freezing on this side is enough to also freeze the visual
+    // remaining-time display.
     this.clearSceneAdvance()
+    if (this.activeSceneStartedAt !== null && this.pauseStartedAt === null) {
+      this.pauseStartedAt = Date.now()
+      this.emitState()
+    }
   }
 
   resumeSequence(): void {
     if (!this.session) return
+    // Apply the pause-shift: activeSceneStartedAt += (now - pauseStartedAt)
+    // so elapsed picks up exactly where it left off.
+    if (this.pauseStartedAt !== null && this.activeSceneStartedAt !== null) {
+      const pauseDur = Date.now() - this.pauseStartedAt
+      this.activeSceneStartedAt += pauseDur
+    }
+    this.pauseStartedAt = null
     // Re-arm from the current active scene's full duration (simple approach).
     const id = this.activeSceneId
-    if (!id) return
+    if (!id) {
+      this.emitState()
+      return
+    }
     const scene = this.session.scenes.find((s) => s.id === id)
     if (scene) this.armSceneAdvance(scene)
+    this.emitState()
   }
 
   // `opts.morphMs` — when set, every cell in the scene morphs over this

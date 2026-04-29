@@ -93,9 +93,19 @@ export default function App(): JSX.Element {
   //
   // Authoring (suppressed inside text fields):
   //   Tab           → toggle Edit ↔ Sequence
-  //   Ctrl+T        → add a Message
+  //   Ctrl+T        → add a new Instrument (draft Template + sidebar header)
+  //   Ctrl+P        → add a new Parameter to the selected Instrument
+  //                   group (or to the parent of a selected Parameter row).
+  //                   No-op when nothing's selected.
   //   Alt+S         → add a Scene
-  //   Delete        → Sequence view: remove focused scene
+  //   M             → toggle the Meta Controller bar
+  //   O             → toggle the OSC Monitor drawer
+  //   P             → toggle the Pool inside the OSC Monitor (also opens
+  //                   the drawer if it's closed). Modifier-less so the
+  //                   user can flick it on/off mid-edit.
+  //   I             → toggle the right-side Inspector panel (Edit view)
+  //   S             → toggle the focused-Scene info panel (Sequence view)
+  //   Delete        → Sequence view: remove focused scene (with confirm)
   //                   Edit view:     remove selected Instrument row(s)
   //
   // Performance (always active, even in show mode):
@@ -110,7 +120,6 @@ export default function App(): JSX.Element {
   //   F11           → toggle show / edit mode
   //   Escape (hold) → exit show mode (press and hold ~800 ms). Short taps
   //                   of Escape still close modals / menus etc.
-  const addTrack = useStore((s) => s.addTrack)
   const addScene = useStore((s) => s.addScene)
   const removeScene = useStore((s) => s.removeScene)
   useEffect(() => {
@@ -158,17 +167,6 @@ export default function App(): JSX.Element {
         e.preventDefault()
         const st = useStore.getState()
         st.setShowMode(!st.showMode)
-        return
-      }
-
-      // ------- CapsLock: toggle OSC monitor drawer. Works everywhere
-      //             (including show mode and inside text inputs) so the
-      //             performer can peek at outgoing OSC traffic without
-      //             taking their hands off the keyboard.
-      if (e.key === 'CapsLock') {
-        e.preventDefault()
-        const st = useStore.getState()
-        st.setOscMonitorOpen(!st.oscMonitorOpen)
         return
       }
 
@@ -238,11 +236,38 @@ export default function App(): JSX.Element {
       // ------- Authoring hotkeys (suppressed in show mode)
       const showMode = useStore.getState().showMode
 
-      // Ctrl/Cmd + T → add Message
+      // Ctrl/Cmd + T → add a new Instrument (draft Template + header
+      // row). Replaces the older "+Message" path; orphan Parameters are
+      // created via the right-click "Add orphan Parameter" menu or by
+      // dragging a Parameter blueprint from the Pool.
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 't') {
         if (showMode) return
+        if (isEditableTarget(e.target)) return
         e.preventDefault()
-        addTrack()
+        useStore.getState().addInstrumentRow(null)
+        return
+      }
+      // Ctrl/Cmd + P → add a Parameter to the currently-selected
+      // Instrument's group. Resolves the target template-row from
+      // selection: if the selected row IS a Template, use it; if it's
+      // a Function with a parent Template, use the parent. No-op if
+      // selection is empty or points at an orphan Function.
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
+        if (showMode) return
+        if (isEditableTarget(e.target)) return
+        const st = useStore.getState()
+        const selId = st.selectedTrack
+        if (!selId) return
+        const sel = st.session.tracks.find((t) => t.id === selId)
+        const groupRowId =
+          sel?.kind === 'template'
+            ? sel.id
+            : sel?.parentTrackId
+              ? sel.parentTrackId
+              : null
+        if (!groupRowId) return
+        e.preventDefault()
+        st.addFunctionToInstrumentRow(groupRowId)
         return
       }
       // `A` → arm the focused scene as the next cue (or clear if it's
@@ -270,19 +295,125 @@ export default function App(): JSX.Element {
         addScene()
         return
       }
+      // M → toggle Meta Controller bar visibility.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'm'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setMetaControllerVisible(!st.session.metaController.visible)
+        return
+      }
+      // O → toggle OSC Monitor drawer.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'o'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setOscMonitorOpen(!st.oscMonitorOpen)
+        return
+      }
+      // P → toggle Pool visibility inside the OSC Monitor. If the
+      // drawer is currently closed, opens it AND shows the Pool — one
+      // keystroke gets the user from "I want to drag a Template" to a
+      // ready-to-grab Pool, regardless of starting state.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'p'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        if (!st.oscMonitorOpen) {
+          st.setOscMonitorOpen(true)
+          if (st.poolHidden) st.setPoolHidden(false)
+        } else {
+          st.setPoolHidden(!st.poolHidden)
+        }
+        return
+      }
+      // I → toggle the Edit-view Inspector panel. Only meaningful in
+      // Edit view (the Sequence view doesn't render it), but harmless
+      // anywhere — flipping it doesn't move the visible UI.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'i'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setEditInspectorVisible(!st.editInspectorVisible)
+        return
+      }
+      // S → toggle the Sequence view's focused-Scene info panel. The
+      // panel only renders when a scene is focused, so this is a
+      // no-op when nothing's focused.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 's'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setSceneInspectorVisible(!st.sceneInspectorVisible)
+        return
+      }
       // Delete →
-      //   Sequence view : remove focused scene
-      //   Edit view     : remove the currently selected Instrument(s)
-      //                   (Templates cascade to their Function children)
+      //   Multi-selected Scenes (either view) : remove all selected scenes
+      //   Sequence view, no scene selection   : remove focused scene
+      //   Edit view, track selection          : remove selected Instrument(s)
+      //                                         (Templates cascade to their
+      //                                         child Parameters)
+      // All paths prompt for confirm before destroying anything.
       if (e.key === 'Delete' || e.key === 'Del') {
         if (isEditableTarget(e.target)) return
         const st = useStore.getState()
         if (st.showMode) return
-        if (st.view === 'sequence') {
-          const focusedId = st.session.focusedSceneId
-          if (!focusedId) return
+        // Scene multi-selection wins in both views — the user is
+        // clearly acting on scenes if they've selected several.
+        if (st.selectedSceneIds.length > 1) {
           e.preventDefault()
-          removeScene(focusedId)
+          const n = st.selectedSceneIds.length
+          if (confirm(`Delete ${n} scenes?`)) st.removeScenes(st.selectedSceneIds)
+          return
+        }
+        if (st.view === 'sequence') {
+          // Fall back to the focused scene (or the single-element
+          // selection that matches it). Both paths produce one id.
+          const id =
+            st.selectedSceneIds.length === 1
+              ? st.selectedSceneIds[0]
+              : st.session.focusedSceneId
+          if (!id) return
+          e.preventDefault()
+          const focused = st.session.scenes.find((s) => s.id === id)
+          if (confirm(`Delete scene "${focused?.name ?? ''}"?`)) {
+            removeScene(id)
+          }
           return
         }
         // Edit view — delete selected Instrument rows. selectedTrackIds
@@ -297,17 +428,33 @@ export default function App(): JSX.Element {
               : []
         if (ids.length === 0) return
         e.preventDefault()
-        st.removeTracks(ids)
+        // Mirror the right-click "Delete" path: if it's a single row, name
+        // it; otherwise show the bulk count. Templates cascade to their
+        // children — flag that in the prompt so the user is warned.
+        const tracks = st.session.tracks
+        const target = tracks.find((t) => t.id === ids[0])
+        const label =
+          ids.length === 1
+            ? `Delete "${target?.name ?? ''}"?` +
+              (target?.kind === 'template'
+                ? ' (Will also delete its child Parameters.)'
+                : '')
+            : `Delete ${ids.length} instruments?`
+        if (confirm(label)) st.removeTracks(ids)
         return
       }
-      // Tab → toggle view. Active in both authoring and show mode — in
-      // show mode the Edit view renders as a read-only browser (no
-      // inspector, no clip editing) so flipping between Sequence and Edit
-      // is still safe for a performer who wants to see what's patched.
-      if (e.key === 'Tab') {
-        if (isEditableTarget(e.target)) return
+      // Tab → toggle view, period. We dedicate Tab to view-switch
+      // even from inside text inputs (where the browser would
+      // otherwise step to the next focusable element) — the user
+      // explicitly asked for Tab to ONLY do this. Pair it with
+      // Shift+Tab → reverse direction, also handled here so the
+      // browser can't reclaim it. Modifier keys other than Shift
+      // fall through (Ctrl+Tab is the OS-level window/tab cycler
+      // and we shouldn't hijack that).
+      if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
         e.preventDefault()
         setView(useStore.getState().view === 'edit' ? 'sequence' : 'edit')
+        return
       }
     }
     function onKeyUp(e: KeyboardEvent): void {
@@ -326,7 +473,7 @@ export default function App(): JSX.Element {
       window.removeEventListener('keyup', onKeyUp)
       if (escTimer) clearTimeout(escTimer)
     }
-  }, [setView, addTrack, addScene, removeScene])
+  }, [setView, addScene, removeScene])
 
   const uiScale = useStore((s) => s.uiScale)
 

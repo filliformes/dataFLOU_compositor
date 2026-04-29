@@ -1,7 +1,7 @@
 {
-  "name": "dataflou-merge",
-  "version": "0.4.0-alpha.0",
-  "description": "dataFLOU_Merge — Pool + Instrument Templates + Functions; bridge build toward dataFLOU library merger",
+  "name": "dataflou-compositor",
+  "version": "0.4.0",
+  "description": "OSC scene compositor — Pool of Instruments + Parameters, Timeline view, group triggers, multi-scene authoring",
   "main": "out/main/index.js",
   "author": "Vincent Fillion",
   "scripts": {
