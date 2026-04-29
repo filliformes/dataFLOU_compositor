@@ -2,16 +2,23 @@ import { create } from 'zustand'
 import type {
   Cell,
   EngineState,
+  FunctionParamNature,
+  FunctionParamType,
+  FunctionStreamMode,
+  InstrumentFunction,
+  InstrumentTemplate,
   MetaController,
   MetaCurve,
   MetaDest,
   MetaKnob,
   MidiBinding,
   NextMode,
+  Pool,
   RampParams,
   Scene,
   Session,
-  Track
+  Track,
+  TrackKind
 } from '@shared/types'
 import { META_KNOB_COUNT, META_MAX_DESTS } from '@shared/types'
 import {
@@ -28,11 +35,16 @@ import {
   META_MAX_HEIGHT,
   META_MAX_SMOOTH_MS,
   META_MIN_HEIGHT,
+  makeBuiltinPool,
   makeCell,
   makeEmptySession,
+  makeFunctionSpec,
+  makeFunctionTrack,
   makeMetaController,
   makeMetaKnob,
   makeScene,
+  makeTemplateSpec,
+  makeTemplateTrack,
   makeTrack
 } from '@shared/factory'
 
@@ -162,6 +174,14 @@ interface UiState {
   // messages (address, ip:port, args) for debugging. Off by default; when
   // closed the monitor component unmounts so no state accumulates.
   oscMonitorOpen: boolean
+  // Pool drawer pane selection. The drawer hosts three panes side-by-side
+  // (OSC log | Pool | Instruments Inspector). The selection drives what
+  // the inspector pane renders: a Template-level form, a Function-level
+  // form, or empty state.
+  poolSelection:
+    | { kind: 'template'; templateId: string }
+    | { kind: 'function'; templateId: string; functionId: string }
+    | null
   // Integrity-check hand-off. When the user triggers Open or restores
   // from autosave, the incoming session is scanned; if issues turn up,
   // we stash it here (session + path + issues) and render the global
@@ -231,6 +251,41 @@ interface Actions {
   setMidiInputName: (name: string | null) => void
   setFocusedScene: (id: string | null) => void
   setView: (v: 'edit' | 'sequence') => void
+
+  // Pool — Instrument Templates + Functions library
+  // ────────────────────────────────────────────────────────────────────
+  // The Pool lives on the session (so a session is self-contained) and
+  // is also the source-of-truth that the Edit-view sidebar instantiates
+  // FROM. CRUD against it is what the Pool drawer drives.
+  addTemplate: () => string                      // returns new template id
+  updateTemplate: (id: string, patch: Partial<InstrumentTemplate>) => void
+  duplicateTemplate: (id: string) => string | null
+  removeTemplate: (id: string) => void
+  addFunctionToTemplate: (templateId: string) => string | null  // returns new fn id
+  updateFunction: (
+    templateId: string,
+    functionId: string,
+    patch: Partial<InstrumentFunction>
+  ) => void
+  removeFunction: (templateId: string, functionId: string) => void
+  setPoolSelection: (sel: UiState['poolSelection']) => void
+  // Drag a Template from the Pool into the Edit sidebar — adds one
+  // header row + one row per Function under it. `insertAfterTrackId`
+  // null means append at end of the tracks list.
+  instantiateTemplate: (
+    templateId: string,
+    insertAfterTrackId: string | null
+  ) => void
+  // Drag a single Function from the Pool — creates an orphan Function
+  // row (no parent template header) by default. If the user drops it
+  // into an existing instantiated Template's group, pass that
+  // template-row's id as `parentTrackId` to nest it.
+  instantiateFunction: (
+    templateId: string,
+    functionId: string,
+    insertAfterTrackId: string | null,
+    parentTrackId?: string | null
+  ) => void
 
   // Tracks
   addTrack: () => void
@@ -437,6 +492,7 @@ export const useStore = create<State>((set, get) => ({
   // Exit: hold Escape for ~1 second while in show mode.
   showMode: false,
   oscMonitorOpen: false,
+  poolSelection: null,
   pendingIntegrityLoad: null,
   armedSceneId: null,
   autoAdvanceArm: false,
@@ -615,6 +671,199 @@ export const useStore = create<State>((set, get) => ({
     }),
   setView: (v) => set({ view: v }),
 
+  // ─── Pool: Templates + Functions library ─────────────────────────────
+  addTemplate: () => {
+    const id = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
+    set((st) => {
+      const idx = st.session.pool.templates.filter((t) => !t.builtin).length
+      const tpl = { ...makeTemplateSpec(idx), id }
+      return {
+        session: {
+          ...st.session,
+          pool: { templates: [...st.session.pool.templates, tpl] }
+        },
+        poolSelection: { kind: 'template', templateId: id }
+      }
+    })
+    return id
+  },
+  updateTemplate: (id, patch) =>
+    set((st) => {
+      const t = st.session.pool.templates.find((tt) => tt.id === id)
+      if (!t || t.builtin) return st
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            templates: st.session.pool.templates.map((tt) =>
+              tt.id === id ? { ...tt, ...patch } : tt
+            )
+          }
+        }
+      }
+    }),
+  duplicateTemplate: (id) => {
+    const src = get().session.pool.templates.find((t) => t.id === id)
+    if (!src) return null
+    const newId = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
+    const cloned: InstrumentTemplate = {
+      ...src,
+      id: newId,
+      name: `${src.name} (copy)`,
+      builtin: false,
+      // Re-id every function so the new template's functions don't
+      // collide with the source template's functions if both are
+      // instantiated into the same session.
+      functions: src.functions.map((f) => ({
+        ...f,
+        id: `fn_user_${Math.random().toString(36).slice(2, 9)}`
+      }))
+    }
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: { templates: [...st.session.pool.templates, cloned] }
+      },
+      poolSelection: { kind: 'template', templateId: newId }
+    }))
+    return newId
+  },
+  removeTemplate: (id) =>
+    set((st) => {
+      const t = st.session.pool.templates.find((tt) => tt.id === id)
+      if (!t || t.builtin) return st
+      return {
+        session: {
+          ...st.session,
+          pool: { templates: st.session.pool.templates.filter((tt) => tt.id !== id) }
+        },
+        poolSelection:
+          st.poolSelection &&
+          'templateId' in st.poolSelection &&
+          st.poolSelection.templateId === id
+            ? null
+            : st.poolSelection
+      }
+    }),
+  addFunctionToTemplate: (templateId) => {
+    const t = get().session.pool.templates.find((tt) => tt.id === templateId)
+    if (!t || t.builtin) return null
+    const fn = makeFunctionSpec(t.functions.length)
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId ? { ...tt, functions: [...tt.functions, fn] } : tt
+          )
+        }
+      },
+      poolSelection: { kind: 'function', templateId, functionId: fn.id }
+    }))
+    return fn.id
+  },
+  updateFunction: (templateId, functionId, patch) =>
+    set((st) => {
+      const t = st.session.pool.templates.find((tt) => tt.id === templateId)
+      if (!t || t.builtin) return st
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            templates: st.session.pool.templates.map((tt) =>
+              tt.id === templateId
+                ? {
+                    ...tt,
+                    functions: tt.functions.map((f) =>
+                      f.id === functionId ? { ...f, ...patch } : f
+                    )
+                  }
+                : tt
+            )
+          }
+        }
+      }
+    }),
+  removeFunction: (templateId, functionId) =>
+    set((st) => {
+      const t = st.session.pool.templates.find((tt) => tt.id === templateId)
+      if (!t || t.builtin) return st
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            templates: st.session.pool.templates.map((tt) =>
+              tt.id === templateId
+                ? { ...tt, functions: tt.functions.filter((f) => f.id !== functionId) }
+                : tt
+            )
+          }
+        },
+        poolSelection:
+          st.poolSelection &&
+          st.poolSelection.kind === 'function' &&
+          st.poolSelection.templateId === templateId &&
+          st.poolSelection.functionId === functionId
+            ? { kind: 'template', templateId }
+            : st.poolSelection
+      }
+    }),
+  setPoolSelection: (sel) => set({ poolSelection: sel }),
+
+  // ─── Pool → Edit-view instantiation ───────────────────────────────────
+  instantiateTemplate: (templateId, insertAfterTrackId) =>
+    set((st) => {
+      const tpl = st.session.pool.templates.find((t) => t.id === templateId)
+      if (!tpl) return st
+      // Cap: don't blow past the 128-row limit. Total rows added =
+      // 1 header + N functions.
+      const headRoom = 128 - st.session.tracks.length
+      if (headRoom < 1 + tpl.functions.length) return st
+
+      const headerRow = makeTemplateTrack(tpl)
+      const fnRows = tpl.functions.map((f) => makeFunctionTrack(tpl, f, headerRow.id))
+      const newRows = [headerRow, ...fnRows]
+
+      const idx = insertAfterTrackId
+        ? st.session.tracks.findIndex((t) => t.id === insertAfterTrackId)
+        : -1
+      const tracks =
+        idx >= 0
+          ? [
+              ...st.session.tracks.slice(0, idx + 1),
+              ...newRows,
+              ...st.session.tracks.slice(idx + 1)
+            ]
+          : [...st.session.tracks, ...newRows]
+      return { session: { ...st.session, tracks } }
+    }),
+  instantiateFunction: (templateId, functionId, insertAfterTrackId, parentTrackId) =>
+    set((st) => {
+      const tpl = st.session.pool.templates.find((t) => t.id === templateId)
+      const fn = tpl?.functions.find((f) => f.id === functionId)
+      if (!tpl || !fn) return st
+      if (st.session.tracks.length >= 128) return st
+
+      const row = makeFunctionTrack(tpl, fn, parentTrackId ?? '')
+      // Empty parentTrackId = orphan function (visual: no nesting). Keep
+      // it as undefined rather than empty string so downstream can simply
+      // truthy-check.
+      if (!parentTrackId) row.parentTrackId = undefined
+
+      const idx = insertAfterTrackId
+        ? st.session.tracks.findIndex((t) => t.id === insertAfterTrackId)
+        : -1
+      const tracks =
+        idx >= 0
+          ? [
+              ...st.session.tracks.slice(0, idx + 1),
+              row,
+              ...st.session.tracks.slice(idx + 1)
+            ]
+          : [...st.session.tracks, row]
+      return { session: { ...st.session, tracks } }
+    }),
+
   addTrack: () =>
     set((st) => {
       if (st.session.tracks.length >= 128) return st
@@ -623,17 +872,35 @@ export const useStore = create<State>((set, get) => ({
     }),
   removeTrack: (id) =>
     set((st) => {
-      const tracks = st.session.tracks.filter((t) => t.id !== id)
+      // Cascade: removing a Template header also removes every Function
+      // row that lists it as parent — Reaper-style "delete track folder"
+      // semantics. Avoids leaving orphan rows that visually float in the
+      // sidebar with no group context.
+      const target = st.session.tracks.find((t) => t.id === id)
+      const cascade = new Set<string>([id])
+      if (target?.kind === 'template') {
+        for (const t of st.session.tracks) {
+          if (t.parentTrackId === id) cascade.add(t.id)
+        }
+      }
+      const tracks = st.session.tracks.filter((t) => !cascade.has(t.id))
       const scenes = st.session.scenes.map((s) => {
-        const { [id]: _drop, ...rest } = s.cells
-        return { ...s, cells: rest }
+        const cells: typeof s.cells = {}
+        for (const [tid, cell] of Object.entries(s.cells)) {
+          if (!cascade.has(tid)) cells[tid] = cell
+        }
+        return { ...s, cells }
       })
       return {
         session: { ...st.session, tracks, scenes },
-        selectedTrack: st.selectedTrack === id ? null : st.selectedTrack,
-        selectedTrackIds: st.selectedTrackIds.filter((tid) => tid !== id),
-        selectedCell: st.selectedCell?.trackId === id ? null : st.selectedCell,
-        selectedCells: st.selectedCells.filter((r) => r.trackId !== id)
+        selectedTrack:
+          st.selectedTrack && cascade.has(st.selectedTrack) ? null : st.selectedTrack,
+        selectedTrackIds: st.selectedTrackIds.filter((tid) => !cascade.has(tid)),
+        selectedCell:
+          st.selectedCell && cascade.has(st.selectedCell.trackId)
+            ? null
+            : st.selectedCell,
+        selectedCells: st.selectedCells.filter((r) => !cascade.has(r.trackId))
       }
     }),
   renameTrack: (id, name) =>
@@ -960,7 +1227,17 @@ export const useStore = create<State>((set, get) => ({
   removeTracks: (ids) =>
     set((st) => {
       if (ids.length === 0) return st
+      // Cascade Template-header deletes to their child Function rows
+      // (same semantics as removeTrack singular).
       const idSet = new Set(ids)
+      for (const id of ids) {
+        const t = st.session.tracks.find((tt) => tt.id === id)
+        if (t?.kind === 'template') {
+          for (const c of st.session.tracks) {
+            if (c.parentTrackId === id) idSet.add(c.id)
+          }
+        }
+      }
       const tracks = st.session.tracks.filter((t) => !idSet.has(t.id))
       // Drop cells that referred to any of the deleted tracks, on every scene.
       const scenes = st.session.scenes.map((s) => {
@@ -1386,7 +1663,24 @@ function propagateDefaults(s: Session): Session {
       .filter((t): t is Track => !!t && typeof t.id === 'string')
       .map((t) => ({
         id: t.id,
-        name: typeof t.name === 'string' ? t.name : 'Message',
+        name: typeof t.name === 'string' ? t.name : 'Instrument',
+        // New `kind` field. Pre-merger sessions don't have it → all
+        // existing tracks load as orphan Functions (the previous
+        // visual). Templates are only created via the Pool flow.
+        kind:
+          (t as { kind?: TrackKind }).kind === 'template' ? 'template' : 'function',
+        parentTrackId:
+          typeof (t as { parentTrackId?: string }).parentTrackId === 'string'
+            ? (t as { parentTrackId: string }).parentTrackId
+            : undefined,
+        sourceTemplateId:
+          typeof (t as { sourceTemplateId?: string }).sourceTemplateId === 'string'
+            ? (t as { sourceTemplateId: string }).sourceTemplateId
+            : undefined,
+        sourceFunctionId:
+          typeof (t as { sourceFunctionId?: string }).sourceFunctionId === 'string'
+            ? (t as { sourceFunctionId: string }).sourceFunctionId
+            : undefined,
         defaultOscAddress:
           typeof t.defaultOscAddress === 'string' ? t.defaultOscAddress : undefined,
         defaultDestIp: typeof t.defaultDestIp === 'string' ? t.defaultDestIp : undefined,
@@ -1394,6 +1688,10 @@ function propagateDefaults(s: Session): Session {
           typeof t.defaultDestPort === 'number' ? t.defaultDestPort : undefined,
         midiTrigger: sanitizeMidiBinding(t.midiTrigger)
       })),
+    // Pool — pre-merger sessions don't have one; ship the builtin library
+    // so the user sees the OCTOCOSME / XYZ / Pandore starter templates
+    // even on a fresh open of an old file.
+    pool: sanitizePool(s.pool),
     focusedSceneId: typeof s.focusedSceneId === 'string' ? s.focusedSceneId : null,
     midiInputName: typeof s.midiInputName === 'string' ? s.midiInputName : null,
     // Transport-level bindings — optional and CC/note shape-validated
@@ -1671,6 +1969,94 @@ const VALID_META_CURVES: ReadonlySet<string> = new Set([
 ])
 function isValidMetaCurve(c: unknown): c is MetaCurve {
   return typeof c === 'string' && VALID_META_CURVES.has(c)
+}
+
+// Sanitize the Pool slice. Pre-merger sessions don't have one; we always
+// at least seed with the builtin library so the user can see what the
+// Pool concept looks like even on an empty session. User-authored
+// templates from the saved session are merged on top, deduped by id.
+const VALID_PARAM_TYPES = new Set<FunctionParamType>([
+  'bool', 'int', 'float', 'v2', 'v3', 'v4', 'colour', 'string'
+])
+const VALID_NATURES = new Set<FunctionParamNature>(['lin', 'log', 'exp'])
+const VALID_STREAM_MODES = new Set<FunctionStreamMode>([
+  'streaming', 'discrete', 'polling'
+])
+
+function sanitizeFunction(raw: unknown, idx: number): InstrumentFunction | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  if (typeof r.id !== 'string' || typeof r.name !== 'string') return null
+  return {
+    id: r.id,
+    name: r.name,
+    oscPath: typeof r.oscPath === 'string' ? r.oscPath : `param${idx + 1}`,
+    destIpOverride:
+      typeof r.destIpOverride === 'string' ? r.destIpOverride : undefined,
+    destPortOverride:
+      typeof r.destPortOverride === 'number' ? r.destPortOverride : undefined,
+    paramType:
+      typeof r.paramType === 'string' && VALID_PARAM_TYPES.has(r.paramType as FunctionParamType)
+        ? (r.paramType as FunctionParamType)
+        : 'float',
+    nature:
+      typeof r.nature === 'string' && VALID_NATURES.has(r.nature as FunctionParamNature)
+        ? (r.nature as FunctionParamNature)
+        : 'lin',
+    streamMode:
+      typeof r.streamMode === 'string' &&
+      VALID_STREAM_MODES.has(r.streamMode as FunctionStreamMode)
+        ? (r.streamMode as FunctionStreamMode)
+        : 'streaming',
+    min: typeof r.min === 'number' ? r.min : undefined,
+    max: typeof r.max === 'number' ? r.max : undefined,
+    init: typeof r.init === 'number' ? r.init : undefined,
+    unit: typeof r.unit === 'string' ? r.unit : undefined,
+    smoothMs: typeof r.smoothMs === 'number' ? r.smoothMs : undefined,
+    notes: typeof r.notes === 'string' ? r.notes : undefined
+  }
+}
+
+function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  if (typeof r.id !== 'string' || typeof r.name !== 'string') return null
+  const fns = (Array.isArray(r.functions) ? r.functions : [])
+    .map((f, i) => sanitizeFunction(f, i))
+    .filter((f): f is InstrumentFunction => f !== null)
+  return {
+    id: r.id,
+    name: r.name,
+    description: typeof r.description === 'string' ? r.description : '',
+    color: typeof r.color === 'string' ? r.color : '#888888',
+    destIp: typeof r.destIp === 'string' ? r.destIp : '127.0.0.1',
+    destPort: typeof r.destPort === 'number' ? r.destPort : 9000,
+    oscAddressBase: typeof r.oscAddressBase === 'string' ? r.oscAddressBase : '/instrument',
+    voices:
+      typeof r.voices === 'number' && r.voices >= 1 ? Math.floor(r.voices) : 1,
+    builtin: r.builtin === true,
+    functions: fns
+  }
+}
+
+function sanitizePool(raw: unknown): Pool {
+  const builtin = makeBuiltinPool()
+  const userTemplates = raw && typeof raw === 'object' && Array.isArray((raw as Pool).templates)
+    ? (raw as Pool).templates
+        .map((t) => sanitizeTemplate(t))
+        .filter((t): t is InstrumentTemplate => t !== null)
+    : []
+  // Merge: dedupe by id, builtin always wins so its definition can't be
+  // accidentally drifted by an old session file. User-authored entries
+  // (no id collision with builtins) are appended in order.
+  const seen = new Set<string>(builtin.templates.map((t) => t.id))
+  const merged: InstrumentTemplate[] = [...builtin.templates]
+  for (const t of userTemplates) {
+    if (seen.has(t.id)) continue
+    seen.add(t.id)
+    merged.push({ ...t, builtin: false })
+  }
+  return { templates: merged }
 }
 
 function sanitizeMetaController(mc: MetaController | undefined): MetaController {

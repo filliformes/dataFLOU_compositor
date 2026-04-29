@@ -19,6 +19,9 @@ interface Props {
   placeholder?: string
   className?: string
   title?: string
+  // Pass-through to the native input. Lets the Inspector pane render
+  // builtin / read-only Templates without forking the component.
+  disabled?: boolean
 }
 
 export function BoundedNumberInput({
@@ -29,7 +32,8 @@ export function BoundedNumberInput({
   integer = false,
   placeholder,
   className,
-  title
+  title,
+  disabled
 }: Props): JSX.Element {
   const [str, setStr] = useState(formatValue(value, integer))
   const focused = useRef(false)
@@ -50,6 +54,7 @@ export function BoundedNumberInput({
       value={str}
       placeholder={placeholder}
       title={title}
+      disabled={disabled}
       onFocus={() => {
         focused.current = true
       }}

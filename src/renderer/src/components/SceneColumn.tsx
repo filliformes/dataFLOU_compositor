@@ -343,16 +343,29 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
       </div>
       )}
 
-      {/* Cells — one per track, same height as track rows. */}
-      {tracks.map((t) => (
-        <div
-          key={t.id}
-          className="border-b border-border shrink-0"
-          style={{ height: rowHeight }}
-        >
-          <CellTile sceneId={sceneId} trackId={t.id} />
-        </div>
-      ))}
+      {/* Cells — one per track, same height as track rows. Template
+          rows are visual-only group headers (carried in tracks for the
+          sidebar's nesting); they don't have clips, so we render an
+          empty matching-height band that keeps every scene column aligned
+          with the sidebar row-by-row. */}
+      {tracks.map((t) =>
+        t.kind === 'template' ? (
+          <div
+            key={t.id}
+            className="border-b border-border shrink-0 bg-panel/40"
+            style={{ height: rowHeight }}
+            aria-hidden
+          />
+        ) : (
+          <div
+            key={t.id}
+            className="border-b border-border shrink-0"
+            style={{ height: rowHeight }}
+          >
+            <CellTile sceneId={sceneId} trackId={t.id} />
+          </div>
+        )
+      )}
 
       {/* Right-click context menu — portaled to <body> so it isn't clipped
           by the column's overflow boundary. Closes on click-outside or

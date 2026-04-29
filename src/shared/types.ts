@@ -228,15 +228,121 @@ export interface Cell {
 /** Max number of space-separated values allowed in a single Value box. */
 export const MAX_VALUE_TOKENS = 16
 
+// Track / Instrument vocabulary
+// ────────────────────────────────────────────────────────────────────────
+// Pre-merger naming: "Messages" = the rows in the Edit grid. Each row was
+// a flat OSC sender.
+//
+// Merger naming (this build): "Instruments". Each row is either:
+//   • a TEMPLATE header — a parent group à la Reaper, holds no clips itself
+//     but visually owns the rows below it; or
+//   • a FUNCTION row — child of a Template, owns clips like the old Messages.
+//
+// We keep the storage shape as a flat `tracks: Track[]` so the engine,
+// scene cell maps, MIDI bindings, etc. stay untouched. The new `kind` /
+// `parentTrackId` fields just describe the visual hierarchy.
+//
+// Old sessions (pre-merger) load with every track defaulted to
+// `kind: 'function'` / no parent — they render as orphan Functions, exactly
+// matching the previous look.
+export type TrackKind = 'template' | 'function'
+
 export interface Track {
   id: string
   name: string
+  // Reaper-style hierarchy. Templates are header rows that don't carry
+  // their own clips; Functions are the child rows that do.
+  kind: TrackKind
+  // Function rows point at their owning template (nullable for orphan
+  // functions instantiated outside any template).
+  parentTrackId?: string
+  // Source-of-truth for instantiated rows: the Pool template they came
+  // from. Lets us refresh defaults if the template definition changes.
+  // Both Template and Function rows can carry this.
+  sourceTemplateId?: string
+  sourceFunctionId?: string
   // Optional per-track defaults used by "Send to clips".
   defaultOscAddress?: string
   defaultDestIp?: string
   defaultDestPort?: number
   // MIDI binding for triggering this track's cell in the focused scene.
   midiTrigger?: MidiBinding
+}
+
+// Pool / Instrument Templates
+// ────────────────────────────────────────────────────────────────────────
+// A Template = a named bundle of pre-mapped Functions (e.g. OCTOCOSME with
+// volume / tilt / colour). Functions inside a Template inherit IP/port +
+// OSC base path from the template unless they override.
+//
+// This deliberately mirrors dataFLOU's `ParamMeta` vocabulary so the
+// eventual merger can import C++ library configs as Templates and export
+// the user's authored Templates back out:
+//   - paramType ↔ ParamType (Bool, Number, Vector, Colour, String…)
+//   - nature ↔ Nature (Lin / Log / Exp)
+//   - streamMode ↔ StreamMode (Streaming / Discrete / Polling)
+//   - unit ↔ unit
+//   - min/max/init ↔ range_min / range_max / range_init
+export type FunctionParamType =
+  | 'bool'
+  | 'int'
+  | 'float'
+  | 'v2'
+  | 'v3'
+  | 'v4'
+  | 'colour'
+  | 'string'
+
+export type FunctionParamNature = 'lin' | 'log' | 'exp'
+
+export type FunctionStreamMode = 'streaming' | 'discrete' | 'polling'
+
+export interface InstrumentFunction {
+  id: string
+  name: string                  // e.g. "Volume", "Tilt", "Colour"
+  // OSC path. May start with "/" or be relative to the template's base
+  // path (resolved at instantiation). e.g. "volume" + base "/octocosme"
+  // → "/octocosme/volume".
+  oscPath: string
+  // Optional per-function destination override. Inherits from template
+  // when absent.
+  destIpOverride?: string
+  destPortOverride?: number
+  // Typed parameter metadata — informational today, drives auto-rendered
+  // UI controls in a future iteration. Already useful for the merger
+  // conversation: every Function is self-describing.
+  paramType: FunctionParamType
+  nature: FunctionParamNature
+  streamMode: FunctionStreamMode
+  min?: number
+  max?: number
+  init?: number
+  unit?: string                 // "Hz", "dB", "°", "RGBA", "m/s", …
+  smoothMs?: number
+  // Free-form notes for the player.
+  notes?: string
+}
+
+export interface InstrumentTemplate {
+  id: string
+  name: string                  // e.g. "OCTOCOSME"
+  description: string
+  color: string                 // hex; drives the Pool / sidebar nesting tint
+  // Defaults inherited by every Function unless overridden.
+  destIp: string
+  destPort: number
+  oscAddressBase: string        // e.g. "/octocosme"
+  // Polyphony hint (informational for now; voice allocation is a later
+  // engine feature). 1 = monophonic.
+  voices: number
+  functions: InstrumentFunction[]
+  // True when this template is shipped by the app rather than authored
+  // by the user. Read-only in the inspector.
+  builtin?: boolean
+}
+
+export interface Pool {
+  templates: InstrumentTemplate[]
 }
 
 export interface Scene {
@@ -350,8 +456,13 @@ export interface Session {
   defaultOscAddress: string
   defaultDestIp: string
   defaultDestPort: number
-  tracks: Track[] // rows
+  tracks: Track[] // rows (Templates + Functions, see Track interface)
   scenes: Scene[] // columns
+  // Pool of authored Instrument Templates. Sourced from a builtin
+  // library + user-authored entries; persisted with the session so a
+  // session is self-contained. Templates instantiate into rows of the
+  // `tracks` array via the Pool drawer.
+  pool: Pool
   sequence: (string | null)[] // 128-length array; only first `sequenceLength` are used
   focusedSceneId: string | null
   midiInputName: string | null

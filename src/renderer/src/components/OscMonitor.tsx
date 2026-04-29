@@ -1,15 +1,21 @@
-// OSC monitor — bottom drawer that streams outgoing OSC messages for
-// debugging. Subscribes to `onOscEvents` (batched from main every 50ms),
-// keeps a ring buffer of the last MAX_ROWS messages, and renders them in a
-// scrollable log. Autoscroll sticks to the bottom unless the user scrolls up.
+// OSC monitor — bottom drawer that hosts THREE panes side-by-side:
+//   1. OSC log (left)            — outgoing OSC traffic, the original use.
+//   2. Pool (center)              — Instrument Templates + Functions library.
+//   3. Instruments Inspector (right) — edit the Pool selection's params.
 //
-// Default-off (per the simplex principle). The toggle lives in the prefs
-// sub-toolbar. When closed, this component unmounts entirely — no
-// subscription, no memory cost.
+// All three live in the same drawer so the user has one place to manage
+// "what instruments exist + what they're sending." Pool drag handles
+// instantiate Templates / Functions into the Edit-view sidebar.
+//
+// Default-off (per the simplex principle). The toggle lives in the top
+// toolbar. When closed, this component unmounts entirely — no subscription,
+// no memory cost.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { OscErrorEvent, OscEvent } from '@shared/types'
 import { useStore } from '../store'
+import PoolPane from './PoolPane'
+import InstrumentsInspectorPane from './InstrumentsInspectorPane'
 
 // Discriminated-union row so the log can interleave successful sends
 // with failures. Kind is the only distinguishing field; everything else
@@ -112,43 +118,57 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
 
   return (
     <div
+      // Bumped from 168 → 260 because we now host 3 panes side-by-side:
+      // OSC log | Pool | Instruments Inspector. The Pool needs vertical
+      // room to comfortably show 3-4 templates expanded, and the Inspector
+      // needs to fit the typical Function form (~9 fields).
       className="border-t border-border bg-panel flex flex-col shrink-0"
-      style={{ height: 168 }}
+      style={{ height: 260 }}
     >
-      {/* Header strip */}
-      <div className="flex items-center gap-2 px-2 py-1.5 border-b border-border">
-        <span className="label shrink-0">OSC Monitor</span>
-        <span className="text-muted text-[10px] shrink-0">
-          {rows.length} / {bufferRef.current.length}
-        </span>
-        <input
-          className="input w-48 text-[11px] py-0.5"
-          placeholder="Filter by address or ip:port"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-        />
-        <button
-          className={`btn text-[11px] py-0.5 ${paused ? 'bg-accent text-black border-accent' : ''}`}
-          onClick={() => setPaused((v) => !v)}
-          title={paused ? 'Resume capture' : 'Pause capture (events still flow, just not displayed)'}
-        >
-          {paused ? 'Paused' : 'Live'}
-        </button>
-        <button className="btn text-[11px] py-0.5" onClick={clearLog}>
-          Clear
-        </button>
+      {/* Top header strip — close button on the right; per-pane controls
+          live inside each pane's own header so each is self-contained. */}
+      <div className="flex items-center gap-2 px-2 py-1 border-b border-border">
+        <span className="label shrink-0">OSC Monitor + Pool</span>
         <div className="flex-1" />
-        <button className="btn text-[11px] py-0.5" onClick={onClose} title="Close monitor">
+        <button className="btn text-[11px] py-0.5" onClick={onClose} title="Close drawer">
           ×
         </button>
       </div>
 
-      {/* Log — monospace, fixed row height, pre-truncated args. */}
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
-      >
+      {/* Three-pane body. Borders between panes give the user a clear
+          read on "this is one widget with three sections." Each pane
+          owns its own scroll. */}
+      <div className="flex-1 min-h-0 flex">
+        {/* Pane 1 — OSC log (left, ~50%). */}
+        <div className="flex flex-col min-h-0 border-r border-border" style={{ flex: '2 1 0' }}>
+          {/* Log toolbar */}
+          <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0">
+            <span className="label">Log</span>
+            <span className="text-muted text-[10px]">
+              {rows.length} / {bufferRef.current.length}
+            </span>
+            <input
+              className="input flex-1 min-w-0 text-[11px] py-0.5"
+              placeholder="Filter by address or ip:port"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+            <button
+              className={`btn text-[10px] py-0.5 ${paused ? 'bg-accent text-black border-accent' : ''}`}
+              onClick={() => setPaused((v) => !v)}
+              title={paused ? 'Resume capture' : 'Pause capture (events still flow, just not displayed)'}
+            >
+              {paused ? 'Paused' : 'Live'}
+            </button>
+            <button className="btn text-[10px] py-0.5" onClick={clearLog}>
+              Clear
+            </button>
+          </div>
+          <div
+            ref={scrollRef}
+            onScroll={onScroll}
+            className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
+          >
         {rows.length === 0 ? (
           <div className="p-3 text-muted text-[11px]">
             No OSC traffic yet. Trigger a scene or clip to see messages here.
@@ -195,6 +215,23 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
             </div>
           ))
         )}
+          </div>
+        </div>
+
+        {/* Pane 2 — Pool (center). Lists Templates + Functions, drag
+            sources for the Edit-view sidebar. */}
+        <div
+          className="flex flex-col min-h-0 border-r border-border"
+          style={{ flex: '1 1 0', minWidth: 220 }}
+        >
+          <PoolPane />
+        </div>
+
+        {/* Pane 3 — Instruments Inspector (right). Edits the Pool's
+            current selection. */}
+        <div className="flex flex-col min-h-0" style={{ flex: '1 1 0', minWidth: 240 }}>
+          <InstrumentsInspectorPane />
+        </div>
       </div>
     </div>
   )

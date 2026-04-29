@@ -4,11 +4,14 @@ import type {
   Cell,
   ChaosParams,
   EnvelopeParams,
+  InstrumentFunction,
+  InstrumentTemplate,
   MetaController,
   MetaCurve,
   MetaKnob,
   Modulation,
   MultMode,
+  Pool,
   RampParams,
   RandomParams,
   SampleHoldParams,
@@ -383,10 +386,209 @@ export function makeScene(index: number): Scene {
   }
 }
 
+// Plain orphan-Function track — what the old "Add Message" produced.
+// Kept as the default makeTrack() so other code paths that already call
+// makeTrack(idx) without thinking about Templates keep working.
 export function makeTrack(index: number): Track {
   return {
     id: uid('t_'),
-    name: `Message ${index + 1}`
+    name: `Instrument ${index + 1}`,
+    kind: 'function'
+  }
+}
+
+// Header-row track for an instantiated Template. Holds no clips; just
+// owns the visual group of Function rows below it via parentTrackId.
+export function makeTemplateTrack(template: InstrumentTemplate): Track {
+  return {
+    id: uid('t_'),
+    name: template.name,
+    kind: 'template',
+    sourceTemplateId: template.id,
+    defaultOscAddress: template.oscAddressBase,
+    defaultDestIp: template.destIp,
+    defaultDestPort: template.destPort
+  }
+}
+
+// Function-row track instantiated from a Template's Function spec. The
+// row inherits IP/port from the template unless the function overrides;
+// the resolved OSC address is "<template.base>/<function.oscPath>" with
+// a single slash between (or just function.oscPath when it starts with /).
+export function makeFunctionTrack(
+  template: InstrumentTemplate,
+  fn: InstrumentFunction,
+  parentTrackId: string
+): Track {
+  const base = template.oscAddressBase ?? ''
+  const path = fn.oscPath ?? ''
+  const resolvedOscAddress = path.startsWith('/')
+    ? path
+    : (base.endsWith('/') ? base.slice(0, -1) : base) + '/' + path
+  return {
+    id: uid('t_'),
+    name: fn.name,
+    kind: 'function',
+    parentTrackId,
+    sourceTemplateId: template.id,
+    sourceFunctionId: fn.id,
+    defaultOscAddress: resolvedOscAddress,
+    defaultDestIp: fn.destIpOverride ?? template.destIp,
+    defaultDestPort: fn.destPortOverride ?? template.destPort
+  }
+}
+
+// Default for "Add Function" inside a Template authoring flow.
+export function makeFunctionSpec(
+  index: number,
+  paramType: InstrumentFunction['paramType'] = 'float'
+): InstrumentFunction {
+  return {
+    id: uid('fn_'),
+    name: `Function ${index + 1}`,
+    oscPath: `param${index + 1}`,
+    paramType,
+    nature: 'lin',
+    streamMode: 'streaming',
+    min: paramType === 'bool' ? 0 : 0,
+    max: paramType === 'bool' ? 1 : 1,
+    init: 0
+  }
+}
+
+// Default for "New Template" in the Pool authoring flow.
+export function makeTemplateSpec(index: number): InstrumentTemplate {
+  return {
+    id: uid('tpl_'),
+    name: `Template ${index + 1}`,
+    description: '',
+    color: randomSceneColor(),
+    destIp: '127.0.0.1',
+    destPort: 9000,
+    oscAddressBase: `/instr${index + 1}`,
+    voices: 1,
+    builtin: false,
+    functions: [makeFunctionSpec(0)]
+  }
+}
+
+// Pre-shipped templates. Deliberately small + concrete — these
+// double as documentation of the Pool concept. `builtin: true` makes
+// them read-only in the Inspector but still cloneable.
+export function makeBuiltinPool(): Pool {
+  return {
+    templates: [
+      {
+        id: 'tpl_octocosme',
+        name: 'OCTOCOSME',
+        description:
+          'Octocosme installation — 5 RGB LED rings + a strip RGB. Per Vincent\'s show patch.',
+        color: '#ff7a3d',
+        destIp: '192.168.101.255',
+        destPort: 8888,
+        oscAddressBase: '/octocosme',
+        voices: 1,
+        builtin: true,
+        functions: [
+          {
+            id: 'fn_octo_rgba1',
+            name: 'Ring RGBs',
+            oscPath: 'rgba1',
+            paramType: 'v3',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 255,
+            init: 0,
+            unit: 'RGB',
+            notes: '5 LEDs × 3 channels = 15 ints'
+          },
+          {
+            id: 'fn_octo_rgba2',
+            name: 'Strip RGB',
+            oscPath: 'rgba2',
+            paramType: 'colour',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 255,
+            init: 0,
+            unit: 'RGB'
+          }
+        ]
+      },
+      {
+        id: 'tpl_xyz',
+        name: 'Generic XYZ',
+        description: 'Three-axis pad. Common controller for any X/Y/Z device.',
+        color: '#5dd6c4',
+        destIp: '127.0.0.1',
+        destPort: 9000,
+        oscAddressBase: '/xyz',
+        voices: 1,
+        builtin: true,
+        functions: [
+          {
+            id: 'fn_xyz_x',
+            name: 'X',
+            oscPath: 'x',
+            paramType: 'float',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 1,
+            init: 0.5,
+            unit: ''
+          },
+          {
+            id: 'fn_xyz_y',
+            name: 'Y',
+            oscPath: 'y',
+            paramType: 'float',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 1,
+            init: 0.5
+          },
+          {
+            id: 'fn_xyz_z',
+            name: 'Z',
+            oscPath: 'z',
+            paramType: 'float',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 1,
+            init: 0.5
+          }
+        ]
+      },
+      {
+        id: 'tpl_pandore',
+        name: 'Pandore',
+        description: 'Pandore digital instrument prototyping platform — placeholder until DECLARE import lands.',
+        color: '#9b6dff',
+        destIp: '127.0.0.1',
+        destPort: 9001,
+        oscAddressBase: '/pandore',
+        voices: 1,
+        builtin: true,
+        functions: [
+          {
+            id: 'fn_pandore_value',
+            name: 'Value',
+            oscPath: 'value',
+            paramType: 'float',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 1,
+            init: 0
+          }
+        ]
+      }
+    ]
   }
 }
 
@@ -407,7 +609,8 @@ export function makeEmptySession(): Session {
     sequence: new Array(128).fill(null),
     focusedSceneId: scene.id,
     midiInputName: null,
-    metaController: makeMetaController()
+    metaController: makeMetaController(),
+    pool: makeBuiltinPool()
   }
   // Default sequence is empty — users drag scenes into slots explicitly.
   // Previously slot 0 was pre-filled with the default scene, which was
