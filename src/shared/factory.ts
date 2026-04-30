@@ -596,38 +596,143 @@ export function makeBuiltinPool(): Pool {
         id: 'tpl_octocosme',
         name: 'OCTOCOSME',
         description:
-          'Octocosme installation — 5 RGB LED rings + a strip RGB. Per Vincent\'s show patch.',
+          'Octocosme V9 — sends OSC to the Pure Data software (port 1986). ' +
+          'Each Parameter is a complete bundle expected by the patch\'s else/osc.route ' +
+          'receivers. The Teensy hardware controller and the compositor can both feed ' +
+          'the same patch in parallel without conflict (UDP allows multiple senders); ' +
+          'just don\'t fight over the same control at the same moment. ' +
+          'IMPORTANT: every bundle must be prefixed with 2 dummy header args ' +
+          '(string + int) — e.g. "compositor 0 0.5 0.5 …" — because the Pd patch\'s ' +
+          '`list split 2` strips a sender_ip + timestamp pair before the data unpack. ' +
+          'See each Parameter\'s notes for the per-bundle order.',
         color: '#ff7a3d',
-        destIp: '192.168.101.255',
-        destPort: 8888,
-        oscAddressBase: '/octocosme',
+        destIp: '127.0.0.1',
+        destPort: 1986,
+        oscAddressBase: '',
         voices: 1,
         builtin: true,
         functions: [
           {
-            id: 'fn_octo_rgba1',
-            name: 'Ring RGBs',
-            oscPath: 'rgba1',
-            paramType: 'v3',
+            id: 'fn_octo_voice_pots',
+            name: 'Voice Pots',
+            oscPath: '/A/strips/pots',
+            paramType: 'float',
             nature: 'lin',
             streamMode: 'streaming',
             min: 0,
-            max: 255,
-            init: 0,
-            unit: 'RGB',
-            notes: '5 LEDs × 3 channels = 15 ints'
+            max: 1,
+            init: 0.5,
+            notes:
+              '12 floats after the 2-arg prefix, in order: ' +
+              'HAUTEUR1, HAUTEUR2, HAUTEUR3, HAUTEUR4, ' +
+              'MODA1, MODA2, MODA3, MODA4, ' +
+              'MODB1, MODB2, MODB3, MODB4. ' +
+              'Each 0–1. Drives per-voice pitch + ModA + ModB on Voices 1–4. ' +
+              'Example clip Value: "compositor 0 0.5 0.5 0.5 0.5 0 0 0 0 0 0 0 0".'
           },
           {
-            id: 'fn_octo_rgba2',
-            name: 'Strip RGB',
-            oscPath: 'rgba2',
-            paramType: 'colour',
+            id: 'fn_octo_voice_volumes',
+            name: 'Voice Volumes',
+            oscPath: '/B/strips/pots',
+            paramType: 'float',
             nature: 'lin',
             streamMode: 'streaming',
             min: 0,
-            max: 255,
+            max: 1,
+            init: 0.5,
+            notes:
+              '4 floats after the prefix: VOLUME1, VOLUME2, VOLUME3, VOLUME4. ' +
+              'Each 0–1. Per-voice gain. ' +
+              'Example: "compositor 0 0.5 0.5 0.5 0.5".'
+          },
+          {
+            id: 'fn_octo_voice_instruments',
+            name: 'Voice Instruments',
+            oscPath: '/A/strips/switches',
+            paramType: 'int',
+            nature: 'lin',
+            streamMode: 'discrete',
+            min: 0,
+            max: 7,
             init: 0,
-            unit: 'RGB'
+            notes:
+              '4 ints after the prefix: INSTRU1, INSTRU2, INSTRU3, INSTRU4. ' +
+              'Each 0–7, picks one of 8 instruments per voice ' +
+              '(0=SuperMorpher, 1=MeloWave, 2=TremWave, 3=VibeWave, ' +
+              '4=Electric, 5=ResoNoise, 6=TremNoise, 7=RandomNoise). ' +
+              'Example: "compositor 0 0 1 2 3".'
+          },
+          {
+            id: 'fn_octo_voice_kills',
+            name: 'Voice Kills',
+            oscPath: '/B/strips/switches',
+            paramType: 'bool',
+            nature: 'lin',
+            streamMode: 'discrete',
+            min: 0,
+            max: 1,
+            init: 0,
+            notes:
+              '4 bools after the prefix: KILL1, KILL2, KILL3, KILL4 ' +
+              '(send 0 or 1 each). Example: "compositor 0 0 0 0 0".'
+          },
+          {
+            id: 'fn_octo_global_fx',
+            name: 'Global FX',
+            oscPath: '/A/global/pots',
+            paramType: 'float',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 1,
+            init: 0.5,
+            notes:
+              '6 floats after the prefix: VOLUME, FILTRE, MOUVEMENT, DELAI, ' +
+              'AMBIANCE, DISTORSION. Each 0–1. Master FX chain controls. ' +
+              'Example: "compositor 0 0.5 0.5 0 0 0.2 0".'
+          },
+          {
+            id: 'fn_octo_global_notes',
+            name: 'Notes / Variation / Vitesse',
+            oscPath: '/B/global/pots',
+            paramType: 'float',
+            nature: 'lin',
+            streamMode: 'streaming',
+            min: 0,
+            max: 1,
+            init: 0,
+            notes:
+              '3 floats after the prefix: NOTES, VARIATION, VITESSE. ' +
+              'Each 0–1. Drives global note generation / arpeggiation. ' +
+              'Example: "compositor 0 0.5 0 0".'
+          },
+          {
+            id: 'fn_octo_intervalle',
+            name: 'Intervalle',
+            oscPath: '/A/global/switches',
+            paramType: 'int',
+            nature: 'lin',
+            streamMode: 'discrete',
+            min: 0,
+            max: 15,
+            init: 0,
+            notes:
+              '1 int after the prefix: INTERVALLE (0–15, 16 chord/scale presets). ' +
+              'Example: "compositor 0 5".'
+          },
+          {
+            id: 'fn_octo_modes',
+            name: 'Global / Touch Mode',
+            oscPath: '/B/global/switches',
+            paramType: 'bool',
+            nature: 'lin',
+            streamMode: 'discrete',
+            min: 0,
+            max: 1,
+            init: 0,
+            notes:
+              '2 bools after the prefix: GLOBAL_MODE, TOUCH_MODE (0 or 1 each). ' +
+              'Example: "compositor 0 0 0".'
           }
         ]
       },
