@@ -1477,26 +1477,32 @@ export const useStore = create<State>((set, get) => ({
     })),
 
   ensureCell: (sceneId, trackId) =>
-    set((st) => ({
-      session: {
-        ...st.session,
-        scenes: st.session.scenes.map((s) => {
-          if (s.id !== sceneId) return s
-          if (s.cells[trackId]) return s
-          return {
-            ...s,
-            cells: {
-              ...s.cells,
-              [trackId]: makeCell({
-                destIp: st.session.defaultDestIp,
-                destPort: st.session.defaultDestPort,
-                oscAddress: st.session.defaultOscAddress
-              })
+    set((st) => {
+      const track = st.session.tracks.find((t) => t.id === trackId)
+      const def = resolveCellDefaults(st.session, track)
+      return {
+        session: {
+          ...st.session,
+          scenes: st.session.scenes.map((s) => {
+            if (s.id !== sceneId) return s
+            if (s.cells[trackId]) return s
+            const cell = makeCell({
+              destIp: def.destIp,
+              destPort: def.destPort,
+              oscAddress: def.oscAddress
+            })
+            // Override the linked flags — a cell sourced from a
+            // track default is NOT tracking the session default.
+            cell.destLinkedToDefault = def.destLinked
+            cell.addressLinkedToDefault = def.addressLinked
+            return {
+              ...s,
+              cells: { ...s.cells, [trackId]: cell }
             }
-          }
-        })
+          })
+        }
       }
-    })),
+    }),
   removeCell: (sceneId, trackId) =>
     set((st) => {
       const matches = (r: { sceneId: string; trackId: string }): boolean =>
@@ -1923,14 +1929,21 @@ export const useStore = create<State>((set, get) => ({
       // Templates persist in localStorage across app versions, so an old
       // template may be missing fields the current Cell schema requires
       // (e.g. `modulation.envelope`, `sequencer`, `scaleToUnit`). Merge the
-      // template on top of a fresh makeCell() baseline with this session's
-      // defaults — any missing field falls back to a sensible default
-      // instead of crashing the renderer when components read it.
+      // template on top of a fresh makeCell() baseline with the right
+      // defaults for THIS track — Pool-instantiated tracks have their
+      // own default IP/port/address (e.g. OCTOCOSME's /A/strips/pots),
+      // and the cell should inherit those if the template doesn't
+      // override them. Any field the template doesn't carry falls back
+      // to the resolved track / session default.
+      const track = st.session.tracks.find((t) => t.id === trackId)
+      const def = resolveCellDefaults(st.session, track)
       const base = makeCell({
-        destIp: st.session.defaultDestIp,
-        destPort: st.session.defaultDestPort,
-        oscAddress: st.session.defaultOscAddress
+        destIp: def.destIp,
+        destPort: def.destPort,
+        oscAddress: def.oscAddress
       })
+      base.destLinkedToDefault = def.destLinked
+      base.addressLinkedToDefault = def.addressLinked
       const tc = tpl.cell as Partial<Cell>
       const tm = tc.modulation as Partial<Cell['modulation']> | undefined
       const ts = tc.sequencer as Partial<Cell['sequencer']> | undefined
@@ -2108,6 +2121,46 @@ useStore.subscribe((state) => {
 function clampInt(v: number, lo: number, hi: number): number {
   const n = Math.round(v)
   return n < lo ? lo : n > hi ? hi : n
+}
+
+// Resolve the right destIp / destPort / oscAddress for a freshly-
+// created cell on `track`. Track-level defaults (set when a Pool
+// Template instantiates) win over session defaults — so dropping an
+// OCTOCOSME Instrument and then adding clips on its child Parameters
+// inherits each Parameter's `/A/strips/pots` etc. without forcing
+// the user to retype them on every cell.
+//
+// `linked` flags indicate "this cell tracks the SESSION default";
+// they're false when we sourced from track defaults so a future
+// session-default change doesn't silently rewrite this cell.
+function resolveCellDefaults(
+  session: Session,
+  track: Track | undefined
+): {
+  destIp: string
+  destPort: number
+  oscAddress: string
+  destLinked: boolean
+  addressLinked: boolean
+} {
+  const trackIp = track?.defaultDestIp
+  const trackPort = track?.defaultDestPort
+  const trackAddr = track?.defaultOscAddress
+  const trackHasIp = trackIp != null && trackIp !== ''
+  const trackHasPort = trackPort != null && trackPort > 0
+  const trackHasAddr = trackAddr != null && trackAddr !== ''
+  // destLinkedToDefault covers ip+port together (matches the
+  // existing freeze-on-change behavior in setDefaults). If the
+  // track overrides EITHER, treat the cell as decoupled from the
+  // session dest default.
+  const trackHasDest = trackHasIp || trackHasPort
+  return {
+    destIp: trackHasIp ? (trackIp as string) : session.defaultDestIp,
+    destPort: trackHasPort ? (trackPort as number) : session.defaultDestPort,
+    oscAddress: trackHasAddr ? (trackAddr as string) : session.defaultOscAddress,
+    destLinked: !trackHasDest,
+    addressLinked: !trackHasAddr
+  }
 }
 
 function clampFloat(v: number, lo: number, hi: number): number {

@@ -200,6 +200,18 @@ export default function TrackSidebar(): JSX.Element {
         /* ignore */
       }
     }
+    // After a Pool drop, Electron / Chromium can leave the HTML5 drag
+    // controller in a sticky state where the source pill (still living
+    // in the OSC drawer) holds the document's "drag interest" until
+    // the window loses + regains focus. The visible symptom: clicking
+    // a freshly-instantiated track's name input doesn't accept
+    // keystrokes until the user alt-tabs away and back. Defer one
+    // microtask after dragend, then explicitly release the active
+    // element — kicks the controller out of its sticky state.
+    requestAnimationFrame(() => {
+      const el = document.activeElement as HTMLElement | null
+      el?.blur()
+    })
   }
 
   return (
