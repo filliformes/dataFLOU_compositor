@@ -6,9 +6,137 @@ import {
   effectiveLfoHz,
   generateStepValue
 } from '@shared/factory'
+import type { ParamArgSpec } from '@shared/types'
 import { DestHealthDot } from './DestHealthDot'
 
 const DRAG_MIME = 'application/x-dataflou-cell'
+
+// Cap the rendered length of a single numeric token in the clip
+// tile. OCTOCOSME-style 12-float bundles with 7-decimal mantissas
+// otherwise blow the column width way out (`0.7895432` * 12 ≈ 130
+// chars). Inspector still sees the full precision. Strings, bool
+// tokens, and ints pass through unchanged.
+const CLIP_TOKEN_MAX_CHARS = 5
+function truncateClipToken(tok: string): string {
+  // Only trim numeric-looking tokens. Leave anything with non-digit
+  // / non-decimal-separator characters alone (OSC addresses, sender
+  // names, etc.).
+  if (!/^-?\d+(\.\d+)?$/.test(tok)) return tok
+  if (tok.length <= CLIP_TOKEN_MAX_CHARS) return tok
+  const n = parseFloat(tok)
+  if (!Number.isFinite(n)) return tok
+  // Integers: show as-is (cropping digits would change the
+  // magnitude, which is much worse than a wide column).
+  if (Number.isInteger(n)) return tok
+  // Floats: clip the trailing decimals so the whole string fits in
+  // CLIP_TOKEN_MAX_CHARS. Min one digit after the dot.
+  const sign = n < 0 ? '-' : ''
+  const abs = Math.abs(n)
+  const intStr = String(Math.trunc(abs))
+  // Budget for after the dot = MAX - sign - intStr - "." sep, ≥ 1.
+  const budget = CLIP_TOKEN_MAX_CHARS - sign.length - intStr.length - 1
+  if (budget <= 0) return tok // integer part already too big — punt
+  const fixed = abs.toFixed(budget)
+  return sign + fixed
+}
+
+// Render `cell.value` for the GRID TILE only. Three transforms:
+//   1. Drop fixed argSpec slots — the engine re-prepends them at
+//      send time, but the user doesn't care about seeing
+//      `192.168.x.x 17` before every float on their OCTOCOSME cells.
+//   2. Round numeric tokens longer than CLIP_TOKEN_MAX_CHARS.
+//   3. Pass everything through unchanged when there's no argSpec
+//      (single-arg cells render verbatim).
+// The Inspector, the engine, and `cell.value` itself are unchanged.
+function formatCellDisplayValue(
+  raw: string,
+  argSpec: ParamArgSpec[] | undefined
+): string {
+  const tokens = raw.trim().split(/\s+/).filter((t) => t.length > 0)
+  if (!argSpec || argSpec.length === 0) {
+    return tokens.map(truncateClipToken).join(' ')
+  }
+  const out: string[] = []
+  for (let i = 0; i < tokens.length; i++) {
+    const spec = argSpec[i]
+    if (spec && spec.fixed !== undefined) continue
+    out.push(truncateClipToken(tokens[i]))
+  }
+  return out.join(' ')
+}
+
+// How many tokens per row in the value grid. Past 4, tokens wrap to
+// a new row instead of stretching the column horizontally — keeps a
+// 12-float OCTOCOSME cell readable inside a normal-width column.
+const CELL_TOKENS_PER_ROW = 4
+
+// Cell value renderer. Splits the post-formatter display string back
+// into tokens and lays them out in an auto-sizing CSS grid with up
+// to 4 columns. ≤4 tokens render as a single row (matching the old
+// inline look); >4 wrap into two or more rows. The whole grid sits
+// inside an overflow-hidden parent so the wrapped rows stay within
+// the clip's box — if the user wants more vertical room, they can
+// drag the row-height slider up. Live engine values get the accent
+// color, same as before.
+function CellValueGrid({
+  display,
+  isLiveDisplay
+}: {
+  display: string
+  isLiveDisplay: boolean
+}): JSX.Element {
+  const tokens = display.trim().split(/\s+/).filter((t) => t.length > 0)
+  if (tokens.length === 0) {
+    return (
+      <span
+        className={`text-[14px] font-mono font-semibold ${
+          isLiveDisplay ? 'text-accent' : ''
+        }`}
+      >
+        &nbsp;
+      </span>
+    )
+  }
+  // ≤4 tokens: single line — keeps the legacy compact look so simple
+  // single-arg or vec3/vec4 cells don't suddenly take more vertical
+  // space than they used to.
+  if (tokens.length <= CELL_TOKENS_PER_ROW) {
+    return (
+      <span
+        className={`text-[14px] font-mono font-semibold whitespace-nowrap ${
+          isLiveDisplay ? 'text-accent' : ''
+        }`}
+      >
+        {tokens.join(' ')}
+      </span>
+    )
+  }
+  // >4 tokens: render as a 4-column CSS grid. `auto` columns size to
+  // the widest token in each column (so floats with different
+  // magnitudes line up vertically). Compact font + tight line height
+  // + zero row gap so a 12-arg OCTOCOSME bundle (3 rows of 4) fits
+  // in the default row height without cropping the bottom row.
+  // User can still drag the row-height slider for even more
+  // headroom on deeply-nested cells.
+  return (
+    <div
+      className={`grid gap-x-1.5 font-mono text-[9px] font-semibold w-full leading-none ${
+        isLiveDisplay ? 'text-accent' : ''
+      }`}
+      style={{
+        gridTemplateColumns: `repeat(${CELL_TOKENS_PER_ROW}, minmax(0, auto))`,
+        justifyContent: 'start',
+        rowGap: '2px'
+      }}
+    >
+      {tokens.map((t, i) => (
+        <span key={i} className="truncate py-px" title={t}>
+          {t}
+        </span>
+      ))}
+    </div>
+  )
+}
 
 export default function CellTile({
   sceneId,
@@ -19,6 +147,16 @@ export default function CellTile({
 }): JSX.Element {
   const scene = useStore((s) => s.session.scenes.find((sc) => sc.id === sceneId))
   const cell = scene?.cells[trackId]
+  // Track lookup — used to read argSpec so we can hide the
+  // auto-prefix (fixed) tokens from the clip-tile display + round
+  // long floats. The Inspector still shows full precision; only
+  // the grid tile is cosmetic.
+  const track = useStore((s) => s.session.tracks.find((t) => t.id === trackId))
+  // Row height drives adaptive layout: at very small heights we
+  // drop the ip:port row + footer chips entirely so the value grid
+  // gets every available pixel. Avoids mid-letter clipping when
+  // the user pulls the row-height slider all the way down.
+  const rowHeight = useStore((s) => s.rowHeight)
   const ensureCell = useStore((s) => s.ensureCell)
   const removeCell = useStore((s) => s.removeCell)
   const selectCell = useStore((s) => s.selectCell)
@@ -100,10 +238,17 @@ export default function CellTile({
     cell?.sequencer.bounceDecay,
     currentStep
   ])
-  const displayValue =
+  const rawDisplayValue =
     isPlaying && liveValue !== undefined
       ? liveValue
       : generativePreview ?? cell?.value ?? ''
+  // Cosmetic transform — drop the auto-prefix tokens (`fixed`
+  // argSpec entries; usually an IP / sequence-id the engine
+  // re-prepends at send time) and trim per-token precision so a
+  // 12-float OCTOCOSME-style bundle doesn't blow the column width
+  // out to fit `0.7895432 0.7895432 …`. The Inspector keeps full
+  // precision; this is the grid tile's display only.
+  const displayValue = formatCellDisplayValue(rawDisplayValue, track?.argSpec)
   // Whether the displayed value comes from the engine (live) or from
   // either the generative preview or the static seed. Drives the
   // accent-tinted styling so live values pop visually.
@@ -115,6 +260,7 @@ export default function CellTile({
   const compact = tracksCollapsedRaw || showMode
   const templates = useStore((s) => s.clipTemplates)
   const applyClipTemplate = useStore((s) => s.applyClipTemplate)
+  const saveClipAsTemplate = useStore((s) => s.saveClipAsTemplate)
   const midiLearnMode = useStore((s) => s.midiLearnMode)
   const midiLearnTarget = useStore((s) => s.midiLearnTarget)
   const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
@@ -197,7 +343,16 @@ export default function CellTile({
   // Plain click on a filled clip: single-select. Ctrl+click: toggle this
   // cell in the disjoint multi-selection. Keeps right-click's "act on
   // everything that's selected" semantics straightforward.
+  //
+  // stopPropagation prevents the SceneColumn root's `onClick` from
+  // firing setFocusedScene as a side effect — that bubble used to
+  // co-set `selectedSceneIds = [id]` on every cell click, which made
+  // the Del-key handler think the user wanted to delete the WHOLE
+  // SCENE rather than the cell's track. Cell clicks should be
+  // exclusively about the cell; if the user wants to focus the
+  // scene, they click the header.
   function onClickCell(e: React.MouseEvent): void {
+    e.stopPropagation()
     if (e.ctrlKey || e.metaKey) {
       toggleCellSelection(sceneId, trackId)
     } else {
@@ -477,6 +632,23 @@ export default function CellTile({
             applyDefaultOscToCells(filledMenu.targets)
             setFilledMenu(null)
           }}
+          onSaveAsTemplate={() => {
+            // Save the FIRST target's cell as a new clip template.
+            // Multi-selection saves only one — saving N copies of
+            // the same template at once isn't useful, and asking
+            // for N names would be a wall of modals. Auto-name from
+            // the track + scene so the user sees something
+            // meaningful in the Apply-template list; rename via
+            // the Inspector after the fact if needed.
+            const first = filledMenu.targets[0]
+            const st = useStore.getState()
+            const tr = st.session.tracks.find((t) => t.id === first.trackId)
+            const sc = st.session.scenes.find((s) => s.id === first.sceneId)
+            const autoName =
+              `${tr?.name ?? 'Clip'} — ${sc?.name ?? ''}`.trim().replace(/\s+—\s+$/, '')
+            saveClipAsTemplate(first.sceneId, first.trackId, autoName)
+            setFilledMenu(null)
+          }}
           onClose={() => setFilledMenu(null)}
         />
       )}
@@ -487,7 +659,7 @@ export default function CellTile({
   return (
     <>
     <div
-      className={`relative h-full flex flex-col px-1.5 py-1 cursor-pointer ${
+      className={`relative h-full flex flex-col px-1.5 py-0.5 cursor-pointer ${
         inMulti || selected ? 'bg-panel2 border-l-2 border-l-accent2' : 'hover:bg-panel3/30'
       }`}
       draggable
@@ -530,25 +702,39 @@ export default function CellTile({
       </div>
       {/* Row 2: ip:port — secondary info, smaller, allowed to truncate.
           Health dot appears when this destination has had a send failure
-          in the last 5 s (from main's oscErrors IPC stream). */}
-      <div
-        className="text-[10px] text-muted truncate mt-0.5 flex items-center gap-1"
-        title={`${cell.destIp}:${cell.destPort}`}
-      >
-        <DestHealthDot ip={cell.destIp} port={cell.destPort} />
-        <span className="truncate">
-          {cell.destIp}:{cell.destPort}
-        </span>
-      </div>
-      <div className="flex-1 flex items-center">
-        <span
-          className={`text-[14px] font-mono font-semibold whitespace-nowrap ${
-            isLiveDisplay ? 'text-accent' : ''
-          }`}
+          in the last 5 s (from main's oscErrors IPC stream). Tightened
+          to leading-tight + 9px text so multi-arg cells get more
+          vertical room for their wrapped 4-col value grid.
+          Hidden below 75 px row height — the ip:port is rarely
+          glanced at compared to the value, and the row gains ~12 px
+          of room for the multi-arg grid without it. The OSC address
+          row above still carries the addressing info, and the
+          Inspector still shows the full destination. */}
+      {rowHeight >= 75 && (
+        <div
+          className="text-[9px] text-muted truncate flex items-center gap-1 leading-tight"
+          title={`${cell.destIp}:${cell.destPort}`}
         >
-          {displayValue}
-        </span>
+          <DestHealthDot ip={cell.destIp} port={cell.destPort} />
+          <span className="truncate">
+            {cell.destIp}:{cell.destPort}
+          </span>
+        </div>
+      )}
+      <div className="flex-1 min-h-0 flex items-start overflow-hidden mt-0.5">
+        <CellValueGrid
+          display={displayValue}
+          isLiveDisplay={isLiveDisplay}
+        />
       </div>
+      {/* Modulator / sequencer / timing / transport-badge footer.
+          Hidden below 60 px row height so the value grid grabs the
+          last ~12 px — at that size the user has explicitly chosen
+          a compact view and the chips are the lowest-priority info
+          (still editable via the inspector). The transport badge
+          stays visible at any row height >=60 since OSC/MIDI mute
+          state is the most actionable footer info. */}
+      {rowHeight >= 60 && (
       <div className="flex items-center gap-1 text-[9px] text-muted">
         {modOn && cell.modulation.type === 'lfo' && (
           <span className="text-accent2">
@@ -607,15 +793,33 @@ export default function CellTile({
               : `SEQ${cell.sequencer.steps}`}
           </span>
         )}
-        {cell.delayMs > 0 && (
+        {cell.timingEnabled === true && cell.delayMs > 0 && (
           <span title="Delay before trigger (ms)">⟲{cell.delayMs}ms</span>
         )}
-        {cell.transitionMs > 0 && (
+        {cell.timingEnabled === true && cell.transitionMs > 0 && (
           <span title="Trigger transition — morph time from current output to the clip's value when the clip is triggered. Unrelated to the modulator; change it in the inspector's Transition field.">
             ~{cell.transitionMs}ms
           </span>
         )}
+        <span className="flex-1" />
+        {/* Right edge stack — when MIDI is enabled, the live MIDI
+            byte sits ABOVE the transport badge so the user can read
+            "what's currently going out on the MIDI wire" at a glance.
+            For CC mode → the 0..127 byte; for Note mode → "note→vel".
+            Distinct violet/teal hue from the orange accent used by
+            the OSC live value above the row. */}
+        <div className="flex flex-col items-end shrink-0 gap-0.5">
+          <ClipMidiLiveValue
+            cell={cell}
+            displayValue={isLiveDisplay ? displayValue : null}
+          />
+          <ClipTransportBadge
+            oscOn={(cell.oscEnabled ?? true) && !!cell.oscAddress}
+            midiOn={!!cell.midiOut?.enabled && !!cell.midiOut.portName}
+          />
+        </div>
       </div>
+      )}
     </div>
     {filledMenu && (
       <FilledCellMenu
@@ -629,6 +833,16 @@ export default function CellTile({
         }}
         onUseDefaultOsc={() => {
           applyDefaultOscToCells(filledMenu.targets)
+          setFilledMenu(null)
+        }}
+        onSaveAsTemplate={() => {
+          const first = filledMenu.targets[0]
+          const st = useStore.getState()
+          const tr = st.session.tracks.find((t) => t.id === first.trackId)
+          const sc = st.session.scenes.find((s) => s.id === first.sceneId)
+          const autoName =
+            `${tr?.name ?? 'Clip'} — ${sc?.name ?? ''}`.trim().replace(/\s+—\s+$/, '')
+          saveClipAsTemplate(first.sceneId, first.trackId, autoName)
           setFilledMenu(null)
         }}
         onClose={() => setFilledMenu(null)}
@@ -727,6 +941,7 @@ function FilledCellMenu({
   templates,
   onApplyTemplate,
   onUseDefaultOsc,
+  onSaveAsTemplate,
   onClose
 }: {
   x: number
@@ -735,6 +950,7 @@ function FilledCellMenu({
   templates: { id: string; name: string }[]
   onApplyTemplate: (id: string) => void
   onUseDefaultOsc: () => void
+  onSaveAsTemplate: () => void
   onClose: () => void
 }): JSX.Element {
   useEffect(() => {
@@ -786,7 +1002,139 @@ function FilledCellMenu({
       >
         Use Default OSC
       </button>
+      <div className="border-t border-border my-1" />
+      {/* Save the (first) clip as a reusable Clip template. The new
+          template shows up in the Apply-template list above + in the
+          Inspector's Templates section, ready to drop onto any other
+          empty clip slot. */}
+      <button
+        className="w-full text-left px-3 py-1 hover:bg-panel2"
+        onClick={onSaveAsTemplate}
+        title={
+          plural
+            ? 'Save the FIRST selected clip as a reusable Clip template (multi-save would create N identical copies — skipped). Rename via the Inspector after.'
+            : 'Save this clip’s value + modulation + sequencer as a reusable Clip template'
+        }
+      >
+        Save Clip as Template
+        {plural && (
+          <span className="text-muted text-[10px] ml-1">(first only)</span>
+        )}
+      </button>
     </div>,
     document.body
+  )
+}
+
+// Tiny coloured badge at the bottom-right of every clip tile so the
+// user can scan the grid and see which clips fire which transport.
+// Three states: OSC only (slate), MIDI only (violet), both (teal).
+// When the clip has neither (a Parameter with a blank OSC address +
+// disabled MIDI), no badge is rendered.
+// Live MIDI byte for the cell tile. Renders just above the
+// transport badge in the bottom-right of the clip. When MIDI is
+// configured + the cell is currently playing (displayValue
+// non-null), shows the byte the engine is about to put on the MIDI
+// wire. Distinct violet (CC) / teal (Note) colour so it doesn't
+// blend with the orange OSC live value above the row.
+function ClipMidiLiveValue({
+  cell,
+  displayValue
+}: {
+  cell: import('@shared/types').Cell
+  // Live OSC display string — null when the cell isn't playing yet
+  // (we don't render a frozen "what would the byte be" tease when
+  // nothing's emitting).
+  displayValue: string | null
+}): JSX.Element | null {
+  const m = cell.midiOut
+  if (!m || !m.enabled || !m.portName) return null
+  if (displayValue == null) return null
+  // Extract the first numeric token from the displayValue. For
+  // multi-arg cells like OCTOCOSME's "compositor 0 0.5 0.5 ...", the
+  // first parseable float is the user's actual sequenced/modulated
+  // value — the prefix strings get skipped.
+  const tokens = displayValue.trim().split(/\s+/)
+  let firstNum: number | null = null
+  for (const tok of tokens) {
+    const n = parseFloat(tok)
+    if (Number.isFinite(n)) {
+      firstNum = n
+      break
+    }
+  }
+  if (firstNum === null) return null
+  // Same mapping the engine uses: scaleToUnit OR midiScale → multiply
+  // by 127. Otherwise the value is already in MIDI range (0..127).
+  const wantMap = !!cell.midiScale || cell.scaleToUnit
+  const ccByte = Math.max(
+    0,
+    Math.min(127, Math.round(wantMap ? firstNum * 127 : firstNum))
+  )
+  // For Note mode the same value drives the NOTE NUMBER; velocity
+  // comes from the separate cell.velocity field.
+  if (m.kind === 'note') {
+    const noteMap = wantMap
+      ? Math.round(36 + firstNum * (84 - 36))
+      : Math.round(firstNum)
+    const note = Math.max(0, Math.min(127, noteMap))
+    const velRaw = parseFloat(cell.velocity ?? '100')
+    const vel = Number.isFinite(velRaw)
+      ? Math.max(0, Math.min(127, Math.round(velRaw)))
+      : 100
+    return (
+      <span
+        className="text-[10px] font-mono font-semibold leading-none tabular-nums"
+        style={{ color: 'rgb(195 150 240)' }} /* violet — matches MIDI badge */
+        title={`MIDI Note ${note}, velocity ${vel} on ch${m.channel}`}
+      >
+        {note}→{vel}
+      </span>
+    )
+  }
+  // CC mode — single byte 0..127.
+  return (
+    <span
+      className="text-[10px] font-mono font-semibold leading-none tabular-nums"
+      style={{ color: 'rgb(120 220 200)' }} /* teal — matches OSC/MIDI mix */
+      title={`MIDI CC ${m.cc ?? 0} = ${ccByte} on ch${m.channel}`}
+    >
+      {ccByte}
+    </span>
+  )
+}
+
+function ClipTransportBadge({
+  oscOn,
+  midiOn
+}: {
+  oscOn: boolean
+  midiOn: boolean
+}): JSX.Element | null {
+  if (!oscOn && !midiOn) return null
+  const label = oscOn && midiOn ? 'OSC/MIDI' : oscOn ? 'OSC' : 'MIDI'
+  // Distinct color per state — none of these are the orange accent
+  // or the cyan accent2 already used for live values + modulator
+  // chips. Keeps the visual layer cleanly distinct.
+  const bg =
+    oscOn && midiOn
+      ? 'rgb(80 200 180 / 0.18)' // teal tint
+      : midiOn
+        ? 'rgb(170 110 220 / 0.18)' // violet tint
+        : 'rgb(150 165 185 / 0.18)' // slate tint
+  const fg =
+    oscOn && midiOn
+      ? 'rgb(120 220 200)'
+      : midiOn
+        ? 'rgb(195 150 240)'
+        : 'rgb(175 185 200)'
+  return (
+    <span
+      className="text-[8px] font-mono font-semibold px-1 py-px rounded leading-none shrink-0"
+      style={{ background: bg, color: fg, letterSpacing: '0.04em' }}
+      title={`Transport: ${label}`}
+    >
+      {label}
+    </span>
   )
 }

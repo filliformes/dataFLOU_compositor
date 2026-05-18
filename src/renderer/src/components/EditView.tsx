@@ -6,6 +6,10 @@ import Inspector from './Inspector'
 import InstrumentsInspectorPane from './InstrumentsInspectorPane'
 import { ResizeHandle } from './ResizeHandle'
 import { Modal } from './Modal'
+import {
+  POOL_SAVED_SCENE_DRAG_MIME,
+  type PoolSavedSceneDragPayload
+} from './PoolPane'
 
 // Header height in the Edit view.
 // The TrackSidebar's "Buttons box" now holds only two rows (Scenes, Messages) —
@@ -66,9 +70,50 @@ export default function EditView(): JSX.Element {
 
   const gridHeight = headerH + tracks.length * rowHeight
 
+  // Drag-drop landing for Pool · Scenes tab items dropped on the
+  // Edit-view scene strip. Mirrors PaletteGrid's onPaletteDrop —
+  // instantiates the saved scene, then focuses it. Lets the user
+  // drop anywhere in the grid's blank space (between columns, past
+  // the last column) without having to switch to the Sequence view
+  // first.
+  function onGridDragOver(e: React.DragEvent): void {
+    if (e.dataTransfer.types.includes(POOL_SAVED_SCENE_DRAG_MIME)) {
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    }
+  }
+  function onGridDrop(e: React.DragEvent): void {
+    const raw = e.dataTransfer.getData(POOL_SAVED_SCENE_DRAG_MIME)
+    if (!raw) return
+    e.preventDefault()
+    try {
+      const payload = JSON.parse(raw) as PoolSavedSceneDragPayload
+      const st = useStore.getState()
+      const newSceneId = st.instantiateSavedScene(payload.savedSceneId)
+      if (newSceneId) st.setFocusedScene(newSceneId)
+    } catch {
+      /* malformed payload — ignore */
+    }
+    // HTML5 drag-and-drop in Electron / Chromium can leave the drag
+    // source element with sticky pseudo-focus, which then swallows
+    // subsequent click → input-focus chains on the grid until the
+    // user alt-tabs to refocus the window. Blurring + nudging focus
+    // back to <body> on the next frame breaks the stickiness so the
+    // user can immediately edit the dropped scene's clip values.
+    requestAnimationFrame(() => {
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur()
+      }
+      document.body.focus?.()
+    })
+  }
   return (
     <div className="flex h-full min-h-0">
-      <div className="flex-1 min-w-0 overflow-auto bg-bg">
+      <div
+        className="flex-1 min-w-0 overflow-auto bg-bg"
+        onDragOver={onGridDragOver}
+        onDrop={onGridDrop}
+      >
         <div
           className="flex items-stretch"
           style={{ minHeight: gridHeight, width: 'max-content' }}

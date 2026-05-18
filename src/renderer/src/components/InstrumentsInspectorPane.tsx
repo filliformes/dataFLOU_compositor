@@ -10,6 +10,7 @@
 //   • unit ↔ unit
 //   • min / max / init ↔ range_min / range_max / range_init
 
+import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
@@ -19,6 +20,7 @@ import type {
   FunctionStreamMode,
   InstrumentFunction,
   InstrumentTemplate,
+  ParamArgSpec,
   ParameterTemplate
 } from '@shared/types'
 
@@ -56,6 +58,12 @@ export default function InstrumentsInspectorPane(): JSX.Element {
         </div>
       </div>
     )
+  }
+  // SavedScene selections — fetched from the global library, rendered
+  // with the SceneInspector-style metadata fields plus a read-only
+  // breakdown of the Instruments + Parameters bundled with the scene.
+  if (sel.kind === 'savedScene') {
+    return <SavedSceneInspector savedSceneId={sel.savedSceneId} />
   }
   // ParameterTemplate selections handled below; Template / Function selections
   // both reference a template by templateId.
@@ -337,7 +345,499 @@ function FunctionInspector({
             placeholder="Free-form note about this parameter"
           />
         </Field>
+
+        {/* Arg Layout — the multi-arg argSpec editor. Lets the user
+            split a Parameter's outgoing OSC bundle into pinned
+            (fixed protocol prefix) and editable (value) slots, then
+            edit each slot's name / type / fixed value or init value.
+            Required for OCTOCOSME-style parameters whose every
+            address fires `siffffff` with the first two args being
+            an IP + sequence-int that we pin, and the trailing
+            floats being modulatable values. */}
+        <ParameterArgSpecSection fn={fn} onChange={patch} readonly={readonly} />
+
+        {/* MIDI Output default — sets what every new cell on this
+            Parameter inherits at creation. Per-cell overrides go on
+            Cell.midiOut. Setting this here means: create a Parameter
+            with MIDI pre-wired, drag it into a Scene, the new cell
+            already has the MIDI section configured (enable/disable
+            per cell from the cell inspector). */}
+        <ParameterMidiSection fn={fn} onChange={patch} readonly={readonly} />
       </div>
+    </div>
+  )
+}
+
+// Arg Layout editor — drives a Parameter's `argSpec`. When the array
+// is missing (or single-entry), the Parameter emits a single value
+// inferred from `paramType`. When it has 2+ entries, each entry is
+// either PINNED (a fixed protocol prefix invisibly prepended) or
+// EDITABLE (a user-controllable slot the cell can modulate/sequence).
+//
+// OCTOCOSME's `/A/strips/pots` for example becomes:
+//   [{ type: 'string', fixed: '192.168.101.191' },  // IP prefix
+//    { type: 'int',    fixed: 17 },                  // sequence id
+//    { type: 'float',  init: 0, min: 0, max: 1 },    // pot 1
+//    { type: 'float',  init: 0, min: 0, max: 1 },    // pot 2
+//    … ]
+//
+// Capture's `buildOscTemplate` writes argSpec automatically when
+// observing multi-arg traffic — this UI lets the user adjust or
+// hand-author it after the fact.
+const ARG_TYPES: { id: ParamArgSpec['type']; label: string }[] = [
+  { id: 'float', label: 'Float' },
+  { id: 'int', label: 'Int' },
+  { id: 'string', label: 'String' },
+  { id: 'bool', label: 'Bool' }
+]
+function ParameterArgSpecSection({
+  fn,
+  onChange,
+  readonly
+}: {
+  fn: InstrumentFunction
+  onChange: (patch: Partial<InstrumentFunction>) => void
+  readonly: boolean
+}): JSX.Element {
+  const spec = fn.argSpec ?? []
+  const [open, setOpen] = useState<boolean>(spec.length > 1)
+  function setSpec(next: ParamArgSpec[]): void {
+    onChange({ argSpec: next.length > 0 ? next : undefined })
+  }
+  function addSlot(): void {
+    setSpec([
+      ...spec,
+      {
+        name: `Value ${spec.filter((s) => s.fixed === undefined).length + 1}`,
+        type: 'float',
+        init: 0,
+        min: 0,
+        max: 1
+      }
+    ])
+  }
+  function removeSlot(i: number): void {
+    setSpec(spec.filter((_, idx) => idx !== i))
+  }
+  function patchSlot(i: number, p: Partial<ParamArgSpec>): void {
+    setSpec(spec.map((s, idx) => (idx === i ? { ...s, ...p } : s)))
+  }
+  function togglePinned(i: number, pinned: boolean): void {
+    const s = spec[i]
+    if (!s) return
+    if (pinned) {
+      // Convert editable → pinned. Capture the current init as the
+      // fixed value so the in-flight bundle keeps emitting the same
+      // token the user has been seeing live.
+      const defaultFixed: number | string | boolean =
+        s.type === 'string'
+          ? typeof s.init === 'string'
+            ? s.init
+            : ''
+          : s.type === 'bool'
+            ? !!s.init
+            : typeof s.init === 'number'
+              ? s.init
+              : 0
+      patchSlot(i, { fixed: defaultFixed, init: undefined, min: undefined, max: undefined })
+    } else {
+      // Convert pinned → editable. Move the fixed value into init.
+      const moveBack: number | string | boolean | undefined = s.fixed
+      const isNum = typeof moveBack === 'number'
+      patchSlot(i, {
+        fixed: undefined,
+        init:
+          typeof moveBack === 'number' || typeof moveBack === 'string' || typeof moveBack === 'boolean'
+            ? moveBack
+            : 0,
+        min: isNum ? 0 : undefined,
+        max: isNum ? 1 : undefined
+      })
+    }
+  }
+  return (
+    <div className="flex flex-col gap-1 pt-2 mt-1 border-t border-border">
+      <button
+        type="button"
+        className="flex items-center justify-between w-full text-left"
+        onClick={() => setOpen((v) => !v)}
+        title="Argument layout for the outgoing OSC bundle — split into pinned protocol prefixes (fixed) and editable value slots."
+      >
+        <span className="label">Arg Layout</span>
+        <span className="text-muted text-[10px]">
+          {spec.length === 0
+            ? 'single-arg (default)'
+            : `${spec.length} slot${spec.length === 1 ? '' : 's'} · ${spec.filter((s) => s.fixed !== undefined).length} pinned`}{' '}
+          {open ? '▾' : '▸'}
+        </span>
+      </button>
+      {open && (
+        <>
+          <div className="text-[10px] text-muted leading-snug">
+            Define each slot of the outgoing OSC bundle. Pin a slot
+            to send a constant token (typically a protocol prefix
+            like an IP or sequence id). Leave a slot un-pinned to
+            make it user-editable + modulatable per cell.
+          </div>
+          {spec.length === 0 ? (
+            <div className="text-[10px] text-muted italic">
+              No multi-arg layout — Parameter uses its single Type
+              setting above. Click <span className="text-text">+ Add slot</span> to
+              start building a layout.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-0.5">
+              {/* Header row */}
+              <div className="grid grid-cols-[1fr_72px_64px_1fr_18px] gap-1 text-[9px] uppercase tracking-wide text-muted px-0.5">
+                <span>Name</span>
+                <span>Type</span>
+                <span title="Pinned = fixed protocol prefix (invisible in cells). Un-pinned = editable value.">
+                  Pinned
+                </span>
+                <span>Value</span>
+                <span />
+              </div>
+              {spec.map((s, i) => {
+                const isPinned = s.fixed !== undefined
+                return (
+                  <div
+                    key={i}
+                    className="grid grid-cols-[1fr_72px_64px_1fr_18px] gap-1 items-center"
+                  >
+                    <UncontrolledTextInput
+                      className="input text-[10px] py-0.5 w-full"
+                      value={s.name}
+                      onChange={(v) => patchSlot(i, { name: v })}
+                      disabled={readonly}
+                      placeholder={isPinned ? `Prefix ${i + 1}` : `Value ${i + 1}`}
+                    />
+                    <select
+                      className="input text-[10px] py-0.5 w-full"
+                      value={s.type}
+                      onChange={(e) =>
+                        patchSlot(i, { type: e.target.value as ParamArgSpec['type'] })
+                      }
+                      disabled={readonly}
+                    >
+                      {ARG_TYPES.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.label}
+                        </option>
+                      ))}
+                    </select>
+                    <label className="flex items-center justify-center cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={isPinned}
+                        onChange={(e) => togglePinned(i, e.target.checked)}
+                        disabled={readonly}
+                        title={
+                          isPinned
+                            ? 'Un-pin: make this slot user-editable on every cell'
+                            : 'Pin: emit a fixed token regardless of cell value'
+                        }
+                      />
+                    </label>
+                    {isPinned ? (
+                      <ArgFixedInput
+                        type={s.type}
+                        value={s.fixed!}
+                        onChange={(v) => patchSlot(i, { fixed: v })}
+                        readonly={readonly}
+                      />
+                    ) : (
+                      <ArgEditableInput
+                        type={s.type}
+                        value={s.init}
+                        onChange={(v) => patchSlot(i, { init: v })}
+                        readonly={readonly}
+                      />
+                    )}
+                    <button
+                      className="text-muted hover:text-danger text-[14px] leading-none px-1"
+                      onClick={() => removeSlot(i)}
+                      disabled={readonly}
+                      title="Remove this slot"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          <div className="flex items-center gap-1.5 pt-1">
+            <button
+              type="button"
+              className="btn text-[10px] py-0.5"
+              onClick={addSlot}
+              disabled={readonly}
+              title="Append a new editable slot"
+            >
+              + Add slot
+            </button>
+            {spec.length > 0 && (
+              <button
+                type="button"
+                className="btn text-[10px] py-0.5"
+                onClick={() => setSpec([])}
+                disabled={readonly}
+                title="Clear the entire arg layout (Parameter falls back to single-arg via the Type select above)"
+              >
+                Clear all
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// Input for a PINNED slot's fixed value. Picks the right widget per
+// type — number input for float/int, text input for string, checkbox
+// for bool.
+function ArgFixedInput({
+  type,
+  value,
+  onChange,
+  readonly
+}: {
+  type: ParamArgSpec['type']
+  value: number | string | boolean
+  onChange: (v: number | string | boolean) => void
+  readonly: boolean
+}): JSX.Element {
+  if (type === 'bool') {
+    return (
+      <input
+        type="checkbox"
+        checked={!!value}
+        onChange={(e) => onChange(e.target.checked)}
+        disabled={readonly}
+      />
+    )
+  }
+  if (type === 'string') {
+    return (
+      <UncontrolledTextInput
+        className="input text-[10px] py-0.5 w-full font-mono"
+        value={typeof value === 'string' ? value : String(value)}
+        onChange={(v) => onChange(v)}
+        disabled={readonly}
+      />
+    )
+  }
+  return (
+    <BoundedNumberInput
+      className="input text-[10px] py-0.5 w-full tabular-nums"
+      value={typeof value === 'number' ? value : 0}
+      onChange={(v) => onChange(v)}
+      min={-1e9}
+      max={1e9}
+      integer={type === 'int'}
+      disabled={readonly}
+    />
+  )
+}
+
+// Input for an EDITABLE slot's init value. Same widget rules as
+// ArgFixedInput, but stored to `init` instead of `fixed`. The
+// per-cell value at instantiation seeds from this.
+function ArgEditableInput({
+  type,
+  value,
+  onChange,
+  readonly
+}: {
+  type: ParamArgSpec['type']
+  value: number | string | boolean | undefined
+  onChange: (v: number | string | boolean) => void
+  readonly: boolean
+}): JSX.Element {
+  if (type === 'bool') {
+    return (
+      <input
+        type="checkbox"
+        checked={!!value}
+        onChange={(e) => onChange(e.target.checked)}
+        disabled={readonly}
+      />
+    )
+  }
+  if (type === 'string') {
+    return (
+      <UncontrolledTextInput
+        className="input text-[10px] py-0.5 w-full font-mono"
+        value={typeof value === 'string' ? value : ''}
+        onChange={(v) => onChange(v)}
+        disabled={readonly}
+        placeholder="init"
+      />
+    )
+  }
+  return (
+    <BoundedNumberInput
+      className="input text-[10px] py-0.5 w-full tabular-nums"
+      value={typeof value === 'number' ? value : 0}
+      onChange={(v) => onChange(v)}
+      min={-1e9}
+      max={1e9}
+      integer={type === 'int'}
+      disabled={readonly}
+    />
+  )
+}
+
+// MIDI Output section for the Parameter (InstrumentFunction)
+// Inspector. Mirrors the cell-level MidiOutputSection — Port +
+// Channel + CC/Note + CC number / Note gate — but stores defaults
+// on the Parameter so freshly-created cells inherit them.
+function ParameterMidiSection({
+  fn,
+  onChange,
+  readonly
+}: {
+  fn: InstrumentFunction
+  onChange: (patch: Partial<InstrumentFunction>) => void
+  readonly: boolean
+}): JSX.Element {
+  // Default to the canonical "disabled CC on ch 1 / CC 1" so the
+  // section renders intelligibly even when the Parameter has never
+  // had MIDI configured before.
+  const m =
+    fn.midiOut ??
+    ({
+      enabled: false,
+      portName: '',
+      channel: 1,
+      kind: 'cc' as const,
+      cc: 1,
+      noteMode: 'velocity' as const,
+      gateLengthMs: 0
+    } satisfies InstrumentFunction['midiOut'])
+  function setMidi(p: Partial<NonNullable<InstrumentFunction['midiOut']>>): void {
+    onChange({ midiOut: { ...m, ...p } })
+  }
+  const [ports, setPorts] = useState<string[]>([])
+  const [available, setAvailable] = useState<boolean>(true)
+  useEffect(() => {
+    let cancelled = false
+    window.api?.midiListPorts?.().then((r) => {
+      if (cancelled) return
+      setPorts(r.ports)
+      setAvailable(r.available)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [m.enabled])
+  return (
+    <div className="flex flex-col gap-1 pt-2 mt-1 border-t border-border">
+      <label
+        className="flex items-center gap-2 cursor-pointer select-none"
+        title="Default MIDI Output for cells created on this Parameter. Per-cell can override."
+      >
+        <input
+          type="checkbox"
+          checked={m.enabled}
+          onChange={(e) => setMidi({ enabled: e.target.checked })}
+          disabled={readonly}
+        />
+        <span className="label">MIDI Output (default)</span>
+        {!available && (
+          <span className="text-[10px] text-danger">unavailable</span>
+        )}
+      </label>
+      {m.enabled && (
+        <div className="flex flex-col gap-1 mt-1 text-[11px]">
+          <div className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto] gap-x-2 gap-y-1 items-center">
+            <span className="label">Port</span>
+            <select
+              className="input text-[11px] py-0.5 min-w-0 max-w-full"
+              style={{ textOverflow: 'ellipsis' }}
+              value={m.portName}
+              onChange={(e) => setMidi({ portName: e.target.value })}
+              disabled={readonly}
+            >
+              <option value="">— select port —</option>
+              {m.portName && !ports.includes(m.portName) && (
+                <option value={m.portName}>{m.portName} (disconnected)</option>
+              )}
+              {ports.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+            <span className="label">Ch</span>
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-10 text-center tabular-nums"
+              value={m.channel}
+              onChange={(v) => setMidi({ channel: v })}
+              min={1}
+              max={16}
+              integer
+              disabled={readonly}
+            />
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="label">Kind</span>
+            <div className="flex items-center gap-0.5">
+              <button
+                className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+                  m.kind === 'cc'
+                    ? 'bg-accent text-black border-accent'
+                    : 'border-border text-muted hover:text-text'
+                }`}
+                onClick={() => setMidi({ kind: 'cc' })}
+                disabled={readonly}
+              >
+                CC
+              </button>
+              <button
+                className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+                  m.kind === 'note'
+                    ? 'bg-accent text-black border-accent'
+                    : 'border-border text-muted hover:text-text'
+                }`}
+                onClick={() => setMidi({ kind: 'note' })}
+                disabled={readonly}
+              >
+                Note
+              </button>
+            </div>
+            {m.kind === 'cc' ? (
+              <>
+                <span className="label">CC #</span>
+                <BoundedNumberInput
+                  className="input text-[11px] py-0.5 w-14"
+                  value={m.cc ?? 0}
+                  onChange={(v) => setMidi({ cc: v })}
+                  min={0}
+                  max={127}
+                  integer
+                  disabled={readonly}
+                />
+              </>
+            ) : (
+              <>
+                <span className="label">Gate</span>
+                <BoundedNumberInput
+                  className="input text-[11px] py-0.5 w-16"
+                  value={m.gateLengthMs ?? 0}
+                  onChange={(v) => setMidi({ gateLengthMs: v })}
+                  min={0}
+                  max={60000}
+                  integer
+                  disabled={readonly}
+                />
+                <span className="text-[10px] text-muted">ms</span>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -544,6 +1044,287 @@ function ParameterTemplateInspector({
             placeholder="Free-form note about this parameter"
           />
         </Field>
+      </div>
+    </div>
+  )
+}
+
+// Saved-Scene Inspector — renders when the user clicks a row in the
+// Pool's Scenes tab. Mirrors the in-grid Scene controls (name / color
+// / notes / duration / next mode / multiplicator / morph-in time)
+// so the user can curate the saved scene before re-instantiating it,
+// plus a read-only breakdown of which Pool Instruments + Parameters
+// this scene was authored against. Edits push back to the global
+// library via `updateSavedScene`.
+function SavedSceneInspector({
+  savedSceneId
+}: {
+  savedSceneId: string
+}): JSX.Element {
+  const sceneLibrary = useStore((s) => s.sceneLibrary)
+  const updateSavedScene = useStore((s) => s.updateSavedScene)
+  const removeSavedScene = useStore((s) => s.removeSavedScene)
+  const instantiateSavedScene = useStore((s) => s.instantiateSavedScene)
+  const setFocusedScene = useStore((s) => s.setFocusedScene)
+  const setPoolSelection = useStore((s) => s.setPoolSelection)
+  const poolTemplates = useStore((s) => s.session.pool.templates)
+  const sc = sceneLibrary.find((s) => s.id === savedSceneId)
+  if (!sc) {
+    return (
+      <div className="flex flex-col h-full min-h-0">
+        <Header title="Saved Scene Inspector" />
+        <div className="p-3 text-muted text-[11px]">
+          Selection is stale — pick another Saved Scene.
+        </div>
+      </div>
+    )
+  }
+  // Build the Instruments / orphan-Parameters breakdown by walking
+  // saved.tracks. Templates already in the local Pool show their
+  // current name (in case the user has renamed them since saving);
+  // templates that ONLY exist in the saved scene fall back to the
+  // saved.templates copy's name.
+  const headerTracks = sc.tracks.filter((t) => t.kind === 'template')
+  const childTracks = sc.tracks.filter((t) => t.kind === 'function')
+  const tplNameById = new Map<string, string>()
+  for (const t of poolTemplates) tplNameById.set(t.id, t.name)
+  for (const t of sc.templates) {
+    if (!tplNameById.has(t.id)) tplNameById.set(t.id, t.name)
+  }
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <Header title={`Saved Scene — ${sc.name}`} />
+      <div className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-col gap-2 text-[11px]">
+        <Field label="Name">
+          <UncontrolledTextInput
+            className="input text-[11px] py-0.5 w-full"
+            value={sc.name}
+            onChange={(v) => updateSavedScene(sc.id, { name: v })}
+          />
+        </Field>
+        <div className="grid grid-cols-2 gap-1">
+          <Field label="Color">
+            <input
+              type="color"
+              className="input p-0 h-6 w-full cursor-pointer"
+              value={sc.color}
+              onChange={(e) => updateSavedScene(sc.id, { color: e.target.value })}
+            />
+          </Field>
+          <Field label="Created">
+            <span className="text-muted text-[10px] py-0.5">
+              {sc.createdAt ? new Date(sc.createdAt).toLocaleString() : '—'}
+            </span>
+          </Field>
+        </div>
+        <Field label="Notes">
+          <textarea
+            className="input italic text-[11px] leading-snug w-full"
+            style={{ height: 56, resize: 'vertical' }}
+            placeholder="Notes…"
+            value={sc.sceneMeta.notes ?? ''}
+            onChange={(e) =>
+              updateSavedScene(sc.id, { notes: e.target.value })
+            }
+          />
+        </Field>
+        <div className="grid grid-cols-3 gap-1">
+          <Field label="Duration (s)">
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-full"
+              value={sc.sceneMeta.durationSec}
+              onChange={(v) => updateSavedScene(sc.id, { durationSec: v })}
+              min={0.5}
+              max={300}
+            />
+          </Field>
+          <Field label="Multiplier">
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-full"
+              value={sc.sceneMeta.multiplicator}
+              onChange={(v) => updateSavedScene(sc.id, { multiplicator: v })}
+              min={1}
+              max={128}
+              integer
+            />
+          </Field>
+          <Field label="Morph (ms)">
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5 w-full"
+              value={sc.sceneMeta.morphInMs ?? 0}
+              onChange={(v) => updateSavedScene(sc.id, { morphInMs: v })}
+              min={0}
+              max={60000}
+              integer
+            />
+          </Field>
+        </div>
+        <Field label="Next mode">
+          <select
+            className="input select-compact text-[11px] py-0.5 w-full"
+            value={sc.sceneMeta.nextMode}
+            onChange={(e) =>
+              updateSavedScene(sc.id, {
+                nextMode: e.target.value as typeof sc.sceneMeta.nextMode
+              })
+            }
+          >
+            <option value="stop">Stop</option>
+            <option value="loop">Loop</option>
+            <option value="next">Next</option>
+            <option value="prev">Previous</option>
+            <option value="first">First</option>
+            <option value="last">Last</option>
+            <option value="any">Any</option>
+            <option value="other">Other</option>
+          </select>
+        </Field>
+
+        {/* Instruments + Parameters breakdown — read-only. Shows what
+            the saved scene will pull into the Pool / sidebar when
+            re-instantiated. Clicking an Instrument name jumps the
+            Pool selection to its Template Inspector. */}
+        <div className="flex flex-col gap-1 pt-2 mt-1 border-t border-border">
+          <div className="flex items-baseline justify-between">
+            <span className="label">Contents</span>
+            <span className="text-muted text-[10px]">
+              {headerTracks.length} instr · {childTracks.length} param ·{' '}
+              {Object.keys(sc.cells).length} cell
+              {Object.keys(sc.cells).length === 1 ? '' : 's'}
+            </span>
+          </div>
+          {headerTracks.length === 0 && childTracks.length === 0 ? (
+            <span className="text-[10px] text-muted italic">
+              No tracks — this scene was saved empty.
+            </span>
+          ) : (
+            <div className="flex flex-col gap-0.5">
+              {headerTracks.map((h) => {
+                const tplName = h.sourceTemplateId
+                  ? tplNameById.get(h.sourceTemplateId) ?? h.name
+                  : h.name
+                const kids = childTracks.filter(
+                  (c) => c.parentTrackId === h.id
+                )
+                const inPool = h.sourceTemplateId
+                  ? poolTemplates.find((t) => t.id === h.sourceTemplateId)
+                  : null
+                return (
+                  <div
+                    key={h.id}
+                    className="flex flex-col gap-0.5 border border-border rounded p-1 bg-panel2"
+                  >
+                    <div className="flex items-center gap-1">
+                      <button
+                        className="font-semibold text-[11px] truncate flex-1 text-left hover:text-accent"
+                        onClick={() => {
+                          if (h.sourceTemplateId && inPool) {
+                            setPoolSelection({
+                              kind: 'template',
+                              templateId: h.sourceTemplateId
+                            })
+                          }
+                        }}
+                        disabled={!inPool}
+                        title={
+                          inPool
+                            ? 'Open this Instrument in the Pool Inspector'
+                            : "This Instrument isn't in the current Pool yet — instantiating the scene will add it."
+                        }
+                      >
+                        {tplName}
+                      </button>
+                      {!inPool && (
+                        <span
+                          className="text-[8px] text-muted px-1 rounded border border-border shrink-0"
+                          title="Will be added to your Pool on instantiate"
+                        >
+                          new
+                        </span>
+                      )}
+                      <span className="text-[9px] text-muted shrink-0">
+                        {kids.length} param
+                      </span>
+                    </div>
+                    {kids.length > 0 && (
+                      <div className="flex flex-col gap-px pl-2 text-[10px]">
+                        {kids.map((c) => {
+                          const cell = sc.cells[c.id]
+                          return (
+                            <div
+                              key={c.id}
+                              className="flex items-center gap-1"
+                              title={
+                                cell
+                                  ? `OSC: ${cell.oscAddress || '—'}  →  value: ${cell.value}`
+                                  : 'No cell saved for this parameter'
+                              }
+                            >
+                              <span className="truncate flex-1">{c.name}</span>
+                              <span className="font-mono text-muted shrink-0">
+                                {cell ? cell.value || '∅' : '—'}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+              {/* Orphan Parameter tracks (no header — rare) */}
+              {childTracks
+                .filter((c) => !c.parentTrackId)
+                .map((c) => {
+                  const cell = sc.cells[c.id]
+                  return (
+                    <div
+                      key={c.id}
+                      className="flex items-center gap-1 border border-border rounded px-1 py-0.5 text-[10px] bg-panel2"
+                    >
+                      <span className="truncate flex-1 font-semibold">
+                        {c.name}
+                      </span>
+                      <span className="font-mono text-muted shrink-0">
+                        {cell ? cell.value || '∅' : '—'}
+                      </span>
+                    </div>
+                  )
+                })}
+            </div>
+          )}
+        </div>
+
+        {/* Action row — Use (instantiate) + Delete from library. */}
+        <div className="flex items-center gap-1.5 pt-2 mt-1 border-t border-border">
+          <button
+            className="btn text-[11px]"
+            onClick={() => {
+              const newId = instantiateSavedScene(sc.id)
+              if (newId) setFocusedScene(newId)
+            }}
+            title="Instantiate this scene at the end of the grid"
+          >
+            Use
+          </button>
+          <div className="flex-1" />
+          <button
+            className="btn text-[11px]"
+            style={{
+              borderColor: 'rgb(var(--c-danger))',
+              color: 'rgb(var(--c-danger))'
+            }}
+            onClick={() => {
+              if (window.confirm(`Delete saved scene "${sc.name}" from the Pool?`)) {
+                void removeSavedScene(sc.id)
+                setPoolSelection(null)
+              }
+            }}
+            title="Permanently delete from the saved-scene library"
+          >
+            Delete
+          </button>
+        </div>
       </div>
     </div>
   )

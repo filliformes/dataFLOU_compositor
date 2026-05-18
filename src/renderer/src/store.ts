@@ -1,4 +1,8 @@
 import { create } from 'zustand'
+// Imported lazily-used (only referenced inside action bodies) so the
+// undo.ts ↔ store.ts circular import resolves cleanly under ESM —
+// no top-level reads of `resetUndoHistory` before it's bound.
+import { resetUndoHistory } from './undo'
 import type {
   Cell,
   EngineState,
@@ -13,6 +17,7 @@ import type {
   MetaKnob,
   MidiBinding,
   NextMode,
+  OscForwardTarget,
   ParameterTemplate,
   Pool,
   RampParams,
@@ -63,18 +68,29 @@ const TEMPLATES_KEY = 'dataflou:clipTemplates:v1'
 // ---- UI scale: persisted in localStorage. Controls Ctrl+wheel zoom of
 // everything below the main toolbar. Clamped to [UI_SCALE_MIN, UI_SCALE_MAX]
 // so the user can't accidentally render the app unusable (too small or huge).
+//
+// Default 1.35 (≈ 7 Ctrl-wheel ticks above the legacy 1.0) — at modern
+// monitor DPIs the legacy scale rendered the toolbar/scene tiles tiny
+// enough that a fresh install was unreadable until the user discovered
+// the zoom. 1.35 keeps the layout dense without forcing immediate
+// zoom on first launch. Users who prefer the old size can drop it
+// back via Ctrl+wheel; their choice persists per the localStorage key
+// below.
 const UI_SCALE_KEY = 'dataflou:uiScale:v1'
 export const UI_SCALE_MIN = 0.5
 export const UI_SCALE_MAX = 2.0
 export const UI_SCALE_STEP = 0.05
+const UI_SCALE_DEFAULT = 1.35
 
 function loadUiScale(): number {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(UI_SCALE_KEY) : null
     const n = raw == null ? NaN : parseFloat(raw)
-    return Number.isFinite(n) && n >= UI_SCALE_MIN && n <= UI_SCALE_MAX ? n : 1
+    return Number.isFinite(n) && n >= UI_SCALE_MIN && n <= UI_SCALE_MAX
+      ? n
+      : UI_SCALE_DEFAULT
   } catch {
-    return 1
+    return UI_SCALE_DEFAULT
   }
 }
 function saveUiScale(v: number): void {
@@ -115,6 +131,15 @@ export interface ClipTemplate {
   id: string
   name: string
   cell: Cell
+  // Snapshot of the source track's argSpec at save time. Carries
+  // the multi-arg structure (pinned prefixes + editable value slots)
+  // so applying this template onto an empty Parameter — one with
+  // no argSpec yet — fills it in. Without this, a multi-arg clip
+  // template applied to a fresh Parameter would only see its
+  // space-separated value string without knowing which tokens are
+  // fixed and which are user-controllable. Optional + back-compat
+  // for legacy templates saved before this field existed.
+  argSpec?: import('@shared/types').ParamArgSpec[]
 }
 
 interface UiState {
@@ -231,7 +256,25 @@ interface UiState {
     | { kind: 'template'; templateId: string }
     | { kind: 'function'; templateId: string; functionId: string }
     | { kind: 'parameter'; parameterId: string }
+    | { kind: 'savedScene'; savedSceneId: string }
     | null
+  // Multi-selection set for the Pool's Scenes tab. Ctrl/Meta-click
+  // toggles a row in/out of this set; plain click resets to just
+  // that row. `poolSelection.kind === 'savedScene'` always points
+  // at the most recently clicked (anchor) scene, which is also in
+  // this set when non-empty. The Del key handler reads this list
+  // to bulk-remove via the scene library IPC. Mirrors the
+  // `selectedSceneIds` / `selectedTrackIds` pattern used for the
+  // grid + sidebar selections.
+  selectedSavedSceneIds: string[]
+  // Undo/redo counters — published by undo.ts whenever its
+  // module-scope past/future stacks change. UI buttons read these
+  // to render enabled/disabled. The actual snapshot arrays live
+  // outside Zustand because they hold deep-cloned Sessions
+  // (potentially large) — there's no reason to make them reactive
+  // beyond "stack non-empty / empty".
+  undoCount: number
+  redoCount: number
   // Integrity-check hand-off. When the user triggers Open or restores
   // from autosave, the incoming session is scanned; if issues turn up,
   // we stash it here (session + path + issues) and render the global
@@ -272,6 +315,23 @@ interface UiState {
   // Listener bind status (enabled / port / lastError / local IPv4s).
   // Pulled on Network-tab mount + refreshed on every push update.
   networkStatus: import('@shared/types').NetworkListenerStatus
+  // ── Saved scene library (global, across sessions) ──────────────
+  // Mirrors the main-process `SceneLibrary` cache. Populated on
+  // app start via `sceneLibraryList` + refreshed whenever main
+  // pushes `scene-library:changed`. Not persisted in the session
+  // (the source of truth is the on-disk file).
+  sceneLibrary: import('@shared/types').SavedScene[]
+  // Whether the Capture popup is currently open. Drives the modal
+  // overlay rendered at app level. Set by the Pool's Capture
+  // button + cleared by the popup's Save / Cancel.
+  captureOpen: boolean
+  // True while the "Save before opening a new session?" modal is up.
+  // TopBar's New button sets this true instead of calling newSession
+  // directly so the user gets a chance to save unsaved work; the
+  // modal lives in App.tsx and runs save → newSession or just
+  // newSession depending on the user's choice. Same UX as the quit
+  // confirmation triggered by the OS X button.
+  newSessionConfirmOpen: boolean
 }
 
 // Height (px) assigned to the scene-notes textarea when the Notes toggle
@@ -318,6 +378,88 @@ export function isRichTheme(t: ThemeName): boolean {
   return RICH_THEMES.has(t)
 }
 
+// Bundle the renderer's runtime GUI layout into a `session.ui`
+// snapshot so the next save (manual Save / Save As / autosave)
+// captures the user's chosen zoom + sizes + collapse state. Called
+// at every save site so the UI travels with the session file.
+// On load, `setSession` reads `session.ui` back and applies each
+// field to the matching top-level store key (the live source of
+// truth at runtime).
+export function buildSessionForSave(
+  state: { session: Session } & Partial<{
+    uiScale: number
+    rowHeight: number
+    sceneColumnWidth: number
+    inspectorWidth: number
+    trackColumnWidth: number
+    editorNotesHeight: number
+    oscMonitorHeight: number
+    tracksCollapsed: boolean
+    scenesCollapsed: boolean
+  }>
+): Session {
+  return {
+    ...state.session,
+    ui: {
+      uiScale: state.uiScale,
+      rowHeight: state.rowHeight,
+      sceneColumnWidth: state.sceneColumnWidth,
+      inspectorWidth: state.inspectorWidth,
+      trackColumnWidth: state.trackColumnWidth,
+      editorNotesHeight: state.editorNotesHeight,
+      oscMonitorHeight: state.oscMonitorHeight,
+      tracksCollapsed: state.tracksCollapsed,
+      scenesCollapsed: state.scenesCollapsed
+    }
+  }
+}
+
+// Module-scope set of scene ids that originated from
+// `instantiateSavedScene` (i.e. dropped onto the grid from the
+// Pool's Scenes tab via Use / drag). App.tsx's auto-save effect
+// checks this set to skip pushing these scenes BACK to the library
+// — they already live there, otherwise clicking Use would silently
+// create a sibling library entry on every recall.
+//
+// Set, not state: we don't render off it and we don't want it
+// triggering re-renders. It only grows over a session's lifetime
+// (bounded by the number of Use clicks); cleared implicitly on
+// app restart.
+export const sceneIdsFromLibrary = new Set<string>()
+
+// Last-known pool library payload — kept in module scope so
+// `newSession` can re-seed the fresh session's pool with the user's
+// authored Instruments + Parameters. App.tsx fetches the library on
+// mount and pushes updates here on every `pool-library:changed`
+// IPC. Without this, hitting New wiped the User tab until the user
+// saved something.
+export const poolLibraryCache: {
+  templates: import('@shared/types').InstrumentTemplate[]
+  parameters: import('@shared/types').ParameterTemplate[]
+} = { templates: [], parameters: [] }
+export function setPoolLibraryCache(payload: {
+  templates: import('@shared/types').InstrumentTemplate[]
+  parameters: import('@shared/types').ParameterTemplate[]
+}): void {
+  poolLibraryCache.templates = payload.templates ?? []
+  poolLibraryCache.parameters = payload.parameters ?? []
+}
+
+// Build a unique " (copy)" name for a duplicated Pool entry. The
+// first duplicate is `<base> (copy)`; subsequent duplicates count
+// up: `(copy 1)`, `(copy 2)`, …. Duplicating an already-numbered
+// copy strips the existing suffix first so we don't accumulate
+// `(copy) (copy) (copy)` chains.
+function uniqueCopyName(srcName: string, existingNames: string[]): string {
+  const stripRe = /\s*\(copy(?:\s+\d+)?\)$/
+  const base = srcName.replace(stripRe, '')
+  const first = `${base} (copy)`
+  if (!existingNames.includes(first)) return first
+  let n = 1
+  while (existingNames.includes(`${base} (copy ${n})`)) n += 1
+  return `${base} (copy ${n})`
+}
+
 interface Actions {
   // Session-level
   setSession: (s: Session) => void
@@ -325,7 +467,15 @@ interface Actions {
   setCurrentFilePath: (p: string | null) => void
   setName: (name: string) => void
   setTickRate: (hz: number) => void
+  setMidiEnabled: (enabled: boolean) => void
   setDefaults: (fields: Partial<Pick<Session, 'defaultOscAddress' | 'defaultDestIp' | 'defaultDestPort'>>) => void
+  // OSC forwarding — every received UDP packet is byte-copied to each
+  // ENABLED entry in the list. Replacing the whole list on every edit
+  // is fine: the list is short (<10 typical) and main re-applies it
+  // synchronously.
+  addForwardTarget: (init?: Partial<OscForwardTarget>) => string
+  updateForwardTarget: (id: string, fields: Partial<OscForwardTarget>) => void
+  removeForwardTarget: (id: string) => void
   setMidiInputName: (name: string | null) => void
   setFocusedScene: (id: string | null) => void
   setView: (v: 'edit' | 'sequence') => void
@@ -347,6 +497,14 @@ interface Actions {
   ) => void
   removeFunction: (templateId: string, functionId: string) => void
   setPoolSelection: (sel: UiState['poolSelection']) => void
+  // SavedScene multi-selection helpers. `selectSavedScene` is the
+  // anchor setter (single click); `toggleSavedSceneSelection` is
+  // Ctrl/Meta-click; `clearSavedSceneSelection` wipes the set.
+  // All three keep `poolSelection` in sync — the inspector pane
+  // always renders the anchor (last-clicked or single) scene.
+  selectSavedScene: (savedSceneId: string) => void
+  toggleSavedSceneSelection: (savedSceneId: string) => void
+  clearSavedSceneSelection: () => void
   // Drag a Template from the Pool into the Edit sidebar — adds one
   // header row + one row per Function under it. `insertAfterTrackId`
   // null means append at end of the tracks list.
@@ -400,7 +558,25 @@ interface Actions {
   setTrackMidi: (id: string, binding: Track['midiTrigger']) => void
   setTrackDefaults: (
     id: string,
-    fields: Partial<Pick<Track, 'defaultOscAddress' | 'defaultDestIp' | 'defaultDestPort'>>
+    fields: Partial<
+      Pick<
+        Track,
+        | 'defaultOscAddress'
+        | 'defaultDestIp'
+        | 'defaultDestPort'
+        // `oscEnabled` is technically not a "default" but it shares
+        // the same per-track-shallow-patch shape, so the existing
+        // action handles it without a new code path.
+        | 'oscEnabled'
+      >
+    >
+  ) => void
+  // Set the Parameter-row's MIDI Output default. Patch-style so the
+  // Inspector can flip individual fields (port, channel, kind, cc)
+  // without sending the whole object. Pass `null` to clear.
+  setTrackMidiOut: (
+    id: string,
+    patch: Partial<import('@shared/types').MidiOut> | null
   ) => void
   sendTrackDefaultsToClips: (id: string) => void
   // Toggle a track's "enabled" flag (default: enabled). When false,
@@ -416,6 +592,29 @@ interface Actions {
     slotIdx: number,
     persistent: boolean,
     capturedValue?: string
+  ) => void
+  // Per-CELL pin toggle. Overrides the track-level pin for that slot
+  // on this specific scene's clip only. `persistent: true` → pin
+  // (capture current value); `false` → explicit unpin; pass
+  // `undefined` to clear the override and fall back to the
+  // track-level default. Out-of-range indices are no-ops.
+  setCellPersistentSlot: (
+    sceneId: string,
+    trackId: string,
+    slotIdx: number,
+    persistent: boolean | undefined,
+    capturedValue?: string
+  ) => void
+  // Per-cell post-modulation Scaling — sets one slot's
+  // `[min, max]` band. When `enabled` true the engine clamps that
+  // slot's output to the configured range AFTER modulators /
+  // sequencer but BEFORE Scale 0.0–1.0 + MIDI Scale. Pass `min` /
+  // `max` to update a single slot; pass `enabled` separately to
+  // toggle the whole feature.
+  setCellScaling: (
+    sceneId: string,
+    trackId: string,
+    patch: { enabled?: boolean; slotIdx?: number; min?: number; max?: number }
   ) => void
   // Reorder a track. `dragId` is dropped immediately AFTER `targetId` (or
   // at the very top of the list when `targetId` is null). When `dragId`
@@ -617,6 +816,54 @@ interface Actions {
   // embed it in the existing POOL_TEMPLATE_DRAG_MIME payload.
   materialiseNetworkDevice: (deviceId: string) => string | null
 
+  // ── Scene library ───────────────────────────────────────────────
+  // Mirror of the main-process cache. App.tsx subscribes to
+  // `onSceneLibrary` and pipes pushes through this setter.
+  setSceneLibrary: (scenes: import('@shared/types').SavedScene[]) => void
+  // ── Pool library (User Instruments + Parameters) ──────────────
+  // Merges entries from the on-disk Pool library into the current
+  // session's pool. Called once on app start (and any time the
+  // main-process pushes a `pool-library:changed` event). Only
+  // User entries (non-builtin) are merged. Entries already in
+  // the session's pool by id are skipped — the session's edits
+  // win over the library's stale copy. New library entries get
+  // added at the end of the User section.
+  mergePoolLibrary: (payload: {
+    templates: import('@shared/types').InstrumentTemplate[]
+    parameters: import('@shared/types').ParameterTemplate[]
+  }) => void
+  // Capture-popup visibility — Pool's Capture button flips it true,
+  // popup's Save/Cancel flips back.
+  setCaptureOpen: (open: boolean) => void
+  setNewSessionConfirmOpen: (open: boolean) => void
+  // Snapshot a scene from `session.scenes` into the saved-scene
+  // library. Includes the relevant Pool templates + sidebar tracks
+  // + cell map so the saved entry is self-contained across
+  // sessions. Returns the new SavedScene id.
+  saveSceneToLibrary: (sceneId: string, name: string) => Promise<string | null>
+  // Patch the metadata on a SavedScene (name / color / notes /
+  // duration / nextMode / multiplicator / morphInMs). Library is
+  // replaced by-id on disk; the renderer's local mirror updates
+  // both immediately + again via the push-on-change channel.
+  updateSavedScene: (
+    id: string,
+    patch: Partial<import('@shared/types').SavedScene['sceneMeta']> & {
+      name?: string
+      color?: string
+    }
+  ) => Promise<void>
+  // Remove a saved scene by id. Just forwards to the IPC bridge.
+  removeSavedScene: (id: string) => Promise<void>
+  // Drop a saved scene into the current session — instantiates any
+  // missing Pool templates + missing sidebar tracks, then creates a
+  // new Scene with cells linked to the new tracks. Returns the new
+  // scene id so the caller can focus it.
+  instantiateSavedScene: (savedSceneId: string) => string | null
+  // Duplicate an in-session Scene. Clones every cell on the same
+  // tracks (same trackIds, no new sidebar rows), names the copy
+  // "<orig> (copy)". Returns the new scene id.
+  duplicateScene: (sceneId: string) => string | null
+
   // Engine state mirror
   setEngineState: (s: EngineState) => void
 }
@@ -653,7 +900,14 @@ export const useStore = create<State>((set, get) => ({
   // ResizeHandle's `min` of 60 px). User can drag taller; the
   // collapsed view uses a separate 32 px constant. Keeps a fresh
   // session compact so more rows fit on screen by default.
-  rowHeight: 60,
+  // Default row height — sized to give a 12-float OCTOCOSME-style
+  // multi-arg cell (3 rows × 4 columns of small floats) enough
+  // vertical room to render its full value grid without cropping
+  // the last row. Single-arg / vec3 cells happily live at this
+  // height too. Users can drag the row-height slider in the sidebar
+  // to shrink for single-arg-only sessions or grow further for
+  // very deep bundles.
+  rowHeight: 95,
   sceneColumnWidth: 200,
   // 360 px default — wide enough for DUR + NEXT + × multiplicator inputs
   // to all fit on one row in the Sequence-tab scene inspector. Users can
@@ -682,6 +936,9 @@ export const useStore = create<State>((set, get) => ({
   selectedSequenceSlots: [],
   focusDurationToken: 0,
   poolSelection: null,
+  selectedSavedSceneIds: [],
+  undoCount: 0,
+  redoCount: 0,
   pendingIntegrityLoad: null,
   armedSceneId: null,
   autoAdvanceArm: false,
@@ -700,6 +957,11 @@ export const useStore = create<State>((set, get) => ({
     localAddresses: [],
     lastError: ''
   },
+  // Saved-scene library mirror — populated on app start via
+  // `window.api.sceneLibraryList()` and refreshed on every push.
+  sceneLibrary: [],
+  captureOpen: false,
+  newSessionConfirmOpen: false,
   // Ephemeral per-knob display values, interpolated by metaSmooth.ts. Not
   // persisted — on session load we reset these to each knob's `value`
   // (see setSession below).
@@ -708,7 +970,34 @@ export const useStore = create<State>((set, get) => ({
   clipTemplates: loadTemplates(),
 
   setSession: (s) => {
-    const next = backfillTrackArgSpecsFromPool(propagateDefaults(s))
+    const propagated = backfillTrackArgSpecsFromPool(propagateDefaults(s))
+    // Merge any User entries from the global pool library that the
+    // loaded session doesn't already include — same rule as
+    // newSession (library entries follow the user across sessions).
+    // Loaded sessions usually carry their own pool already; this
+    // only adds library entries the user has authored elsewhere.
+    const existingTplIds = new Set(propagated.pool.templates.map((t) => t.id))
+    const existingParIds = new Set(propagated.pool.parameters.map((p) => p.id))
+    const mergedTpls = [
+      ...propagated.pool.templates,
+      ...poolLibraryCache.templates.filter(
+        (t) => !existingTplIds.has(t.id) && !t.builtin
+      )
+    ]
+    const mergedPars = [
+      ...propagated.pool.parameters,
+      ...poolLibraryCache.parameters.filter(
+        (p) => !existingParIds.has(p.id) && !p.builtin
+      )
+    ]
+    const next = {
+      ...propagated,
+      pool: {
+        ...propagated.pool,
+        templates: mergedTpls,
+        parameters: mergedPars
+      }
+    }
     // Reset display values to each knob's persisted value so the UI opens
     // at the right position after loading a session.
     const display = next.metaController.knobs.map((k) => k.value)
@@ -717,6 +1006,60 @@ export const useStore = create<State>((set, get) => ({
     // transport counter) can't point at objects that no longer exist —
     // those dangling refs were causing Inspector / GO / morph features
     // to act on a mix of old and new data after an Open / restore.
+    // Apply persisted GUI layout from session.ui — clamped against
+    // the same bounds the live UI sliders use, so a hand-edited
+    // session file can't push the renderer into a broken state. Any
+    // missing sub-field falls back to whatever's currently in the
+    // store (i.e. the default or the previous session's value).
+    const ui = next.ui ?? {}
+    const cur = get()
+    const uiPatch: Partial<UiState> = {}
+    if (typeof ui.uiScale === 'number' && Number.isFinite(ui.uiScale)) {
+      uiPatch.uiScale = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, ui.uiScale))
+      // Mirror to localStorage so the runtime zoom hook stays in
+      // sync with whatever the session restored.
+      saveUiScale(uiPatch.uiScale)
+    }
+    if (typeof ui.rowHeight === 'number' && Number.isFinite(ui.rowHeight)) {
+      uiPatch.rowHeight = clampInt(ui.rowHeight, 45, 220)
+    }
+    if (
+      typeof ui.sceneColumnWidth === 'number' &&
+      Number.isFinite(ui.sceneColumnWidth)
+    ) {
+      uiPatch.sceneColumnWidth = clampInt(ui.sceneColumnWidth, 140, 480)
+    }
+    if (
+      typeof ui.inspectorWidth === 'number' &&
+      Number.isFinite(ui.inspectorWidth)
+    ) {
+      uiPatch.inspectorWidth = clampInt(ui.inspectorWidth, 280, 640)
+    }
+    if (
+      typeof ui.trackColumnWidth === 'number' &&
+      Number.isFinite(ui.trackColumnWidth)
+    ) {
+      uiPatch.trackColumnWidth = clampInt(ui.trackColumnWidth, 160, 400)
+    }
+    if (
+      typeof ui.editorNotesHeight === 'number' &&
+      Number.isFinite(ui.editorNotesHeight)
+    ) {
+      uiPatch.editorNotesHeight = clampInt(ui.editorNotesHeight, 0, 220)
+    }
+    if (
+      typeof ui.oscMonitorHeight === 'number' &&
+      Number.isFinite(ui.oscMonitorHeight)
+    ) {
+      uiPatch.oscMonitorHeight = clampInt(ui.oscMonitorHeight, 120, 800)
+    }
+    if (typeof ui.tracksCollapsed === 'boolean') {
+      uiPatch.tracksCollapsed = ui.tracksCollapsed
+    }
+    if (typeof ui.scenesCollapsed === 'boolean') {
+      uiPatch.scenesCollapsed = ui.scenesCollapsed
+    }
+    void cur // keep ref-stable for the inner closure below
     set({
       session: next,
       metaKnobDisplayValues: display,
@@ -731,12 +1074,49 @@ export const useStore = create<State>((set, get) => ({
       transportAccumulatedMs: 0,
       // Leave midiLearnMode alone — it's a performer-facing toggle that
       // shouldn't flip unexpectedly mid-session-load.
-      midiLearnTarget: null
+      midiLearnTarget: null,
+      ...uiPatch
+    })
+    // Loading a new session resets the undo timeline — the user
+    // shouldn't be able to "undo" their way back into the previous
+    // file's state by accident. Called AFTER the set so the
+    // subscriber's eager pre-snapshot capture (above) is wiped.
+    resetUndoHistory()
+    // Defensive: re-pull the saved-scene library from main. The
+    // initial fetch on app mount can race with the Pool drawer's
+    // first paint; re-syncing whenever the user loads a session
+    // guarantees the Scenes tab shows the full library after Open.
+    void window.api?.sceneLibraryList?.().then((scenes) => {
+      if (Array.isArray(scenes)) set({ sceneLibrary: scenes })
     })
   },
-  newSession: () =>
+  newSession: () => {
+    // Seed the fresh session's pool with the user's library of
+    // authored Instruments + Parameters BEFORE we set state. Adding
+    // them after the set would trigger App.tsx's auto-push effect
+    // mid-way through (templates: [] → push empty → main writes
+    // empty library) and wipe the library on every New.
+    const empty = makeEmptySession()
+    const existingTplIds = new Set(empty.pool.templates.map((t) => t.id))
+    const existingParIds = new Set(empty.pool.parameters.map((p) => p.id))
+    const mergedTpls = [
+      ...empty.pool.templates,
+      ...poolLibraryCache.templates.filter(
+        (t) => !existingTplIds.has(t.id) && !t.builtin
+      )
+    ]
+    const mergedPars = [
+      ...empty.pool.parameters,
+      ...poolLibraryCache.parameters.filter(
+        (p) => !existingParIds.has(p.id) && !p.builtin
+      )
+    ]
+    const seeded = {
+      ...empty,
+      pool: { ...empty.pool, templates: mergedTpls, parameters: mergedPars }
+    }
     set({
-      session: makeEmptySession(),
+      session: seeded,
       currentFilePath: null,
       metaKnobDisplayValues: Array.from({ length: META_KNOB_COUNT }, () => 0),
       // Same ephemeral reset as setSession — see comment there.
@@ -750,10 +1130,21 @@ export const useStore = create<State>((set, get) => ({
       transportStartedAt: null,
       transportAccumulatedMs: 0,
       midiLearnTarget: null
-    }),
+    })
+    resetUndoHistory()
+    // Defensive sceneLibrary refresh — same rationale as setSession.
+    void window.api?.sceneLibraryList?.().then((scenes) => {
+      if (Array.isArray(scenes)) set({ sceneLibrary: scenes })
+    })
+  },
   setCurrentFilePath: (p) => set({ currentFilePath: p }),
   setName: (name) => set((st) => ({ session: { ...st.session, name } })),
   setTickRate: (hz) => set((st) => ({ session: { ...st.session, tickRateHz: clampInt(hz, 10, 300) } })),
+  setMidiEnabled: (enabled) =>
+    // Persists in the session — main process reads `session.midiEnabled`
+    // on every `engine:updateSession` IPC and propagates the flag to the
+    // MIDI sender (which closes all ports when flipped off).
+    set((st) => ({ session: { ...st.session, midiEnabled: !!enabled } })),
   setDefaults: (fields) =>
     set((st) => {
       // Bug fix: changing a session default used to rewrite EVERY currently-
@@ -813,11 +1204,65 @@ export const useStore = create<State>((set, get) => ({
         })
       }
     }),
+  // ─── OSC forward target CRUD ─────────────────────────────────────
+  // Every mutator pushes the resulting list to the main process via
+  // `network:setForwardTargets` so the listener's hot path stays in
+  // sync without any subscription dance. We send the FULL list (not a
+  // delta) on every change — the list is bounded to ~10 entries in
+  // practice and main re-applies it synchronously.
+  addForwardTarget: (init) => {
+    const id = `fwd_${Math.random().toString(36).slice(2, 10)}`
+    set((st) => {
+      const next: OscForwardTarget[] = [
+        ...(st.session.forwardTargets ?? []),
+        {
+          id,
+          enabled: init?.enabled ?? true,
+          label: init?.label,
+          // Default to loopback + a sensible OSC port so a freshly-
+          // added row is "almost configured" — the user typically
+          // just types the port their downstream consumer listens on.
+          ip: init?.ip ?? '127.0.0.1',
+          port: init?.port ?? 9001
+        }
+      ]
+      window.api?.networkSetForwardTargets?.(next)
+      return { session: { ...st.session, forwardTargets: next } }
+    })
+    return id
+  },
+  updateForwardTarget: (id, fields) =>
+    set((st) => {
+      const list = st.session.forwardTargets ?? []
+      const next = list.map((t) => (t.id === id ? { ...t, ...fields } : t))
+      window.api?.networkSetForwardTargets?.(next)
+      return { session: { ...st.session, forwardTargets: next } }
+    }),
+  removeForwardTarget: (id) =>
+    set((st) => {
+      const next = (st.session.forwardTargets ?? []).filter((t) => t.id !== id)
+      window.api?.networkSetForwardTargets?.(next)
+      return { session: { ...st.session, forwardTargets: next } }
+    }),
   setMidiInputName: (name) => set((st) => ({ session: { ...st.session, midiInputName: name } })),
   setFocusedScene: (id) =>
     set((st) => ({
       session: { ...st.session, focusedSceneId: id },
-      selectedSceneIds: id ? [id] : []
+      selectedSceneIds: id ? [id] : [],
+      // Explicit scene selection clears every other Pool / Edit
+      // selection so the Del-key handler sees an unambiguous target.
+      // Cell-tile clicks `e.stopPropagation` to avoid triggering
+      // this path via bubble (which used to wipe the cell selection
+      // the click had just made); the only entry points that now
+      // call setFocusedScene are real scene-header clicks + a few
+      // programmatic flows (instantiateSavedScene, focus after
+      // duplicate, etc.).
+      poolSelection: id ? null : st.poolSelection,
+      selectedTrack: id ? null : st.selectedTrack,
+      selectedTrackIds: id ? [] : st.selectedTrackIds,
+      selectedCell: id ? null : st.selectedCell,
+      selectedCells: id ? [] : st.selectedCells,
+      selectedSavedSceneIds: id ? [] : st.selectedSavedSceneIds
     })),
   selectSceneRange: (id) =>
     set((st) => {
@@ -826,11 +1271,20 @@ export const useStore = create<State>((set, get) => ({
       if (clickedIdx < 0) return st
       const anchor = st.session.focusedSceneId
       const anchorIdx = anchor ? order.indexOf(anchor) : -1
+      // Range-select only clears POOL-side selections (templates /
+      // parameters / saved scenes) — grid cell + track selections
+      // can coexist with a focused scene. See `setFocusedScene` for
+      // the explanation.
+      const clearOthers = {
+        poolSelection: null,
+        selectedSavedSceneIds: []
+      }
       // No anchor yet → behave like plain focus.
       if (anchorIdx < 0) {
         return {
           session: { ...st.session, focusedSceneId: id },
-          selectedSceneIds: [id]
+          selectedSceneIds: [id],
+          ...clearOthers
         }
       }
       const from = Math.min(anchorIdx, clickedIdx)
@@ -838,7 +1292,8 @@ export const useStore = create<State>((set, get) => ({
       return {
         // Keep the anchor where it is so further Ctrl-clicks re-extend from it.
         session: { ...st.session, focusedSceneId: anchor },
-        selectedSceneIds: order.slice(from, to + 1)
+        selectedSceneIds: order.slice(from, to + 1),
+        ...clearOthers
       }
     }),
   removeScenes: (ids) =>
@@ -907,10 +1362,11 @@ export const useStore = create<State>((set, get) => ({
     const src = get().session.pool.templates.find((t) => t.id === id)
     if (!src) return null
     const newId = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
+    const existingNames = get().session.pool.templates.map((t) => t.name)
     const cloned: InstrumentTemplate = {
       ...src,
       id: newId,
-      name: `${src.name} (copy)`,
+      name: uniqueCopyName(src.name, existingNames),
       builtin: false,
       // Re-id every function so the new template's functions don't
       // collide with the source template's functions if both are
@@ -1027,10 +1483,67 @@ export const useStore = create<State>((set, get) => ({
             selectedCell: null,
             selectedCells: [],
             selectedTrack: null,
-            selectedTrackIds: []
+            selectedTrackIds: [],
+            // Picking a non-SavedScene Pool entry wipes the multi-
+            // scene selection so a stale Del-press doesn't act on
+            // scenes the user can no longer see highlighted.
+            selectedSavedSceneIds:
+              sel.kind === 'savedScene'
+                ? st.selectedSavedSceneIds
+                : []
           }
-        : { poolSelection: null }
+        : { poolSelection: null, selectedSavedSceneIds: [] }
     ),
+  selectSavedScene: (savedSceneId) =>
+    set({
+      poolSelection: { kind: 'savedScene', savedSceneId },
+      selectedSavedSceneIds: [savedSceneId],
+      selectedCell: null,
+      selectedCells: [],
+      selectedTrack: null,
+      selectedTrackIds: []
+    }),
+  toggleSavedSceneSelection: (savedSceneId) =>
+    set((st) => {
+      const has = st.selectedSavedSceneIds.includes(savedSceneId)
+      const nextIds = has
+        ? st.selectedSavedSceneIds.filter((id) => id !== savedSceneId)
+        : [...st.selectedSavedSceneIds, savedSceneId]
+      // Anchor follows the last interaction. If the user is REMOVING
+      // the currently anchored scene, fall back to the previous
+      // anchor (last element of the new list) or null if empty.
+      let nextPool: UiState['poolSelection']
+      if (nextIds.length === 0) {
+        nextPool = null
+      } else if (has) {
+        // We just removed `savedSceneId`. If it was the anchor,
+        // move to the new last element. If it wasn't, keep the
+        // existing anchor (it's still in the set).
+        const wasAnchor =
+          st.poolSelection?.kind === 'savedScene' &&
+          st.poolSelection.savedSceneId === savedSceneId
+        nextPool = wasAnchor
+          ? { kind: 'savedScene', savedSceneId: nextIds[nextIds.length - 1] }
+          : st.poolSelection
+      } else {
+        // Add path — the new scene becomes the anchor.
+        nextPool = { kind: 'savedScene', savedSceneId }
+      }
+      return {
+        poolSelection: nextPool,
+        selectedSavedSceneIds: nextIds,
+        selectedCell: null,
+        selectedCells: [],
+        selectedTrack: null,
+        selectedTrackIds: []
+      }
+    }),
+  clearSavedSceneSelection: () =>
+    set((st) => ({
+      selectedSavedSceneIds: [],
+      poolSelection:
+        st.poolSelection?.kind === 'savedScene' ? null : st.poolSelection
+    })),
 
   // ─── Pool → Edit-view instantiation ───────────────────────────────────
   instantiateTemplate: (templateId, insertAfterTrackId) =>
@@ -1246,10 +1759,11 @@ export const useStore = create<State>((set, get) => ({
     const src = get().session.pool.parameters.find((p) => p.id === id)
     if (!src) return null
     const newId = `par_user_${Math.random().toString(36).slice(2, 9)}`
+    const existingNames = get().session.pool.parameters.map((p) => p.name)
     const cloned: ParameterTemplate = {
       ...src,
       id: newId,
-      name: `${src.name} (copy)`,
+      name: uniqueCopyName(src.name, existingNames),
       builtin: false
     }
     set((st) => ({
@@ -1421,6 +1935,32 @@ export const useStore = create<State>((set, get) => ({
         tracks: st.session.tracks.map((t) => (t.id === id ? { ...t, ...fields } : t))
       }
     })),
+  setTrackMidiOut: (id, patch) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        tracks: st.session.tracks.map((t) => {
+          if (t.id !== id) return t
+          if (patch === null) {
+            // Clear the MIDI default entirely (next cell created on
+            // this row gets no inherited midiOut).
+            const { midiOut: _drop, ...rest } = t
+            void _drop
+            return rest
+          }
+          const base = t.midiOut ?? {
+            enabled: false,
+            portName: '',
+            channel: 1,
+            kind: 'cc' as const,
+            cc: 1,
+            noteMode: 'velocity' as const,
+            gateLengthMs: 0
+          }
+          return { ...t, midiOut: { ...base, ...patch } }
+        })
+      }
+    })),
   setTrackEnabled: (id, enabled) =>
     set((st) => ({
       session: {
@@ -1467,6 +2007,91 @@ export const useStore = create<State>((set, get) => ({
         })
       }
     })),
+  setCellPersistentSlot: (sceneId, trackId, slotIdx, persistent, capturedValue) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        scenes: st.session.scenes.map((sc) => {
+          if (sc.id !== sceneId) return sc
+          const cell = sc.cells[trackId]
+          if (!cell) return sc
+          // Sparse-array semantics: persistent === undefined means
+          // "no override" (track default applies). Stretching slots
+          // up to slotIdx fills any gap with undefined → falsy.
+          const slots = cell.persistentSlots ? cell.persistentSlots.slice() : []
+          const values = cell.persistentValues ? cell.persistentValues.slice() : []
+          while (slots.length <= slotIdx) slots.push(undefined)
+          while (values.length <= slotIdx) values.push('')
+          slots[slotIdx] = persistent
+          if (persistent === true) {
+            // Capture the current cell-value token (caller passes
+            // it; empty string parses as 0 just like track-level
+            // pinning).
+            values[slotIdx] = capturedValue ?? ''
+          } else if (persistent === false) {
+            // Explicit unpin — clear the captured value but keep
+            // the `false` entry so the engine knows this is an
+            // OVERRIDE of the track default (not "no opinion").
+            values[slotIdx] = ''
+          } else {
+            // undefined → drop the override entirely. Trim trailing
+            // undefineds so the array stays compact.
+            values[slotIdx] = ''
+            while (slots.length > 0 && slots[slots.length - 1] === undefined) {
+              slots.pop()
+              values.pop()
+            }
+          }
+          const anyDefined = slots.some((b) => b !== undefined)
+          const nextCell: Cell = {
+            ...cell,
+            persistentSlots: anyDefined ? slots : undefined,
+            persistentValues: anyDefined ? values : undefined
+          }
+          return { ...sc, cells: { ...sc.cells, [trackId]: nextCell } }
+        })
+      }
+    })),
+  setCellScaling: (sceneId, trackId, patch) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        scenes: st.session.scenes.map((sc) => {
+          if (sc.id !== sceneId) return sc
+          const cell = sc.cells[trackId]
+          if (!cell) return sc
+          let nextEnabled = cell.scalingEnabled
+          let nextMin = cell.scalingMin ? cell.scalingMin.slice() : []
+          let nextMax = cell.scalingMax ? cell.scalingMax.slice() : []
+          if (typeof patch.enabled === 'boolean') {
+            nextEnabled = patch.enabled
+          }
+          if (typeof patch.slotIdx === 'number') {
+            // Stretch the per-slot arrays to cover the touched
+            // index; gaps fill with 0 / 1 as sensible defaults so
+            // an enabled clamp doesn't accidentally pin the slot
+            // at NaN.
+            while (nextMin.length <= patch.slotIdx) nextMin.push(0)
+            while (nextMax.length <= patch.slotIdx) nextMax.push(1)
+            if (typeof patch.min === 'number' && Number.isFinite(patch.min)) {
+              nextMin[patch.slotIdx] = patch.min
+            }
+            if (typeof patch.max === 'number' && Number.isFinite(patch.max)) {
+              nextMax[patch.slotIdx] = patch.max
+            }
+          }
+          const nextCell: Cell = {
+            ...cell,
+            scalingEnabled: nextEnabled,
+            // Drop empty arrays so saved sessions stay tidy when
+            // the feature is off + nothing's been touched.
+            scalingMin: nextMin.length > 0 ? nextMin : undefined,
+            scalingMax: nextMax.length > 0 ? nextMax : undefined
+          }
+          return { ...sc, cells: { ...sc.cells, [trackId]: nextCell } }
+        })
+      }
+    })),
   sendTrackDefaultsToClips: (id) =>
     set((st) => {
       const track = st.session.tracks.find((t) => t.id === id)
@@ -1474,6 +2099,7 @@ export const useStore = create<State>((set, get) => ({
       const addr = track.defaultOscAddress
       const ip = track.defaultDestIp
       const port = track.defaultDestPort
+      const midiOut = track.midiOut
       // Fall back to session defaults for anything the Message didn't specify,
       // so newly-created cells still have valid destinations.
       const effIp = ip && ip !== '' ? ip : st.session.defaultDestIp
@@ -1496,6 +2122,8 @@ export const useStore = create<State>((set, get) => ({
               if (ip) created.destLinkedToDefault = false
               if (port) created.destLinkedToDefault = false
               if (addr) created.addressLinkedToDefault = false
+              // Inherit the Parameter's MIDI defaults on auto-create.
+              if (midiOut) created.midiOut = { ...midiOut }
               return { ...s, cells: { ...s.cells, [id]: created } }
             }
             const next: Cell = { ...existing }
@@ -1510,6 +2138,14 @@ export const useStore = create<State>((set, get) => ({
             if (port !== undefined && port > 0) {
               next.destPort = port
               next.destLinkedToDefault = false
+            }
+            // Push the Parameter row's MIDI default down to every
+            // clip. Overwrites the cell's existing midiOut so a
+            // "Send to Clips" click pushes all current settings —
+            // port + channel + kind + CC# + gate — in lockstep with
+            // the OSC fields. That's what the button promises.
+            if (midiOut) {
+              next.midiOut = { ...midiOut }
             }
             return { ...s, cells: { ...s.cells, [id]: next } }
           })
@@ -1630,6 +2266,25 @@ export const useStore = create<State>((set, get) => ({
             // inputs in the inspector instead of one big string.
             if (track?.argSpec && track.argSpec.length > 0) {
               cell.value = buildInitialValueFromArgSpec(track.argSpec)
+            }
+            // Inherit the Parameter row's MIDI default. Lookup
+            // order:
+            //   1. The Parameter row's own `midiOut` (edited from
+            //      the TrackInspector in the Edit view) — this is
+            //      where the user does most of the wiring.
+            //   2. The source Function in the Pool — for cells
+            //      created on a row that was just instantiated from
+            //      a built-in MIDI Parameter blueprint.
+            if (track?.midiOut) {
+              cell.midiOut = { ...track.midiOut }
+            } else if (track?.sourceTemplateId && track?.sourceFunctionId) {
+              const tpl = st.session.pool.templates.find(
+                (t) => t.id === track.sourceTemplateId
+              )
+              const src = tpl?.functions.find((f) => f.id === track.sourceFunctionId)
+              if (src?.midiOut) {
+                cell.midiOut = { ...src.midiOut }
+              }
             }
             return {
               ...s,
@@ -1870,7 +2525,12 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
   setEditorNotesHeight: (h) => set({ editorNotesHeight: clampInt(h, 0, 240) }),
-  setRowHeight: (h) => set({ rowHeight: clampInt(h, 30, 220) }),
+  // Minimum 45 px: below that, the trigger button (20 px) + a
+  // single line of the value grid (~11 px) wouldn't fit, leaving
+  // the cell visually empty. Users who want extreme compactness
+  // can collapse tracks via the sidebar toggle instead, which
+  // switches to the 32-px single-line layout.
+  setRowHeight: (h) => set({ rowHeight: clampInt(h, 45, 220) }),
   setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 180, 480) }),
   setScenePaletteWidth: (w) => set({ scenePaletteWidth: clampInt(w, 200, 1200) }),
   setTrackColumnWidth: (w) => set({ trackColumnWidth: clampInt(w, 160, 400) }),
@@ -2056,10 +2716,17 @@ export const useStore = create<State>((set, get) => ({
         modulation: { ...cell.modulation },
         sequencer: { ...cell.sequencer, stepValues: [...cell.sequencer.stepValues] }
       }
+      // Capture the source track's argSpec so a multi-arg clip
+      // template can re-impose its structure on an empty Parameter
+      // later. Single-arg cells have no argSpec — that's fine,
+      // applyClipTemplate just skips the projection step.
+      const track = st.session.tracks.find((t) => t.id === trackId)
+      const argSpec = track?.argSpec ? track.argSpec.map((a) => ({ ...a })) : undefined
       const tpl: ClipTemplate = {
         id: 'tpl_' + Math.random().toString(36).slice(2, 10),
         name: name.trim() || 'Untitled',
-        cell: cleaned
+        cell: cleaned,
+        argSpec
       }
       return { clipTemplates: [...st.clipTemplates, tpl] }
     }),
@@ -2117,9 +2784,34 @@ export const useStore = create<State>((set, get) => ({
             : [...base.sequencer.stepValues]
         }
       }
+      // Project the template's argSpec onto the target track if (a)
+      // the template carries one (multi-arg clip) AND (b) the track
+      // has no argSpec yet (empty / fresh Parameter row, or a row
+      // instantiated from a single-arg source that the user now
+      // wants to upgrade). When the track ALREADY has an argSpec,
+      // we leave it alone — overwriting could clobber the user's
+      // hand-tuned pin / value layout. Same rule for any track
+      // that has cells already filled on OTHER scenes: changing
+      // its argSpec here would re-interpret their value strings.
+      const otherCellsExist = st.session.scenes.some(
+        (s) => s.id !== sceneId && s.cells[trackId]
+      )
+      const shouldProjectArgSpec =
+        tpl.argSpec && tpl.argSpec.length > 1 && track && !track.argSpec && !otherCellsExist
+      const tracksUpdated = shouldProjectArgSpec
+        ? st.session.tracks.map((t) =>
+            t.id === trackId
+              ? {
+                  ...t,
+                  argSpec: tpl.argSpec!.map((a) => ({ ...a }))
+                }
+              : t
+          )
+        : st.session.tracks
       return {
         session: {
           ...st.session,
+          tracks: tracksUpdated,
           scenes: st.session.scenes.map((s) =>
             s.id === sceneId ? { ...s, cells: { ...s.cells, [trackId]: cell } } : s
           )
@@ -2369,6 +3061,278 @@ export const useStore = create<State>((set, get) => ({
     return newId
   },
 
+  // ── Scene library actions ────────────────────────────────────────
+  setSceneLibrary: (scenes) => set({ sceneLibrary: scenes }),
+  mergePoolLibrary: (payload) =>
+    set((st) => {
+      // Skip any library entry whose id is already in the
+      // current session's pool. The session's data wins because
+      // it may have local edits the library hasn't seen yet
+      // (e.g. an entry that's in the middle of being renamed).
+      const existingTplIds = new Set(st.session.pool.templates.map((t) => t.id))
+      const existingParIds = new Set(st.session.pool.parameters.map((p) => p.id))
+      const newTpls = (payload.templates ?? []).filter(
+        (t) => !existingTplIds.has(t.id) && !t.builtin
+      )
+      const newPars = (payload.parameters ?? []).filter(
+        (p) => !existingParIds.has(p.id) && !p.builtin
+      )
+      if (newTpls.length === 0 && newPars.length === 0) return st
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            ...st.session.pool,
+            templates: [...st.session.pool.templates, ...newTpls],
+            parameters: [...st.session.pool.parameters, ...newPars]
+          }
+        }
+      }
+    }),
+  setCaptureOpen: (open) => set({ captureOpen: open }),
+  setNewSessionConfirmOpen: (open) => set({ newSessionConfirmOpen: open }),
+
+  saveSceneToLibrary: async (sceneId, name) => {
+    const st = get()
+    const scene = st.session.scenes.find((s) => s.id === sceneId)
+    if (!scene) return null
+    // Collect every track that actually has a cell on this scene
+    // plus each of those tracks' parent Template (header) row so
+    // the saved scene preserves the visual grouping when re-
+    // instantiated. We work via a Set of needed track ids, then
+    // walk session.tracks in its SIDEBAR ORDER to materialise the
+    // list — this matters because the saved-scene instantiator
+    // resolves parentTrackId by id-map lookup as it walks the list:
+    // a parent header that lands AFTER its child function row would
+    // come out with parentTrackId=undefined (orphan), which is the
+    // bug that re-shuffled an OCTOCOSME scene onto a blank grid.
+    const cellTrackIds = Object.keys(scene.cells).filter(
+      (tid) => st.session.tracks.some((t) => t.id === tid)
+    )
+    const neededIds = new Set<string>(cellTrackIds)
+    const usedTemplateIds = new Set<string>()
+    for (const tid of cellTrackIds) {
+      const tr = st.session.tracks.find((t) => t.id === tid)
+      if (!tr) continue
+      if (tr.parentTrackId) neededIds.add(tr.parentTrackId)
+      if (tr.sourceTemplateId) usedTemplateIds.add(tr.sourceTemplateId)
+    }
+    // Pick up parent's sourceTemplateId too (header tracks carry
+    // one even though they don't have cells), so the saved scene's
+    // Pool block includes every needed Instrument template.
+    for (const id of neededIds) {
+      const tr = st.session.tracks.find((t) => t.id === id)
+      if (tr?.sourceTemplateId) usedTemplateIds.add(tr.sourceTemplateId)
+    }
+    // Materialise in session.tracks order — preserves parent-before-
+    // child invariant and the user's chosen Instrument grouping.
+    const usedTracks: Track[] = st.session.tracks.filter((t) =>
+      neededIds.has(t.id)
+    )
+    const usedTemplates: InstrumentTemplate[] = []
+    usedTemplateIds.forEach((tplId) => {
+      const tpl = st.session.pool.templates.find((t) => t.id === tplId)
+      if (tpl) usedTemplates.push(tpl)
+    })
+    const savedSceneCells: Record<string, Cell> = {}
+    for (const tid of cellTrackIds) {
+      if (scene.cells[tid]) savedSceneCells[tid] = scene.cells[tid]
+    }
+    const saved: import('@shared/types').SavedScene = {
+      id: `scn_lib_${Math.random().toString(36).slice(2, 9)}`,
+      name: name.trim() || scene.name || 'Saved Scene',
+      color: scene.color,
+      createdAt: Date.now(),
+      origin: 'manual',
+      templates: usedTemplates,
+      tracks: usedTracks,
+      cells: savedSceneCells,
+      sceneMeta: {
+        name: scene.name,
+        color: scene.color,
+        notes: scene.notes,
+        durationSec: scene.durationSec,
+        nextMode: scene.nextMode,
+        multiplicator: scene.multiplicator,
+        morphInMs: scene.morphInMs
+      }
+    }
+    try {
+      await window.api?.sceneLibrarySave?.(saved)
+    } catch (e) {
+      console.error('[saveSceneToLibrary] failed:', (e as Error).message)
+      return null
+    }
+    return saved.id
+  },
+
+  updateSavedScene: async (id, patch) => {
+    const st = get()
+    const cur = st.sceneLibrary.find((s) => s.id === id)
+    if (!cur) return
+    // Top-level overrides for name + color travel separately from
+    // the sceneMeta payload because instantiation reads them from
+    // both locations (top-level for the row display; sceneMeta for
+    // the instantiated Scene's defaults). Keep them in sync.
+    const nextName = patch.name ?? cur.name
+    const nextColor = patch.color ?? cur.color
+    const nextMeta = {
+      ...cur.sceneMeta,
+      ...patch,
+      name: nextName,
+      color: nextColor
+    }
+    const next: import('@shared/types').SavedScene = {
+      ...cur,
+      name: nextName,
+      color: nextColor,
+      sceneMeta: nextMeta
+    }
+    // Optimistic local update so the UI reflects the change before
+    // the IPC round-trip resolves — main will push the same scene
+    // back via `scene-library:changed`, which is idempotent.
+    set({ sceneLibrary: st.sceneLibrary.map((s) => (s.id === id ? next : s)) })
+    try {
+      await window.api?.sceneLibrarySave?.(next)
+    } catch (e) {
+      console.error('[updateSavedScene] failed:', (e as Error).message)
+    }
+  },
+
+  removeSavedScene: async (id) => {
+    try {
+      await window.api?.sceneLibraryRemove?.(id)
+    } catch (e) {
+      console.error('[removeSavedScene] failed:', (e as Error).message)
+    }
+  },
+
+  instantiateSavedScene: (savedSceneId) => {
+    const st = get()
+    const saved = st.sceneLibrary.find((s) => s.id === savedSceneId)
+    if (!saved) return null
+    // Map oldTrackId → newTrackId so the cells map can be rewritten
+    // to the freshly-created sidebar rows.
+    const trackIdMap = new Map<string, string>()
+    const newTracks: Track[] = []
+    // Walk the saved tracks in their original order so Template
+    // (header) rows land before their Function (child) rows — the
+    // sidebar relies on that order to render the hierarchy.
+    for (const oldTrack of saved.tracks) {
+      // If a track with the same sourceTemplateId + sourceFunctionId
+      // (or same sourceTemplateId for a Template row) already exists
+      // in the sidebar, reuse it instead of creating a duplicate.
+      // Keeps "drag the same saved scene twice" idempotent.
+      const reusable = st.session.tracks.find((t) => {
+        if (oldTrack.kind === 'template') {
+          return t.kind === 'template' && t.sourceTemplateId === oldTrack.sourceTemplateId
+        }
+        return (
+          t.kind === 'function' &&
+          t.sourceTemplateId === oldTrack.sourceTemplateId &&
+          t.sourceFunctionId === oldTrack.sourceFunctionId
+        )
+      })
+      if (reusable) {
+        trackIdMap.set(oldTrack.id, reusable.id)
+        continue
+      }
+      // Fresh sidebar row, new id, parentTrackId remapped via the
+      // map (which by now contains the parent's new id since we
+      // walked templates first).
+      const newId = `t_${Math.random().toString(36).slice(2, 9)}`
+      trackIdMap.set(oldTrack.id, newId)
+      const cloned: Track = {
+        ...oldTrack,
+        id: newId,
+        parentTrackId: oldTrack.parentTrackId
+          ? trackIdMap.get(oldTrack.parentTrackId) ?? undefined
+          : undefined
+      }
+      newTracks.push(cloned)
+    }
+    // Pool templates: copy any that aren't already in this session
+    // (by id). Existing entries with the same id win — we don't
+    // overwrite the user's local Pool edits.
+    const newPoolTemplates: InstrumentTemplate[] = []
+    for (const tpl of saved.templates) {
+      if (!st.session.pool.templates.find((t) => t.id === tpl.id)) {
+        newPoolTemplates.push(tpl)
+      }
+    }
+    // Rebuild the cells map with new track ids.
+    const newCells: Record<string, Cell> = {}
+    for (const [oldTid, cell] of Object.entries(saved.cells)) {
+      const newTid = trackIdMap.get(oldTid)
+      if (!newTid) continue
+      newCells[newTid] = { ...cell }
+    }
+    const newSceneId = `s_${Math.random().toString(36).slice(2, 9)}`
+    const newScene: Scene = {
+      id: newSceneId,
+      name: saved.sceneMeta.name,
+      color: saved.sceneMeta.color,
+      notes: saved.sceneMeta.notes ?? '',
+      durationSec: saved.sceneMeta.durationSec,
+      nextMode: saved.sceneMeta.nextMode,
+      multiplicator: saved.sceneMeta.multiplicator,
+      morphInMs: saved.sceneMeta.morphInMs,
+      cells: newCells
+    }
+    // Mark this scene as coming from the library so App.tsx's
+    // auto-save effect doesn't create a duplicate library entry
+    // when it sees session.scenes grow. See `sceneIdsFromLibrary`.
+    sceneIdsFromLibrary.add(newSceneId)
+    set((s) => ({
+      session: {
+        ...s.session,
+        tracks: [...s.session.tracks, ...newTracks],
+        scenes: [...s.session.scenes, newScene],
+        pool: {
+          ...s.session.pool,
+          templates: [...s.session.pool.templates, ...newPoolTemplates]
+        },
+        // Focus the freshly-instantiated scene so the inspector
+        // lands on it without callers having to remember a follow-
+        // up `setFocusedScene`. Not all entry points did (Use button
+        // did, drag-drop didn't), so the user had to click again
+        // to inspect the new column.
+        focusedSceneId: newSceneId
+      },
+      selectedSceneIds: [newSceneId],
+      // Same selection-mutex rule as setFocusedScene — landing a
+      // saved scene clears any active Pool selection.
+      poolSelection: null,
+      selectedSavedSceneIds: []
+    }))
+    return newSceneId
+  },
+
+  duplicateScene: (sceneId) => {
+    const st = get()
+    const scene = st.session.scenes.find((s) => s.id === sceneId)
+    if (!scene) return null
+    const newSceneId = `s_${Math.random().toString(36).slice(2, 9)}`
+    // Clone cells one-by-one so a future field addition to Cell
+    // doesn't accidentally skip a slot. Track ids stay the same —
+    // duplicating a scene doesn't add sidebar rows.
+    const newCells: Record<string, Cell> = {}
+    for (const [tid, cell] of Object.entries(scene.cells)) {
+      newCells[tid] = { ...cell }
+    }
+    const existingNames = st.session.scenes.map((s) => s.name)
+    const newScene: Scene = {
+      ...scene,
+      id: newSceneId,
+      name: uniqueCopyName(scene.name, existingNames),
+      cells: newCells
+    }
+    set((s) => ({
+      session: { ...s.session, scenes: [...s.session.scenes, newScene] }
+    }))
+    return newSceneId
+  },
+
   setEngineState: (s) => set({ engine: s })
 }))
 
@@ -2545,6 +3509,13 @@ function propagateDefaults(s: Session): Session {
       typeof s.defaultOscAddress === 'string' ? s.defaultOscAddress : '/dataflou/value',
     defaultDestIp: typeof s.defaultDestIp === 'string' ? s.defaultDestIp : '127.0.0.1',
     defaultDestPort: typeof s.defaultDestPort === 'number' ? s.defaultDestPort : 9000,
+    // Global MIDI output — default true on legacy sessions so users
+    // with new MIDI cells "just work" after upgrading. They can flip
+    // it off from the prefs sub-toolbar if they don't want it.
+    midiEnabled:
+      typeof (s as Partial<Session>).midiEnabled === 'boolean'
+        ? (s as Partial<Session>).midiEnabled!
+        : true,
     // Soft-migrate tracks: guarantee every Track has a proper shape, and
     // validate optional per-track fields (defaults, midiTrigger). Previously
     // we just passed through `s.tracks` unchanged, so older files' optional
@@ -2580,6 +3551,18 @@ function propagateDefaults(s: Session): Session {
         defaultDestPort:
           typeof t.defaultDestPort === 'number' ? t.defaultDestPort : undefined,
         midiTrigger: sanitizeMidiBinding(t.midiTrigger),
+        // Parameter-row MIDI default. Optional; cells inherit it
+        // at ensureCell-time. Legacy sessions have nothing here.
+        midiOut: sanitizeMidiOut(
+          (t as Partial<Track>).midiOut as import('@shared/types').MidiOut | undefined
+        ),
+        // Parameter-row OSC emission toggle. Default true — legacy
+        // sessions keep firing. When false the engine skips OSC for
+        // every cell on this track.
+        oscEnabled:
+          typeof (t as Partial<Track>).oscEnabled === 'boolean'
+            ? (t as Partial<Track>).oscEnabled
+            : true,
         // argSpec is initialized from the saved track if present.
         // A second pass below re-resolves it against the FINAL
         // (builtin-merged) pool so older OCTOCOSME rows pick up the
@@ -2655,6 +3638,42 @@ function propagateDefaults(s: Session): Session {
             // adding new modes from blowing up this block.
             sequencer: migrateSequencer(c.sequencer),
             scaleToUnit: typeof c.scaleToUnit === 'boolean' ? c.scaleToUnit : false,
+            // OSC emission — default true so legacy cells keep firing.
+            oscEnabled:
+              typeof (c as Partial<Cell>).oscEnabled === 'boolean'
+                ? (c as Partial<Cell>).oscEnabled
+                : true,
+            // MIDI output — backfill missing fields on legacy cells so
+            // the engine + Inspector can read them unconditionally.
+            // Default `enabled: false` keeps existing cells silent on
+            // MIDI until the user explicitly opts in.
+            midiOut: sanitizeMidiOut(
+              (c as Partial<Cell>).midiOut as import('@shared/types').MidiOut | undefined
+            ),
+            velocity:
+              typeof (c as Partial<Cell>).velocity === 'string'
+                ? (c as Partial<Cell>).velocity
+                : '100',
+            velocityPersistent:
+              typeof (c as Partial<Cell>).velocityPersistent === 'boolean'
+                ? (c as Partial<Cell>).velocityPersistent
+                : false,
+            notePersistent:
+              typeof (c as Partial<Cell>).notePersistent === 'boolean'
+                ? (c as Partial<Cell>).notePersistent
+                : false,
+            midiScale:
+              typeof (c as Partial<Cell>).midiScale === 'boolean'
+                ? (c as Partial<Cell>).midiScale
+                : false,
+            // Pre-MIDI sessions had no Timing-collapse concept; the
+            // delay + transition fields were always live. Migrate
+            // legacy cells with `timingEnabled: true` when they have
+            // non-zero values (preserves intent), `false` otherwise.
+            timingEnabled:
+              typeof (c as Partial<Cell>).timingEnabled === 'boolean'
+                ? (c as Partial<Cell>).timingEnabled
+                : (c.delayMs ?? 0) > 0 || (c.transitionMs ?? 0) > 0,
             // Migrate modulation fields — older sessions lack type/mode/sync/etc.
             modulation: {
               enabled: !!m?.enabled,
@@ -2781,8 +3800,36 @@ function propagateDefaults(s: Session): Session {
     // Soft-migrate Meta Controller for sessions saved before this feature.
     // Fill any missing fields with factory defaults and clamp the array to
     // META_KNOB_COUNT. Destinations are capped at META_MAX_DESTS.
-    metaController: sanitizeMetaController(s.metaController)
+    metaController: sanitizeMetaController(s.metaController),
+    // OSC forward targets — new in v0.5, defaults to empty list. Sanitize
+    // each entry so a hand-edited session file with garbage values doesn't
+    // crash the main-process listener.
+    forwardTargets: sanitizeForwardTargets(s.forwardTargets)
   }
+}
+
+// Sanitize a forward-targets array — drops entries with missing/empty
+// IP, out-of-range port, or missing id. Falls back to [] for anything
+// non-array. Pure function, called from session migration.
+function sanitizeForwardTargets(raw: unknown): OscForwardTarget[] {
+  if (!Array.isArray(raw)) return []
+  const out: OscForwardTarget[] = []
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const rr = r as Record<string, unknown>
+    const id = typeof rr.id === 'string' && rr.id.length > 0 ? rr.id : null
+    const ip = typeof rr.ip === 'string' ? rr.ip.trim() : ''
+    const port = Number.isFinite(rr.port) ? Math.floor(rr.port as number) : 0
+    if (!id || ip.length === 0 || port < 1 || port > 65535) continue
+    out.push({
+      id,
+      enabled: !!rr.enabled,
+      label: typeof rr.label === 'string' ? rr.label : undefined,
+      ip,
+      port
+    })
+  }
+  return out
 }
 
 // Second pass — once the pool has been merged with the builtin
@@ -2936,6 +3983,39 @@ function migrateSequencer(raw: unknown): SequencerParams {
 // else is treated as "no binding" rather than leaving a malformed object in
 // state. Used in propagateDefaults to keep older / hand-edited session files
 // from crashing the MIDI router.
+// Sanitise a stored `MidiOut` blob from a session file — guarantees
+// every field is present + in-range so the engine + Inspector can
+// read them without conditional defaulting. Returns undefined when
+// the input is null/undefined (the call site spreads from a default
+// instead) and a fully-defaulted MidiOut when the input is malformed
+// (the user keeps their port + channel choice even if other fields
+// got corrupted).
+function sanitizeMidiOut(
+  raw: import('@shared/types').MidiOut | undefined
+): import('@shared/types').MidiOut | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Partial<import('@shared/types').MidiOut>
+  const kind = r.kind === 'note' ? 'note' : 'cc'
+  return {
+    enabled: r.enabled === true,
+    portName: typeof r.portName === 'string' ? r.portName : '',
+    channel:
+      typeof r.channel === 'number' && Number.isFinite(r.channel)
+        ? Math.max(1, Math.min(16, Math.floor(r.channel)))
+        : 1,
+    kind,
+    cc:
+      typeof r.cc === 'number' && Number.isFinite(r.cc)
+        ? Math.max(0, Math.min(127, Math.floor(r.cc)))
+        : 1,
+    noteMode: r.noteMode === 'pitch' ? 'pitch' : 'velocity',
+    gateLengthMs:
+      typeof r.gateLengthMs === 'number' && Number.isFinite(r.gateLengthMs)
+        ? Math.max(0, Math.min(60_000, Math.floor(r.gateLengthMs)))
+        : 0
+  }
+}
+
 function sanitizeMidiBinding(
   b: unknown
 ): { kind: 'note' | 'cc'; channel: number; number: number } | undefined {

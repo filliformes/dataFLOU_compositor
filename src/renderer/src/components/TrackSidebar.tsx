@@ -508,10 +508,18 @@ export default function TrackSidebar(): JSX.Element {
                     </button>
                   )}
 
-                  {/* 4. Save as Template — only when the anchor is a
+                  {/* 4. Save as User — only when the anchor is a
                          Template row (i.e. the user right-clicked the
-                         header itself). Prompts for a name and flips
-                         the linked Pool entry from draft → saved. */}
+                         header itself). Flips the linked Pool entry
+                         from draft → saved so it appears in the
+                         Pool's User tab. Renamed from "Save as
+                         Template" because BOTH Built-in and User
+                         entries are templates; "User" is the
+                         specific destination.
+                         Electron disables `window.prompt`, so we
+                         skip the name dialog and just use the
+                         instrument's current name. User can rename
+                         in the Pool inspector after the fact. */}
                   {anchor?.kind === 'template' && anchor.sourceTemplateId && (
                     <>
                       <div className="border-t border-border my-1" />
@@ -519,18 +527,12 @@ export default function TrackSidebar(): JSX.Element {
                         className="w-full text-left px-3 py-1 hover:bg-panel2"
                         onClick={() => {
                           setMenu(null)
-                          const proposed = anchor.name || 'My Instrument'
-                          const name = prompt(
-                            'Save Instrument as Template — name?',
-                            proposed
-                          )
-                          if (name && name.trim()) {
-                            saveAsTemplate(anchor.id, name.trim())
-                          }
+                          const proposed = (anchor.name || 'My Instrument').trim()
+                          saveAsTemplate(anchor.id, proposed)
                         }}
-                        title="Save this Instrument + all its Parameters as a reusable Template in the Pool"
+                        title="Save this Instrument + all its Parameters into the Pool's User tab as a reusable entry"
                       >
-                        Save as Template…
+                        Save as User
                       </button>
                     </>
                   )}

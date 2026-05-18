@@ -3,9 +3,14 @@ import type {
   DiscoveredOscDevice,
   EngineState,
   ExposedApi,
+  InstrumentTemplate,
+  MidiErrorEvent,
+  MidiSendEvent,
   NetworkListenerStatus,
   OscErrorEvent,
   OscEvent,
+  ParameterTemplate,
+  SavedScene,
   Session
 } from '@shared/types'
 
@@ -46,12 +51,29 @@ const api: ExposedApi = {
     ipcRenderer.on('engine:oscErrors', h)
     return () => ipcRenderer.off('engine:oscErrors', h)
   },
+  onMidiEvents: (cb) => {
+    const h = (_e: Electron.IpcRendererEvent, batch: MidiSendEvent[]): void =>
+      cb(batch)
+    ipcRenderer.on('engine:midiEvents', h)
+    return () => ipcRenderer.off('engine:midiEvents', h)
+  },
+  onMidiErrors: (cb) => {
+    const h = (_e: Electron.IpcRendererEvent, batch: MidiErrorEvent[]): void =>
+      cb(batch)
+    ipcRenderer.on('engine:midiErrors', h)
+    return () => ipcRenderer.off('engine:midiErrors', h)
+  },
+
+  // ── MIDI output ──────────────────────────────────────────────────
+  midiListPorts: () => ipcRenderer.invoke('midi:listPorts'),
 
   // ── Network discovery ────────────────────────────────────────────
   networkSetEnabled: (enabled, port) =>
     ipcRenderer.invoke('network:setEnabled', enabled, port),
   networkList: () => ipcRenderer.invoke('network:list'),
   networkClear: () => ipcRenderer.invoke('network:clear'),
+  networkSetForwardTargets: (targets) =>
+    ipcRenderer.invoke('network:setForwardTargets', targets),
   onNetworkDevices: (cb) => {
     const h = (
       _e: Electron.IpcRendererEvent,
@@ -59,6 +81,45 @@ const api: ExposedApi = {
     ): void => cb(payload)
     ipcRenderer.on('network:devices', h)
     return () => ipcRenderer.off('network:devices', h)
+  },
+
+  // ── Scene library ────────────────────────────────────────────────
+  sceneLibraryList: () => ipcRenderer.invoke('sceneLibrary:list'),
+  sceneLibrarySave: (scene) => ipcRenderer.invoke('sceneLibrary:save', scene),
+  sceneLibraryRemove: (id) => ipcRenderer.invoke('sceneLibrary:remove', id),
+  onSceneLibrary: (cb) => {
+    const h = (_e: Electron.IpcRendererEvent, scenes: SavedScene[]): void => cb(scenes)
+    ipcRenderer.on('scene-library:changed', h)
+    return () => ipcRenderer.off('scene-library:changed', h)
+  },
+
+  // ── Pool library ─────────────────────────────────────────────────
+  poolLibraryGet: () => ipcRenderer.invoke('pool-library:get'),
+  poolLibrarySetAll: (payload) =>
+    ipcRenderer.invoke('pool-library:setAll', payload),
+  onPoolLibrary: (cb) => {
+    const h = (
+      _e: Electron.IpcRendererEvent,
+      payload: { templates: InstrumentTemplate[]; parameters: ParameterTemplate[] }
+    ): void => cb(payload)
+    ipcRenderer.on('pool-library:changed', h)
+    return () => ipcRenderer.off('pool-library:changed', h)
+  },
+
+  // ── App lifecycle ────────────────────────────────────────────────
+  // Save without prompting — writes to the app's Sessions folder.
+  // Returns the absolute path the file landed on (or null on error).
+  sessionSaveToDefault: (s) => ipcRenderer.invoke('session:saveToDefault', s),
+  // Renderer signals main: "ok to close the window, I'm done with
+  // the Save-before-quit modal." Main sets its appQuitting flag
+  // and re-issues window.close().
+  appCloseProceed: () => ipcRenderer.invoke('app:close-proceed'),
+  // Main asks renderer to show the save-before-quit modal. The
+  // renderer's listener replies by calling `appCloseProceed`.
+  onAppBeforeClose: (cb) => {
+    const h = (): void => cb()
+    ipcRenderer.on('app:before-close', h)
+    return () => ipcRenderer.off('app:before-close', h)
   }
 }
 

@@ -1,6 +1,6 @@
 # dataFLOU_compositor
 
-**Send OSC data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC messages at once with optional modulation, sequencing, transitions, delays, MIDI control, and an authorable **Pool of Instruments and Parameters** that mirrors the dataFLOU C++ library's vocabulary.
+**Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of Pure Data / Ableton / another machine, **3‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
 
 ![dataFLOU_compositor — Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--045)
+- [Release notes](#release-notes--050)
+  - [0.5.0](#release-notes--050)
   - [0.4.5](#release-notes--045)
   - [0.4.1](#release-notes--041)
   - [0.4.0](#release-notes--040)
@@ -61,8 +62,15 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
-- **Pool drawer with three tabs** — Built‑in, User, **Network**. Browse shipped Instrument Templates (OCTOCOSME, Generic XYZ, Pandore) and Parameter blueprints (RGB Light, Knob, Motor, Button, XY Pad); author your own; or watch the local network for OSC senders and drag any discovered device onto the grid as an Instrument with one Parameter per observed address.
-- **Multi‑value OSC** — space‑separated entries in a clip's Value field become multiple OSC args in a single message. Every modulator treats each entry independently. **Pin individual slots** to freeze them while the sequencer / modulator drives the rest.
+- **Native MIDI output (v0.5)** — `@julusian/midi` (RtMidi) lives in the main process. Each cell / track / Parameter blueprint can carry a `midiOut` config (port + channel + CC# / Note + velocity / gate). The same modulators and sequencer that drive your OSC fire MIDI in parallel. Six new MIDI Pool blueprints ship out of the box (CC, Note, CC pair, Drum, DAW macro bank, CC×8 template). Global enable toggle in the prefs sub‑toolbar.
+- **Pool drawer with four tabs** — Built‑in, User, **Scenes**, **Network**. Browse shipped Instrument Templates (OCTOCOSME, Generic XYZ, Pandore) and Parameter blueprints (RGB Light, Knob, Motor, Button, XY Pad, MIDI CC, MIDI Note, MIDI CC pair, MIDI Drum, MIDI DAW macros, MIDI CC×8); author your own; recall **Saved Scenes** across sessions; or watch the local network for OSC senders and drag any discovered device onto the grid as an Instrument with one Parameter per observed address.
+- **Capture (v0.5)** — one button (or **`C`** key) opens a popup that snapshots live OSC / MIDI traffic into the Pool. Four modes: **New Scene for Instrument** (snapshot current values into an existing Pool Instrument), **New Instrument + Scene** (build both at once), **New OSC Instrument** (just the Pool entry), **New MIDI Instrument** (every wiggled CC / Note becomes a Parameter). Live in‑popup monitor shows the full multi‑arg payload per address with type‑coloured chips + freshness dots. Resizable, X‑remove per address, per‑parameter argSpec auto‑generated from observed OSC tag strings.
+- **OSC forwarding (v0.5)** — every UDP packet received on the compositor's listen port is byte‑copied to a configurable LIST of downstream destinations (Pure Data, Ableton, another machine). Lets the compositor sit in front of consumers whose OSC port is fixed (firmware‑locked controllers). Configured via a "Forward" popover in the Default OSC group; per‑target enable + label + IP + port.
+- **Pool + Scene libraries (v0.5)** — User Instruments + Parameters persist to `<userData>/pool-library.json` and are auto‑merged into every new / loaded session, so authored instruments follow you across files. Saved Scenes are reusable presets that live in `<userData>/scene-library.json`; drag any Saved Scene anywhere on the grid (including blank space) to instantiate; right‑click in the grid → Save N Scenes to Pool / Duplicate N Scenes works for multi‑selections; Ctrl+click + Del bulk‑delete in the Scenes tab.
+- **Saved Scene Inspector (v0.5)** — left‑click any Saved Scene in the Pool to inspect/edit its name, color, notes, duration, multiplier, morph‑in, next‑mode, plus a read‑only Contents breakdown showing every Instrument + Parameter + captured cell value the scene carries.
+- **Multi‑value OSC** — space‑separated entries in a clip's Value field become multiple OSC args in a single message. Every modulator treats each entry independently. **Pin individual slots** to freeze them while the sequencer / modulator drives the rest, with a **two‑level pin model (v0.5)**: the Parameter Inspector sets a row default; each clip can override (true / false / inherit) so Scene A can pin a slot while Scene B leaves it modulated.
+- **Per‑arg post‑modulation Scaling (v0.5)** — new collapsible section in the Cell Inspector between Values and Timing. Clamps each arg's output to a user‑chosen `[min, max]` band AFTER modulators / sequencer but BEFORE Scale 0.0–1.0 and MIDI Scale. Lets you tame extreme values from a Random / Chaos / Generative source without rewriting the whole sequencer. Per‑cell, per‑arg.
+- **3‑deep undo / redo (v0.5)** — Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Snapshot ring buffer (3 past + 3 future), 500 ms coalesce so typing bursts count as one undoable edit. Buttons live in the prefs sub‑toolbar with depth indicators. History resets on session load.
 - **Smart Scale 0.0 – 1.0** — auto‑ranges each parameter's actual min/max into `[0, 1]` instead of blunt‑clamping. Works for sequencer cycles, modulator outputs, even multi‑arg colour channels.
 - **Eight modulation types with live visualisations** — **LFO**, **Ramp** (Normal / Inverted / Loop), **Envelope (ADSR)**, **Arpeggiator** (with mode‑aware playback patterns), **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet); per‑modulator preview SVG redraws as you tweak.
 - **Nine sequencer modes** — **Steps**, **Euclidean**, **Polyrhythm** (two interlocking rings), **Density** (per‑step probability), **Cellular** (1‑D Wolfram automaton with Seed LFO), **Drift** (Brownian playhead), **Ratchet** (sub‑pulse bursts with 7 shaping modes), **Bounce** (geometrically accelerating step duration), **Draw** (free‑form curve up to 1024 steps). Each has its own inspector preview.
@@ -79,7 +87,9 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **Pause freezes scene time** — Pressing Pause freezes the active scene's elapsed time; on Resume the countdown continues from where it was. Visual countdowns in Timeline + transport bar freeze in lockstep.
 - **Show / Kiosk mode** — locks the UI into a performance view (F11, hold Escape to exit).
 - **Autosave + crash recovery** — silent snapshot every 60 s to `~/AppData/Roaming/dataFLOU/autosave/`, keeps 30 rolling copies. Writes are atomic so a crash mid‑save can never corrupt the session file.
-- **OSC monitor drawer** — bottom panel streams outgoing OSC in real time. Resizable via top‑edge drag handle. Toggle with **O**.
+- **Save‑before‑quit + Save‑before‑new (v0.5)** — clicking the OS X button or the **New** button prompts a "Save before…?" modal with Yes / No / Cancel. Yes overwrites the current file or writes into the project's `Sessions/` folder. No discards. Cancel aborts.
+- **Per‑session GUI layout (v0.5)** — zoom, row height, column widths, inspector width, drawer height, and Collapse Scenes / Collapse Instruments flags are saved inside the session file. Re‑opening a session restores the exact layout you saved.
+- **Monitor drawer (renamed v0.5)** — bottom panel streams BOTH outgoing OSC AND outgoing MIDI in parallel resizable columns. Per‑data‑column widths drag from the header. Filter + Pause + Clear. Buffers persist across drawer close. Toggle with **O**.
 - **Transport bar** — always visible at the bottom: Play / Pause / Stop, cue GO, Morph enable + ms, **live HH:MM:SS:MS time counter** AND a **live remaining‑time pill** for the currently playing scene right next to it.
 - **Clip Templates** — save full clip configs and apply them to empty cells.
 - **Multi‑select clips** — Ctrl+click adds clips to a disjoint selection.
@@ -412,16 +422,25 @@ Saved as plain JSON via the standard OS save dialog (suggested extension `.dflou
 Contents:
 
 - Session name, default OSC, global BPM, tick rate, sequence length
-- All Tracks (Templates + Parameters with their kind/parent/source‑template links), per‑track defaults, MIDI bindings, per‑arg `persistentSlots` / `persistentValues` (pins)
-- All Scenes (name, color, notes, duration, follow action, multiplicator, morph‑in, MIDI binding, per‑Instrument group MIDI bindings) and the cells inside them — with every sequencer + modulator field, including drawValues (length 1024), ratchet mode, cellular seed LFO, generative state, rest behaviour, etc.
+- All Tracks (Templates + Parameters with their kind/parent/source‑template links), per‑track defaults, MIDI bindings, per‑arg `persistentSlots` / `persistentValues` (pins), `midiOut` defaults
+- All Scenes (name, color, notes, duration, follow action, multiplicator, morph‑in, MIDI binding, per‑Instrument group MIDI bindings) and the cells inside them — with every sequencer + modulator field, including drawValues (length 1024), ratchet mode, cellular seed LFO, generative state, rest behaviour, `midiOut`, per‑cell `persistentSlots` overrides, `scalingEnabled` / `scalingMin` / `scalingMax`, etc.
 - The 128‑slot sequence
 - The Pool (Instrument Templates + Parameter blueprints; builtin entries dedup'd against the shipped library on load)
-- Selected MIDI input device name
-- Meta Controller bank state
+- Selected MIDI input device name (reopened automatically on load)
+- Meta Controller bank state (knobs + MIDI bindings)
+- `forwardTargets[]` — OSC fan‑out configuration
+- `session.ui` — persisted GUI layout: zoom, row height, column widths, drawer height, collapse flags
 
-Old sessions migrate cleanly via `propagateDefaults()` + `migrateSequencer()` — pre‑v0.4.0 single‑track sessions load as orphan Parameters with no parent; new sequencer fields are backfilled with sane defaults.
+In addition, two separate library files live in `<userData>/`:
+
+- `pool-library.json` — User Instruments + Parameters that follow you across sessions. Auto‑merged into every new / loaded session's pool.
+- `scene-library.json` — Saved Scenes (capture results + manual saves). Displayed in the Pool's **Scenes** tab; drag onto the grid to instantiate.
+
+Old sessions migrate cleanly via `propagateDefaults()` + `migrateSequencer()` — pre‑v0.4.0 single‑track sessions load as orphan Parameters with no parent; new fields (MIDI Out, persistentSlots, scaling, session.ui) are backfilled with sane defaults.
 
 Saves are **atomic** — the file is written to `<path>.tmp` then renamed, so a crash mid‑write can never corrupt your session. The Save button **flashes blue** on a successful write.
+
+By default, sessions saved via the Save‑before‑quit / Save‑before‑new flow (when no file path is set yet) land in `<project-root>/Sessions/` (or `<install-dir>/Sessions/` in production builds), with a fallback to `<userData>/Sessions/` if the install dir is unwritable.
 
 ---
 
@@ -438,10 +457,13 @@ Saves are **atomic** — the file is written to `<path>.tmp` then renamed, so a 
 | **F11** | Toggle Show / Kiosk mode |
 | **Esc** (hold ≥ 800 ms) | Exit Show mode |
 | **M** | Toggle the Meta Controller bar |
-| **O** | Toggle the OSC Monitor drawer |
-| **P** | Toggle the Pool inside the OSC Monitor (opens drawer if closed) |
+| **O** | Toggle the Monitor drawer |
+| **P** | Toggle the Pool inside the Monitor drawer (opens drawer if closed) |
+| **C** | Open the Capture popup |
 | **I** | Toggle the right‑side Inspector panel (Edit view) |
 | **S** | Toggle the focused‑Scene info panel (Sequence view) |
+| **Ctrl/⌘ + Z** | Undo (3 levels) |
+| **Ctrl/⌘ + Shift + Z** *or* **Ctrl/⌘ + Y** | Redo |
 | **Ctrl + S** *(Cmd + S on macOS)* | Save the current session |
 | **Ctrl + T** *(Cmd + T on macOS)* | Add a new Instrument |
 | **Ctrl + P** *(Cmd + P on macOS)* | Add a Parameter to the selected Instrument's group |
@@ -469,38 +491,261 @@ Saves are **atomic** — the file is written to `<path>.tmp` then renamed, so a 
 ## Architecture
 
 - **Electron 33 / electron‑vite / TypeScript / React 18 / Tailwind / Zustand**
-- **Main process (Node)** — UDP sockets (OSC sender + passive discovery listener), scene engine, fixed‑tick LFO + sequencer + all 9 generative modes, file I/O, autosave, network discovery. Pure logic so timing stays stable independent of the UI.
-- **Renderer process** — all UI, Web MIDI input handling, drag‑drop sequence grid (`@dnd-kit`), bespoke SVG modulator visuals.
+- **Main process (Node)** — UDP sockets (OSC sender + passive discovery listener + byte‑perfect Forwarder), native MIDI output (`@julusian/midi` / RtMidi), scene engine, fixed‑tick LFO + sequencer + all 9 generative modes, file I/O, autosave, Pool library, Scene library, network discovery. Pure logic so timing stays stable independent of the UI.
+- **Renderer process** — all UI, Web MIDI input handling, drag‑drop sequence grid (`@dnd-kit`), bespoke SVG modulator visuals, Capture popup, Undo/Redo subscriber.
 - **Preload** — typed `window.api` bridge.
 
 ```
 src/
 ├── main/
-│   ├── engine.ts        # fixed-tick scene engine, 9 sequencer modes, 8 modulators (10–300 Hz)
-│   ├── osc.ts           # UDP sender
-│   ├── oscNetwork.ts    # passive UDP OSC discovery listener
-│   ├── session.ts       # Save / Save As / Open + atomic JSON I/O
-│   ├── autosave.ts      # 60s rolling snapshots + crash-recovery sentinel + serialised writes
-│   └── index.ts         # window creation, IPC handler wiring, safeHandle wrapper
+│   ├── engine.ts            # fixed-tick scene engine, 9 sequencer modes, 8 modulators,
+│   │                          # cell pin precedence (cell > track > argSpec fixed),
+│   │                          # per-arg post-modulation Scaling clamp (10–300 Hz)
+│   ├── osc.ts               # UDP OSC sender
+│   ├── oscNetwork.ts        # passive UDP OSC discovery listener +
+│   │                          # byte-perfect Forwarder (sits in front of Pd/Ableton/etc.)
+│   ├── midiOut.ts           # native MIDI output (RtMidi), lazy port open, global enable
+│   ├── session.ts           # Save / Save As / Open / Save-to-default (Sessions folder) + atomic JSON I/O
+│   ├── autosave.ts          # 60s rolling snapshots + crash-recovery sentinel + serialised writes
+│   ├── sceneLibrary.ts      # cross-session SavedScene library (<userData>/scene-library.json)
+│   ├── poolLibrary.ts       # cross-session User-Pool library (<userData>/pool-library.json)
+│   └── index.ts             # window creation, IPC handler wiring, safeHandle wrapper,
+│                              # save-before-quit intercept (app:before-close)
 ├── preload/
-├── shared/              # types & factories used by main and renderer
-│   ├── types.ts         # Session, Pool, ParameterTemplate, EngineState, MIDI binding, network discovery shapes
-│   └── factory.ts       # makeEmptySession, makeBuiltinPool, generative rules (tide/accent/voicing/wave/crowd/terrain/scatter/bounce),
-│                        # cellular automaton, drift walker, ratchet shaping, draw curve regen, paramType inference, …
+├── shared/                  # types & factories used by main and renderer
+│   ├── types.ts             # Session (incl session.ui for GUI layout + forwardTargets),
+│   │                          # SavedScene, Cell (incl persistentSlots/scalingMin/scalingMax),
+│   │                          # Track, ParamArgSpec, MidiOut, MidiBinding,
+│   │                          # OscForwardTarget, DiscoveredOscAddress (incl argValues),
+│   │                          # EngineState, ExposedApi, …
+│   └── factory.ts           # makeEmptySession, makeBuiltinPool (incl 6 MIDI Pool blueprints),
+│                              # buildInitialValueFromArgSpec, generative rules
+│                              # (tide/accent/voicing/wave/crowd/terrain/scatter/bounce), …
 └── renderer/
     ├── components/
     │   ├── TopBar / TransportBar / OscMonitor / PoolPane / InstrumentsInspectorPane
     │   ├── EditView / TrackSidebar / SceneColumn / CellTile / Inspector
+    │   ├── CapturePopup     # 4 modes + live multi-arg monitor + ArgChip / SceneForInstrumentRow
     │   ├── SequenceView / MetaControllerBar (incl DestinationPicker) / MetaKnob
     │   ├── DrawCanvas / ModulatorVisuals (LFO/Ramp/Envelope/Arp/Random/SH/Slew/Chaos)
     │   └── RcModeIcons / RcArcSlider / RcFlatBar  # rich-theme controls
     ├── fonts/
     ├── hooks/sessionIntegrity.ts, useSceneCountdown.ts
-    ├── store.ts                     # Zustand global state (session + UI state + network devices)
-    ├── metaSmooth.ts                # renderer-side knob-value tweener
-    ├── midi.ts                      # Web MIDI manager
-    └── styles.css                    # incl rich-theme variables + animations
+    ├── store.ts             # Zustand global state — session, UI state, network devices,
+    │                          # poolLibraryCache, sceneLibrary, undo/redo counters,
+    │                          # newSessionConfirmOpen, captureOpen, …
+    │                          # + buildSessionForSave() helper
+    ├── undo.ts              # 3-deep ring buffer subscriber, 500ms coalesce
+    ├── metaSmooth.ts        # renderer-side knob-value tweener
+    ├── midi.ts              # Web MIDI input manager
+    └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes — 0.5.0
+
+The "native MIDI + Capture + libraries + undo" release. On top of v0.4.5's sequencer / modulator / Pool foundation, v0.5 adds a parallel MIDI output engine, a Capture function that snapshots live OSC / MIDI traffic into the Pool, OSC forwarding so the compositor can fan out to multiple downstream consumers, cross‑session Pool + Scene libraries, 3‑deep undo / redo, per‑session GUI layout persistence, a Save‑before‑quit flow, per‑arg post‑modulation Scaling, and a long list of UX + correctness fixes.
+
+### Native MIDI output
+
+`@julusian/midi` (RtMidi) ships in the main process. Every cell / track / Parameter blueprint can carry a `midiOut` config — port name + channel + kind (`cc` / `note`) + cc number or note number + velocity + gate length. The same modulators + sequencer that drive your OSC fire MIDI in parallel.
+
+- **`MidiOutSender`** in `src/main/midiOut.ts` — lazy port open, rate‑limited error logging, panic, `setEnabled(false)` closes every open port.
+- **Global MIDI Output toggle** in the prefs sub‑toolbar — zero‑CPU when off (every emit short‑circuits before the native call).
+- **Six MIDI Pool blueprints** out of the box: `par_midi_cc`, `par_midi_note`, `par_midi_cc_pair`, `par_midi_drum`, `par_midi_daw_macro_bank`, `tpl_midi_cc8`.
+- **Per‑cell MIDI Output section** in the Inspector — Port picker, Channel (1–16 wide enough to read), Kind (CC/Note), CC# / Note number, Velocity (with its own pin), Gate length, Persistent note flag.
+- **MIDI Scale** checkbox next to Scale 0.0–1.0 — independent normalisation; scales the cell's `[0, 1]` float into `0–127` for the MIDI emit only.
+- **Live MIDI byte** in the cell tile (`ClipMidiLiveValue`) — violet for CC mode, teal for Note mode, always visible above the transport badge so you can read what's going out on the wire at a glance.
+- **`ClipTransportBadge`** — OSC / MIDI / OSC+MIDI pill in every clip tile (slate / violet / teal palette).
+- **Native module bundling** via `electron-builder`'s `asarUnpack` so the prebuilt `.node` binaries load at runtime on Windows + macOS universal.
+
+### Monitor drawer (renamed from "OSC Monitor")
+
+Bottom drawer now streams BOTH OSC and MIDI in parallel resizable columns.
+
+- **OSC + MIDI checkboxes** at the top of the toolbar; either column can be hidden.
+- **Resizable column split** — vertical drag handle between OSC and MIDI panes; widths persist.
+- **Per‑data‑column widths** — drag any header's right edge to resize. Per‑column widths persist independently for OSC vs MIDI.
+- **Module‑scope IPC buffers** — closing + reopening the drawer keeps the captured history; capture keeps running while the drawer is closed, so reopening shows messages that fired during the closure.
+- **Pool pane resizable** via a leftmost drag bar inside the drawer (200–1200 px, persisted).
+- **HMR‑safe IPC subscribers** — Vite hot‑reload no longer doubles the log rows.
+
+### Capture function
+
+A one‑click popup that snapshots live OSC / MIDI traffic into the Pool. Opens via the **● Capture** button in the Pool drawer's header, or by pressing **`C`**.
+
+Four modes:
+
+1. **New Scene for Instrument** *(default)* — pick an existing Pool Instrument; the popup watches OSC traffic that matches its addresses and writes a SavedScene seeded with current values. No new Pool entry.
+2. **New Instrument + Scene** — capture a discovered sender as a fresh Pool Instrument AND save its current state as a Scene in the library. Two name fields (Instrument + Scene).
+3. **New OSC Instrument** — just the Pool Instrument, no Scene.
+4. **New MIDI Instrument** — listens for CC / Note events; each unique slot becomes a Parameter with `midiOut` pre‑wired.
+
+Inside the popup:
+
+- **Live capture monitor** — full multi‑arg payload per address, one **type‑coloured `ArgChip`** per slot (strings amber, ints accent, floats white, bools green / muted, nil / blob muted). Freshness dot per row (green < 500 ms, accent < 3 s, muted otherwise).
+- **Mirror monitor in "New Scene for Instrument"** — same chip‑row layout against the picked Instrument's Parameters, with `(no traffic yet)` placeholders for addresses that haven't been seen.
+- **Resizable popup** via native CSS `resize: both` corner grip — default `640 × min(700, 88vh)`; no persistence so every open starts at the default.
+- **X‑remove per address** — clicking ✕ on a captured row excludes it from the resulting Instrument (toggle ↺ to restore).
+- **Address list resize handle** at the bottom edge — drag to grow the captured‑addresses scroll box.
+- **Drop‑focus fix on close** — modal close no longer leaves Chromium's sticky pseudo‑focus on the popup's inputs.
+- **`destPort` defaults to `dev.port`** instead of hardcoded 9000 — works for OCTOCOSME (1986) or any non‑canonical inbox.
+- **Full OSC path as Parameter name** — captured `/A/strips/pots` reads as `/A/strips/pots` in the sidebar, not just `Pots` (which used to collide across mixed‑root devices).
+- **Multi‑arg argSpec auto‑generated** from observed OSC type tags — every arg becomes an editable `Value N` slot with the matching type. Pin the leading IP‑string / sequence‑int afterwards in the Pool Inspector's Arg Layout.
+- **Cell value positional** — captured cells store the FULL token list (including fixed‑slot placeholders) so `tokensWithDefaults` lines up correctly on edit + emit.
+- **Mode order**: top row = scene workflows (`Scene for Instrument`, `Instrument + Scene`); bottom row = bootstrap workflows (`OSC Instrument`, `MIDI Instrument`). Name input blank by default; placeholders read `My OSC Instrument`, `New Scene`, etc.
+
+### OSC forwarding (multi‑target fan‑out)
+
+The compositor can now sit IN FRONT of downstream consumers whose OSC port is fixed. Every UDP packet received on the listen port is byte‑copied to a configurable LIST of forward targets.
+
+- **Forward popover** in the Default OSC group of the top toolbar — green dot + `Forward N/M` count chip; click for the popover.
+- **Per‑target row**: enable checkbox, label, IP, port, ✕ remove. `+ Add target` button at the bottom.
+- **Byte‑perfect** — a second `'message'` listener attached to the listener's `dgram.Socket` captures raw bytes BEFORE osc‑js parses them; forwarded via a dedicated outbound socket so the source port is ephemeral.
+- **Persisted with the session** in `session.forwardTargets[]`. Replayed to main on app load.
+- **Safe under disable race** — `setForwardTargets([])` mid‑callback re‑checks the socket inside the loop and try/catches the synchronous `ERR_SOCKET_DGRAM_NOT_RUNNING`.
+
+### Cross‑session libraries
+
+#### Pool library (User Instruments + Parameters)
+
+User‑authored Pool entries now persist to `<userData>/pool-library.json` separately from the session file, and auto‑merge into every new / loaded session.
+
+- **Main process `PoolLibrary`** class — same atomic write pattern as `SceneLibrary`.
+- **Auto‑push on every change** — the renderer pushes the User‑entry set to main whenever the store's pool changes.
+- **Auto‑merge on load + new** — `setSession` and `newSession` seed the freshly‑built session's pool with the library entries before the auto‑push effect fires, so the library never gets accidentally wiped to `[]` mid‑frame.
+- **Cache mirror** in `poolLibraryCache` module‑scope state so `newSession` can re‑seed without an extra IPC roundtrip.
+
+#### Scene library + new Saved Scene Inspector
+
+- **Drag a Saved Scene anywhere on the grid** to instantiate — works in both the Edit‑view grid (including blank space between columns) and the Sequence‑view palette.
+- **`instantiateSavedScene` focuses + selects** the new scene; Pool's saved‑scene multi‑selection is cleared at the same time so subsequent Del doesn't act on the source.
+- **Save Scene to Pool** right‑click now works (the previous version silently failed because Electron disables `window.prompt`). Uses the scene's current name; rename in the inspector after.
+- **Multi‑select Saved Scenes** in the Pool: Ctrl/⌘ + click toggles inclusion, plain click resets to that one; Del bulk‑removes with confirm. Selection auto‑clears when the user switches Pool tab.
+- **Save N Scenes to Pool** + **Duplicate N Scenes** right‑click actions on a grid scene multi‑selection.
+- **Auto‑increment duplicate names**: `OCTOCOSME (copy)`, then `(copy 1)`, `(copy 2)`, ... — strips an existing `(copy N)` suffix before duplicating so chains stay clean. Applies to Templates, Parameters, and Scenes.
+- **New `SavedSceneInspector`** — left‑click a Saved Scene in the Pool's Scenes tab to inspect:
+  - Editable: Name, Color (color picker), Notes, Duration, Multiplier, Morph‑in (ms), Next mode.
+  - Read‑only "Contents" breakdown listing every Instrument + child Parameter with its captured value; clickable Instrument names jump the Pool selection to its Template Inspector. A `new` badge marks templates not yet in the local Pool.
+  - **Use** / **Delete** action buttons.
+- **Track ordering on save** — `saveSceneToLibrary` now builds the `tracks[]` list by filtering `session.tracks` in its native sidebar order (Set of needed ids), guaranteeing parent header rows come BEFORE their child Function rows. Eliminates the "scenes reshuffle on instantiate to a blank grid" bug.
+- **Scene drag‑drop blur** — after dropping a Saved Scene onto the grid, `requestAnimationFrame(blur + body.focus)` releases Chromium's sticky drag pseudo‑focus so the next click on a clip's input lands cleanly without an alt‑tab.
+
+### Per‑arg pin + per‑arg post‑modulation Scaling
+
+Two new value‑shaping affordances on multi‑arg cells, both per‑slot.
+
+- **Cell‑level pin override** — every editable slot in a multi‑arg cell now has its own pin checkbox in the Cell Inspector with a "cell" / "track" source badge. Three states per slot:
+  - `cell.persistentSlots[i] === true` → pinned for this clip, emits `cell.persistentValues[i]`.
+  - `cell.persistentSlots[i] === false` → explicit unpin, overrides the track default for this clip only.
+  - `cell.persistentSlots[i] === undefined` → inherits the track default.
+- **Engine emit precedence**: `argSpec.fixed` (Pool) > cell pin > track pin > live modulated value.
+- **Scaling section (new, between Values and Timing)** — collapsible, disabled by default. Per slot:
+  - Slot name + Min input + Max input.
+  - When enabled, the engine clamps each slot's `out` to `[min, max]` AFTER modulators / sequencer but BEFORE Scale 0.0–1.0 and MIDI Scale. Pinned slots bypass (their value is the user's explicit final say).
+  - Lets you tame a Random / Chaos / Generative source overshooting your target band without rewriting the entire sequencer.
+- **Inspector `ParameterArgSpecSection`** in the Pool — collapsible Arg Layout editor with per‑slot Name / Type / Pinned / Value rows. Lets you author and edit multi‑arg argSpec entries (including pinning protocol prefixes) on User templates — not just on captured ones.
+
+### Undo / redo — 3 levels
+
+Module `src/renderer/src/undo.ts` runs a Zustand subscriber on `session` identity changes and writes deep‑cloned snapshots into a 3‑deep ring buffer.
+
+- **Coalesce window** of 500 ms — typing bursts collapse into one undoable step.
+- **`undo()` / `redo()`** with `suppressSnapshot` flag flipped synchronously inside `try/finally` so unrelated synchronous setStates can't get accidentally swallowed.
+- **Counters in store** (`undoCount` / `redoCount`) drive disabled state + depth indicators on the Undo / Redo buttons.
+- **Buttons** in the prefs sub‑toolbar (under the dataFLOU brand drop‑down), just left of Close.
+- **Keyboard**: Ctrl/⌘+Z (undo), Ctrl/⌘+Shift+Z (redo), Ctrl/⌘+Y (redo alias). Works inside text fields — the snapshot coalescer treats a typing burst as one logical edit, so Ctrl+Z mid‑edit rolls back the whole burst cleanly.
+- **History reset** on session load / new / autosave restore so you can't "undo" your way back into a previous file's state.
+
+### Save‑before‑quit + Save‑before‑new
+
+OS X‑button (window close) and toolbar `New` button both go through a modal asking "Save before …?".
+
+- **Save before quitting?** modal — Yes saves the current session (overwrite path or write into the project's `Sessions/` folder if no path), then closes. No discards. Cancel keeps the window open. Errors during save show a red‑bordered banner inside the modal and keep it open instead of silently dropping data.
+- **Save before opening a new session?** modal — identical UX, runs `newSession()` after the user picks. New button no longer creates a fresh session without prompting.
+- **Sessions folder** — `<project-root>/Sessions/` in dev (or `<install-dir>/Sessions/` in production), with `<userData>/Sessions/` as a fallback when the install dir is unwritable. Auto‑numbered filenames (`session.dflou.json` → `session (1).dflou.json` → …) avoid silent overwrites.
+
+### Per‑session GUI layout
+
+A new `session.ui` subfield captures the user's layout so a saved session re‑opens at the exact size and shape it was at save time.
+
+Fields persisted:
+
+```ts
+ui: {
+  uiScale, rowHeight, sceneColumnWidth, inspectorWidth,
+  trackColumnWidth, editorNotesHeight, oscMonitorHeight,
+  tracksCollapsed, scenesCollapsed
+}
+```
+
+- **`buildSessionForSave(state)`** helper in `store.ts` bundles UI state into the session at every save site (Save / Save As / Ctrl+S / Save‑before‑quit / Save‑before‑new / autosave push).
+- **`setSession`** reads `session.ui` and applies each field to the matching top‑level store key, clamped against the same bounds the live UI sliders use. `uiScale` mirrors to localStorage so the runtime zoom hook stays in sync.
+- **Older sessions** without `ui` inherit current runtime defaults — no breakage.
+- **Default UI scale bumped** from 1.0 to 1.35 so fresh installs aren't tiny on modern monitor DPIs.
+
+### MIDI bindings recall on session load
+
+Every MIDI binding stored in the session (scene `midiTrigger`, cell `midiTrigger`, track `midiTrigger`, `instrumentTriggers`, Meta knob `midiCc`, transport `goMidi` / `morphTimeMidi`) was already serialised — but the renderer never re‑attached the persisted MIDI input device after load, so the bindings looked "gone" until the user manually re‑picked their controller from the top toolbar.
+
+Fixed with a watcher in App.tsx that calls `midi.open(midiInputName)` whenever `session.midiInputName` changes. Open / autosave‑restore / new session all funnel through this and reopen the device cleanly.
+
+### Top toolbar
+
+- **Default OSC group is collapsible** + collapsed by default. Compact chip reads `Default OSC 127.0.0.1:9000 ▸`; click to expand the address / IP / port inputs. Saves ~340 px of toolbar space on the common case.
+- **Forward popover button** sits in the Default OSC group with a status dot + `N/M enabled` count.
+- **Listening pill** moved from the top toolbar to the Pool drawer's header, immediately left of the `● Capture` button. Reads `Listening 192.168.x.x:1986` with a status dot (green bound, red error, grey off). Auto‑binds the listener to `session.defaultDestPort` on app start.
+- **Vertical separator** after the **Pool** label in the Pool's tab strip so the static label no longer reads as a disabled 5th tab.
+- **Scenes tab moved** to position 3 (before Network).
+
+### Cell tile rendering
+
+- **Multi‑arg cells** now wrap into a 4‑column grid (`CellValueGrid`). ≤4 tokens render inline; >4 tokens wrap to 3+ rows. Token text rounded to ≤5 chars per slot.
+- **Auto‑prefix tokens hidden** from the clip tile display — only EDITABLE slots render (the engine still emits the fixed prefix at send time).
+- **Adaptive layout based on row height**: at `rowHeight ≥ 75` shows ip:port row + modulator chips footer; at `60–74` hides ip:port; at `45–59` hides both so the value grid gets every available pixel. Minimum row height bumped from 30 → 45 (below 45 the cell was visually empty).
+- **Default row height bumped** from 60 → 95 so multi‑arg cells fit without cropping out of the box.
+
+### Cell + Parameter Inspector
+
+- **CollapsibleViewSection `headerEnd` slot** — renders content at the FAR RIGHT of the section header (outside the toggle button). Used by Destination's `OSC Output` checkbox so the chevron stays in the leftmost column, aligned with every other section's chevron.
+- **Parameter Inspector multi‑arg layout** is visible even when there's no clip on the focused scene yet — falls back to `argSpec.init` values as synthetic "current" tokens so the user can pin / unpin slots immediately after dragging in a captured Instrument.
+- **MIDI binding chip on scene headers** folded inline with the DUR / NEXT row — no more orphan "floating" lines.
+- **Scene name + cell input drop‑focus fixes** — `onFocus` on the scene name re‑anchors selection; cell click stops propagation so it doesn't bubble to the scene header and clobber `selectedCell`.
+- **Selection mutex** — clicking a scene clears Pool / track / cell selections; clicking a cell clears Pool selection but preserves the cell's own. Resolves the Del key picking the wrong branch.
+
+### Pool inspector improvements
+
+- **Argument layout editor** for Pool Instruments — collapsible "Arg Layout" section with per‑slot Name / Type / Pinned / Value rows + `+ Add slot` / `Clear all`. Required for duplicated OCTOCOSME‑style templates (the user couldn't edit their multi‑arg argSpec before).
+- **"Save as Template" renamed to "Save as User"** in the Track sidebar right‑click menu (the destination is the User tab, not just any "template").
+- **"Save Clip as Template"** action added to the filled‑clip right‑click menu. Auto‑names the saved template `Track — Scene`.
+- **Multi‑arg clip template projection** — applying a multi‑arg clip template to an empty Parameter row also writes the template's argSpec onto the target track so the multi‑slot structure travels with the template.
+
+### Generative formulas — non‑negative
+
+The generative system used to produce negative values in some modes (tide / wave centred on 0, etc.), which then got clamped to 0 by `scaleToUnit` — giving the appearance of an all‑zero output. Every generative helper rewritten to LIFT above the base instead of swinging around it:
+
+- `tideValue`: `(sin + 1) / 2` for a unipolar sine swell.
+- `accentValue`: lift accents above the base by Variation.
+- `voicingValue`: Ring A = +33 %, Ring B = +66 %, coincidence = +100 %.
+- `waveValue` / `crowdValue` / `terrainValue` / `scatterValue` / `bounceValue` — all post‑clamp to `[0, 1]` if scaleToUnit, otherwise just non‑negative.
+- `bounceValue` switched from multiplicative `base × ...` to additive `base + e^i × amount × mag` so it doesn't collapse a zero base.
+- `generateStepValue` post‑clamp: `v < 0 → 0`; `if scaleToUnit && v > 1 → 1`.
+
+### Misc engine + correctness
+
+- **OSC port `9000` no longer hardcoded** in Capture — uses the discovered device's actual source port.
+- **`/touches`, `/switches_change`** and other captured paths that don't share the dominant root now keep their leading `/`. Previously the no‑root branch stripped them unconditionally.
+- **Bounce + Ratchet sub‑pulse** timing uses the actual current step duration (which Bounce varies geometrically across the row).
+- **Modulator reseed** under `rndStep` / `rndSmooth` / S&H / Slew / Chaos uses the per‑track PRNG instead of `Math.random()` for deterministic re‑triggers.
+- **OSC forwarder use‑after‑close** guarded with an inner socket re‑check + try/catch.
+- **Auto‑increment duplicate names** strip existing `(copy N)` suffixes so chains stay clean.
+
+### Build + packaging
+
+- **Native MIDI module bundling** — `electron-builder.yml` adds `node_modules/@julusian/midi/**/*` to `files` and `node_modules/@julusian/midi/prebuilds/**/*` to `asarUnpack` so the prebuilt `.node` binaries load at runtime on Windows + macOS.
+- **macOS DMG target** unchanged (universal arch).
+- **Windows NSIS + portable** targets unchanged.
 
 ---
 
@@ -715,13 +960,20 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. Out of scope for now:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5:
 
-- No undo / redo
-- No MIDI output (MIDI is input‑only for triggering)
+- ✅ **Undo / redo** — 3 levels deep, debounced, available via Ctrl+Z / Ctrl+Shift+Z and toolbar buttons.
+- ✅ **MIDI output** — native (RtMidi) per cell / track / Parameter, with global enable + live Monitor.
+- ✅ **OSC fan‑out** — multi‑target Forward popover lets the compositor sit in front of Pure Data / Ableton / another machine.
+- ✅ **Cross‑session libraries** — Pool (Instruments + Parameters) and Scene libraries persist across sessions.
+- ✅ **Save‑on‑quit / Save‑on‑new** with confirmation modals + error surfacing.
+
+Still out of scope:
+
 - No OSC bundles with timestamps
 - No quantized scene changes (cue firing is immediate)
 - No mDNS / OSCQuery (Network discovery is passive listening only)
+- No MIDI clock output (MIDI is per‑message CC + Note; sync is OSC‑driven internally)
 
 Issues and PRs welcome.
 

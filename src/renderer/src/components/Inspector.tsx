@@ -9,6 +9,7 @@ import type {
   LfoMode,
   LfoShape,
   LfoSync,
+  MidiOut,
   ModType,
   MultMode,
   ParamArgSpec,
@@ -16,9 +17,11 @@ import type {
   SeqCombine,
   SeqDriftEdge,
   SeqMode,
-  SeqSyncMode
+  SeqSyncMode,
+  Track
 } from '@shared/types'
 import {
+  DEFAULT_MIDI_OUT,
   DIVISIONS,
   cellularInitialRow,
   euclidean,
@@ -277,9 +280,9 @@ function TrackInspector(): JSX.Element {
   return (
     <div className="p-3 flex flex-col gap-3 text-[12px]">
       <Section title={`${noun} name`}>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <UncontrolledTextInput
-            className="input flex-1"
+            className="input flex-1 min-w-[120px]"
             value={track.name}
             onChange={(v) => renameTrack(trackId, v)}
             placeholder={`${noun} name`}
@@ -298,6 +301,28 @@ function TrackInspector(): JSX.Element {
               onChange={(e) => setTrackEnabled(trackId, e.target.checked)}
             />
             <span>Enabled</span>
+          </label>
+          {/* OSC Output toggle — when off, every cell on this
+              Parameter row stops emitting OSC. MIDI is independent
+              (governed by each cell's `midiOut.enabled` + the global
+              MIDI toggle). Default true via migration so legacy
+              sessions keep their OSC. */}
+          <label
+            className="flex items-center gap-1 text-[11px] shrink-0"
+            title={
+              (track.oscEnabled ?? true)
+                ? `Disable OSC output for every cell on this ${noun.toLowerCase()}. MIDI keeps firing if configured.`
+                : `Re-enable OSC output for every cell on this ${noun.toLowerCase()}.`
+            }
+          >
+            <input
+              type="checkbox"
+              checked={track.oscEnabled ?? true}
+              onChange={(e) =>
+                setTrackDefaults(trackId, { oscEnabled: e.target.checked })
+              }
+            />
+            <span>OSC Output</span>
           </label>
         </div>
       </Section>
@@ -346,16 +371,20 @@ function TrackInspector(): JSX.Element {
         </Section>
       )}
 
-      {/* Per-slot persistence — only for Parameter rows that have
-          an argSpec AND the focused scene has a clip on this track
-          (so we can show concrete current values next to each
-          toggle). Persistent slots ignore scene triggers and
-          modulators, freezing at their last-sent value. */}
-      {!isTemplate && track.argSpec && track.argSpec.length > 0 && cellOnFocused && (
+      {/* Per-slot persistence — always shown for Parameter rows
+          that have an argSpec, even when the focused scene has no
+          clip on this track yet. Without a clip we fall back to the
+          argSpec's own `init` values so the user still sees the
+          captured multi-arg layout the moment they click the row
+          (matters for fresh Captures: drop the Instrument, click a
+          row → see all the slots immediately instead of having to
+          create a clip first). Persistent slots ignore scene
+          triggers and modulators, freezing at their last-sent value. */}
+      {!isTemplate && track.argSpec && track.argSpec.length > 0 && (
         <Section title="Values · pin to freeze">
           <PersistentSlotList
             argSpec={track.argSpec}
-            cellValue={cellOnFocused.value}
+            cellValue={cellOnFocused?.value ?? argSpecInitTokens(track.argSpec)}
             persistentSlots={track.persistentSlots ?? []}
             persistentValues={track.persistentValues ?? []}
             onToggle={(idx, persistent, capturedValue) =>
@@ -363,10 +392,9 @@ function TrackInspector(): JSX.Element {
             }
           />
           <div className="text-[10px] text-muted mt-1 leading-snug">
-            Pin captures the value shown next to it and the engine
-            emits THAT value forever — modulators don't drive it,
-            scene triggers don't overwrite it. To change a pinned
-            value, untick first, edit the clip, then re-pin.
+            {cellOnFocused
+              ? "Pin captures the value shown next to it and the engine emits THAT value forever — modulators don't drive it, scene triggers don't overwrite it. To change a pinned value, untick first, edit the clip, then re-pin."
+              : 'No clip on the focused scene yet — the values above are the argSpec defaults. Pinning here works once a clip exists.'}
           </div>
         </Section>
       )}
@@ -406,6 +434,13 @@ function TrackInspector(): JSX.Element {
         />
       </Section>
 
+      {/* MIDI Output default for this Parameter row. Cells created
+          on this track (via the empty-cell click flow) snapshot the
+          settings onto cell.midiOut. So: configure MIDI here once
+          per Parameter, then every new Scene's cell on this row
+          gets MIDI pre-wired. */}
+      <TrackMidiOutSection track={track} noun={noun} />
+
       <button
         className="btn-accent"
         onClick={() => {
@@ -428,7 +463,330 @@ function TrackInspector(): JSX.Element {
   )
 }
 
+// MIDI Output default editor for the Parameter/Instrument row
+// (TrackInspector). Stored on `track.midiOut`. New cells created
+// on this track inherit it at ensureCell-time so a fresh Scene's
+// cell on a MIDI-wired Parameter is already configured — the user
+// just flips Enable per-cell.
+function TrackMidiOutSection({
+  track,
+  noun
+}: {
+  track: Track
+  noun: string
+}): JSX.Element {
+  const setTrackMidiOut = useStore((s) => s.setTrackMidiOut)
+  const m =
+    track.midiOut ??
+    ({
+      enabled: false,
+      portName: '',
+      channel: 1,
+      kind: 'cc' as const,
+      cc: 1,
+      noteMode: 'velocity' as const,
+      gateLengthMs: 0
+    } satisfies NonNullable<Track['midiOut']>)
+  function patchMidi(p: Partial<NonNullable<Track['midiOut']>>): void {
+    setTrackMidiOut(track.id, p)
+  }
+  const [ports, setPorts] = useState<string[]>([])
+  const [available, setAvailable] = useState<boolean>(true)
+  useEffect(() => {
+    let cancelled = false
+    window.api?.midiListPorts?.().then((r) => {
+      if (cancelled) return
+      setPorts(r.ports)
+      setAvailable(r.available)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [m.enabled])
+  return (
+    <Section title={`${noun} default MIDI output`}>
+      <label
+        className="flex items-center gap-2 cursor-pointer select-none mb-1"
+        title="When ON, every new cell created on this Parameter row will inherit these MIDI settings — port, channel, CC/Note, etc. Per-cell can flip enable + override."
+      >
+        <input
+          type="checkbox"
+          checked={m.enabled}
+          onChange={(e) => {
+            patchMidi({ enabled: e.target.checked })
+            // Drop-focus stickiness fix (same pattern as v0.4.1's
+            // Pool drop handler): when this checkbox flips enabled
+            // TRUE, the conditional body below mounts a fresh
+            // <select> + CH input. Chromium-on-Electron sometimes
+            // keeps `document.activeElement` glued to the checkbox
+            // after a programmatic re-render, so the user's next
+            // click on the CH input wouldn't actually transfer
+            // focus (looked focused, didn't accept keystrokes
+            // until a window-switch reset the state). Blurring on
+            // the next animation frame releases the stale focus.
+            if (e.target.checked) {
+              requestAnimationFrame(() => {
+                const ae = document.activeElement as HTMLElement | null
+                ae?.blur?.()
+              })
+            }
+          }}
+        />
+        <span className="text-[11px]">Enabled by default on new cells</span>
+        {!available && (
+          <span className="text-[10px] text-danger">MIDI unavailable</span>
+        )}
+      </label>
+      {m.enabled && (
+        <div className="flex flex-col gap-1 text-[11px]">
+          <div className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto] gap-x-2 gap-y-1 items-center">
+            <span className="label">Port</span>
+            <select
+              className="input text-[11px] py-0.5 min-w-0 max-w-full"
+              style={{ textOverflow: 'ellipsis' }}
+              value={m.portName}
+              onChange={(e) => patchMidi({ portName: e.target.value })}
+            >
+              <option value="">— select port —</option>
+              {m.portName && !ports.includes(m.portName) && (
+                <option value={m.portName}>{m.portName} (disconnected)</option>
+              )}
+              {ports.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+            <span className="label">Ch</span>
+            <BoundedNumberInput
+              className="input w-10 text-center tabular-nums"
+              value={m.channel}
+              onChange={(v) => patchMidi({ channel: v })}
+              min={1}
+              max={16}
+              integer
+            />
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="label">Kind</span>
+            <div className="flex items-center gap-0.5">
+              <button
+                className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+                  m.kind === 'cc'
+                    ? 'bg-accent text-black border-accent'
+                    : 'border-border text-muted hover:text-text'
+                }`}
+                onClick={() => patchMidi({ kind: 'cc' })}
+              >
+                CC
+              </button>
+              <button
+                className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+                  m.kind === 'note'
+                    ? 'bg-accent text-black border-accent'
+                    : 'border-border text-muted hover:text-text'
+                }`}
+                onClick={() => patchMidi({ kind: 'note' })}
+              >
+                Note
+              </button>
+            </div>
+            {m.kind === 'cc' ? (
+              <>
+                <span className="label">CC #</span>
+                <BoundedNumberInput
+                  className="input w-14"
+                  value={m.cc ?? 0}
+                  onChange={(v) => patchMidi({ cc: v })}
+                  min={0}
+                  max={127}
+                  integer
+                />
+              </>
+            ) : (
+              <>
+                <span className="label">Gate</span>
+                <BoundedNumberInput
+                  className="input w-16"
+                  value={m.gateLengthMs ?? 0}
+                  onChange={(v) => patchMidi({ gateLengthMs: v })}
+                  min={0}
+                  max={60000}
+                  integer
+                  title="Note Off fires this many ms after Note On. 0 = until next trigger / scene change."
+                />
+                <span className="text-[10px] text-muted">ms</span>
+              </>
+            )}
+          </div>
+          <div className="text-[10px] text-muted leading-snug mt-1">
+            These settings populate <span className="text-text">cell.midiOut</span> on every
+            new clip you author on this {noun.toLowerCase()}. Existing cells aren&apos;t
+            rewritten — to push current defaults to live clips, edit the cell
+            directly from its Inspector.
+          </div>
+        </div>
+      )}
+    </Section>
+  )
+}
+
 // Per-arg persistence toggle list. One row per editable arg in the
+// Render a space-joined string of the editable slots' init values
+// from an argSpec. Used as a fallback "cell value" for the
+// Parameter Inspector's pin-list when no clip exists on the focused
+// scene yet — gives the user a preview of the multi-arg layout
+// immediately instead of forcing them to create a clip first.
+function argSpecInitTokens(argSpec: ParamArgSpec[]): string {
+  const out: string[] = []
+  for (const a of argSpec) {
+    if (a.fixed !== undefined) continue
+    const v = a.init
+    if (typeof v === 'number') out.push(String(v))
+    else if (typeof v === 'string') out.push(v)
+    else if (typeof v === 'boolean') out.push(v ? '1' : '0')
+    else out.push('0')
+  }
+  return out.join(' ')
+}
+
+// Per-arg post-modulation Scaling editor in the Cell Inspector.
+// Renders a CollapsibleSection between Value(s) and Timing. The
+// checkbox on the header doubles as the engine-side enable flag —
+// when off, no clamping happens; when on, each slot's `out` is
+// clamped to `[scalingMin[i], scalingMax[i]]` BEFORE Scale 0.0–1.0
+// and MIDI Scale (handled in the engine emit pipeline).
+//
+// Multi-arg cells (track.argSpec.length > 1) render one row per
+// EDITABLE slot (fixed protocol prefixes don't have a clamp — the
+// engine emits their fixed value verbatim regardless). Single-arg
+// cells render a single "Value" row. Defaults come from the
+// source InstrumentFunction's min/max (or 0/1 if missing) so an
+// "enable" tick gives the user a sensible starting band.
+function CellScalingSection({
+  cell,
+  track,
+  onChange
+}: {
+  cell: Cell
+  track: Track | undefined
+  onChange: (patch: Partial<Cell>) => void
+}): JSX.Element {
+  const setCellScaling = useStore((s) => s.setCellScaling)
+  const selectedCell = useStore((s) => s.selectedCell)
+  if (!selectedCell) {
+    // Shouldn't reach here — the inspector only renders when a cell
+    // is selected — but guard so the section never crashes the pane.
+    return <></>
+  }
+  // Slot list: editable argSpec entries for multi-arg cells, or a
+  // single synthetic "Value" entry for single-arg cells (so the UI
+  // shape is identical regardless of token count).
+  type SlotMeta = { name: string; idx: number; defaultMin: number; defaultMax: number }
+  const slots: SlotMeta[] = []
+  if (track?.argSpec && track.argSpec.length > 0) {
+    track.argSpec.forEach((a, i) => {
+      if (a.fixed !== undefined) return
+      slots.push({
+        name: a.name || `Value ${i + 1}`,
+        idx: i,
+        defaultMin: typeof a.min === 'number' ? a.min : 0,
+        defaultMax: typeof a.max === 'number' ? a.max : 1
+      })
+    })
+  } else {
+    slots.push({ name: 'Value', idx: 0, defaultMin: 0, defaultMax: 1 })
+  }
+  const enabled = cell.scalingEnabled === true
+  return (
+    <CollapsibleSection
+      title="Scaling"
+      enabled={enabled}
+      onToggle={(v) => {
+        // Toggling ON: seed default min/max from argSpec for every
+        // slot that doesn't already have a clamp, so the engine
+        // has concrete numbers to clamp against straight away.
+        // Otherwise an "enable" with empty arrays would no-op.
+        if (v && !cell.scalingEnabled) {
+          const seedMin: number[] = cell.scalingMin ? cell.scalingMin.slice() : []
+          const seedMax: number[] = cell.scalingMax ? cell.scalingMax.slice() : []
+          for (const s of slots) {
+            if (typeof seedMin[s.idx] !== 'number') seedMin[s.idx] = s.defaultMin
+            if (typeof seedMax[s.idx] !== 'number') seedMax[s.idx] = s.defaultMax
+          }
+          onChange({
+            scalingEnabled: true,
+            scalingMin: seedMin,
+            scalingMax: seedMax
+          })
+        } else {
+          onChange({ scalingEnabled: v })
+        }
+      }}
+    >
+      <div className="text-[10px] text-muted leading-snug">
+        Clamps each value to [min, max] AFTER modulators / sequencer
+        but BEFORE Scale 0.0–1.0 and MIDI Scale. Use it to tame
+        extreme outputs (a Random / Chaos source overshooting your
+        target band, an LFO swinging too wide, etc.). Pinned slots
+        bypass this clamp.
+      </div>
+      <div className="grid grid-cols-[1fr_auto_auto] gap-x-2 gap-y-1 items-center">
+        <span className="text-[9px] uppercase tracking-wide text-muted">
+          Slot
+        </span>
+        <span className="text-[9px] uppercase tracking-wide text-muted">
+          Min
+        </span>
+        <span className="text-[9px] uppercase tracking-wide text-muted">
+          Max
+        </span>
+        {slots.map((s) => {
+          const min =
+            typeof cell.scalingMin?.[s.idx] === 'number'
+              ? cell.scalingMin![s.idx]
+              : s.defaultMin
+          const max =
+            typeof cell.scalingMax?.[s.idx] === 'number'
+              ? cell.scalingMax![s.idx]
+              : s.defaultMax
+          return (
+            <Fragment key={s.idx}>
+              <span className="text-[11px] truncate" title={s.name}>
+                {s.name}
+              </span>
+              <BoundedNumberInput
+                className="input text-[11px] py-0.5 w-[72px]"
+                value={min}
+                onChange={(v) =>
+                  setCellScaling(selectedCell.sceneId, selectedCell.trackId, {
+                    slotIdx: s.idx,
+                    min: v
+                  })
+                }
+                min={-1e9}
+                max={1e9}
+              />
+              <BoundedNumberInput
+                className="input text-[11px] py-0.5 w-[72px]"
+                value={max}
+                onChange={(v) =>
+                  setCellScaling(selectedCell.sceneId, selectedCell.trackId, {
+                    slotIdx: s.idx,
+                    max: v
+                  })
+                }
+                min={-1e9}
+                max={1e9}
+              />
+            </Fragment>
+          )
+        })}
+      </div>
+    </CollapsibleSection>
+  )
+}
+
 // track's argSpec — shows the current value (from the focused
 // scene's cell when not pinned, or the captured pinned value when
 // pinned) + a checkbox that pins/unpins the slot. Pin captures the
@@ -551,6 +909,7 @@ function CellInspector(): JSX.Element {
   const updateCell = useStore((s) => s.updateCell)
   const setAddressToDefault = useStore((s) => s.setAddressToDefault)
   const setDestToDefault = useStore((s) => s.setDestToDefault)
+  const setCellPersistentSlot = useStore((s) => s.setCellPersistentSlot)
   const currentStep = useStore(
     (s) => s.engine.seqStepBySceneAndTrack[sel.sceneId]?.[sel.trackId]
   )
@@ -592,7 +951,34 @@ function CellInspector(): JSX.Element {
         </span>
       </div>
 
-      <Section title="Destination">
+      <CollapsibleViewSection
+        title="Destination"
+        forceCollapsed={cell.oscEnabled === false}
+        headerEnd={
+          // OSC Output toggle parked at the FAR RIGHT of the
+          // section header (label first, checkbox second). Keeping
+          // the chevron in the leftmost column means every section
+          // header's collapse arrow lines up in the same vertical
+          // column down the inspector. Unticking auto-collapses
+          // Destination + OSC Address (via `forceCollapsed` on both).
+          <label
+            className="flex items-center gap-1.5 text-[11px] cursor-pointer select-none"
+            title={
+              (cell.oscEnabled ?? true)
+                ? 'Disable OSC output for this clip (MIDI still fires if enabled). Collapses the Destination + OSC Address sections.'
+                : 'Re-enable OSC output for this clip.'
+            }
+            onClick={(e) => e.stopPropagation()}
+          >
+            <span>OSC Output</span>
+            <input
+              type="checkbox"
+              checked={cell.oscEnabled ?? true}
+              onChange={(e) => u({ oscEnabled: e.target.checked })}
+            />
+          </label>
+        }
+      >
         <div className="flex gap-1 items-center">
           <UncontrolledTextInput
             className="input flex-1 min-w-0"
@@ -623,9 +1009,12 @@ function CellInspector(): JSX.Element {
             </button>
           )}
         </div>
-      </Section>
+      </CollapsibleViewSection>
 
-      <Section title="OSC Address">
+      <CollapsibleViewSection
+        title="OSC Address"
+        forceCollapsed={cell.oscEnabled === false}
+      >
         <div className="flex gap-1 items-center">
           <UncontrolledTextInput
             className="input flex-1 min-w-0"
@@ -644,7 +1033,7 @@ function CellInspector(): JSX.Element {
             </button>
           )}
         </div>
-      </Section>
+      </CollapsibleViewSection>
 
       {/* When the track was instantiated from a multi-arg spec
           (e.g. OCTOCOSME's /A/strips/pots — 2-arg fixed prefix +
@@ -654,7 +1043,7 @@ function CellInspector(): JSX.Element {
           prepended on save. Sequencer mode disables the editor
           since per-step values can't yet be split across args. */}
       {track.argSpec && track.argSpec.length > 0 ? (
-        <Section
+        <CollapsibleViewSection
           title={
             track.argSpec.filter((a) => a.fixed === undefined).length > 1
               ? 'Values'
@@ -665,6 +1054,7 @@ function CellInspector(): JSX.Element {
           <MultiArgValueEditor
             cell={c}
             argSpec={track.argSpec}
+            trackPersistentSlots={track.persistentSlots}
             disabled={cell.sequencer.enabled && !cell.sequencer.generative}
             onChange={(v) => u({ value: v })}
             onCommitTrigger={() => {
@@ -673,8 +1063,17 @@ function CellInspector(): JSX.Element {
                 window.api.triggerCell(sceneId, trackId)
               }, 0)
             }}
+            onTogglePin={(idx, nextPinned, capturedValue) =>
+              setCellPersistentSlot(
+                sel.sceneId,
+                sel.trackId,
+                idx,
+                nextPinned,
+                capturedValue
+              )
+            }
           />
-          <div className="flex items-center gap-2 mt-2">
+          <div className="flex items-center gap-2 mt-2 flex-wrap">
             <label
               className="flex items-center gap-1 text-[11px] shrink-0"
               title="Clamp every output to [0.0, 1.0]"
@@ -686,6 +1085,24 @@ function CellInspector(): JSX.Element {
               />
               <span>Scale 0.0–1.0</span>
             </label>
+            <label
+              className="flex items-center gap-1 text-[10px] shrink-0"
+              title="Scale the MIDI emit only — maps 0.0–1.0 to 0–127. Independent of Scale 0.0–1.0 (OSC). Live."
+            >
+              <input
+                type="checkbox"
+                checked={!!cell.midiScale}
+                onChange={(e) => u({ midiScale: e.target.checked })}
+              />
+              {/* Stack "MIDI" / "Scale" on two lines, centered to the
+                  checkbox, so the badge takes ~30 px wide instead of
+                  ~70. Keeps the Scale-row tidy when both checkboxes
+                  are visible alongside the muted hint span. */}
+              <span className="flex flex-col leading-[1.05] text-center">
+                <span>MIDI</span>
+                <span>Scale</span>
+              </span>
+            </label>
             {cell.sequencer.enabled && cell.sequencer.generative ? (
               <span className="text-success text-[10px]">
                 (seed — generative mode on)
@@ -696,9 +1113,9 @@ function CellInspector(): JSX.Element {
               </span>
             ) : null}
           </div>
-        </Section>
+        </CollapsibleViewSection>
       ) : (
-        <Section title="Value">
+        <CollapsibleViewSection title="Value">
           <div className="flex items-center gap-2">
             <UncontrolledTextInput
               className="input flex-1 font-mono"
@@ -738,6 +1155,20 @@ function CellInspector(): JSX.Element {
               />
               <span>Scale 0.0–1.0</span>
             </label>
+            <label
+              className="flex items-center gap-1 text-[10px] shrink-0"
+              title="Scale the MIDI emit only — maps the cell's 0.0–1.0 float to 0–127. Independent of Scale 0.0–1.0 (which only affects OSC). Live: takes effect mid-play with no re-trigger."
+            >
+              <input
+                type="checkbox"
+                checked={!!cell.midiScale}
+                onChange={(e) => u({ midiScale: e.target.checked })}
+              />
+              <span className="flex flex-col leading-[1.05] text-center">
+                <span>MIDI</span>
+                <span>Scale</span>
+              </span>
+            </label>
           </div>
           <div className="text-[10px] text-muted mt-1">
             {(() => {
@@ -761,10 +1192,27 @@ function CellInspector(): JSX.Element {
               )
             })()}
           </div>
-        </Section>
+        </CollapsibleViewSection>
       )}
 
-      <Section title="Timing">
+      {/* Scaling — per-arg post-modulation clamp, applied BEFORE
+          Scale 0.0–1.0 and MIDI Scale. Lets the user tame extreme
+          values from a Random / Chaos / Generative source: "I want
+          numbers between 0.2 and 0.8 even if the LFO swings to 0..1".
+          Multi-arg cells get a row per editable slot (fixed protocol
+          prefixes don't appear). Single-arg cells get one row labelled
+          "Value". Collapsed + disabled by default. */}
+      <CellScalingSection cell={c} track={track} onChange={u} />
+
+      {/* Timing is collapsible + default-disabled. Checkbox on the
+          section header flips `cell.timingEnabled`; when OFF the
+          engine bypasses delay + transition entirely (treated as 0)
+          but the stored values stick around for re-enable. */}
+      <CollapsibleSection
+        title="Timing"
+        enabled={cell.timingEnabled === true}
+        onToggle={(v) => u({ timingEnabled: v })}
+      >
         <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
           <span className="label">Delay</span>
           <BoundedNumberInput
@@ -787,7 +1235,22 @@ function CellInspector(): JSX.Element {
           />
           <span className="text-muted text-[11px]">ms</span>
         </div>
-      </Section>
+      </CollapsibleSection>
+
+      {/* MIDI Output — fires in PARALLEL with the OSC destination
+          above. When `kind === 'note'`, the cell's Value field is
+          interpreted as the MIDI note number and a new Velocity
+          field appears below; both go through the modulator +
+          sequencer pipeline and each can be independently pinned. */}
+      <MidiOutputSection
+        cell={cell}
+        onChange={(patch) =>
+          u({ midiOut: { ...(cell.midiOut ?? DEFAULT_MIDI_OUT), ...patch } })
+        }
+        onVelocityChange={(v) => u({ velocity: v })}
+        onPinVelocity={(p) => u({ velocityPersistent: p })}
+        onPinNote={(p) => u({ notePersistent: p })}
+      />
 
       <CollapsibleSection
         title="Modulation"
@@ -891,11 +1354,19 @@ function CellInspector(): JSX.Element {
           {cell.sequencer.generative &&
             (rich ? (
               <>
-                <span className="label">Variation</span>
-                {/* Rich theme uses a flat tonal-gradient bar instead
-                    of the half-arc — same Rainbow-Circuit DNA, no
-                    pump/scale animation, fits inline with the rest
-                    of the controls without a big footprint. */}
+                {/* The Variation slider's label changes per
+                    sequencer mode — Tide for Steps, Accent for
+                    Euclidean, Voicing for Polyrhythm, etc. — so the
+                    Inspector reads as "what musical idea am I
+                    actually dialling in" rather than the generic
+                    "Variation". Tooltip preserves the long-form
+                    metaphor explanation. */}
+                <span
+                  className="label"
+                  title={genVariationTitle(cell.sequencer.mode)}
+                >
+                  {genVariationLabel(cell.sequencer.mode)}
+                </span>
                 <div className="col-span-2">
                   <RcFlatBar
                     value={cell.sequencer.genAmount}
@@ -910,7 +1381,12 @@ function CellInspector(): JSX.Element {
               </>
             ) : (
               <>
-                <span className="label">Variation</span>
+                <span
+                  className="label"
+                  title={genVariationTitle(cell.sequencer.mode)}
+                >
+                  {genVariationLabel(cell.sequencer.mode)}
+                </span>
                 <input
                   type="range"
                   min={0}
@@ -1838,9 +2314,21 @@ function LfoEditor({
             min={0}
             max={DIVISIONS.length - 1}
             step={1}
-            value={m.divisionIdx}
+            // Slider is INVERTED: visually left = slow (large
+            // division → low Hz), right = fast (small division →
+            // high Hz). Matches the Free-mode slider direction
+            // (left = low rate, right = high rate) so toggling
+            // Sync mode doesn't flip the user's mental model. The
+            // stored `divisionIdx` is still the canonical
+            // small-to-large index into DIVISIONS — we just
+            // present it back-to-front.
+            value={DIVISIONS.length - 1 - m.divisionIdx}
             list="dataflou-division-ticks"
-            onChange={(e) => uMod({ divisionIdx: Number(e.target.value) })}
+            onChange={(e) =>
+              uMod({
+                divisionIdx: DIVISIONS.length - 1 - Number(e.target.value)
+              })
+            }
           />
           <div className="flex items-center justify-end">
             <span className="text-muted text-[11px] font-mono w-full text-right">
@@ -2025,9 +2513,21 @@ Div/Mult: Value in the middle; halvings below, doublings above."
             min={0}
             max={DIVISIONS.length - 1}
             step={1}
-            value={m.divisionIdx}
+            // Slider is INVERTED: visually left = slow (large
+            // division → low Hz), right = fast (small division →
+            // high Hz). Matches the Free-mode slider direction
+            // (left = low rate, right = high rate) so toggling
+            // Sync mode doesn't flip the user's mental model. The
+            // stored `divisionIdx` is still the canonical
+            // small-to-large index into DIVISIONS — we just
+            // present it back-to-front.
+            value={DIVISIONS.length - 1 - m.divisionIdx}
             list="dataflou-division-ticks"
-            onChange={(e) => uMod({ divisionIdx: Number(e.target.value) })}
+            onChange={(e) =>
+              uMod({
+                divisionIdx: DIVISIONS.length - 1 - Number(e.target.value)
+              })
+            }
           />
           <div className="flex items-center justify-end">
             <span className="text-muted text-[11px] font-mono w-full text-right">
@@ -2189,9 +2689,21 @@ function RandomEditor({
             min={0}
             max={DIVISIONS.length - 1}
             step={1}
-            value={m.divisionIdx}
+            // Slider is INVERTED: visually left = slow (large
+            // division → low Hz), right = fast (small division →
+            // high Hz). Matches the Free-mode slider direction
+            // (left = low rate, right = high rate) so toggling
+            // Sync mode doesn't flip the user's mental model. The
+            // stored `divisionIdx` is still the canonical
+            // small-to-large index into DIVISIONS — we just
+            // present it back-to-front.
+            value={DIVISIONS.length - 1 - m.divisionIdx}
             list="dataflou-division-ticks"
-            onChange={(e) => uMod({ divisionIdx: Number(e.target.value) })}
+            onChange={(e) =>
+              uMod({
+                divisionIdx: DIVISIONS.length - 1 - Number(e.target.value)
+              })
+            }
           />
           <div className="flex items-center justify-end">
             <span className="text-muted text-[11px] font-mono w-full text-right">
@@ -2289,8 +2801,14 @@ function CompactRateControls({
           min={0}
           max={DIVISIONS.length - 1}
           step={1}
-          value={m.divisionIdx}
-          onChange={(e) => uMod({ divisionIdx: Number(e.target.value) })}
+          // Inverted division slider — see comment on the LFO
+          // instance above. Left = slow, right = fast.
+          value={DIVISIONS.length - 1 - m.divisionIdx}
+          onChange={(e) =>
+            uMod({
+              divisionIdx: DIVISIONS.length - 1 - Number(e.target.value)
+            })
+          }
         />
       )}
       <div className="flex items-center gap-1 justify-end">
@@ -3203,6 +3721,108 @@ function Section({
         {rightContent && <span className="flex items-center gap-1 min-w-0 truncate">{rightContent}</span>}
       </div>
       {children}
+    </div>
+  )
+}
+
+// Click-to-view collapsible section. Same visual shape as `Section`
+// but the header is a button that toggles the body's visibility.
+// Starts EXPANDED — the user clicks the chevron / title to collapse,
+// then the section's body hides. Differs from `CollapsibleSection`:
+//   - no enable/disable checkbox (no engine-state semantics);
+//   - the underlying setting is always "on" — this only hides the
+//     editing chrome to declutter the inspector.
+// Local component state; doesn't persist across navigations (each
+// time you open the inspector, the section re-expands — matches the
+// "always on by default" promise).
+function CollapsibleViewSection({
+  title,
+  rightContent,
+  headerLeft,
+  forceCollapsed,
+  headerEnd,
+  children
+}: {
+  title: string
+  rightContent?: React.ReactNode
+  // Optional control rendered BEFORE the chevron / title on the
+  // header row. DEPRECATED for new sections — `headerEnd` parks
+  // the same kind of control at the far right of the row so
+  // chevrons stay column-aligned across every collapsible section
+  // in the inspector. Kept here so older callers still compile.
+  headerLeft?: React.ReactNode
+  // Optional control rendered AT THE FAR RIGHT of the header row,
+  // OUTSIDE the toggle button. Used by the Destination section's
+  // OSC Output checkbox so it sits flush right and the chevron
+  // stays in the leftmost column, aligned with every other section's
+  // chevron in the cell inspector. Clicks on this slot don't bubble
+  // up to the toggle.
+  headerEnd?: React.ReactNode
+  // When true, the section is forced collapsed regardless of the
+  // user's local open state. Used to auto-collapse Destination + OSC
+  // Address when the cell's OSC Output is disabled. The chevron
+  // greys out so the user knows clicking won't help.
+  forceCollapsed?: boolean
+  children: React.ReactNode
+}): JSX.Element {
+  const [open, setOpen] = useState(true)
+  const effectiveOpen = forceCollapsed ? false : open
+  return (
+    <div className="flex flex-col gap-1 pt-2 border-t border-border first:border-t-0 first:pt-0">
+      <div className="flex items-center gap-2 min-w-0">
+        {headerLeft && (
+          // Stop click propagation so toggling the headerLeft
+          // checkbox doesn't also flip the collapse state via the
+          // toggle button below.
+          <span
+            onClick={(e) => e.stopPropagation()}
+            className="shrink-0 flex items-center"
+          >
+            {headerLeft}
+          </span>
+        )}
+        <button
+          type="button"
+          className={`flex flex-1 items-center gap-2 min-w-0 text-left bg-transparent border-0 p-0 select-none ${
+            forceCollapsed ? 'cursor-default opacity-60' : 'cursor-pointer hover:opacity-80'
+          }`}
+          onClick={() => {
+            if (forceCollapsed) return
+            setOpen((v) => !v)
+          }}
+          title={
+            forceCollapsed
+              ? 'Section is auto-collapsed because OSC Output is disabled'
+              : effectiveOpen
+                ? 'Click to collapse this section'
+                : 'Click to expand this section'
+          }
+        >
+          {/* Chevron — same character set the Pool's template chevrons
+              use so the affordance reads consistently. */}
+          <span className="text-muted text-[12px] font-bold leading-none w-3 shrink-0">
+            {effectiveOpen ? '▾' : '▸'}
+          </span>
+          <span className="label shrink-0">{title}</span>
+          {rightContent && (
+            <span className="flex items-center gap-1 min-w-0 truncate">
+              {rightContent}
+            </span>
+          )}
+        </button>
+        {headerEnd && (
+          // Stop click propagation so toggling the headerEnd
+          // checkbox doesn't flip the collapse state via the
+          // toggle button.
+          <span
+            onClick={(e) => e.stopPropagation()}
+            className="shrink-0 flex items-center"
+          >
+            {headerEnd}
+          </span>
+        )}
+      </div>
+      {effectiveOpen && children}
     </div>
   )
 }
@@ -4123,22 +4743,43 @@ function GenerativeStepPreview({
   const liveValue = useStore((st) =>
     sel ? st.engine.currentValueBySceneAndTrack[sel.sceneId]?.[sel.trackId] : undefined
   )
+  // Look up the source track to read its argSpec. The preview hides
+  // any tokens at positions where `argSpec[i].fixed !== undefined`
+  // — those are protocol headers (OCTOCOSME's "compositor" + "0"
+  // for the Pure Data `list split 2`) that always emit the same
+  // value and just add noise to the user-facing preview grid.
+  const track = useStore((st) =>
+    sel ? st.session.tracks.find((t) => t.id === sel.trackId) : undefined
+  )
+  const fixedMask = (track?.argSpec ?? []).map((a) => a.fixed !== undefined)
+  // Strip fixed-position tokens from a generated value string. Splits
+  // on whitespace, drops tokens whose corresponding argSpec entry is
+  // marked fixed, and rejoins. Returns the original string when the
+  // track has no argSpec (or no fixed entries) so single-arg cells
+  // are unchanged.
+  function stripFixed(raw: string): string {
+    if (!fixedMask.some((f) => f)) return raw
+    const toks = raw.trim().split(/\s+/)
+    return toks.filter((_, i) => !fixedMask[i]).join(' ')
+  }
   const values = Array.from({ length: steps }, (_, i) =>
-    generateStepValue({
-      baseRaw: cell.value,
-      mode: seq.mode,
-      stepIdx: i,
-      steps,
-      amount: seq.genAmount,
-      seed: seq.seed,
-      ringALength: seq.ringALength,
-      ringBLength: seq.ringBLength,
-      cellRow: cellularInitialRow(seq.cellSeed, steps),
-      bounceDecay: seq.bounceDecay,
-      subIdx: 0,
-      subdiv: 1,
-      scaleToUnit: cell.scaleToUnit
-    })
+    stripFixed(
+      generateStepValue({
+        baseRaw: cell.value,
+        mode: seq.mode,
+        stepIdx: i,
+        steps,
+        amount: seq.genAmount,
+        seed: seq.seed,
+        ringALength: seq.ringALength,
+        ringBLength: seq.ringBLength,
+        cellRow: cellularInitialRow(seq.cellSeed, steps),
+        bounceDecay: seq.bounceDecay,
+        subIdx: 0,
+        subdiv: 1,
+        scaleToUnit: cell.scaleToUnit
+      })
+    )
   )
   return (
     <div className="grid grid-cols-4 gap-1">
@@ -4146,7 +4787,10 @@ function GenerativeStepPreview({
         const isActive = i === currentStep
         // Active step → show engine's live emitted value (captures
         // Ratchet sub-pulse scatter, Cellular evolved row, etc).
-        const display = isActive && liveValue !== undefined ? liveValue : v
+        // Live value also passes through the fixed-token strip so
+        // the active cell stays visually consistent with siblings.
+        const display =
+          isActive && liveValue !== undefined ? stripFixed(liveValue) : v
         return (
           <div
             key={`${i}-${display}-${isActive ? 'now' : ''}`}
@@ -4263,15 +4907,25 @@ function detectedLabel(s: string): string {
 function MultiArgValueEditor({
   cell,
   argSpec,
+  trackPersistentSlots,
   disabled,
   onChange,
-  onCommitTrigger
+  onCommitTrigger,
+  onTogglePin
 }: {
   cell: Cell
   argSpec: ParamArgSpec[]
+  // Track-level pin defaults — used to compute the EFFECTIVE pin
+  // state for each slot when the cell hasn't set its own override.
+  trackPersistentSlots?: boolean[]
   disabled: boolean
   onChange: (newValue: string) => void
   onCommitTrigger: () => void
+  // Toggle the per-cell pin for slot `idx`. Passes `nextPinned` so
+  // the caller (CellInspector) can branch on the desired state +
+  // capture the current value if pinning. Pass `undefined` to clear
+  // the cell-level override entirely (fall back to track default).
+  onTogglePin: (idx: number, nextPinned: boolean | undefined, capturedValue: string) => void
 }): JSX.Element {
   const tokens = tokensWithDefaults(tokensFromValue(cell.value), argSpec)
   function setAt(i: number, raw: string): void {
@@ -4291,12 +4945,51 @@ function MultiArgValueEditor({
     <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
       {argSpec.map((a, i) => {
         if (a.fixed !== undefined) return null
+        // Effective pin state: cell override beats track default.
+        // - cell.persistentSlots[i] === true  → pinned (source: cell)
+        // - cell.persistentSlots[i] === false → forced unpin (source: cell)
+        // - cell.persistentSlots[i] === undefined → fall back to track
+        const cellOverride = cell.persistentSlots?.[i]
+        const trackPinned = trackPersistentSlots?.[i] === true
+        const effectivePinned =
+          cellOverride === true
+            ? true
+            : cellOverride === false
+              ? false
+              : trackPinned
+        // "source" drives the badge: did the cell explicitly pin /
+        // unpin, or are we inheriting the track default?
+        const source: 'cell' | 'track' | 'none' =
+          cellOverride !== undefined
+            ? 'cell'
+            : trackPinned
+              ? 'track'
+              : 'none'
         return (
           <ArgInput
             key={i}
             spec={a}
             value={tokens[i] ?? ''}
-            disabled={disabled}
+            disabled={disabled || effectivePinned}
+            pinned={effectivePinned}
+            pinSource={source}
+            onTogglePin={() =>
+              // Flip the EFFECTIVE state. If we're inheriting track
+              // pinned-true and the user clicks, set explicit false
+              // on the cell (override). Same logic in reverse for
+              // unpinning a cell-level pin while track default is
+              // unpinned.
+              onTogglePin(
+                i,
+                effectivePinned ? false : true,
+                tokens[i] ?? ''
+              )
+            }
+            onClearPinOverride={
+              source === 'cell'
+                ? () => onTogglePin(i, undefined, tokens[i] ?? '')
+                : undefined
+            }
             onChange={(v) => setAt(i, v)}
             onCommitTrigger={onCommitTrigger}
           />
@@ -4333,12 +5026,28 @@ function ArgInput({
   spec,
   value,
   disabled,
+  pinned,
+  pinSource,
+  onTogglePin,
+  onClearPinOverride,
   onChange,
   onCommitTrigger
 }: {
   spec: ParamArgSpec
   value: string
   disabled: boolean
+  // Effective pin state (cell override OR inherited from track).
+  // When pinned, the input is grey-disabled and the badge shows
+  // who pinned it (cell vs track default).
+  pinned: boolean
+  pinSource: 'cell' | 'track' | 'none'
+  // Flip the effective pin state — captures the current displayed
+  // token at pin time so the engine emits it.
+  onTogglePin: () => void
+  // Defined only when the cell has an EXPLICIT override (source = 'cell').
+  // Clicking the small "(cell)" badge clears the override and falls
+  // back to the track default.
+  onClearPinOverride?: () => void
   onChange: (v: string) => void
   onCommitTrigger: () => void
 }): JSX.Element {
@@ -4348,12 +5057,64 @@ function ArgInput({
   // receiver coerces 0/1 → bool. Modulating a "bool" continuously
   // alternates 0 and 1 (or stays at the modulated value, clamped),
   // letting the user wire e.g. an LFO to a kill switch.
+  // Tiny label row shared by both branches — name on the left, pin
+  // checkbox + source-badge on the right. The pin captures the
+  // current value at toggle time; the badge tells the user whether
+  // this slot's pin came from the cell-level override or the
+  // track-level default ("(track)" = inherited, click to override
+  // explicitly; "(cell)" = explicit override, click × to clear and
+  // fall back).
+  const labelRow = (
+    <div className="flex items-baseline gap-1 min-w-0">
+      <span className="text-[9px] text-muted uppercase tracking-wide truncate flex-1">
+        {spec.name}
+        {spec.type === 'bool' && <span className="ml-1 text-[8px]">(0/1)</span>}
+      </span>
+      <label
+        className="flex items-center gap-0.5 cursor-pointer shrink-0"
+        title={
+          pinned
+            ? pinSource === 'cell'
+              ? 'Pinned for this clip — engine emits the captured value regardless of modulators / sequencer. Click to unpin.'
+              : 'Pinned by the Parameter Inspector (applies to every clip on this row). Click to override + unpin for this clip only.'
+            : pinSource === 'cell'
+              ? 'Explicitly unpinned for this clip — overrides the track default. Click × to clear the override.'
+              : 'Unpinned. Click to freeze this slot at the value shown.'
+        }
+      >
+        <input
+          type="checkbox"
+          checked={pinned}
+          onChange={onTogglePin}
+          disabled={disabled && !pinned}
+        />
+        <span
+          className={`text-[8px] ${
+            pinSource === 'cell'
+              ? 'text-accent'
+              : pinSource === 'track'
+                ? 'text-muted'
+                : 'text-muted'
+          }`}
+        >
+          {pinSource === 'cell' ? 'cell' : pinSource === 'track' ? 'track' : 'pin'}
+        </span>
+      </label>
+      {onClearPinOverride && (
+        <button
+          className="text-muted hover:text-text text-[10px] leading-none shrink-0"
+          onClick={onClearPinOverride}
+          title="Clear this clip's pin override (revert to the Parameter Inspector default)"
+        >
+          ×
+        </button>
+      )}
+    </div>
+  )
   if (spec.type === 'string') {
     return (
       <label className="flex flex-col gap-0.5 min-w-0">
-        <span className="text-[9px] text-muted uppercase tracking-wide truncate">
-          {spec.name}
-        </span>
+        {labelRow}
         <UncontrolledTextInput
           className="input text-[11px] py-0.5 font-mono"
           value={value}
@@ -4387,10 +5148,7 @@ function ArgInput({
   const safeNum = Number.isFinite(parsed) ? parsed : initFallback
   return (
     <label className="flex flex-col gap-0.5 min-w-0">
-      <span className="text-[9px] text-muted uppercase tracking-wide truncate">
-        {spec.name}
-        {spec.type === 'bool' && <span className="ml-1 text-[8px]">(0/1)</span>}
-      </span>
+      {labelRow}
       <BoundedNumberInput
         className="input text-[11px] py-0.5"
         value={safeNum}
@@ -4425,4 +5183,204 @@ function tokensWithDefaults(tokens: string[], spec: ParamArgSpec[]): string[] {
 function formatTok(v: number | string | boolean): string {
   if (typeof v === 'boolean') return v ? '1' : '0'
   return String(v)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MIDI Output — parallel destination alongside OSC. Shown as a
+// CollapsibleSection in the cell editor; toggle the section header
+// to enable / disable. In Note mode, the Value field above this
+// section is interpreted as the MIDI note number (0..127) and we
+// render a separate Velocity field below with its own pin.
+// ─────────────────────────────────────────────────────────────────
+function MidiOutputSection({
+  cell,
+  onChange,
+  onVelocityChange,
+  onPinVelocity,
+  onPinNote
+}: {
+  cell: Cell
+  onChange: (patch: Partial<MidiOut>) => void
+  onVelocityChange: (v: string) => void
+  onPinVelocity: (pinned: boolean) => void
+  onPinNote: (pinned: boolean) => void
+}): JSX.Element {
+  const m = cell.midiOut ?? DEFAULT_MIDI_OUT
+  const [ports, setPorts] = useState<string[]>([])
+  const [available, setAvailable] = useState<boolean>(true)
+  const [lastError, setLastError] = useState<string>('')
+  // Refresh ports on mount + every time the section opens. Cheap
+  // (RtMidi rescans synchronously) so we just re-poll on every
+  // toggle rather than subscribing to a hot-plug stream.
+  useEffect(() => {
+    let cancelled = false
+    window.api?.midiListPorts?.().then((r) => {
+      if (cancelled) return
+      setPorts(r.ports)
+      setAvailable(r.available)
+      setLastError(r.lastError)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [m.enabled])
+  return (
+    <CollapsibleSection
+      title="MIDI Output"
+      enabled={m.enabled}
+      onToggle={(v) => onChange({ enabled: v })}
+      headerRight={
+        !available ? (
+          <span className="text-[10px] text-danger" title={lastError}>
+            unavailable
+          </span>
+        ) : null
+      }
+    >
+      {/* Port + channel row. The port dropdown lists everything
+          RtMidi sees right now; an empty list means no MIDI
+          interfaces are attached. `min-w-0` lets the dropdown
+          shrink so long device names ("Komplete Audio 6 MIDI") get
+          truncated to ellipsis instead of pushing the CH spinner
+          off-screen. The CH input on the right is fixed-width. */}
+      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto] gap-x-2 gap-y-1 items-center">
+        <span className="label">Port</span>
+        <select
+          className="input text-[12px] min-w-0 max-w-full"
+          style={{ textOverflow: 'ellipsis' }}
+          value={m.portName}
+          onChange={(e) => onChange({ portName: e.target.value })}
+          disabled={!available}
+        >
+          <option value="">— select port —</option>
+          {/* Show the currently-stored port even if it's not in
+              the live list (cable might be unplugged), so the user
+              doesn't lose their selection. */}
+          {m.portName && !ports.includes(m.portName) && (
+            <option value={m.portName}>{m.portName} (disconnected)</option>
+          )}
+          {ports.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+        <span className="label">Ch</span>
+        {/* CH input is 2-digit (channels 1..16) so it doesn't eat the
+            row width — gives the PORT dropdown more room to display
+            long device names without clipping. */}
+        <BoundedNumberInput
+          className="input w-10 text-center tabular-nums"
+          value={m.channel}
+          onChange={(v) => onChange({ channel: v })}
+          min={1}
+          max={16}
+          integer
+        />
+      </div>
+
+      {/* Message kind toggle. Switching between CC and Note re-
+          interprets the cell's Value field (CC value vs note number)
+          and reveals the Velocity slot below for Note mode. */}
+      <div className="flex items-center gap-2 mt-1">
+        <span className="label">Kind</span>
+        <div className="flex items-center gap-0.5">
+          <button
+            className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+              m.kind === 'cc'
+                ? 'bg-accent text-black border-accent'
+                : 'border-border text-muted hover:text-text'
+            }`}
+            onClick={() => onChange({ kind: 'cc' })}
+          >
+            CC
+          </button>
+          <button
+            className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+              m.kind === 'note'
+                ? 'bg-accent text-black border-accent'
+                : 'border-border text-muted hover:text-text'
+            }`}
+            onClick={() => onChange({ kind: 'note' })}
+          >
+            Note
+          </button>
+        </div>
+        {m.kind === 'cc' ? (
+          <>
+            <span className="label">CC #</span>
+            <BoundedNumberInput
+              className="input w-14"
+              value={m.cc ?? 0}
+              onChange={(v) => onChange({ cc: v })}
+              min={0}
+              max={127}
+              integer
+            />
+            <span className="text-[10px] text-muted">
+              Value field drives the CC value (0–127).
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="label">Gate</span>
+            <BoundedNumberInput
+              className="input w-16"
+              value={m.gateLengthMs ?? 0}
+              onChange={(v) => onChange({ gateLengthMs: v })}
+              min={0}
+              max={60000}
+              integer
+              title="Note Off fires this many ms after Note On. 0 = until next trigger / scene change."
+            />
+            <span className="text-[10px] text-muted">ms (0 = until next trigger)</span>
+          </>
+        )}
+      </div>
+
+      {/* Note mode: explicit Note Number + Velocity slots, each
+          with its own pin. Value above this section drives the
+          note number; Velocity is a separate cell field. The pin
+          machinery freezes either slot independently so the user
+          can modulate / sequence ONE while keeping the OTHER
+          locked. */}
+      {m.kind === 'note' && (
+        <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center mt-1">
+          <span className="text-[10px] text-muted" title="MIDI note 0..127">
+            Note (= Value)
+          </span>
+          <span className="font-mono text-[11px] text-right text-muted">
+            see Value field above ↑
+          </span>
+          <label className="flex items-center gap-1 text-[10px] shrink-0">
+            <input
+              type="checkbox"
+              checked={!!cell.notePersistent}
+              onChange={(e) => onPinNote(e.target.checked)}
+              title="Pin — freeze the note number; sequencer / modulator only drives Velocity below."
+            />
+            <span>pin</span>
+          </label>
+          <span className="text-[10px] text-muted" title="MIDI velocity 0..127">
+            Velocity
+          </span>
+          <UncontrolledTextInput
+            className="input font-mono"
+            value={cell.velocity ?? '100'}
+            onChange={(v) => onVelocityChange(v.trim() || '0')}
+            placeholder="100"
+          />
+          <label className="flex items-center gap-1 text-[10px] shrink-0">
+            <input
+              type="checkbox"
+              checked={!!cell.velocityPersistent}
+              onChange={(e) => onPinVelocity(e.target.checked)}
+              title="Pin — freeze the velocity; sequencer / modulator only drives the note number above."
+            />
+            <span>pin</span>
+          </label>
+        </div>
+      )}
+    </CollapsibleSection>
+  )
 }

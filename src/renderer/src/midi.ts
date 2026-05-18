@@ -18,10 +18,26 @@ export interface MidiDevice {
 
 type LearnResolver = (b: MidiBinding) => void
 
+/** Raw MIDI message forwarded to the Capture popup. Strips down to
+ *  the fields the capture buffer cares about: status nibble (CC vs
+ *  Note On vs Note Off), channel 0..15, number (CC# or note), and
+ *  value (CC value or velocity). */
+export interface MidiCaptureMessage {
+  kind: 'cc' | 'noteOn' | 'noteOff'
+  channel: number
+  number: number
+  value: number
+}
+
 class MidiManager {
   private access: MIDIAccess | null = null
   private openedId: string | null = null
   private learnCb: LearnResolver | null = null
+  // Capture popup subscriber. When non-null, every incoming MIDI
+  // CC / Note On / Note Off is forwarded here in addition to the
+  // normal routing (so the user can still see real-time feedback
+  // on bound knobs while the popup buffers events).
+  private captureCb: ((m: MidiCaptureMessage) => void) | null = null
   private listeners = new Set<(devs: MidiDevice[]) => void>()
 
   async init(): Promise<boolean> {
@@ -88,6 +104,13 @@ class MidiManager {
     this.learnCb = null
   }
 
+  /** Subscribe to raw CC / Note events for the Capture popup. Pass
+   *  null to unsubscribe. Only one capture subscriber at a time
+   *  (the popup is a singleton). */
+  setCaptureCb(cb: ((m: MidiCaptureMessage) => void) | null): void {
+    this.captureCb = cb
+  }
+
   private onMessage(e: MIDIMessageEvent): void {
     const data = e.data
     if (!data || data.length < 3) return
@@ -95,6 +118,20 @@ class MidiManager {
     const channel = data[0] & 0x0f
     const number = data[1]
     const value = data[2] ?? 0
+    // Capture forwarding — fires for every CC + Note On + Note Off
+    // regardless of whether anything is bound. The popup buffers
+    // events into its UI list; normal routing below continues so
+    // the user's live MIDI control isn't interrupted while they
+    // capture.
+    if (this.captureCb) {
+      if (status === 0xb0) {
+        this.captureCb({ kind: 'cc', channel, number, value })
+      } else if (status === 0x90 && value > 0) {
+        this.captureCb({ kind: 'noteOn', channel, number, value })
+      } else if (status === 0x80 || (status === 0x90 && value === 0)) {
+        this.captureCb({ kind: 'noteOff', channel, number, value })
+      }
+    }
     let binding: MidiBinding | null = null
     // Build a binding from any Note-On or CC message. We do NOT filter out
     // CC value 0 here — knobs need the full 0..127 range (CC0 = knob fully

@@ -109,6 +109,21 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
     }
     if (e.shiftKey) selectSceneRange(sceneId)
     else setFocusedScene(sceneId)
+    // The scene-header div is the parent of every inline scene
+    // editor input (name, duration, notes, next-mode select). After
+    // a focus change, Chromium can leave any previously-focused
+    // input — e.g. the cell editor's value input in the right
+    // panel that just unmounted via setFocusedScene's mutex —
+    // holding a sticky pseudo-focus that swallows the next click
+    // on the freshly-rendered scene-header inputs. rAF blur +
+    // body.focus releases it so the user can type into the scene
+    // name / duration immediately without an alt-tab.
+    requestAnimationFrame(() => {
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur()
+      }
+      document.body.focus?.()
+    })
   }
 
   function onContextMenu(e: React.MouseEvent): void {
@@ -223,6 +238,18 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           <UncontrolledTextInput
             className="input flex-1 text-[12px] font-semibold min-w-0"
             value={scene.name}
+            // Focusing the scene name input re-anchors selection
+            // onto this scene. Without this, clicking the input
+            // while a Pool / SavedScene was still selected left
+            // the inspector pane's input as the truly-focused
+            // element on the next render, and the user had to
+            // alt-tab to break out — the original "have to go to
+            // another window to edit" report.
+            onFocus={() => {
+              if (useStore.getState().session.focusedSceneId !== sceneId) {
+                setFocusedScene(sceneId)
+              }
+            }}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
             onChange={(v) => updateScene(sceneId, { name: v })}
@@ -308,18 +335,30 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             <option value="any">Any</option>
             <option value="other">Other</option>
           </select>
-        </div>
-
-        {/* MIDI binding chip — Delete moved to the right-click context menu. */}
-        {scene.midiTrigger && (
-          <div className="flex items-center gap-1">
-            <span className="chip">
-              {scene.midiTrigger.kind === 'note'
-                ? noteName(scene.midiTrigger.number)
-                : `CC${scene.midiTrigger.number}`}
-              <span className="text-muted">ch{scene.midiTrigger.channel + 1}</span>
+          {/* MIDI binding chip — folded inline with DUR/NEXT so the
+              scene header doesn't carry a separate orphan line for
+              every bound scene. Compact "MIDI" prefix + note/CC
+              label + channel; click ✕ to clear. Hidden when nothing
+              is bound to this scene. */}
+          {scene.midiTrigger && (
+            <span
+              className="flex items-center gap-0.5 text-[9px] text-muted shrink-0 px-1 rounded border border-border ml-1 whitespace-nowrap"
+              title={`MIDI: ${
+                scene.midiTrigger.kind === 'note'
+                  ? noteName(scene.midiTrigger.number)
+                  : `CC${scene.midiTrigger.number}`
+              } on channel ${scene.midiTrigger.channel + 1}`}
+              onClick={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <span className="text-text">
+                {scene.midiTrigger.kind === 'note'
+                  ? noteName(scene.midiTrigger.number)
+                  : `CC${scene.midiTrigger.number}`}
+              </span>
+              <span>ch{scene.midiTrigger.channel + 1}</span>
               <button
-                className="ml-1 text-muted hover:text-danger"
+                className="text-muted hover:text-danger leading-none"
                 onClick={(e) => {
                   e.stopPropagation()
                   setSceneMidi(sceneId, undefined)
@@ -329,8 +368,8 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                 ✕
               </button>
             </span>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Notes resize handle on the bottom border of the header — identical
             placement to the handle in TrackSidebar to keep alignment. */}
@@ -464,6 +503,60 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                 )
               })}
             </div>
+            <div className="border-t border-border my-1" />
+            {/* Save to Pool + Duplicate — now multi-selection aware.
+                Save loops over each target id and saves them as
+                separate SavedScenes (each gets its own row in the
+                Pool's Scenes tab). Duplicate does the same one-at-
+                a-time then focuses the LAST new scene. */}
+            <button
+              className="w-full text-left px-3 py-1 hover:bg-panel2"
+              onClick={() => {
+                const ids = menu.targets
+                setMenu(null)
+                const st = useStore.getState()
+                for (const id of ids) {
+                  const cur = st.session.scenes.find((s) => s.id === id)
+                  const suggestedName = cur?.name ?? 'Saved Scene'
+                  void st.saveSceneToLibrary(id, suggestedName)
+                }
+              }}
+              title={
+                menu.targets.length > 1
+                  ? `Snapshot each of the ${menu.targets.length} selected scenes into the Pool as separate saved scenes.`
+                  : 'Snapshot this scene + its tracks + its Pool templates into the global Saved Scenes library.'
+              }
+            >
+              {menu.targets.length > 1
+                ? `Save ${menu.targets.length} Scenes to Pool`
+                : 'Save Scene to Pool'}
+            </button>
+            <button
+              className="w-full text-left px-3 py-1 hover:bg-panel2"
+              onClick={() => {
+                const ids = menu.targets
+                setMenu(null)
+                const st = useStore.getState()
+                let lastNewId: string | null = null
+                for (const id of ids) {
+                  const newId = st.duplicateScene(id)
+                  if (newId) lastNewId = newId
+                }
+                if (lastNewId) st.setFocusedScene(lastNewId)
+              }}
+              title={
+                menu.targets.length > 1
+                  ? `Create a copy of each selected scene — each new scene named "<orig> (copy)" (auto-incremented if duplicates exist).`
+                  : "Create a copy of this scene (Ctrl+Alt+D) — same tracks + cloned cells, named '<orig> (copy)'."
+              }
+            >
+              {menu.targets.length > 1
+                ? `Duplicate ${menu.targets.length} Scenes`
+                : 'Duplicate Scene'}
+              {menu.targets.length === 1 && (
+                <span className="text-muted text-[10px] ml-1">Ctrl+Alt+D</span>
+              )}
+            </button>
             <div className="border-t border-border my-1" />
             <button
               className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"

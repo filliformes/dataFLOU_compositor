@@ -1,5 +1,12 @@
-import { useEffect, useRef } from 'react'
-import { useStore, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_STEP } from './store'
+import { useEffect, useRef, useState } from 'react'
+import {
+  buildSessionForSave,
+  setPoolLibraryCache,
+  useStore,
+  UI_SCALE_MAX,
+  UI_SCALE_MIN,
+  UI_SCALE_STEP
+} from './store'
 import { midi } from './midi'
 import TopBar from './components/TopBar'
 import EditView from './components/EditView'
@@ -9,6 +16,9 @@ import OscMonitor from './components/OscMonitor'
 import { attachOscErrorStream } from './hooks/oscHealth'
 import { IntegrityPromptHost } from './components/IntegrityPromptHost'
 import CrashRecoveryPrompt from './components/CrashRecoveryPrompt'
+import CapturePopup from './components/CapturePopup'
+import { Modal } from './components/Modal'
+import { initUndo, undo, redo } from './undo'
 import TransportBar from './components/TransportBar'
 
 export default function App(): JSX.Element {
@@ -22,6 +32,15 @@ export default function App(): JSX.Element {
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
   }, [theme])
+
+  // Initialise the undo/redo subscriber exactly once. The module
+  // watches `session` identity changes and captures pre-states into
+  // a 3-deep ring buffer (debounced 500 ms so a typing burst counts
+  // as one undoable step). Buttons + Ctrl+Z hotkey read off the
+  // resulting `undoCount` / `redoCount` published into the store.
+  useEffect(() => {
+    initUndo()
+  }, [])
 
   // Mirror show-mode to <html data-show-mode> so CSS can hide edit chrome
   // selectively. Styling lives in styles.css under [data-show-mode='true'].
@@ -37,6 +56,19 @@ export default function App(): JSX.Element {
   // behavior was one IPC per mutation — under certain scene additions
   // with many cells we saw Electron's IPC pipe back-pressure and freeze
   // the main process (and with it, anything reading its stdout).
+  // GUI layout fields tracked so a change to zoom / row height /
+  // column widths also triggers a flush — autosave needs to capture
+  // these inside the session payload, not just per-session-content
+  // edits.
+  const uiScaleW = useStore((s) => s.uiScale)
+  const rowHeightW = useStore((s) => s.rowHeight)
+  const sceneColumnWidthW = useStore((s) => s.sceneColumnWidth)
+  const inspectorWidthW = useStore((s) => s.inspectorWidth)
+  const trackColumnWidthW = useStore((s) => s.trackColumnWidth)
+  const editorNotesHeightW = useStore((s) => s.editorNotesHeight)
+  const oscMonitorHeightW = useStore((s) => s.oscMonitorHeight)
+  const tracksCollapsedW = useStore((s) => s.tracksCollapsed)
+  const scenesCollapsedW = useStore((s) => s.scenesCollapsed)
   const sessionIpcPendingRef = useRef(false)
   useEffect(() => {
     if (sessionIpcPendingRef.current) return
@@ -44,10 +76,24 @@ export default function App(): JSX.Element {
     requestAnimationFrame(() => {
       sessionIpcPendingRef.current = false
       // Always read the freshest session at flush time, not the one
-      // captured in this effect's closure.
-      window.api.updateSession(useStore.getState().session)
+      // captured in this effect's closure. Bundle the current GUI
+      // layout (zoom + sizes + collapse flags) so autosave + every
+      // ordinary save carries it along — `setSession` on load
+      // re-applies the layout to the store.
+      window.api.updateSession(buildSessionForSave(useStore.getState()))
     })
-  }, [session])
+  }, [
+    session,
+    uiScaleW,
+    rowHeightW,
+    sceneColumnWidthW,
+    inspectorWidthW,
+    trackColumnWidthW,
+    editorNotesHeightW,
+    oscMonitorHeightW,
+    tracksCollapsedW,
+    scenesCollapsedW
+  ])
 
   // Subscribe to engine state events.
   useEffect(() => {
@@ -55,10 +101,29 @@ export default function App(): JSX.Element {
     return off
   }, [setEngineState])
 
-  // Init MIDI once.
+  // Init MIDI once. The manager will also open the persisted
+  // `session.midiInputName` if one is set — but only if init runs
+  // AFTER session-load. In practice init runs early on mount with
+  // the empty default session, so the open-on-init call no-ops; the
+  // session-load reopener below is what actually re-binds the
+  // device every time the session changes.
   useEffect(() => {
     midi.init()
   }, [])
+  // Re-open the persisted MIDI input device whenever the session's
+  // `midiInputName` changes (load / new / autosave restore all
+  // funnel through here). Without this, all the per-cell /
+  // per-scene / per-knob MIDI bindings stored in the session were
+  // recalled correctly but the renderer had no MIDI input attached
+  // — so the bindings looked "missing" until the user manually
+  // re-picked their device from the top-toolbar select.
+  const midiInputName = useStore((s) => s.session.midiInputName)
+  useEffect(() => {
+    // `open()` no-ops if the access handle isn't ready yet (init()
+    // races with this effect on the very first paint); when access
+    // arrives, init()'s own open call covers the initial case.
+    midi.open(midiInputName ?? null)
+  }, [midiInputName])
 
   // Attach the main → renderer OSC-error stream once on startup. This
   // populates the per-destination health map that `useOscDestHealth()`
@@ -187,6 +252,25 @@ export default function App(): JSX.Element {
         return
       }
 
+      // ------- Ctrl/Cmd+Z = Undo, Ctrl/Cmd+Shift+Z (or Ctrl+Y) = Redo.
+      //              Works inside text fields too — the snapshotting
+      //              treats a typing burst as one undoable step, so
+      //              hitting Ctrl+Z mid-edit rolls back the burst
+      //              cleanly. preventDefault stops the browser's
+      //              own "undo last text edit" intercept from
+      //              shadowing the session-level undo.
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault()
+        if (e.shiftKey) redo()
+        else undo()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault()
+        redo()
+        return
+      }
+
       // ------- Performance hotkeys — active everywhere, including inside
       //             text fields (musicians' typing habits notwithstanding,
       //             these are live-fire keys). Guarded only against typing
@@ -206,6 +290,16 @@ export default function App(): JSX.Element {
           const id = nextSceneId()
           if (id) st.triggerSceneWithMorph(id)
         }
+        return
+      }
+      // "C" → Open the Capture window (whether closed or already
+      // open is fine, the modal toggles back on the same press).
+      // Guarded against text-field input so typing "c" in a name
+      // field doesn't pop the modal.
+      if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        useStore.getState().setCaptureOpen(true)
         return
       }
       // "." → Stop All; Shift+"." → Panic.
@@ -247,7 +341,9 @@ export default function App(): JSX.Element {
         if (isEditableTarget(e.target)) return
         e.preventDefault()
         const st = useStore.getState()
-        const sess = st.session
+        // Same buildSessionForSave bundle as the manual Save button
+        // — Ctrl+S also captures the GUI layout into session.ui.
+        const sess = buildSessionForSave(st)
         const path = st.currentFilePath
         // Briefly flash the Save button so the user gets the same visual
         // confirmation they'd get from clicking it. Located by data-attr
@@ -305,6 +401,25 @@ export default function App(): JSX.Element {
         if (!groupRowId) return
         e.preventDefault()
         st.addFunctionToInstrumentRow(groupRowId)
+        return
+      }
+      // Ctrl+Alt+D → duplicate the focused scene. The right-click
+      // menu also offers this; the shortcut is for hands-on-keyboard
+      // workflows. No-op when no scene is focused or in show mode.
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'd'
+      ) {
+        if (showMode) return
+        if (isEditableTarget(e.target)) return
+        const st = useStore.getState()
+        const focusedId = st.session.focusedSceneId
+        if (!focusedId) return
+        e.preventDefault()
+        const newId = st.duplicateScene(focusedId)
+        if (newId) st.setFocusedScene(newId)
         return
       }
       // `A` → arm the focused scene as the next cue (or clear if it's
@@ -430,21 +545,51 @@ export default function App(): JSX.Element {
         if (isEditableTarget(e.target)) return
         const st = useStore.getState()
         if (st.showMode) return
-        // Scene multi-selection wins in both views — the user is
-        // clearly acting on scenes if they've selected several.
-        if (st.selectedSceneIds.length > 1) {
+        // Saved-Scene multi-selection (Pool · Scenes tab) wins first
+        // because the highlight visually pulls focus there. Single
+        // OR multi — both go through removeSavedScene in a loop.
+        if (st.selectedSavedSceneIds.length > 0) {
           e.preventDefault()
-          const n = st.selectedSceneIds.length
-          if (confirm(`Delete ${n} scenes?`)) st.removeScenes(st.selectedSceneIds)
+          const ids = [...st.selectedSavedSceneIds]
+          const n = ids.length
+          const first = st.sceneLibrary.find((s) => s.id === ids[0])
+          const label =
+            n === 1
+              ? `Delete saved scene "${first?.name ?? ''}" from the Pool?`
+              : `Delete ${n} saved scenes from the Pool?`
+          if (confirm(label)) {
+            for (const id of ids) void st.removeSavedScene(id)
+            st.clearSavedSceneSelection()
+          }
           return
         }
+        // Scene selection wins in BOTH views (sequence + edit) as
+        // long as no track/cell is selected. The selection mutex
+        // in `setFocusedScene` guarantees that clicking a scene
+        // header clears track + cell selections, so this branch is
+        // unambiguously "user is acting on scenes". Multi or single,
+        // same path — confirm tag changes with count.
+        if (
+          st.selectedSceneIds.length >= 1 &&
+          st.selectedTrackIds.length === 0 &&
+          !st.selectedTrack &&
+          !st.selectedCell
+        ) {
+          e.preventDefault()
+          const ids = st.selectedSceneIds
+          const n = ids.length
+          if (n > 1) {
+            if (confirm(`Delete ${n} scenes?`)) st.removeScenes(ids)
+          } else {
+            const sc = st.session.scenes.find((s) => s.id === ids[0])
+            if (confirm(`Delete scene "${sc?.name ?? ''}"?`)) removeScene(ids[0])
+          }
+          return
+        }
+        // Sequence view fallback — focused scene with no selection
+        // set (e.g. after launching the app and tapping a slot).
         if (st.view === 'sequence') {
-          // Fall back to the focused scene (or the single-element
-          // selection that matches it). Both paths produce one id.
-          const id =
-            st.selectedSceneIds.length === 1
-              ? st.selectedSceneIds[0]
-              : st.session.focusedSceneId
+          const id = st.session.focusedSceneId
           if (!id) return
           e.preventDefault()
           const focused = st.session.scenes.find((s) => s.id === id)
@@ -521,11 +666,42 @@ export default function App(): JSX.Element {
   // PoolPane mount/unmount and stopped firing the moment the drawer
   // was hidden.
   const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
+  // Default destination port — used as the listener's port too.
+  // Sending and listening converge on a single "compositor OSC
+  // port" the user reads off the top toolbar, so when they
+  // configure their OCTOCOSME controller to send to that port the
+  // Capture popup picks it up automatically.
+  const defaultDestPort = useStore((s) => s.session.defaultDestPort)
+  // Persisted OSC forward targets — every received UDP packet is
+  // byte-copied onward to each enabled entry. We push the whole list
+  // to main once on app load so a freshly-opened session immediately
+  // resumes forwarding without the user having to touch the popover.
+  // Subsequent edits route through the store's CRUD actions, which
+  // push their own updates.
+  const forwardTargets = useStore((s) => s.session.forwardTargets)
   useEffect(() => {
     let cancelled = false
+    // Initial fetch + AUTO-ENABLE the listener bound to the
+    // session's default OSC port. If the user has never changed
+    // it, that's the conventional 9000. Auto-enable means the
+    // Capture popup will see incoming devices without a manual
+    // toggle — the most common workflow.
     window.api?.networkList?.().then((payload) => {
       if (cancelled) return
       setNetworkSnapshot(payload.devices, payload.status)
+      // If the listener is already on (e.g. a hot-reload), don't
+      // re-bind. If it's off OR bound on a different port than
+      // the session's default, kick it on at the right port.
+      const wantPort = defaultDestPort > 0 ? defaultDestPort : 9000
+      if (!payload.status.enabled || payload.status.port !== wantPort) {
+        window.api?.networkSetEnabled?.(true, wantPort).then((next) => {
+          if (cancelled || !next) return
+          setNetworkSnapshot([], next)
+        })
+      }
+      // Replay persisted forward targets to main. Safe to call with
+      // [] — main treats that as "forwarding off".
+      window.api?.networkSetForwardTargets?.(forwardTargets ?? [])
     })
     const off = window.api?.onNetworkDevices?.((payload) => {
       setNetworkSnapshot(payload.devices, payload.status)
@@ -534,7 +710,193 @@ export default function App(): JSX.Element {
       cancelled = true
       if (off) off()
     }
-  }, [setNetworkSnapshot])
+    // Re-run when the session's defaultDestPort changes so the
+    // listener re-binds onto the new port automatically. The
+    // forwardTargets dep handles the rare case where opening a
+    // different session file changes the persisted targets — the
+    // store CRUD actions cover ordinary edits.
+  }, [setNetworkSnapshot, defaultDestPort, forwardTargets])
+
+  // Saved-scene library subscription — also at app level so the
+  // Pool's Scenes tab is up to date the instant the user opens it,
+  // and stays fresh while the drawer is collapsed (e.g. another
+  // window saving a scene). Initial fetch + push-on-change.
+  const setSceneLibrary = useStore((s) => s.setSceneLibrary)
+  useEffect(() => {
+    let cancelled = false
+    window.api?.sceneLibraryList?.().then((scenes) => {
+      if (cancelled) return
+      setSceneLibrary(scenes)
+    })
+    const off = window.api?.onSceneLibrary?.((scenes) => {
+      setSceneLibrary(scenes)
+    })
+    return () => {
+      cancelled = true
+      if (off) off()
+    }
+  }, [setSceneLibrary])
+
+  // Pool library — User Instruments + Parameters persisted across
+  // sessions. On mount we fetch the cache + merge any entries we
+  // don't already have (so a freshly-opened blank session inherits
+  // the user's library). After mount, we watch the session's pool
+  // for changes and push the full User-entry set back to main on
+  // every change so the on-disk file stays in sync.
+  const mergePoolLibrary = useStore((s) => s.mergePoolLibrary)
+  const poolTemplates = useStore((s) => s.session.pool.templates)
+  const poolParameters = useStore((s) => s.session.pool.parameters)
+  // Track whether we've completed the initial merge — auto-push
+  // must NOT run before the merge or we'd overwrite the library
+  // with the session's stale "empty" pool on first paint.
+  const [poolLibraryReady, setPoolLibraryReady] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    window.api?.poolLibraryGet?.().then((payload) => {
+      if (cancelled || !payload) return
+      // Mirror the payload into the module-scope cache used by
+      // `newSession` / `setSession` to re-seed a fresh session's
+      // pool with the user's library, then merge into the current
+      // session as well.
+      setPoolLibraryCache(payload)
+      mergePoolLibrary(payload)
+      setPoolLibraryReady(true)
+    })
+    const off = window.api?.onPoolLibrary?.((payload) => {
+      // Other windows touching the same library push updates here.
+      setPoolLibraryCache(payload)
+      mergePoolLibrary(payload)
+    })
+    return () => {
+      cancelled = true
+      if (off) off()
+    }
+  }, [mergePoolLibrary])
+  // Auto-push: whenever the session's User-pool entries change,
+  // mirror them to the global library. Filter out builtin /
+  // draft entries so the library only stores finished User work.
+  useEffect(() => {
+    if (!poolLibraryReady) return
+    const userTemplates = poolTemplates.filter((t) => !t.builtin && !t.draft)
+    const userParameters = poolParameters.filter((p) => !p.builtin)
+    window.api?.poolLibrarySetAll?.({
+      templates: userTemplates,
+      parameters: userParameters
+    })
+  }, [poolTemplates, poolParameters, poolLibraryReady])
+
+  // Scenes are NOT auto-saved to the library. Adding a fresh empty
+  // column on the grid is a working-session action, not a library
+  // commitment — auto-saving polluted the Pool with placeholder
+  // entries every time the user clicked "+ Scene". The library now
+  // only grows via the explicit paths: right-click → Save Scene to
+  // Pool (in the grid or the palette), and Capture (which builds a
+  // SavedScene as part of its flow). `sceneIdsFromLibrary` still
+  // exists so future re-introduction of auto-save can skip
+  // library-originated instantiations cleanly.
+
+  // Save-before-quit modal. Main intercepts the window-close event
+  // and pushes `app:before-close`; we show a 3-button confirm and
+  // signal main back via `appCloseProceed` (Save / Discard / Cancel
+  // are the choices — Cancel keeps the window open).
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false)
+  const [closeSaving, setCloseSaving] = useState(false)
+  useEffect(() => {
+    const off = window.api?.onAppBeforeClose?.(() => {
+      setCloseConfirmOpen(true)
+    })
+    return () => {
+      if (off) off()
+    }
+  }, [])
+  const [quitSaveError, setQuitSaveError] = useState<string | null>(null)
+  async function handleQuitSave(): Promise<void> {
+    if (closeSaving) return
+    setCloseSaving(true)
+    setQuitSaveError(null)
+    try {
+      const st = useStore.getState()
+      // Bundle GUI layout so the saved file restores zoom + sizes
+      // on next open. See buildSessionForSave in the store.
+      const session = buildSessionForSave(st)
+      const path = st.currentFilePath
+      if (path) {
+        await window.api?.sessionSave?.(session, path)
+      } else {
+        // No file path yet — write into the app's Sessions folder
+        // with the session's current name (no Save-As dialog).
+        const newPath = await window.api?.sessionSaveToDefault?.(session)
+        if (newPath) st.setCurrentFilePath(newPath)
+      }
+    } catch (e) {
+      // SAVE FAILED — surface the error and DO NOT close. Previously
+      // we logged + proceeded, which silently dropped the session
+      // on disk-full / read-only / permission errors. Keep the
+      // modal open with the error visible; the user can retry or
+      // choose No (discard) to close anyway.
+      console.error('[quit-save] failed:', (e as Error).message)
+      setQuitSaveError((e as Error).message || 'Save failed.')
+      setCloseSaving(false)
+      return
+    }
+    setCloseSaving(false)
+    setCloseConfirmOpen(false)
+    await window.api?.appCloseProceed?.()
+  }
+  async function handleQuitDiscard(): Promise<void> {
+    setQuitSaveError(null)
+    setCloseConfirmOpen(false)
+    await window.api?.appCloseProceed?.()
+  }
+  function handleQuitCancel(): void {
+    setQuitSaveError(null)
+    setCloseConfirmOpen(false)
+  }
+
+  // ── New-session confirmation ────────────────────────────────────
+  // TopBar's New button sets `newSessionConfirmOpen` true so we can
+  // ask "Save before opening a new session?" first. Same UX as the
+  // quit-confirm modal: Yes saves (overwrite path or write into the
+  // Sessions folder) then proceeds, No discards then proceeds,
+  // Cancel keeps the current session.
+  const newSessionConfirmOpen = useStore((s) => s.newSessionConfirmOpen)
+  const setNewSessionConfirmOpen = useStore((s) => s.setNewSessionConfirmOpen)
+  const newSessionFromStore = useStore((s) => s.newSession)
+  const [newSessionSaving, setNewSessionSaving] = useState(false)
+  const [newSessionSaveError, setNewSessionSaveError] = useState<string | null>(null)
+  async function handleNewSessionSave(): Promise<void> {
+    if (newSessionSaving) return
+    setNewSessionSaving(true)
+    setNewSessionSaveError(null)
+    try {
+      const st = useStore.getState()
+      const session = st.session
+      const path = st.currentFilePath
+      if (path) {
+        await window.api?.sessionSave?.(session, path)
+      } else {
+        const newPath = await window.api?.sessionSaveToDefault?.(session)
+        if (newPath) st.setCurrentFilePath(newPath)
+      }
+    } catch (e) {
+      console.error('[new-session-save] failed:', (e as Error).message)
+      setNewSessionSaveError((e as Error).message || 'Save failed.')
+      setNewSessionSaving(false)
+      return
+    }
+    setNewSessionSaving(false)
+    setNewSessionConfirmOpen(false)
+    newSessionFromStore()
+  }
+  function handleNewSessionDiscard(): void {
+    setNewSessionSaveError(null)
+    setNewSessionConfirmOpen(false)
+    newSessionFromStore()
+  }
+  function handleNewSessionCancel(): void {
+    setNewSessionSaveError(null)
+    setNewSessionConfirmOpen(false)
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -573,6 +935,117 @@ export default function App(): JSX.Element {
           (Open dialog or crash recovery restore) finds malformed fields.
           Idle / null when there's nothing to resolve. */}
       <IntegrityPromptHost />
+      {/* Capture popup — modal triggered by the Pool's Capture
+          button. Lives at app-root level so it renders above every
+          other panel including the Pool drawer. Null when closed
+          (no subscription / no cost). */}
+      <CapturePopup />
+      {closeConfirmOpen && (
+        <Modal title="Save before quitting?" onClose={handleQuitCancel}>
+          <div className="flex flex-col gap-3 text-[12px]">
+            <p className="text-text">
+              Save the current session before closing the app?
+            </p>
+            <p className="text-muted text-[11px]">
+              {useStore.getState().currentFilePath
+                ? `Saving will overwrite "${useStore.getState().currentFilePath}".`
+                : 'No file path is associated yet — saving will create a new file in the dataFLOU Sessions folder named after the session.'}
+            </p>
+            {quitSaveError && (
+              <p
+                className="text-[11px] px-2 py-1 rounded border"
+                style={{
+                  borderColor: 'rgb(var(--c-danger))',
+                  color: 'rgb(var(--c-danger))'
+                }}
+              >
+                Save failed: {quitSaveError}. Retry, or click No to close
+                without saving.
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                className="btn text-[11px]"
+                onClick={handleQuitCancel}
+                disabled={closeSaving}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn text-[11px]"
+                onClick={handleQuitDiscard}
+                disabled={closeSaving}
+                title="Close without saving"
+              >
+                No
+              </button>
+              <button
+                className="btn-accent text-[11px]"
+                onClick={handleQuitSave}
+                disabled={closeSaving}
+                title="Save the session, then close"
+              >
+                {closeSaving ? 'Saving…' : 'Yes'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {newSessionConfirmOpen && (
+        <Modal
+          title="Save before opening a new session?"
+          onClose={handleNewSessionCancel}
+        >
+          <div className="flex flex-col gap-3 text-[12px]">
+            <p className="text-text">
+              The current session will be replaced by a fresh one.
+              Save it first?
+            </p>
+            <p className="text-muted text-[11px]">
+              {useStore.getState().currentFilePath
+                ? `Saving will overwrite "${useStore.getState().currentFilePath}".`
+                : 'No file path is associated yet — saving will create a new file in the dataFLOU Sessions folder named after the session.'}
+            </p>
+            {newSessionSaveError && (
+              <p
+                className="text-[11px] px-2 py-1 rounded border"
+                style={{
+                  borderColor: 'rgb(var(--c-danger))',
+                  color: 'rgb(var(--c-danger))'
+                }}
+              >
+                Save failed: {newSessionSaveError}. Retry, or click No
+                to discard and start fresh.
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                className="btn text-[11px]"
+                onClick={handleNewSessionCancel}
+                disabled={newSessionSaving}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn text-[11px]"
+                onClick={handleNewSessionDiscard}
+                disabled={newSessionSaving}
+                title="Discard the current session and start fresh"
+              >
+                No
+              </button>
+              <button
+                className="btn-accent text-[11px]"
+                onClick={handleNewSessionSave}
+                disabled={newSessionSaving}
+                title="Save the session, then start fresh"
+              >
+                {newSessionSaving ? 'Saving…' : 'Yes'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }

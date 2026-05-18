@@ -350,8 +350,41 @@ export function makeCell(defaults: {
       ...DEFAULT_SEQUENCER,
       stepValues: [...DEFAULT_SEQUENCER.stepValues]
     },
-    scaleToUnit: false
+    scaleToUnit: false,
+    // MIDI output starts disabled on a freshly-created cell — the
+    // user opts in from the Inspector's MIDI section. Velocity slot
+    // defaults to a safe 100 (musical mezzo-forte) so the first
+    // Note On after the user flips MIDI on isn't a ghost-quiet zero.
+    velocity: '100',
+    velocityPersistent: false,
+    notePersistent: false,
+    // MIDI Scale starts OFF — only affects the MIDI emit path
+    // (multiplies 0..1 by 127 for CC / note range mapping). User
+    // opts in via the Inspector checkbox next to Scale 0.0–1.0.
+    midiScale: false,
+    // OSC emission ON by default — clips wire to OSC out of the
+    // box. Inspector checkbox flips this off when the user wants a
+    // MIDI-only cell (e.g. a Note trigger that doesn't also blast
+    // an unused OSC address).
+    oscEnabled: true,
+    // Timing section starts collapsed AND disabled. The user
+    // explicitly ticks the checkbox on the Timing header to enable
+    // delay + transition. Keeps fresh cells light + uncluttered.
+    timingEnabled: false
   }
+}
+
+// Default MIDI output binding — what a cell or Parameter snapshot
+// reads when the user first toggles MIDI on. CC kind on channel 1
+// with CC 1 (mod wheel) is the safest "the MIDI works at all" probe.
+export const DEFAULT_MIDI_OUT: import('./types').MidiOut = {
+  enabled: false,
+  portName: '',
+  channel: 1,
+  kind: 'cc',
+  cc: 1,
+  noteMode: 'velocity',
+  gateLengthMs: 0
 }
 
 // Build a Euclidean rhythm pattern — `pulses` active hits distributed as
@@ -623,10 +656,21 @@ function genMag(base: number, scaleToUnit: boolean): number {
   return scaleToUnit ? 1 : Math.abs(base || 1)
 }
 
+// ─────────────────────────────────────────────────────────────────
+// All generative helpers below produce values in [base, base + amount·mag].
+// The variation LIFTS the output above the seed/base instead of
+// swinging around it — so base=0 gives a meaningful [0, amount·mag]
+// range instead of half-zeros from a clipped ±swing. Musical
+// interpretation: the user's `cell.value` is the floor of the cycle
+// and Variation adds an upward expressive lift. Reverted from the
+// "swing both ways" original at user request (no negative values
+// in any generative output).
+// ─────────────────────────────────────────────────────────────────
+
 /** Steps → Tide. Smooth sine swell across one cycle, peak position
  *  shifted by the seed (low seed = peak early, high = late). At
- *  amount=0 every step equals the base; at amount=1 the swing is full
- *  ±base around the base value (or ±1 if scaleToUnit is on). */
+ *  amount=0 every step equals the base; at amount=1 the cycle lifts
+ *  from base up to base+mag at the peak and back. */
 export function tideValue(
   base: number,
   i: number,
@@ -636,18 +680,18 @@ export function tideValue(
   scaleToUnit: boolean
 ): number {
   const s = Math.max(1, steps)
-  // Phase offset: -π/2 → +π/2 across seed 0..255. Centre seed (128)
-  // puts the peak at i = steps/2 (a balanced rise-and-fall).
+  // Phase offset across seed 0..255 — slides where the swell crests
+  // across the cycle.
   const phase = ((seed / 255) - 0.5) * Math.PI
   const t = (i / s) * Math.PI * 2
-  // sin returns -1..+1; we want the swell to start near base, rise to
-  // base+amount*base, settle back. Half-cycle so we get one rise and
-  // one fall over the full step row.
-  return genBase(base, scaleToUnit) +
-    Math.sin(t * 0.5 + phase) * amount * genMag(base, scaleToUnit)
+  // Half-cycle sine remapped to [0, 1] — the swell always lifts
+  // above the baseline, never dips below.
+  const swell = (Math.sin(t * 0.5 + phase) + 1) / 2
+  return genBase(base, scaleToUnit) + swell * amount * genMag(base, scaleToUnit)
 }
 
-/** Euclidean → Accent. Hits land harder on the downbeat. */
+/** Euclidean → Accent. Hits land harder on the downbeat — a cosine
+ *  envelope already in [0, 1], so this naturally never dips below base. */
 export function accentValue(
   base: number,
   i: number,
@@ -660,8 +704,13 @@ export function accentValue(
   return genBase(base, scaleToUnit) + w * amount * genMag(base, scaleToUnit)
 }
 
-/** Polyrhythm → Voicing. Three voices: Ring A only (low), Ring B only
- *  (high), both rings hitting (resonance peak). */
+/** Polyrhythm → Voicing. Three voices, all lifted ABOVE the base:
+ *    - Ring A only  → +33%  (low voice, subtle lift)
+ *    - Ring B only  → +66%  (high voice)
+ *    - both rings   → +100% (resonance peak)
+ *    - neither      → base  (no lift)
+ *  The "root sits below the seed" reading from the old formula went
+ *  negative when base=0, so we now treat the base as the floor. */
 export function voicingValue(
   base: number,
   i: number,
@@ -676,16 +725,15 @@ export function voicingValue(
   const hitB = i % b === 0
   const b0 = genBase(base, scaleToUnit)
   const swing = amount * genMag(base, scaleToUnit)
-  if (hitA && hitB) return b0 + swing * 1.5 // resonance peak
-  if (hitB) return b0 + swing               // high voice
-  if (hitA) return b0 - swing * 0.5         // low voice (root)
-  // Gate is closed if neither — engine won't call this branch in
-  // normal flow, but be safe.
+  if (hitA && hitB) return b0 + swing            // peak
+  if (hitB) return b0 + swing * 0.66             // high voice
+  if (hitA) return b0 + swing * 0.33             // low voice (lift, not dip)
   return b0
 }
 
-/** Density → Wave. A continuous sine wraps the row at a phase shifted
- *  by the seed; the gate samples its height at each step. */
+/** Density → Wave. Continuous sine, remapped to [0, 1] so its trough
+ *  sits AT the baseline rather than below. The wave's amplitude is
+ *  driven by `amount`. */
 export function waveValue(
   base: number,
   i: number,
@@ -697,11 +745,15 @@ export function waveValue(
   const s = Math.max(1, steps)
   const phase = (seed / 255) * Math.PI * 2
   const t = (i / s) * Math.PI * 2
-  return genBase(base, scaleToUnit) +
-    Math.sin(t + phase) * amount * genMag(base, scaleToUnit)
+  const wave = (Math.sin(t + phase) + 1) / 2
+  return genBase(base, scaleToUnit) + wave * amount * genMag(base, scaleToUnit)
 }
 
-/** Cellular → Crowd. Cell value rises with on-neighbour count. */
+/** Cellular → Crowd. Crowdedness counts on-neighbours (0, 1, or 2)
+ *  and maps to a [0, 1] lift — lonely cells stay at base, crowded
+ *  cells get the full lift. Previously this was [-1, 0, +1] which
+ *  sent lonely cells below the floor; reverted to a pure-positive
+ *  excitement scale. */
 export function crowdValue(
   base: number,
   i: number,
@@ -714,11 +766,14 @@ export function crowdValue(
   const left = (row >>> ((i - 1 + s) % s)) & 1
   const right = (row >>> ((i + 1) % s)) & 1
   const neighbours = left + right // 0, 1, or 2
-  const w = neighbours - 1 // -1 / 0 / +1
+  const w = neighbours / 2 // 0, 0.5, or 1
   return genBase(base, scaleToUnit) + w * amount * genMag(base, scaleToUnit)
 }
 
-/** Drift → Terrain. Smooth 1D value-noise generated from the seed. */
+/** Drift → Terrain. Smooth 1D value-noise generated from the seed.
+ *  Control points live in [0, 1] (was [-1, +1]) so the walker
+ *  samples a non-negative height field — the hills rise above the
+ *  baseline, never dig below it. */
 export function terrainValue(
   base: number,
   i: number,
@@ -729,21 +784,26 @@ export function terrainValue(
 ): number {
   const s = Math.max(1, steps)
   const ctrl = [
-    stepHash(0, seed) * 2 - 1,
-    stepHash(1, seed * 37 + 1) * 2 - 1,
-    stepHash(2, seed * 61 + 2) * 2 - 1,
-    stepHash(3, seed * 89 + 3) * 2 - 1
+    stepHash(0, seed),
+    stepHash(1, seed * 37 + 1),
+    stepHash(2, seed * 61 + 2),
+    stepHash(3, seed * 89 + 3)
   ]
   const u = (i / s) * (ctrl.length - 1)
   const lo = Math.floor(u)
   const hi = Math.min(lo + 1, ctrl.length - 1)
   const f = u - lo
   const t = f * f * (3 - 2 * f)
-  const h = ctrl[lo] * (1 - t) + ctrl[hi] * t
+  const h = ctrl[lo] * (1 - t) + ctrl[hi] * t // [0, 1]
   return genBase(base, scaleToUnit) + h * amount * genMag(base, scaleToUnit)
 }
 
-/** Ratchet → Scatter. Each sub-pulse lands on a hashed offset. */
+/** Ratchet → Scatter. The first sub-pulse of every burst lands at
+ *  the peak (base + amount·mag); subsequent sub-pulses scatter
+ *  somewhere in [base, base + amount·mag] by a seeded hash. Previously
+ *  the first sub-pulse was the base and the rest swung ± around it,
+ *  which gave a constant 0 when base=0; the new shape always emits
+ *  audible non-zero values. */
 export function scatterValue(
   base: number,
   stepIdx: number,
@@ -754,12 +814,13 @@ export function scatterValue(
   scaleToUnit: boolean
 ): number {
   const b0 = genBase(base, scaleToUnit)
-  // First sub-pulse of any burst lands on the base value — the "loud
-  // first impact". Subsequent sub-pulses scatter from there.
-  if (subIdx <= 0 || subdiv <= 1) return b0
+  const mag = amount * genMag(base, scaleToUnit)
+  // Peak at the start of every burst — the "loud first impact".
+  if (subIdx <= 0 || subdiv <= 1) return b0 + mag
+  // Subsequent sub-pulses land at a hashed [0, 1] fraction of the
+  // peak height — never below baseline.
   const h = stepHash(stepIdx * 32 + subIdx, seed)
-  const offset = (h * 2 - 1) * amount * genMag(base, scaleToUnit)
-  return b0 + offset
+  return b0 + h * mag
 }
 
 /** Map the user-facing 0..100 `bounceDecay` knob to a physical
@@ -801,14 +862,13 @@ export function bounceStepDuration(
   return Math.max(1, t0 * Math.pow(e, ((i % s) + s) % s))
 }
 
-/** Bounce → Bounce. Generative value rule: step i's amplitude is
- *  the seed scaled by the same physical decay that drives the
- *  timing, attenuated by `amount`. amount=0 keeps every step at the
- *  base (timing still bounces, values stay flat). amount=1 lets the
- *  full physical decay through (step i = base · e^i — the hand and
- *  the ear see the same gesture).
- *  Multiplicative decay naturally stays inside [0, 1] for a clamped
- *  base, so scaleToUnit only affects the seed pre-clamp. */
+/** Bounce → Bounce. Step i's amplitude is the physical decay
+ *  envelope ABOVE the baseline (not multiplicative-ON-baseline as
+ *  before — that gave a hard 0 whenever base was 0). With base=0:
+ *  step 0 lifts up by amount·mag, step 1 by amount·mag·e, step 2 by
+ *  amount·mag·e², ... settling back down to base. Musically: a hand
+ *  bouncing a ball — the FIRST impact is loud, each subsequent
+ *  impact softer. */
 export function bounceValue(
   base: number,
   i: number,
@@ -816,9 +876,12 @@ export function bounceValue(
   amount: number,
   scaleToUnit: boolean
 ): number {
-  const e = bounceCoeff(bounceDecay)
-  const k = 1 - amount * (1 - e)
-  return genBase(base, scaleToUnit) * Math.pow(k, i)
+  const e = bounceCoeff(bounceDecay) // [0.40, 0.95]
+  const envelope = Math.pow(e, i) // [e^N, ..., e, 1] — decays toward 0
+  return (
+    genBase(base, scaleToUnit) +
+    envelope * amount * genMag(base, scaleToUnit)
+  )
 }
 
 /** Single dispatcher: given a cell's base value string and the
@@ -910,14 +973,19 @@ export function generateStepValue(args: {
       default:
         v = num
     }
-    // Clamp under scaleToUnit so individual generators (tide/accent/
-    // voicing/wave/crowd/terrain/scatter/bounce) can't smuggle values
-    // outside [0, 1] downstream. The engine re-clamps after modulation
-    // too, but enforcing here keeps the contract self-consistent and
-    // means inspector previews show the same number the engine emits.
-    if (stu) {
-      v = v < 0 ? 0 : v > 1 ? 1 : v
-    }
+    // Generative outputs are ALWAYS clamped to ≥ 0 regardless of
+    // scaleToUnit. The Tide / Accent / Voicing / Wave / Crowd /
+    // Terrain / Scatter / Bounce metaphors are amplitude-shaped
+    // around the user's base value; negative excursions don't carry
+    // musical meaning (a Density gate going below the floor is
+    // nonsense, a CC sweep below 0 is silently clipped by the
+    // receiver, etc.). User explicitly never wants negatives.
+    if (v < 0) v = 0
+    // Under scaleToUnit also clamp to ≤ 1 so the per-mode swing
+    // can't smuggle out of the [0, 1] window the cell promises
+    // downstream. Above 1 with scaleToUnit off is fine — the user
+    // may be sequencing a 0..255 RGB byte or a 0..10000 ms knob.
+    if (stu && v > 1) v = 1
     // Format: keep integer-ish bases as integers, otherwise round to
     // 4 decimals so the read-only display stays compact.
     if (Number.isInteger(num) && Math.abs(v - Math.round(v)) < 0.0001) {
@@ -1226,6 +1294,160 @@ export function makeBuiltinParameters(): import('./types').ParameterTemplate[] {
       max: 1,
       init: 0.5,
       builtin: true
+    },
+    // ── MIDI Parameter blueprints ──────────────────────────────
+    // Each ships with `midiOut` defaults pre-wired so dragging one
+    // onto the sidebar instantiates a cell with MIDI ready to go
+    // (user still picks the actual port from the dropdown). The
+    // OSC fields stay populated too — both transports fire in
+    // parallel if the user enables both. To use as MIDI-only,
+    // just clear the OSC address on the resulting cell.
+    {
+      id: 'par_midi_cc',
+      name: 'MIDI CC',
+      description:
+        'Generic MIDI Control Change. Continuous stream — every tick maps the value to 0..127 and sends.',
+      color: '#7ad6ff',
+      oscPath: 'cc',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'int',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: 0,
+      max: 127,
+      init: 64,
+      unit: 'CC',
+      builtin: true,
+      midiOut: {
+        enabled: true,
+        portName: '',
+        channel: 1,
+        kind: 'cc',
+        cc: 1,
+        noteMode: 'velocity',
+        gateLengthMs: 0
+      }
+    },
+    {
+      id: 'par_midi_note',
+      name: 'MIDI Note',
+      description:
+        'Generic MIDI Note. Note On at every trigger / sequencer step; Note Off at next trigger, cell stop, scene change, or after Gate ms.',
+      color: '#ff9d5d',
+      oscPath: 'note',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'int',
+      nature: 'lin',
+      streamMode: 'discrete',
+      min: 0,
+      max: 127,
+      init: 60, // C4
+      unit: 'note',
+      builtin: true,
+      midiOut: {
+        enabled: true,
+        portName: '',
+        channel: 1,
+        kind: 'note',
+        noteMode: 'velocity',
+        gateLengthMs: 0
+      }
+    },
+    {
+      id: 'par_midi_cc_pair',
+      name: 'MIDI CC Pair (X/Y)',
+      description:
+        'Two-CC bundle — drives an XY-pad-style mapping. Sends two CCs in lockstep.',
+      color: '#7ec8e3',
+      oscPath: 'cc/xy',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'v2',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: 0,
+      max: 127,
+      init: 64,
+      unit: 'CC pair',
+      builtin: true,
+      argSpec: [
+        { name: 'x', type: 'int', min: 0, max: 127, init: 64 },
+        { name: 'y', type: 'int', min: 0, max: 127, init: 64 }
+      ],
+      midiOut: {
+        enabled: true,
+        portName: '',
+        channel: 1,
+        kind: 'cc',
+        cc: 1,
+        noteMode: 'velocity',
+        gateLengthMs: 0
+      }
+    },
+    {
+      id: 'par_midi_drum',
+      name: 'MIDI Drum Pad',
+      description:
+        'Single drum trigger on channel 10 (GM drum convention). Value field = note number (36 kick / 38 snare / etc.); the cell value is the velocity.',
+      color: '#f7c948',
+      oscPath: 'drum',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'int',
+      nature: 'lin',
+      streamMode: 'discrete',
+      min: 0,
+      max: 127,
+      init: 36, // GM kick
+      unit: 'note',
+      builtin: true,
+      midiOut: {
+        enabled: true,
+        portName: '',
+        channel: 10,
+        kind: 'note',
+        noteMode: 'velocity',
+        gateLengthMs: 80
+      }
+    },
+    {
+      id: 'par_midi_daw_macro_bank',
+      name: 'MIDI DAW Macro Bank',
+      description:
+        '8-CC bundle mapped to Ableton/Logic macro slots (CCs 20..27). Drives all eight macros in lockstep — pin individual slots to freeze them.',
+      color: '#a87cff',
+      oscPath: 'macro/bank',
+      destIp: '127.0.0.1',
+      destPort: 9000,
+      paramType: 'int',
+      nature: 'lin',
+      streamMode: 'streaming',
+      min: 0,
+      max: 127,
+      init: 0,
+      unit: 'macro',
+      builtin: true,
+      argSpec: Array.from({ length: 8 }, (_, i) => ({
+        name: `m${i + 1}`,
+        type: 'int' as const,
+        min: 0,
+        max: 127,
+        init: 0
+      })),
+      midiOut: {
+        enabled: true,
+        portName: '',
+        channel: 1,
+        kind: 'cc',
+        cc: 20, // bank starts at CC 20; engine sends only one CC for now,
+                // but with the argSpec the user can sequence each slot
+                // independently and the cell-level multi-arg pinning
+                // works as expected.
+        noteMode: 'velocity',
+        gateLengthMs: 0
+      }
     }
   ]
 }
@@ -1497,6 +1719,48 @@ export function makeBuiltinPool(): Pool {
             init: 0
           }
         ]
+      },
+      // ── MIDI Instrument: generic 8-CC controller ────────────────
+      // A starter "Instrument" wired to 8 MIDI CCs on channel 1.
+      // Matches the layout of MIDI fighter / launch-style desktop
+      // controllers — drop onto the sidebar and pick the port in
+      // each child cell to control eight CCs in parallel. Specific
+      // controllers (LaunchControl XL, MIDI Fighter, etc.) can be
+      // saved by the user as their own Templates from this base.
+      {
+        id: 'tpl_midi_cc8',
+        name: 'MIDI 8× CC',
+        description:
+          'Eight MIDI CCs on channel 1 (CC 21–28). Generic starter for any 8-knob / 8-fader controller — duplicate to retarget at a specific device (LaunchControl XL, MIDI Fighter, etc.).',
+        color: '#7ad6ff',
+        destIp: '127.0.0.1',
+        destPort: 9000,
+        // OSC base intentionally empty — this template is MIDI-first.
+        // Cells can still emit OSC if the user types an address.
+        oscAddressBase: '',
+        voices: 1,
+        builtin: true,
+        functions: Array.from({ length: 8 }, (_, i) => ({
+          id: `fn_midi_cc8_${i + 1}`,
+          name: `CC ${21 + i}`,
+          oscPath: `cc${21 + i}`,
+          paramType: 'int' as const,
+          nature: 'lin' as const,
+          streamMode: 'streaming' as const,
+          min: 0,
+          max: 127,
+          init: 64,
+          unit: 'CC',
+          midiOut: {
+            enabled: true,
+            portName: '',
+            channel: 1,
+            kind: 'cc' as const,
+            cc: 21 + i,
+            noteMode: 'velocity' as const,
+            gateLengthMs: 0
+          }
+        }))
       }
     ]
   }
@@ -1548,6 +1812,11 @@ export function makeEmptySession(): Session {
     sequence: new Array(128).fill(null),
     focusedSceneId: scene.id,
     midiInputName: null,
+    // MIDI output globally ON by default — the engine only touches
+    // the native module for cells whose own `midiOut.enabled` is
+    // true, so an empty session pays zero MIDI cost even though the
+    // global toggle is on.
+    midiEnabled: true,
     metaController: makeMetaController(),
     pool: { ...builtinPool, templates: [...builtinPool.templates, draftTpl] }
   }

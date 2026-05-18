@@ -1,7 +1,7 @@
 {
   "name": "dataflou-compositor",
-  "version": "0.4.5",
-  "description": "OSC scene compositor — 9 sequencer modes, generative system, 8 modulator visuals, multi-arg pinned slots, Pool with Network discovery, Meta Controller destination picker, rich themes",
+  "version": "0.5.0",
+  "description": "OSC + MIDI scene compositor — native MIDI output, Capture (snapshot devices into the Pool), OSC fan-out forward, per-arg pin + per-arg scaling, undo/redo, save-on-quit, per-session GUI layout, Pool + Scene libraries, 9 sequencer modes, generative system, 8 modulators, rich themes",
   "main": "out/main/index.js",
   "author": "Vincent Fillion",
   "scripts": {
@@ -13,6 +13,7 @@
     "start": "electron-vite preview"
   },
   "dependencies": {
+    "@julusian/midi": "^3.6.1",
     "osc": "^2.4.5",
     "zustand": "^4.5.5"
   },

@@ -18,6 +18,10 @@ import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import type { NextMode, Scene } from '@shared/types'
 import { ResizeHandle } from './ResizeHandle'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import {
+  POOL_SAVED_SCENE_DRAG_MIME,
+  type PoolSavedSceneDragPayload
+} from './PoolPane'
 
 export default function SequenceView(): JSX.Element {
   const scenes = useStore((s) => s.session.scenes)
@@ -699,11 +703,46 @@ function PaletteGrid({
     st.setFocusedScene(null)
     st.setSelectedSequenceSlot(null)
   }
+  // Drag-drop landing for Pool · Scenes tab items. A saved scene
+  // dropped anywhere in the palette area instantiates it
+  // (creating missing Pool templates + sidebar tracks + the
+  // scene itself), then focuses the new scene.
+  function onPaletteDragOver(e: React.DragEvent): void {
+    if (e.dataTransfer.types.includes(POOL_SAVED_SCENE_DRAG_MIME)) {
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    }
+  }
+  function onPaletteDrop(e: React.DragEvent): void {
+    const raw = e.dataTransfer.getData(POOL_SAVED_SCENE_DRAG_MIME)
+    if (!raw) return
+    e.preventDefault()
+    try {
+      const payload = JSON.parse(raw) as PoolSavedSceneDragPayload
+      const st = useStore.getState()
+      const newSceneId = st.instantiateSavedScene(payload.savedSceneId)
+      if (newSceneId) st.setFocusedScene(newSceneId)
+    } catch {
+      /* malformed payload — ignore */
+    }
+    // See `EditView.onGridDrop` for the explanation — HTML5 DnD leaves
+    // a sticky pseudo-focus on the drag source that swallows the next
+    // click on the grid until the user alt-tabs. Blur + body focus on
+    // the next paint unsticks it.
+    requestAnimationFrame(() => {
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur()
+      }
+      document.body.focus?.()
+    })
+  }
   return (
     <div
       className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-wrap items-start content-start gap-1"
       onContextMenu={onSectionContextMenu}
       onClick={onBlankClick}
+      onDragOver={onPaletteDragOver}
+      onDrop={onPaletteDrop}
     >
       {scenes.map((s) => (
         <PaletteItem

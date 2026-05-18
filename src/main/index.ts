@@ -3,11 +3,21 @@
 
 import { app, BrowserWindow, ipcMain, shell, session as electronSession } from 'electron'
 import { join } from 'path'
-import type { EngineState, OscErrorEvent, OscEvent, Session } from '@shared/types'
+import type {
+  EngineState,
+  MidiErrorEvent,
+  MidiSendEvent,
+  OscErrorEvent,
+  OscEvent,
+  OscForwardTarget,
+  Session
+} from '@shared/types'
 import { SceneEngine } from './engine'
 import * as sessionIO from './session'
 import * as autosave from './autosave'
 import { OscNetworkListener } from './oscNetwork'
+import { SceneLibrary } from './sceneLibrary'
+import { PoolLibrary } from './poolLibrary'
 
 let mainWindow: BrowserWindow | null = null
 const engine = new SceneEngine()
@@ -15,6 +25,22 @@ const engine = new SceneEngine()
 // the renderer's Pool drawer Network tab flips it on, so we don't fight
 // other apps for port 9000 unless the user actually asked for it.
 const networkListener = new OscNetworkListener()
+// Persistent saved-scenes library — lives in
+// `<userData>/scene-library.json`, separate from any session file
+// so the user can drag scenes across sessions.
+const sceneLibrary = new SceneLibrary()
+// Persistent User Pool library — the user's authored Instrument
+// Templates + Parameter Templates, mirrored across every session.
+// Lives at `<userData>/pool-library.json`. Renderer pushes the
+// FULL current User-entry set on every store change.
+const poolLibrary = new PoolLibrary()
+// Set true once the renderer signals "ok to close" via the
+// `app:close-proceed` IPC. The first window 'close' event is
+// preempted (e.preventDefault()) so the renderer can show its
+// Save-before-quit modal; on user choice the renderer calls
+// proceed-close which flips this flag and re-issues window.close()
+// — the second pass falls through to the OS close.
+let appQuitting = false
 // Hoisted here (rather than inside whenReady()) so the module-level
 // before-quit / window-all-closed handlers can clear it alongside the
 // rest of the shutdown work. Previously there were TWO before-quit
@@ -72,6 +98,17 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => mainWindow?.show())
 
+  // Close intercept — send the "Save before quitting?" question to
+  // the renderer first; renderer responds via `app:close-proceed`
+  // which sets `appQuitting=true` and re-issues close(). On the
+  // second close pass we let it through. Without this guard the X
+  // button would slam the window shut with no chance to save.
+  mainWindow.on('close', (e) => {
+    if (appQuitting) return
+    e.preventDefault()
+    mainWindow?.webContents.send('app:before-close')
+  })
+
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
@@ -107,7 +144,10 @@ app.whenReady().then(async () => {
   // one-off warning per flush to keep the UI responsive.
   let oscBuffer: OscEvent[] = []
   let oscErrBuffer: OscErrorEvent[] = []
+  let midiBuffer: MidiSendEvent[] = []
+  let midiErrBuffer: MidiErrorEvent[] = []
   const OSC_BUFFER_MAX = 2000
+  const MIDI_BUFFER_MAX = 2000
   engine.setOnOscSend((e) => {
     if (oscBuffer.length < OSC_BUFFER_MAX) oscBuffer.push(e)
   })
@@ -119,6 +159,14 @@ app.whenReady().then(async () => {
     // net for the IPC channel.
     if (oscErrBuffer.length < 256) oscErrBuffer.push(e)
   })
+  // Same batching + caps for the MIDI side so a CC sweep at 120 Hz ×
+  // multiple destinations can't flood IPC.
+  engine.setOnMidiSend((e) => {
+    if (midiBuffer.length < MIDI_BUFFER_MAX) midiBuffer.push(e)
+  })
+  engine.setOnMidiError((e) => {
+    if (midiErrBuffer.length < 256) midiErrBuffer.push(e)
+  })
   oscFlushTimer = setInterval(() => {
     if (oscBuffer.length > 0) {
       const batch = oscBuffer
@@ -129,6 +177,16 @@ app.whenReady().then(async () => {
       const errBatch = oscErrBuffer
       oscErrBuffer = []
       mainWindow?.webContents.send('engine:oscErrors', errBatch)
+    }
+    if (midiBuffer.length > 0) {
+      const batch = midiBuffer
+      midiBuffer = []
+      mainWindow?.webContents.send('engine:midiEvents', batch)
+    }
+    if (midiErrBuffer.length > 0) {
+      const errBatch = midiErrBuffer
+      midiErrBuffer = []
+      mainWindow?.webContents.send('engine:midiErrors', errBatch)
     }
     // Piggy-back the discovery flush on the same timer so the Network
     // tab gets fresh device updates at ~20Hz without a second loop.
@@ -199,6 +257,20 @@ app.whenReady().then(async () => {
   // promise rejection mechanism still forwards the error message.
   ipcMain.handle('session:saveAs', (_e, s: Session) => sessionIO.saveAs(mainWindow, s))
   ipcMain.handle('session:saveTo', (_e, s: Session, path: string) => sessionIO.saveTo(path, s))
+  // No-dialog save into `<userData>/sessions/<name>.dflou.json`.
+  // Used by the renderer's Save-before-quit flow when no file path
+  // is associated with the session yet.
+  ipcMain.handle('session:saveToDefault', (_e, s: Session) =>
+    sessionIO.saveToDefault(s as Session)
+  )
+
+  // App close coordination — renderer calls this from its modal's
+  // Yes / No buttons. Setting `appQuitting=true` makes the next
+  // window.close() bypass the preventDefault guard installed above.
+  safeHandle('app:close-proceed', () => {
+    appQuitting = true
+    mainWindow?.close()
+  })
   ipcMain.handle('session:open', () => sessionIO.open(mainWindow))
 
   // ---------- IPC: Network discovery ----------
@@ -212,6 +284,50 @@ app.whenReady().then(async () => {
     devices: networkListener.list()
   }))
   safeHandle('network:clear', () => networkListener.clear())
+  // OSC forwarding — the renderer pushes the current set of targets
+  // any time the user adds/removes/edits/toggles one. Main re-applies
+  // synchronously; the next received packet goes through the new list.
+  safeHandle('network:setForwardTargets', (_e, targets) => {
+    networkListener.setForwardTargets(
+      Array.isArray(targets) ? (targets as OscForwardTarget[]) : []
+    )
+  })
+
+  // ---------- IPC: MIDI ----------
+  // Enumerate currently-visible MIDI output ports. Renderer calls
+  // this on mount + every time it opens the MIDI section of a cell
+  // (so freshly-attached devices show up without a restart).
+  safeHandle('midi:listPorts', () => engine.listMidiPorts())
+
+  // ---------- IPC: Scene library ----------
+  // The Pool's Scenes tab reads the saved-scene library from disk
+  // on mount + subscribes to updates via `scene-library:changed`.
+  // Save / Remove go through atomic writes (.tmp + rename).
+  safeHandle('sceneLibrary:list', () => sceneLibrary.list())
+  safeHandle('sceneLibrary:save', (_e, scene) =>
+    sceneLibrary.save(scene as import('@shared/types').SavedScene)
+  )
+  safeHandle('sceneLibrary:remove', (_e, id) => sceneLibrary.remove(id as string))
+  sceneLibrary.setOnChange((scenes) => {
+    mainWindow?.webContents.send('scene-library:changed', scenes)
+  })
+
+  // ---------- IPC: Pool library ----------
+  // Renderer fetches the persisted User-Pool entries once on mount
+  // (via `pool-library:get`) then pushes the full set back on every
+  // change via `pool-library:setAll`. Pool library notifications
+  // also propagate to OTHER renderers via `pool-library:changed`
+  // so multi-window installations stay in sync (no current use,
+  // but cheap to support).
+  safeHandle('pool-library:get', () => poolLibrary.get())
+  safeHandle('pool-library:setAll', (_e, payload) =>
+    poolLibrary.setAll(
+      payload as import('./poolLibrary').PoolLibraryPayload
+    )
+  )
+  poolLibrary.setOnChange((payload) => {
+    mainWindow?.webContents.send('pool-library:changed', payload)
+  })
 
   // ---------- IPC: Autosave / crash recovery ----------
   // `crashCheck` — renderer calls this on mount to decide whether to show

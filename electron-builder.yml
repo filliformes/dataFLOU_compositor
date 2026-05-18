@@ -4,12 +4,29 @@ copyright: Copyright © 2026 Vincent Fillion
 directories:
   output: release/${version}
   buildResources: build
+# `@julusian/midi` ships its `.node` binaries prebuilt for both
+# Windows and macOS under `prebuilds/`. Tell electron-builder NOT
+# to rebuild from source — there's no MSVC / Xcode toolchain on
+# the dev machine and we'd just be replicating what the prebuilt
+# binaries already provide. Skipping the rebuild keeps the build
+# self-contained and reproducible across CI.
+npmRebuild: false
+buildDependenciesFromSource: false
 files:
   - out/**/*
   - package.json
   - "!**/*.map"
   - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  # `@julusian/midi` ships native .node prebuilds — bundle the whole
+  # package so the runtime can load the right binary for the current
+  # OS + arch from `prebuilds/`.
+  - node_modules/@julusian/midi/**/*
 asar: true
+asarUnpack:
+  # The native .node prebuilds must live OUTSIDE the asar archive so
+  # `require('@julusian/midi')` can dlopen them at runtime. Anything
+  # under `prebuilds/` stays uncompressed in the installer.
+  - "node_modules/@julusian/midi/prebuilds/**/*"
 win:
   target:
     - target: nsis

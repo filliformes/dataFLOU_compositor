@@ -37,6 +37,8 @@ import {
   scaleMetaValue
 } from '@shared/factory'
 import { OscSender, type OscErrorEvent, type OscSendEvent } from './osc'
+import { MidiOutSender } from './midiOut'
+import type { MidiSendEvent, MidiErrorEvent } from '@shared/types'
 
 type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
 
@@ -95,6 +97,11 @@ interface TrackState {
   // full-range output even when their seed produces values that
   // would otherwise saturate at 0 or 1.
   seqGenRanges: Array<{ min: number; max: number }>
+  // Last-seen `cell.scaleToUnit` for this track. When the user
+  // toggles the checkbox mid-play, the per-tick loop notices the
+  // flip and recomputes `seqGenRanges` so auto-range takes effect
+  // immediately (no need to stop + re-trigger the clip).
+  prevScaleToUnit: boolean | null
   // Set true the first time the engine emits a numeric OSC payload
   // for this track. Used by Hold rest-behaviour to allow the
   // initial emit (so the receiver sees SOMETHING) before deduping
@@ -136,6 +143,26 @@ interface TrackState {
   stopping: boolean
   armed: boolean
   delayTimer: NodeJS.Timeout | null
+  // ── MIDI Note tracking ───────────────────────────────────────────
+  // Last (note, channel, port) of a Note On still hanging (no Note
+  // Off sent yet). Null when no note is currently held. The engine
+  // uses these on every new Note On / cell stop / scene change to
+  // emit the corresponding Note Off so we never leave stuck notes.
+  midiHeldNote: number | null
+  midiHeldChannel: number
+  midiHeldPort: string
+  // Last CC value sent per (port + channel + cc) — used to suppress
+  // redundant CC sends in Hold rest-behaviour. Key format is
+  // "<port>|<ch>|<cc>" (string) → last 0..127 int. Lives on the
+  // track state (not global) so two cells targeting the same CC
+  // don't fight each other's dedup cache.
+  midiLastCc: Map<string, number>
+  // Pending Note Off scheduler — when `gateLengthMs > 0` we set a
+  // setTimeout to fire the Note Off after the gate. Cleared (or
+  // re-scheduled) on every new Note On / stop so a quick re-trigger
+  // doesn't leave a stale timer firing the Note Off after the new
+  // note has already started.
+  midiGateTimer: NodeJS.Timeout | null
   // For non-numeric values we only send on change. The "source" key tracks
   // scene/step so we know when to re-send.
   lastSentString: string | null
@@ -169,6 +196,7 @@ function makeTrackState(): TrackState {
     seqRatchetSubStart: 0,
     seqLastStepIdx: -1,
     seqGenRanges: [],
+    prevScaleToUnit: null,
     hasEmittedNumeric: false,
     prevRampMode: null,
     drawGeneratedValues: [],
@@ -191,6 +219,11 @@ function makeTrackState(): TrackState {
     stopping: false,
     armed: false,
     delayTimer: null,
+    midiHeldNote: null,
+    midiHeldChannel: 0,
+    midiHeldPort: '',
+    midiLastCc: new Map(),
+    midiGateTimer: null,
     lastSentString: null,
     lastSentNumeric: [],
     lastStringAtSceneId: null,
@@ -590,6 +623,10 @@ function clamp(v: number, lo: number, hi: number): number {
 
 export class SceneEngine {
   private sender = new OscSender()
+  // Native MIDI output sender. Stays idle until a cell's `midiOut.enabled`
+  // is true AND the session's global `midiEnabled` is on. Lazy-opens
+  // ports per name on first send.
+  private midiSender = new MidiOutSender()
   private session: Session | null = null
   // Map by trackId (tracks are global rows)
   private tracks = new Map<string, TrackState>()
@@ -628,8 +665,14 @@ export class SceneEngine {
   stop(): void {
     this.stopTicker()
     this.sender.stop()
+    // Fire Note Off for every held MIDI note + tear down all open
+    // ports before clearing tracks — without this, app shutdown
+    // would leak ringing notes on every connected MIDI device.
+    this.tracks.forEach((ts) => this.sendMidiNoteOff(ts))
+    this.midiSender.stop()
     this.tracks.forEach((ts) => {
       if (ts.delayTimer) clearTimeout(ts.delayTimer)
+      if (ts.midiGateTimer) clearTimeout(ts.midiGateTimer)
     })
     this.tracks.clear()
     this.clearSceneAdvance()
@@ -657,6 +700,22 @@ export class SceneEngine {
   }
   setOnOscSend(cb: ((e: OscSendEvent) => void) | null): void {
     this.sender.setOnSent(cb)
+  }
+  setOnMidiSend(cb: ((e: MidiSendEvent) => void) | null): void {
+    this.midiSender.setOnSent(cb)
+  }
+  setOnMidiError(cb: ((e: MidiErrorEvent) => void) | null): void {
+    this.midiSender.setOnError(cb)
+  }
+  /** Enumerate currently-visible MIDI output ports + report native
+   *  module availability + last error. Renderer reads this on mount
+   *  and whenever the user re-opens the MIDI section of a cell. */
+  listMidiPorts(): { ports: string[]; available: boolean; lastError: string } {
+    return {
+      ports: this.midiSender.listPorts(),
+      available: this.midiSender.isAvailable(),
+      lastError: this.midiSender.getLastError()
+    }
   }
 
   private emitState(): void {
@@ -692,13 +751,23 @@ export class SceneEngine {
 
   updateSession(next: Session): void {
     const prevTickRate = this.session?.tickRateHz
+    const prevMidiEnabled = this.session?.midiEnabled
     this.session = next
+    // Propagate the global MIDI on/off to the sender. Flipping off
+    // closes every open port (zero CPU); flipping on lets the next
+    // emit lazy-open ports as needed.
+    if (prevMidiEnabled !== next.midiEnabled) {
+      this.midiSender.setEnabled(!!next.midiEnabled)
+    }
     // Ensure per-track state exists for each track; drop stale.
     const keep = new Set(next.tracks.map((t) => t.id))
     for (const id of this.tracks.keys()) {
       if (!keep.has(id)) {
         const ts = this.tracks.get(id)
         if (ts?.delayTimer) clearTimeout(ts.delayTimer)
+        // Note Off for any held note before forgetting the track.
+        const tsRef = this.tracks.get(id)
+        if (tsRef) this.sendMidiNoteOff(tsRef)
         this.tracks.delete(id)
       }
     }
@@ -859,10 +928,16 @@ export class SceneEngine {
       ts.fromCenter = pad(curOut, len, 0)
       ts.toCenter = pad(targets, len, 0)
       ts.morphStart = now()
+      // Timing section can be disabled per-cell. When `timingEnabled`
+      // is false, ignore the stored transition (treat as 0) so the
+      // user can collapse + bypass the section without zeroing the
+      // values. A scene-trigger `morphMsOverride` still wins.
+      const effectiveTransition =
+        cell.timingEnabled === false ? 0 : cell.transitionMs
       ts.morphMs =
         typeof morphMsOverride === 'number' && morphMsOverride >= 0
           ? morphMsOverride
-          : cell.transitionMs
+          : effectiveTransition
       ts.activeSceneId = sceneId
       ts.armed = true
       ts.stopping = false
@@ -918,11 +993,15 @@ export class SceneEngine {
       if (!silent) this.emitState()
     }
 
-    if (cell.delayMs > 0) {
+    // Honour `timingEnabled`: when false, skip the delay even if a
+    // non-zero `delayMs` is stored (collapsed Timing section =
+    // bypass). When true the stored value applies as before.
+    const effectiveDelay = cell.timingEnabled === false ? 0 : cell.delayMs
+    if (effectiveDelay > 0) {
       ts.delayTimer = setTimeout(() => {
         ts.delayTimer = null
         start()
-      }, cell.delayMs)
+      }, effectiveDelay)
     } else {
       start()
     }
@@ -1301,6 +1380,11 @@ export class SceneEngine {
         clearTimeout(ts.delayTimer)
         ts.delayTimer = null
       }
+      // Send Note Off for any held note + clear the gate scheduler
+      // BEFORE the global midi panic sweep. Both layers fire All
+      // Notes Off + All Sound Off — belt-and-braces so no note can
+      // hang regardless of which path got us here.
+      this.sendMidiNoteOff(ts)
       ts.armed = false
       ts.stopping = false
       ts.activeSceneId = null
@@ -1308,6 +1392,11 @@ export class SceneEngine {
       ts.fromCenter = []
       ts.toCenter = []
     }
+    // Global MIDI panic — All Notes Off + All Sound Off + Reset All
+    // Controllers on every open port and every channel. The
+    // midiSender stays alive (panic doesn't tear it down) so
+    // subsequent triggers can still emit.
+    this.midiSender.panic()
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
@@ -1365,9 +1454,39 @@ export class SceneEngine {
       const cell = this.getActiveCell(trackId)
       if (!cell) continue
       // Resolve the session-side Track entry for engine-aware flags
-      // (enabled, persistentSlots) read further down the loop.
+      // (enabled, persistentSlots, oscEnabled) read further down the
+      // loop.
       const track = this.session.tracks.find((tt) => tt.id === trackId)
+      // OSC emission gate. The user can disable OSC at two levels:
+      //   - per-Parameter (track.oscEnabled === false)  → applies to every cell on that row
+      //   - per-cell (cell.oscEnabled === false)        → applies to just this clip
+      // Either being explicitly false silences OSC for this cell on
+      // this tick. Undefined / true means "emit" (default). MIDI is
+      // independent — a cell with OSC off + MIDI on still emits
+      // MIDI normally.
+      const oscEmitAllowed =
+        (cell.oscEnabled ?? true) && (track?.oscEnabled ?? true)
       if (this.isTrackEffectivelyDisabled(trackId)) continue
+
+      // Live-recompute `seqGenRanges` when the user toggles
+      // `scaleToUnit` mid-play. Without this, the auto-range path
+      // would stay on stale cached values (from when the cell was
+      // triggered with scaleToUnit off) until the next cycle wrap
+      // or a fresh trigger — visibly mis-scaling for that interval.
+      // Cheap: computeCycleRanges walks the cell's value once.
+      if (
+        ts.prevScaleToUnit !== null &&
+        ts.prevScaleToUnit !== cell.scaleToUnit
+      ) {
+        if (cell.scaleToUnit && cell.sequencer.enabled) {
+          ts.seqGenRanges = computeCycleRanges(cell, ts)
+        } else if (!cell.scaleToUnit) {
+          // scaleToUnit just turned OFF — drop the ranges so the
+          // non-scaled path doesn't try to use them.
+          ts.seqGenRanges = []
+        }
+      }
+      ts.prevScaleToUnit = cell.scaleToUnit
 
       // Advance LFO phase (only for LFO modulation; envelope uses real time).
       if (cell.modulation.enabled && cell.modulation.type === 'lfo') {
@@ -1528,7 +1647,9 @@ export class SceneEngine {
               }
               return { type: 'i' as const, value: n }
             })
-            this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, args)
+            if (oscEmitAllowed) {
+              this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, args)
+            }
             this.recordLiveValue(
               ts.activeSceneId ?? '',
               trackId,
@@ -1570,6 +1691,11 @@ export class SceneEngine {
       // playhead; Cellular mutates the row at every cycle wrap; Ratchet
       // re-rolls its subdivision count at every step.
       let ratchetForceRetrigger = false
+      // Hoisted out of the sequencer-advance block so the MIDI Note
+      // edge detector at the bottom of this iteration can read it —
+      // any step advance (sequencer enabled or not) qualifies as a
+      // Note On edge for cells with MIDI Note kind.
+      let stepChanged = false
       if (cell.sequencer.enabled && !ts.stopping) {
         // Resolve the step duration based on the sequencer's Sync mode.
         //   'bpm'   — lock to the session's global BPM
@@ -1586,7 +1712,6 @@ export class SceneEngine {
         // other modes use steps (up to 16). Drives the wrap modulus
         // and the cycle-range precompute.
         const steps = effectiveSteps(cell)
-        let stepChanged = false
         // Per-iteration step duration. Most modes use a uniform
         // stepDurMs; Bounce substitutes a geometrically-shrinking
         // duration tied to the current step index, producing the
@@ -1807,6 +1932,8 @@ export class SceneEngine {
       const slotCount = track?.argSpec?.length ?? 0
       const persistArrPad = track?.persistentSlots
       const persistValsPad = track?.persistentValues
+      const cellPersistArrPad = cell.persistentSlots
+      const cellPersistValsPad = cell.persistentValues
       let perToken = perTokenSeq
       if (
         cell.sequencer.enabled &&
@@ -1828,15 +1955,29 @@ export class SceneEngine {
             padded[i] = formatFixedAsOscArg(specEntryPad)
             continue
           }
-          const pinned =
-            persistArrPad?.[i] === true &&
-            persistValsPad?.[i] !== undefined
-          if (pinned) {
+          // Cell-level pin override beats track-level. Three states
+          // per slot — true (use cell value), false (unpinned even
+          // if track says pinned), undefined (track default).
+          const cellOverridePad = cellPersistArrPad?.[i]
+          let pinned = false
+          let pinnedRaw: string | undefined
+          if (cellOverridePad === true) {
+            pinned = cellPersistValsPad?.[i] !== undefined
+            pinnedRaw = cellPersistValsPad?.[i]
+          } else if (cellOverridePad === false) {
+            pinned = false
+          } else {
+            pinned =
+              persistArrPad?.[i] === true &&
+              persistValsPad?.[i] !== undefined
+            if (pinned) pinnedRaw = persistValsPad?.[i]
+          }
+          if (pinned && pinnedRaw !== undefined) {
             // Slot is pinned — seed perToken from the pinned token so
             // the slot is present in the emit loop. The pin override
             // at l.~1920 will re-clamp `out` back to this value after
             // modulation runs.
-            padded[i] = autoDetectOscArg(persistValsPad![i])
+            padded[i] = autoDetectOscArg(pinnedRaw)
           } else if (i < perTokenSeq.length) {
             // Sequencer produced a per-slot token — use it.
             padded[i] = perTokenSeq[i]
@@ -1872,12 +2013,14 @@ export class SceneEngine {
         // Ratchet sub-pulses retrigger the same step value: bypass dedupe
         // so the string/bool re-fires within the step.
         if (morphP >= 1 && (changed || ratchetForceRetrigger)) {
-          this.sender.sendMany(
-            cell.destIp,
-            cell.destPort,
-            cell.oscAddress,
-            perToken.map((a) => ({ type: a.type, value: a.value }))
-          )
+          if (oscEmitAllowed) {
+            this.sender.sendMany(
+              cell.destIp,
+              cell.destPort,
+              cell.oscAddress,
+              perToken.map((a) => ({ type: a.type, value: a.value }))
+            )
+          }
           ts.lastSentString = baseRaw
           ts.lastStringAtSceneId = ts.activeSceneId
           ts.lastStringAtStep = stepKey
@@ -2094,6 +2237,30 @@ export class SceneEngine {
         //   normalised above before modulation; final clamp01 keeps
         //   modulator wobble inside [0, 1]).
         // - Modulator + scaleToUnit (no sequencer): predict the
+        // Per-arg post-modulation Scaling clamp. Tames extreme
+        // values from generative sequencers / random modulators by
+        // pinning each slot's output to a user-configured
+        // [min, max] band BEFORE scaleToUnit + MIDI scale do their
+        // own normalisation. Disabled by default; arrays index
+        // parallel to argSpec slots, missing entries skip the clamp.
+        if (cell.scalingEnabled) {
+          const sMin = cell.scalingMin?.[idx]
+          const sMax = cell.scalingMax?.[idx]
+          if (
+            typeof sMin === 'number' &&
+            Number.isFinite(sMin) &&
+            typeof sMax === 'number' &&
+            Number.isFinite(sMax)
+          ) {
+            // Tolerate min > max (user-typo): swap on the fly so
+            // the clamp is always non-degenerate.
+            const lo = sMin <= sMax ? sMin : sMax
+            const hi = sMin <= sMax ? sMax : sMin
+            if (out < lo) out = lo
+            else if (out > hi) out = hi
+          }
+        }
+
         //   modulator's output range and normalise `out` into [0, 1]
         //   using THAT range. Means a Chaos modulator on a base of
         //   100 spans the full [0, 1] visually rather than clipping.
@@ -2111,17 +2278,36 @@ export class SceneEngine {
           out = clamp01(out)
         }
 
-        // Per-arg-position persistence — if this slot is pinned on
-        // the track, override the computed value with the user-
-        // captured token from track.persistentValues[idx]. Pin
-        // captures whatever the inspector showed at pin moment;
-        // the engine just emits that value forever until unpinned.
-        // Modulators / scene triggers / morphing all bypass.
-        const persistArr = track?.persistentSlots
-        const persistVals = track?.persistentValues
-        const persistThis = !!persistArr && persistArr[idx] === true
-        if (persistThis && persistVals && persistVals[idx] !== undefined) {
-          const parsed = parseFloat(persistVals[idx])
+        // Per-arg-position persistence — cell-level pin overrides
+        // track-level pin overrides nothing. Three states per slot:
+        //   cell.persistentSlots[idx] === true  → pinned, use cell.persistentValues[idx]
+        //   cell.persistentSlots[idx] === false → forced UNpin (overrides track)
+        //   cell.persistentSlots[idx] === undefined → track default applies
+        // The track-level pin (Parameter Inspector) is the "default for
+        // every clip on this row"; the cell-level (Cell Inspector) is
+        // the per-clip override. Lets the user pin every captured slot
+        // on Scene A and selectively unpin on Scene B without
+        // affecting the other.
+        const cellPersistArr = cell.persistentSlots
+        const cellPersistVals = cell.persistentValues
+        const cellOverride = cellPersistArr?.[idx]
+        const trackPersistArr = track?.persistentSlots
+        const trackPersistVals = track?.persistentValues
+        let persistThis = false
+        let pinnedTokenRaw: string | undefined
+        if (cellOverride === true) {
+          persistThis = true
+          pinnedTokenRaw = cellPersistVals?.[idx]
+        } else if (cellOverride === false) {
+          // Explicit unpin — no pin regardless of track default.
+          persistThis = false
+        } else {
+          // No cell-level opinion — fall back to track default.
+          persistThis = !!trackPersistArr && trackPersistArr[idx] === true
+          if (persistThis) pinnedTokenRaw = trackPersistVals?.[idx]
+        }
+        if (persistThis && pinnedTokenRaw !== undefined) {
+          const parsed = parseFloat(pinnedTokenRaw)
           if (Number.isFinite(parsed)) {
             out = cell.scaleToUnit ? clamp01(parsed) : parsed
           }
@@ -2164,13 +2350,42 @@ export class SceneEngine {
         ratchetForceRetrigger ||
         !ts.hasEmittedNumeric
       if (shouldSend) {
-        this.sender.sendMany(
-          cell.destIp,
-          cell.destPort,
-          cell.oscAddress,
-          outs as OscArg[]
-        )
+        if (oscEmitAllowed) {
+          this.sender.sendMany(
+            cell.destIp,
+            cell.destPort,
+            cell.oscAddress,
+            outs as OscArg[]
+          )
+        }
+        // Track "we've emitted at least once" regardless of whether
+        // OSC actually went out — the Hold rest-behaviour dedup +
+        // the MIDI Note edge detector both read this flag and the
+        // semantics should be "the value pipeline has fired", not
+        // "an OSC packet has been delivered."
         ts.hasEmittedNumeric = true
+      }
+      // ── MIDI parallel emit ──────────────────────────────────────
+      // Fires after OSC so the wall-clock order in the Monitor
+      // matches "what the user expects" (OSC first, then MIDI).
+      // `isNoteEdge` captures the three Note On trigger moments:
+      //   1. First numeric emit after a fresh cell trigger
+      //      (`!sentValuesBefore.length` would be the strict test;
+      //       we use `!hadEmittedAtTickStart` so a Hold-mode
+      //       re-trigger still fires a note).
+      //   2. Sequencer step advance this tick (`stepChanged` was
+      //      set by the advance loop above).
+      //   3. Ratchet sub-pulse boundary (`ratchetForceRetrigger`).
+      // For CC kind, every shouldSend emits — same cadence as OSC.
+      if (
+        this.session?.midiEnabled &&
+        cell.midiOut?.enabled &&
+        cell.midiOut.portName
+      ) {
+        const hadEmittedAtTickStart = sentValuesBefore.length > 0
+        const isNoteEdge =
+          !hadEmittedAtTickStart || stepChanged || ratchetForceRetrigger
+        this.emitMidiForCell(ts, cell, newFinalVals, isNoteEdge, shouldSend)
       }
       // Always record liveValue for the UI — even if we suppressed
       // the OSC send for Hold, the cell tile + step previews should
@@ -2197,6 +2412,145 @@ export class SceneEngine {
     row[trackId] = value
   }
 
+  /**
+   * Emit a MIDI message for `cell` after its OSC send (or instead
+   * of, if the user only enabled MIDI on this cell). Two paths:
+   *
+   *   - CC kind: continuous send, gated by Hold rest-behaviour the
+   *     same way OSC is. Maps the cell's first final numeric value
+   *     into 0..127.
+   *   - Note kind: edge-triggered. `isNoteEdge` is true at fresh
+   *     cell triggers, sequencer step advances, and ratchet sub-pulse
+   *     boundaries. On each edge we send Note Off for the previously
+   *     held note (if any), then Note On with the current note number
+   *     (= newFinalVals[0] clamped) and velocity (= cell.velocity
+   *     parsed, with `velocityPersistent` overriding modulator). An
+   *     optional `gateLengthMs` schedules an explicit Note Off after
+   *     N ms; otherwise the next edge or `sendMidiNoteOff()` fires it.
+   *
+   * Returns early if MIDI is globally disabled, the cell doesn't
+   * opt in, or the port name is empty.
+   */
+  private emitMidiForCell(
+    ts: TrackState,
+    cell: Cell,
+    newFinalVals: number[],
+    isNoteEdge: boolean,
+    oscSentThisTick: boolean
+  ): void {
+    const m = cell.midiOut
+    if (!m || !m.enabled || !m.portName) return
+    if (!this.session?.midiEnabled) return
+    if (newFinalVals.length === 0) return
+    const noteOrCcSourceVal = newFinalVals[0] ?? 0
+    if (m.kind === 'cc') {
+      const ccNum = Math.max(0, Math.min(127, Math.floor(m.cc ?? 0)))
+      // Re-clamp to [0, 127]. `midiScale` (MIDI-specific 0..1 → 0..127
+      // mapping, independent of `scaleToUnit`) is the new way to opt
+      // into the multiply; `scaleToUnit` ALSO triggers it for
+      // backwards-compatibility — a session built before midiScale
+      // existed shouldn't suddenly emit raw OSC numbers (e.g. 255)
+      // straight to MIDI just because the user upgrades.
+      const wantMidiMap = !!cell.midiScale || cell.scaleToUnit
+      const raw = wantMidiMap
+        ? noteOrCcSourceVal * 127
+        : noteOrCcSourceVal
+      const value = Math.max(0, Math.min(127, Math.round(raw)))
+      // Dedup under Hold rest-behaviour same as OSC. Skip the dedup
+      // when OSC didn't send either (consistency) and on the first
+      // emit after a trigger (always send so the receiver has a
+      // starting value to hold).
+      const cacheKey = `${m.portName}|${m.channel}|${ccNum}`
+      const last = ts.midiLastCc.get(cacheKey)
+      const hold = cell.sequencer.restBehaviour === 'hold'
+      if (hold && last === value && oscSentThisTick === false) return
+      if (hold && last === value && ts.hasEmittedNumeric) return
+      ts.midiLastCc.set(cacheKey, value)
+      this.midiSender.sendCc(m.portName, m.channel, ccNum, value)
+      return
+    }
+    // Note kind — only fire on edges, but ALWAYS clear a stale held
+    // note on cell stop / scene change (handled in disarm() via
+    // sendMidiNoteOff()).
+    if (!isNoteEdge) return
+    // Resolve the note number. Under `midiScale` / `scaleToUnit` the
+    // engine normalised to [0, 1]; map that to a musical C2..C6
+    // window. Otherwise assume the user's value field is already a
+    // MIDI note number (0..127).
+    const wantNoteMap = !!cell.midiScale || cell.scaleToUnit
+    const rawNote = wantNoteMap
+      ? Math.round(36 + noteOrCcSourceVal * (84 - 36)) // map 0..1 → C2..C6
+      : Math.round(noteOrCcSourceVal)
+    const noteNum = Math.max(0, Math.min(127, rawNote))
+    // Resolve velocity. Pinned velocity always reads from the cell's
+    // velocity field; unpinned velocity also reads from the field
+    // (full per-velocity modulation is a v0.6 feature — for v0.5
+    // the velocity slot is a static or hand-edited value).
+    const velRaw = parseFloat(cell.velocity ?? '100')
+    const velocity = Number.isFinite(velRaw)
+      ? Math.max(0, Math.min(127, Math.round(velRaw)))
+      : 100
+    // Send Note Off for the previously held note BEFORE the new
+    // Note On (mono per cell — no overlap).
+    if (ts.midiHeldNote !== null) {
+      this.midiSender.sendNoteOff(
+        ts.midiHeldPort,
+        ts.midiHeldChannel,
+        ts.midiHeldNote
+      )
+      ts.midiHeldNote = null
+    }
+    if (ts.midiGateTimer) {
+      clearTimeout(ts.midiGateTimer)
+      ts.midiGateTimer = null
+    }
+    if (velocity <= 0) {
+      // velocity 0 is technically Note Off — skip the Note On so
+      // we don't leave a phantom "held" note on the wire.
+      return
+    }
+    this.midiSender.sendNoteOn(m.portName, m.channel, noteNum, velocity)
+    ts.midiHeldNote = noteNum
+    ts.midiHeldChannel = m.channel
+    ts.midiHeldPort = m.portName
+    // Explicit gate length — schedule Note Off so the receiver gets
+    // a defined release time. Without it the note rings until the
+    // next edge (sequencer step / scene change / cell stop).
+    const gateMs = Math.max(0, m.gateLengthMs ?? 0)
+    if (gateMs > 0) {
+      const port = m.portName
+      const ch = m.channel
+      const note = noteNum
+      ts.midiGateTimer = setTimeout(() => {
+        // Only Note Off if we're still the held note — a quick
+        // re-trigger may have replaced it before the timer fired.
+        if (ts.midiHeldNote === note && ts.midiHeldPort === port) {
+          this.midiSender.sendNoteOff(port, ch, note)
+          ts.midiHeldNote = null
+        }
+        ts.midiGateTimer = null
+      }, gateMs)
+    }
+  }
+
+  /** Send Note Off for any held MIDI note on `ts` and clear the
+   *  scheduler. Called from `disarm()` and `panic()` so a stopped
+   *  cell or hard-stop never leaves a stuck note. */
+  private sendMidiNoteOff(ts: TrackState): void {
+    if (ts.midiHeldNote !== null) {
+      this.midiSender.sendNoteOff(
+        ts.midiHeldPort,
+        ts.midiHeldChannel,
+        ts.midiHeldNote
+      )
+      ts.midiHeldNote = null
+    }
+    if (ts.midiGateTimer) {
+      clearTimeout(ts.midiGateTimer)
+      ts.midiGateTimer = null
+    }
+  }
+
   private disarm(ts: TrackState): void {
     const wasScene = ts.activeSceneId
     // Drop the live-value entry so the cell tile stops "ghost-displaying".
@@ -2205,6 +2559,10 @@ export class SceneEngine {
         if (this.tracks.get(tid) === ts) delete this.liveValues[wasScene][tid]
       }
     }
+    // Send Note Off for any held MIDI note before tearing the track
+    // state down — without this a stopped cell could leave a note
+    // ringing forever on the wire.
+    this.sendMidiNoteOff(ts)
     ts.armed = false
     ts.stopping = false
     ts.activeSceneId = null

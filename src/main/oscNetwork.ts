@@ -13,10 +13,12 @@
 
 import * as osc from 'osc'
 import * as os from 'os'
+import * as dgram from 'dgram'
 import type {
   DiscoveredOscAddress,
   DiscoveredOscDevice,
-  NetworkListenerStatus
+  NetworkListenerStatus,
+  OscForwardTarget
 } from '@shared/types'
 
 // 9000 is the canonical OSC inbox port (TouchOSC, Lemur, Max/MSP demos,
@@ -48,6 +50,18 @@ export class OscNetworkListener {
   // periodic IPC timer so we only push to the renderer when something
   // actually changed (cheap when the network is quiet).
   private dirty = false
+  // OSC forward targets — every received UDP packet is byte-copied to
+  // each enabled target. Mutated via setForwardTargets(); a dedicated
+  // outbound dgram socket (lazy-created on first enabled target) does
+  // the actual sendto. We deliberately use a SEPARATE socket from the
+  // listener so the forwarded packet's source port is ephemeral and
+  // downstream consumers can't accidentally reply into the listener.
+  private forwardTargets: OscForwardTarget[] = []
+  private forwardSocket: dgram.Socket | null = null
+  // Rate-limit forward error logging so a single bad target doesn't
+  // flood the console at the upstream sender's packet rate (which can
+  // be hundreds of msg/sec for control surfaces).
+  private forwardErrorThrottle = new Map<string, number>()
   // Push callback invoked by external code on each tick of the IPC
   // batching timer (set up in main/index.ts). Same shape as OscSender.
   private onUpdate:
@@ -131,6 +145,112 @@ export class OscNetworkListener {
   }
 
   /**
+   * Replace the forward-target list. The next received packet will
+   * use the new list. Lazy-creates the outbound socket on first
+   * enabled target; tears it down when the list becomes empty (or
+   * all entries are disabled) so we don't hold a socket for nothing.
+   */
+  setForwardTargets(targets: OscForwardTarget[]): void {
+    // Defensive copy + sanitisation. Bad ip/port get filtered out so
+    // the hot path doesn't have to re-validate per packet. We keep
+    // disabled targets in the list (the user might re-enable them
+    // mid-session) but `forwardPacket` skips them.
+    this.forwardTargets = targets
+      .filter((t) => typeof t.id === 'string' && t.id.length > 0)
+      .map((t) => ({
+        id: t.id,
+        enabled: !!t.enabled,
+        label: t.label,
+        ip: typeof t.ip === 'string' ? t.ip.trim() : '',
+        port: Number.isFinite(t.port) ? Math.floor(t.port) : 0
+      }))
+      .filter((t) => t.ip.length > 0 && t.port >= 1 && t.port <= 65535)
+    const anyEnabled = this.forwardTargets.some((t) => t.enabled)
+    if (!anyEnabled && this.forwardSocket) {
+      // No work to do — close the send socket so we're not holding
+      // an unnecessary fd. Lazily reopened on the next enabled add.
+      try {
+        this.forwardSocket.close()
+      } catch {
+        /* ignore */
+      }
+      this.forwardSocket = null
+    }
+    // Clear the per-target error throttle on every config change so
+    // a fresh "Pd at 127.0.0.1:1987" can log its first error even if
+    // a previous "Pd at 127.0.0.1:1986" had hit the throttle.
+    this.forwardErrorThrottle.clear()
+  }
+
+  /**
+   * Byte-perfect copy of a received datagram to every enabled forward
+   * target. Called from the raw dgram 'message' hook so we don't go
+   * through osc-js's parse + re-encode (which can shift float bit
+   * patterns and re-pad blobs). Errors are rate-limited per target.
+   */
+  private forwardPacket(buf: Buffer): void {
+    if (this.forwardTargets.length === 0) return
+    // Lazy-create the outbound socket on first send. Bound to port 0
+    // so the OS picks an ephemeral source port. Bind to 0.0.0.0 so
+    // routing follows the host's normal outbound table — same NIC
+    // selection any other UDP send from this process gets.
+    if (!this.forwardSocket) {
+      try {
+        this.forwardSocket = dgram.createSocket('udp4')
+        this.forwardSocket.on('error', (err) => {
+          console.error('[OSC Forward] outbound socket error:', err.message)
+        })
+      } catch (e) {
+        console.error(
+          '[OSC Forward] failed to create outbound socket:',
+          (e as Error).message
+        )
+        this.forwardSocket = null
+        return
+      }
+    }
+    const sock = this.forwardSocket
+    for (const t of this.forwardTargets) {
+      if (!t.enabled) continue
+      // Re-check the socket reference INSIDE the loop — a parallel
+      // `setForwardTargets([])` between iterations can null
+      // `this.forwardSocket` and close the underlying dgram, and
+      // calling `.send` on a closed socket throws synchronously
+      // (`ERR_SOCKET_DGRAM_NOT_RUNNING`). The try/catch absorbs the
+      // tail of the race window where the listener fires this hot
+      // path one more time after the user disabled forwarding.
+      if (this.forwardSocket !== sock) break
+      try {
+        sock.send(buf, 0, buf.length, t.port, t.ip, (err) => {
+          if (err) {
+            // Rate-limit to 1 log per target per second — at high
+            // packet rates an unreachable target would otherwise
+            // bury the console.
+            const now = Date.now()
+            const last = this.forwardErrorThrottle.get(t.id) ?? 0
+            if (now - last > 1000) {
+              this.forwardErrorThrottle.set(t.id, now)
+              console.error(
+                `[OSC Forward] ${t.label || t.id} → ${t.ip}:${t.port} failed:`,
+                err.message
+              )
+            }
+          }
+        })
+      } catch (e) {
+        // Synchronous throw — almost always the socket-not-running
+        // case after a parallel close. One log, then bail the loop
+        // since further targets would just hit the same error.
+        console.error(
+          '[OSC Forward] send threw, dropping batch:',
+          (e as Error).message
+        )
+        break
+      }
+    }
+  }
+
+  /**
    * Called externally on the same 50ms timer the OSC sender uses to
    * batch outgoing-event IPC. Pushes only when something changed.
    */
@@ -156,6 +276,21 @@ export class OscNetworkListener {
         this.enabled = true
         this.lastError = ''
         this.udp = port
+        // Attach a RAW-bytes listener to the underlying dgram socket so
+        // the forward path can byte-copy each datagram before osc-js
+        // parses it. osc.UDPPort exposes `socket` after open(). Two
+        // 'message' listeners coexist fine — dgram fans events out.
+        const rawSock = (port as unknown as { socket?: dgram.Socket })
+          .socket
+        if (rawSock && typeof rawSock.on === 'function') {
+          rawSock.on('message', (buf: Buffer) => {
+            if (!this.enabled) return
+            // Skip if no forward targets — avoids a Buffer copy and
+            // the for-loop on every quiet packet.
+            if (this.forwardTargets.length === 0) return
+            this.forwardPacket(buf)
+          })
+        }
         if (!settled) {
           settled = true
           resolve()
@@ -241,6 +376,18 @@ export class OscNetworkListener {
 
   private closeUdp(): Promise<void> {
     return new Promise((resolve) => {
+      // Always release the outbound forward socket on listener close.
+      // It's a child of the listener session — keeping it open across
+      // a listener restart would leak an fd if the user later disables
+      // forwarding entirely.
+      if (this.forwardSocket) {
+        try {
+          this.forwardSocket.close()
+        } catch {
+          /* ignore */
+        }
+        this.forwardSocket = null
+      }
       const port = this.udp
       if (!port) {
         this.enabled = false
@@ -317,6 +464,26 @@ export class OscNetworkListener {
       .slice(0, 4)
       .map((a) => formatArgPreview(String(a.type), a.value))
       .join(' ')
+    // Full last-seen values (capped) so the Capture popup can wire
+    // up multi-arg argSpec[] entries correctly. The cap matches the
+    // engine's typical max for a single OSC bundle — beyond this
+    // we'd be looking at a streaming pathological case the UI
+    // can't render usefully anyway.
+    const MAX_RECORDED_ARGS = 16
+    const argValues = msg.args.slice(0, MAX_RECORDED_ARGS).map((a) => {
+      const v = a.value
+      let coerced: number | string | boolean | null
+      if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+        coerced = v
+      } else if (v === null || v === undefined) {
+        coerced = null
+      } else {
+        // Blob / bigint / etc. — stringify so the renderer at least
+        // sees something printable.
+        coerced = String(v)
+      }
+      return { type: String(a.type), value: coerced }
+    })
     let addr = dev.addresses.find((a) => a.path === msg.address)
     if (!addr) {
       // Cap distinct addresses per device. The pathological case is a
@@ -331,7 +498,8 @@ export class OscNetworkListener {
         lastSeen: now,
         count: 0,
         argTypes,
-        argsPreview
+        argsPreview,
+        argValues
       }
       dev.addresses.push(addr)
     }
@@ -339,6 +507,7 @@ export class OscNetworkListener {
     addr.count += 1
     addr.argTypes = argTypes
     addr.argsPreview = argsPreview
+    addr.argValues = argValues
     this.dirty = true
   }
 }

@@ -376,6 +376,9 @@ export interface Cell {
   oscAddress: string
   addressLinkedToDefault: boolean
   // Raw value string — type auto-detected at send time (bool → int → float → string).
+  // When the cell's `midiOut.kind === 'note'`, the parsed value is
+  // interpreted as the MIDI note number (0..127); a separate
+  // `velocity` token below drives Note On velocity.
   value: string
   delayMs: number // 0..10000
   transitionMs: number // 0..10000
@@ -384,9 +387,121 @@ export interface Cell {
   // If true, each numeric output (post-modulation) is clamped to [0, 1].
   // Applies to each token when `value` contains space-separated values.
   scaleToUnit: boolean
+  // OSC emission toggle. When false the engine skips the OSC send for
+  // this cell entirely (MIDI keeps firing if its own enable is on).
+  // Default true via migration so legacy sessions keep their OSC.
+  // The Inspector renders a checkbox at the head of the Destination
+  // section; unticking it visually collapses Destination + OSC
+  // Address sub-sections too.
+  oscEnabled?: boolean
+  // If true, the MIDI emit path scales the cell's final 0..1 output
+  // up to 0..127. Independent of `scaleToUnit` (which only affects
+  // OSC). Lets the user send raw OSC values while still getting a
+  // proper 0..127 MIDI range, or use both together so a scaleToUnit-
+  // normalised colour byte maps cleanly to MIDI.
+  midiScale?: boolean
+  // Timing section enable. When false (default), the cell's
+  // `delayMs` + `transitionMs` are bypassed at trigger (treated as 0)
+  // and the Inspector's Timing section renders collapsed. When true
+  // the values apply as before. The UI shows a checkbox on the
+  // Timing section header that flips this flag.
+  timingEnabled?: boolean
   // MIDI binding that triggers/stops just this clip (one per cell).
   midiTrigger?: MidiBinding
+  // Optional MIDI output destination — fires in PARALLEL with the
+  // OSC send (or alone if the OSC fields are empty). Inherits from
+  // the track's `midiOut` defaults at cell creation; per-cell
+  // overrides are stored here.
+  midiOut?: MidiOut
+  // Note-mode velocity (0..127). Only meaningful when
+  // `midiOut.kind === 'note'`; rendered as a second pinnable slot
+  // beneath the Value field in the Inspector. Stored as a raw
+  // string so it round-trips through the same parser as `value`
+  // and can be modulated / sequenced just like a regular numeric
+  // arg. The pin flags live in `velocityPersistent`.
+  velocity?: string
+  // Pin for the velocity slot. Mirrors the per-arg pin array on
+  // multi-arg Parameters but lives on the cell so the velocity
+  // pin is per-clip rather than per-parameter.
+  velocityPersistent?: boolean
+  // Pin for the value slot when in MIDI Note mode — lets the
+  // user freeze the note number while sequencer/modulator drives
+  // velocity (or vice versa via `velocityPersistent`).
+  notePersistent?: boolean
+  // ── Per-arg pin/freeze, CELL-level ────────────────────────────
+  // Mirrors `Track.persistentSlots` / `Track.persistentValues` but
+  // PER CLIP, so the user can pin specific arg positions on a
+  // single scene without affecting other scenes on the same track.
+  // When `persistentSlots[i] === true`, the engine emits
+  // `persistentValues[i]` for that slot regardless of modulators
+  // / sequencer / scene triggers. When `persistentSlots[i] === false`,
+  // the cell explicitly UN-PINS that slot even if the track-level
+  // pin is on. When the cell entry is `undefined`, the track-level
+  // pin (if any) applies as the default.
+  //
+  // Capture writes these on every captured cell so a saved Scene
+  // reproduces its frozen state verbatim — that's what "Scenes are
+  // presets" means in practice.
+  persistentSlots?: (boolean | undefined)[]
+  persistentValues?: string[]
+  // ── Per-arg post-modulation Scaling ───────────────────────────
+  // When `scalingEnabled` is true, every editable arg position is
+  // CLAMPED to `[scalingMin[i], scalingMax[i]]` AFTER modulators /
+  // sequencer compute the live value but BEFORE `scaleToUnit` and
+  // `midiScale`. Lets the user tame extreme values from a Random
+  // / Chaos / Generative source — "give me numbers between 0.2 and
+  // 0.8 even if the LFO swings to 0..1". Per-cell, per-arg; pinned
+  // slots bypass the clamp (a pin is an explicit override and the
+  // user's pinned value should fire verbatim).
+  //
+  // Arrays index parallel to argSpec / cell.value tokens. Missing
+  // entries (or `undefined`) on a slot mean "no clamp on this
+  // slot" — useful when the user wants to tame only some args
+  // of a multi-arg bundle.
+  scalingEnabled?: boolean
+  scalingMin?: number[]
+  scalingMax?: number[]
 }
+
+// MIDI output binding. Sits on Cell.midiOut and on
+// InstrumentFunction.midiOut (the per-Parameter default). The cell
+// inherits the function's defaults at instantiation; subsequent
+// edits go to the cell-level field so changes to the Parameter
+// blueprint don't retroactively rewrite live cells (same contract
+// as OSC destinations and argSpec).
+export interface MidiOut {
+  // Toggle. When false the engine skips MIDI emission for this
+  // cell — the Inspector still renders the MIDI section so the
+  // user can edit defaults while the destination is muted.
+  enabled: boolean
+  // RtMidi port name as reported by `MidiOutSender.listPorts()`.
+  // Empty string = no port selected; sends are skipped.
+  portName: string
+  // MIDI channel 1..16 (UI-facing; engine subtracts 1 for the wire).
+  channel: number
+  // Message kind. `cc` emits one Control Change per tick; `note`
+  // emits a Note On at every sequencer / modulator clock and a
+  // Note Off when the next trigger fires (mono per cell).
+  kind: 'cc' | 'note'
+  // CC number 0..127 when `kind === 'cc'`. Ignored for `note`.
+  cc?: number
+  // For `kind === 'note'` only — picks whether the modulated /
+  // sequenced output drives the note NUMBER (pitch) or the
+  // velocity. `velocity` is the natural fit when the value field
+  // holds a fixed pitch (e.g. drum trigger on note 36); `pitch`
+  // when the value field holds a melodic line and a separate
+  // Velocity slot drives loudness.
+  noteMode?: 'velocity' | 'pitch'
+  // Note-Off gate length in ms. 0 = "until next trigger" (the
+  // engine schedules Note Off on the next Note On / cell stop /
+  // scene change). Positive value schedules an explicit Note Off
+  // `gateLengthMs` after each Note On.
+  gateLengthMs?: number
+}
+
+/** Range / bound check for MIDI channel — 1..16 inclusive. */
+export const MIDI_CHANNEL_MIN = 1
+export const MIDI_CHANNEL_MAX = 16
 
 /** Max number of space-separated values allowed in a single Value box. */
 export const MAX_VALUE_TOKENS = 16
@@ -435,6 +550,18 @@ export interface Track {
   // seeds initial cell values. Tracks are snapshots — Pool edits
   // don't propagate retroactively (drag the entry again to refresh).
   argSpec?: ParamArgSpec[]
+  // MIDI output default for this Parameter row. Cells freshly
+  // created on this track (via ensureCell or the empty-cell click
+  // flow) snapshot this onto `cell.midiOut`. Editing here in the
+  // Parameter Inspector is the natural place to wire up a Parameter
+  // for MIDI once, before authoring per-scene clips.
+  midiOut?: MidiOut
+  // OSC emission toggle at the Parameter-row level. When false, the
+  // engine skips OSC for EVERY cell on this row (independent of
+  // each cell's own `oscEnabled`). Per-cell flag still applies on
+  // top: cell off + track on → cell muted; track off → all cells
+  // muted. Default true via migration.
+  oscEnabled?: boolean
   // Disable flag — when explicitly false, the engine skips this
   // track on any trigger path (cell or scene). Sidebar row renders
   // greyed out. Undefined / true means enabled (default). Used by
@@ -516,6 +643,11 @@ export interface InstrumentFunction {
   // Octocosme Pure Data patch's `[sender] [timestamp]` prefix that
   // its `list split 2` discards).
   argSpec?: ParamArgSpec[]
+  // Default MIDI output binding for cells instantiated from this
+  // Parameter. Cells snapshot this at creation time; per-cell
+  // overrides go on `Cell.midiOut`. When undefined, cells render
+  // a blank MIDI section the user can fill in by hand.
+  midiOut?: MidiOut
 }
 
 // Per-arg spec for a multi-arg OSC bundle. Drives the UI's split
@@ -598,6 +730,12 @@ export interface ParameterTemplate {
   // standalone Parameter blueprint. Drag-drop instantiation
   // snapshots this onto the resulting Track.
   argSpec?: ParamArgSpec[]
+  // Default MIDI output binding — copied to cells created from this
+  // blueprint at instantiation, same contract as on
+  // InstrumentFunction. Builtin MIDI blueprints (CC, Note, Drum Pad,
+  // etc.) set this so the user only needs to pick the port to wire
+  // up actual hardware.
+  midiOut?: MidiOut
 }
 
 export interface Pool {
@@ -606,6 +744,70 @@ export interface Pool {
   // library + user-authored entries. Persisted with the session for
   // self-containment.
   parameters: ParameterTemplate[]
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Saved Scene library — persistent across sessions.
+//
+// Lives in `<userData>/scene-library.json` on disk, not inside the
+// session file, so the user can drag a saved Scene from the Pool
+// into ANY open session. The payload is self-contained: it embeds
+// the Instrument Templates + Track definitions + Cells needed to
+// reconstruct the scene cold.
+//
+// When the user drops a saved Scene onto the grid:
+//   1. For each `templates[]` entry not already in the target
+//      session's Pool (by id), copy it in.
+//   2. For each `tracks[]` entry, instantiate a fresh sidebar row
+//      linked to the corresponding Pool template/function. The
+//      mapping `oldTrackId → newTrackId` is kept in scope so the
+//      cell map can be rewritten.
+//   3. Create a new Scene in `session.scenes` whose cells reference
+//      the freshly-created tracks with the embedded Cell values.
+//
+// Captured via the Capture popup in the Pool drawer — see
+// `src/renderer/src/components/CapturePopup.tsx`.
+// ─────────────────────────────────────────────────────────────────────
+export interface SavedScene {
+  // Stable id across all sessions. Generated at save time and used
+  // as the React key / drag payload.
+  id: string
+  // User-facing name + optional notes.
+  name: string
+  description?: string
+  // Hex colour for the Pool row stripe + the resulting scene's
+  // colour swatch when instantiated.
+  color: string
+  // When this entry was written. Used by the Pool list to sort
+  // most-recent-first.
+  createdAt: number
+  // Free-form tag for "kind of thing this came from" — purely
+  // informational, lets the Pool show a small badge.
+  origin?: 'manual' | 'capture-osc' | 'capture-midi' | 'duplicate'
+  // ── Embedded payload ─────────────────────────────────────────
+  // The Pool templates this scene references. Copied to the
+  // target session's Pool on instantiation if missing.
+  templates: InstrumentTemplate[]
+  // The sidebar tracks the scene's cells live on. Each carries
+  // its sourceTemplateId/sourceFunctionId so the loader can match
+  // it against the templates above.
+  tracks: Track[]
+  // Per-trackId cell snapshot. Same shape as `Scene.cells`.
+  cells: Record<string, Cell>
+  // The scene's own properties — name, color, notes, duration,
+  // nextMode, multiplicator, morphInMs. Stored separately from
+  // the Pool entry's `name`/`color` so the user can rename the
+  // saved entry without affecting how the instantiated scene
+  // looks.
+  sceneMeta: {
+    name: string
+    color: string
+    notes?: string
+    durationSec: number
+    nextMode: NextMode
+    multiplicator: number
+    morphInMs?: number
+  }
 }
 
 export interface Scene {
@@ -734,6 +936,13 @@ export interface Session {
   sequence: (string | null)[] // 128-length array; only first `sequenceLength` are used
   focusedSceneId: string | null
   midiInputName: string | null
+  // Global MIDI OUTPUT enable. When false the engine skips every
+  // `midiOut.enabled` cell entirely — no port opens, no native send
+  // happens, zero CPU cost for live shows that don't need MIDI.
+  // Default true (on) so a freshly-installed app with MIDI hardware
+  // attached just works. Toggle lives in the top toolbar's prefs
+  // sub-toolbar next to the theme picker.
+  midiEnabled: boolean
   // Transport-level MIDI bindings. These fire the cue GO (identical to
   // clicking the GO button / hitting Space) and set the transport-level
   // morph time (CC value 0..127 → 0..10 000 ms, linear). Both are
@@ -743,6 +952,37 @@ export interface Session {
   // Global Meta Controller bank — 8 user-assignable knobs that broadcast a
   // scaled value to up to 8 OSC destinations each. Persisted with the session.
   metaController: MetaController
+  // OSC forwarding — dataFLOU listens on `defaultDestPort` and, for
+  // every enabled target in this list, copies each received UDP packet
+  // onward. Lets dataFLOU sit in front of Pd / Ableton / second machine
+  // when the upstream sender (e.g. a Teensy-firmware-locked controller)
+  // can only target one port and we still need multiple consumers.
+  // Optional + defaults to `[]` for back-compat with v0.4 sessions.
+  forwardTargets?: OscForwardTarget[]
+  // Persisted GUI layout — captures Ctrl+wheel zoom, row height,
+  // column widths, drawer heights, and collapse flags so a saved
+  // session re-opens at exactly the size + shape the user left it.
+  // Optional + every sub-field is also optional, so older sessions
+  // without this field fall back to the renderer's runtime defaults.
+  ui?: SessionUiState
+}
+
+// GUI layout snapshot saved with each session. Mirrors the
+// runtime fields in the renderer's store; loaded back into the
+// store via `setSession` so the user's layout travels with the
+// session file. Every field is optional — partial UI snapshots
+// (e.g. a hand-edited session file) just inherit defaults for any
+// missing pieces.
+export interface SessionUiState {
+  uiScale?: number
+  rowHeight?: number
+  sceneColumnWidth?: number
+  inspectorWidth?: number
+  trackColumnWidth?: number
+  editorNotesHeight?: number
+  oscMonitorHeight?: number
+  tracksCollapsed?: boolean
+  scenesCollapsed?: boolean
 }
 
 // ---- IPC payloads ----
@@ -801,6 +1041,27 @@ export interface OscErrorEvent {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// MIDI output telemetry — streamed to the Monitor drawer in parallel
+// with OSC events. Same batching cadence (50 ms) as the OSC monitor.
+// ─────────────────────────────────────────────────────────────────────
+
+export interface MidiSendEvent {
+  timestamp: number
+  portName: string
+  kind: 'cc' | 'noteOn' | 'noteOff'
+  channel: number // 1..16, UI-facing
+  data1: number   // cc number or note number
+  data2: number   // cc value or velocity (Note Off = 0)
+}
+
+export interface MidiErrorEvent {
+  timestamp: number
+  portName: string
+  channel: number // 0 for port-open errors
+  message: string
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Network discovery — passive OSC listener.
 //
 // The Pool drawer's Network tab surfaces every OSC sender on the local
@@ -823,6 +1084,12 @@ export interface DiscoveredOscAddress {
   argTypes: string[]
   // Truncated string-rendered preview of the latest args, for display.
   argsPreview: string
+  // Full last-seen values, one per argType. Capture's `buildOscTemplate`
+  // reads this to wire up argSpec[] correctly for multi-arg addresses
+  // like OCTOCOSME's `siffffff` (string + int + 6 floats) — without
+  // it we could only ever see the first 4 args (the preview cap).
+  // Capped to MAX_RECORDED_ARGS in main to bound IPC payload growth.
+  argValues?: Array<{ type: string; value: number | string | boolean | null }>
 }
 
 // One sender on the local network — keyed by `${ip}:${port}` so a
@@ -857,6 +1124,25 @@ export interface NetworkListenerStatus {
   lastError: string
 }
 
+// One OSC forward destination. dataFLOU listens on `session.defaultDestPort`
+// and, if any forward target is enabled, byte-copies every received UDP
+// packet onward to that target's ip:port. Lets dataFLOU sit in front of
+// downstream consumers (Pure Data, Ableton, TouchDesigner, another
+// machine on the LAN) that used to share the listener port directly.
+//
+// The forward path is byte-perfect — no parsing, no re-encoding, no
+// rewriting of source IP. Downstream sees packets coming FROM this
+// machine (not from the original sender), which is normally fine
+// because consumers care about content, not origin.
+export interface OscForwardTarget {
+  id: string
+  enabled: boolean
+  // Optional friendly label — "Pd", "Ableton", "TD machine" — for the UI.
+  label?: string
+  ip: string
+  port: number
+}
+
 // Window.api signature — consumed by renderer.
 // MIDI is handled via Web MIDI in the renderer (not through IPC).
 export interface ExposedApi {
@@ -889,6 +1175,9 @@ export interface ExposedApi {
   // Session I/O
   sessionSaveAs: (session: Session) => Promise<string | null> // returns filepath
   sessionSave: (session: Session, path: string) => Promise<boolean>
+  // No-dialog save to `<userData>/sessions/<name>.dflou.json`.
+  // Used by the Save-before-quit modal when no path is associated.
+  sessionSaveToDefault: (session: Session) => Promise<string>
   sessionOpen: () => Promise<{ session: Session; path: string } | null>
   // Autosave / crash recovery
   autosaveCrashCheck: () => Promise<{ crashed: boolean; entries: AutosaveEntry[] }>
@@ -902,6 +1191,53 @@ export interface ExposedApi {
   // Batched OSC send errors. Rendered as the health dot next to each
   // destination + as [ERR] rows in the OSC monitor drawer.
   onOscErrors: (cb: (batch: OscErrorEvent[]) => void) => () => void
+  // Batched outgoing MIDI events (Monitor drawer). Same cadence as
+  // OSC events — main side batches at 50 ms.
+  onMidiEvents: (cb: (batch: MidiSendEvent[]) => void) => () => void
+  // Batched MIDI send / port-open errors.
+  onMidiErrors: (cb: (batch: MidiErrorEvent[]) => void) => () => void
+
+  // ── MIDI output ──────────────────────────────────────────────────
+  // Returns the list of MIDI output ports currently visible to the
+  // OS. UI calls this on mount + after the global enable toggle.
+  midiListPorts: () => Promise<{ ports: string[]; available: boolean; lastError: string }>
+
+  // ── Scene library (global, persists across sessions) ────────────
+  // The library lives in `<userData>/scene-library.json`. Reads are
+  // cached in main; writes go through atomic .tmp + rename. The
+  // renderer's Pool · Scenes tab subscribes to changes via
+  // `onSceneLibrary` for instant updates after a save.
+  sceneLibraryList: () => Promise<SavedScene[]>
+  sceneLibrarySave: (scene: SavedScene) => Promise<void>
+  sceneLibraryRemove: (id: string) => Promise<void>
+  onSceneLibrary: (cb: (scenes: SavedScene[]) => void) => () => void
+
+  // ── Pool library (User Instruments + Parameters) ────────────────
+  // Cross-session persistent store of the user's authored Pool
+  // entries. Renderer fetches the current set on mount + pushes
+  // back the full User-entry set on every store change. Other
+  // windows (if any) hear updates via `onPoolLibrary`.
+  poolLibraryGet: () => Promise<{
+    templates: InstrumentTemplate[]
+    parameters: ParameterTemplate[]
+  }>
+  poolLibrarySetAll: (payload: {
+    templates: InstrumentTemplate[]
+    parameters: ParameterTemplate[]
+  }) => Promise<void>
+  onPoolLibrary: (
+    cb: (payload: {
+      templates: InstrumentTemplate[]
+      parameters: ParameterTemplate[]
+    }) => void
+  ) => () => void
+
+  // ── App lifecycle (close coordination) ───────────────────────────
+  // Main fires `app:before-close` when the OS X button is pressed;
+  // renderer shows the Save-before-quit modal, then signals back
+  // via `appCloseProceed` to let the window actually close.
+  onAppBeforeClose: (cb: () => void) => () => void
+  appCloseProceed: () => Promise<void>
 
   // ── Network discovery ────────────────────────────────────────────
   // Enable / disable the passive UDP OSC listener. Optional `port`
@@ -921,6 +1257,12 @@ export interface ExposedApi {
   // Wipe the device cache — useful when the user wants to re-scan
   // without restarting the app.
   networkClear: () => Promise<void>
+  // Push the current set of forward targets to the main process. The
+  // listener re-emits every received UDP packet to each ENABLED target
+  // in the list. Pass `[]` (or all disabled) to turn forwarding off.
+  // Called from the store on any add/remove/enable/edit so main always
+  // mirrors the renderer's session state.
+  networkSetForwardTargets: (targets: OscForwardTarget[]) => Promise<void>
   // Push channel — fired on a 250ms timer whenever the device map has
   // changed (new sender, new address, or fresh packet count). Status
   // is bundled in so port-rebinds and bind errors round-trip too.
