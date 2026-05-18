@@ -1072,10 +1072,16 @@ function ClipMidiLiveValue({
     Math.min(127, Math.round(wantMap ? firstNum * 127 : firstNum))
   )
   // For Note mode the same value drives the NOTE NUMBER; velocity
-  // comes from the separate cell.velocity field.
+  // comes from the separate cell.velocity field. The [0..1] →
+  // MIDI note mapping mirrors engine.emitMidiForCell exactly so the
+  // tile reads identical to what's going out on the wire.
   if (m.kind === 'note') {
+    const rawLo = typeof m.noteMin === 'number' && Number.isFinite(m.noteMin) ? m.noteMin : 36
+    const rawHi = typeof m.noteMax === 'number' && Number.isFinite(m.noteMax) ? m.noteMax : 84
+    const lo = Math.max(0, Math.min(127, Math.min(rawLo, rawHi)))
+    const hi = Math.max(0, Math.min(127, Math.max(rawLo, rawHi)))
     const noteMap = wantMap
-      ? Math.round(36 + firstNum * (84 - 36))
+      ? Math.round(lo + firstNum * (hi - lo))
       : Math.round(firstNum)
     const note = Math.max(0, Math.min(127, noteMap))
     const velRaw = parseFloat(cell.velocity ?? '100')

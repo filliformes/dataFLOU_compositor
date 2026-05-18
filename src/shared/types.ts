@@ -461,7 +461,164 @@ export interface Cell {
   scalingEnabled?: boolean
   scalingMin?: number[]
   scalingMax?: number[]
+  // ── Pitch snap — quantise to a musical scale ──────────────────
+  // When `pitchSnap.enabled` is true, the cell's modulated /
+  // sequenced output (after Scaling + scaleToUnit) is mapped into
+  // the MIDI note window defined by `cell.midiOut.noteMin/noteMax`,
+  // snapped to the NEAREST in-scale semitone for the chosen
+  // (`scale`, `root`) combo, then written BACK into the unified
+  // `finalVal` slot — so OSC + MIDI both emit the same scale-
+  // locked event. OSC sees the snapped value re-normalised to the
+  // window so downstream consumers (Pure Data / Max / a custom
+  // hardware controller in [0..1]) get a quantised stepped output.
+  // MIDI Note emits the snapped MIDI note number directly.
+  //
+  // `slotIdx` picks which arg slot gets snapped (default 0). The
+  // other slots in a multi-arg bundle pass through unchanged so
+  // pitch can be quantised while velocity / duration / etc stay
+  // continuous.
+  //
+  // Requires `cell.scaleToUnit` OR `cell.midiScale` to be on (the
+  // engine needs a [0..1]-domain value to do the note-window
+  // mapping). Inspector hides the section otherwise.
+  pitchSnap?: {
+    enabled: boolean
+    root: number   // 0..11, 0 = C
+    scale: ScaleId
+    slotIdx?: number // default 0
+  }
 }
+
+// Musical scale identifier. The intervals live in `SCALE_INTERVALS`
+// (semitone offsets from the root, 0 included). Adding a new scale
+// is one line in the const map + one entry here.
+export type ScaleId =
+  // Diatonic modes
+  | 'major' | 'dorian' | 'phrygian' | 'lydian' | 'mixolydian'
+  | 'minor' | 'locrian'
+  // Minor variants
+  | 'harmonicMinor' | 'melodicMinor'
+  // Pentatonic / blues
+  | 'pentatonicMajor' | 'pentatonicMinor' | 'bluesMinor' | 'bluesMajor'
+  // Symmetric
+  | 'chromatic' | 'wholeTone' | 'diminished'
+  // Chord tones
+  | 'majorTriad' | 'minorTriad' | 'dominant7' | 'major7' | 'minor7'
+  // World / exotic
+  | 'hirajoshi' | 'insen' | 'hungarianMinor' | 'phrygianDominant'
+  | 'doubleHarmonic'
+
+// Semitone intervals from root, ascending and inclusive of 0.
+// Engine reduces a candidate note's `(note - root) mod 12` to test
+// scale membership; the `snapToScale` helper picks the nearest
+// in-scale semitone (in either direction) when the candidate
+// isn't a member. Lookup is O(1) for membership thanks to the
+// fixed 12-bit mask cached per scale at module load time.
+export const SCALE_INTERVALS: Record<ScaleId, number[]> = {
+  // Diatonic modes
+  major:           [0, 2, 4, 5, 7, 9, 11],
+  dorian:          [0, 2, 3, 5, 7, 9, 10],
+  phrygian:        [0, 1, 3, 5, 7, 8, 10],
+  lydian:          [0, 2, 4, 6, 7, 9, 11],
+  mixolydian:      [0, 2, 4, 5, 7, 9, 10],
+  minor:           [0, 2, 3, 5, 7, 8, 10],
+  locrian:         [0, 1, 3, 5, 6, 8, 10],
+  // Minor variants
+  harmonicMinor:   [0, 2, 3, 5, 7, 8, 11],
+  melodicMinor:    [0, 2, 3, 5, 7, 9, 11],
+  // Pentatonic / blues
+  pentatonicMajor: [0, 2, 4, 7, 9],
+  pentatonicMinor: [0, 3, 5, 7, 10],
+  bluesMinor:      [0, 3, 5, 6, 7, 10],
+  bluesMajor:      [0, 2, 3, 4, 7, 9],
+  // Symmetric
+  chromatic:       [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+  wholeTone:       [0, 2, 4, 6, 8, 10],
+  diminished:      [0, 2, 3, 5, 6, 8, 9, 11],
+  // Chord tones
+  majorTriad:      [0, 4, 7],
+  minorTriad:      [0, 3, 7],
+  dominant7:       [0, 4, 7, 10],
+  major7:          [0, 4, 7, 11],
+  minor7:          [0, 3, 7, 10],
+  // World / exotic
+  hirajoshi:       [0, 2, 3, 7, 8],
+  insen:           [0, 1, 5, 7, 10],
+  hungarianMinor:  [0, 2, 3, 6, 7, 8, 11],
+  phrygianDominant:[0, 1, 4, 5, 7, 8, 10],
+  doubleHarmonic:  [0, 1, 4, 5, 7, 8, 11]
+}
+
+/**
+ * Human-readable label for a ScaleId — used in the Inspector
+ * dropdown. Kept here (not in the renderer) so the same labels
+ * round-trip into engine logs / debug prints if needed.
+ */
+export const SCALE_LABELS: Record<ScaleId, string> = {
+  major: 'Major (Ionian)',
+  dorian: 'Dorian',
+  phrygian: 'Phrygian',
+  lydian: 'Lydian',
+  mixolydian: 'Mixolydian',
+  minor: 'Natural Minor (Aeolian)',
+  locrian: 'Locrian',
+  harmonicMinor: 'Harmonic Minor',
+  melodicMinor: 'Melodic Minor',
+  pentatonicMajor: 'Pentatonic Major',
+  pentatonicMinor: 'Pentatonic Minor',
+  bluesMinor: 'Blues Minor',
+  bluesMajor: 'Blues Major',
+  chromatic: 'Chromatic (no snap)',
+  wholeTone: 'Whole Tone',
+  diminished: 'Diminished (W–H)',
+  majorTriad: 'Major Triad',
+  minorTriad: 'Minor Triad',
+  dominant7: 'Dominant 7th',
+  major7: 'Major 7th',
+  minor7: 'Minor 7th',
+  hirajoshi: 'Hirajoshi (Japanese)',
+  insen: 'Insen (Japanese)',
+  hungarianMinor: 'Hungarian Minor',
+  phrygianDominant: 'Phrygian Dominant',
+  doubleHarmonic: 'Double Harmonic'
+}
+
+/**
+ * Scale picker dropdown groups — used by the Inspector to wrap
+ * the 26 scales into `<optgroup>` blocks. Keeps the dropdown
+ * legible.
+ */
+export const SCALE_GROUPS: { label: string; scales: ScaleId[] }[] = [
+  {
+    label: 'Diatonic modes',
+    scales: ['major', 'dorian', 'phrygian', 'lydian', 'mixolydian', 'minor', 'locrian']
+  },
+  {
+    label: 'Minor variants',
+    scales: ['harmonicMinor', 'melodicMinor']
+  },
+  {
+    label: 'Pentatonic + Blues',
+    scales: ['pentatonicMajor', 'pentatonicMinor', 'bluesMinor', 'bluesMajor']
+  },
+  {
+    label: 'Symmetric',
+    scales: ['chromatic', 'wholeTone', 'diminished']
+  },
+  {
+    label: 'Chord tones',
+    scales: ['majorTriad', 'minorTriad', 'dominant7', 'major7', 'minor7']
+  },
+  {
+    label: 'World / exotic',
+    scales: ['hirajoshi', 'insen', 'hungarianMinor', 'phrygianDominant', 'doubleHarmonic']
+  }
+]
+
+/** Pretty name for a root index 0..11 — used in the Inspector. */
+export const ROOT_LABELS = [
+  'C', 'C♯/D♭', 'D', 'D♯/E♭', 'E', 'F', 'F♯/G♭', 'G', 'G♯/A♭', 'A', 'A♯/B♭', 'B'
+] as const
 
 // MIDI output binding. Sits on Cell.midiOut and on
 // InstrumentFunction.midiOut (the per-Parameter default). The cell
@@ -497,6 +654,19 @@ export interface MidiOut {
   // scene change). Positive value schedules an explicit Note Off
   // `gateLengthMs` after each Note On.
   gateLengthMs?: number
+  // Note range used by the [0..1] → MIDI-note mapping when
+  // `midiScale` or `scaleToUnit` is enabled on the cell. Without
+  // these, the engine falls back to its historical default of
+  // C2..C6 (36..84) so older sessions keep behaving the same. With
+  // them set, a generative / modulated value in [0..1] is mapped
+  // linearly to [noteMin..noteMax] before the int round + Note On
+  // — lets the user pick the octave + width of their melodic
+  // window (e.g. 60..72 for one chromatic octave starting at C4,
+  // or 36..60 for a two-octave bass spread).
+  //
+  // Only meaningful when `kind === 'note'`. Inclusive on both ends.
+  noteMin?: number
+  noteMax?: number
 }
 
 /** Range / bound check for MIDI channel — 1..16 inclusive. */

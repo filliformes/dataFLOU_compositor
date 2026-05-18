@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--050)
+- [Release notes](#release-notes--051)
+  - [0.5.1](#release-notes--051)
   - [0.5.0](#release-notes--050)
   - [0.4.5](#release-notes--045)
   - [0.4.1](#release-notes--041)
@@ -540,6 +541,70 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes — 0.5.1
+
+A small follow‑up to v0.5.0 focused on **scene ergonomics** and **musical MIDI**. Three additions on top of the v0.5.0 feature set:
+
+### Drag‑to‑reorder scenes
+
+- **In the Edit view grid** — grab the top‑edge color strip of any scene column and drag it horizontally. Other columns slide aside in real time; release to drop. The 6 px strip doubles as the visual scene identifier (its colour) AND the drag handle (cursor‑grab on hover). Activation distance is 4 px so a quick click on the strip never starts a stray drag.
+- **In the Sequence view palette** — drop a scene pill onto another pill to reorder. Existing pill → slot, slot → slot drag-and-drop behaviours are preserved unchanged; the reorder is just a new "drop target = sibling pill" case in the same `DndContext`.
+- **`session.sequence` is preserved on reorder** — sequence slots reference scenes by ID, so reordering the palette doesn't touch the timeline. Multi‑select, arming, focused scene, engine state all key by ID and survive intact.
+- New store action: `moveScene(fromIndex, toIndex)` with clamp + no-op-on-equal-indices.
+
+### User‑configurable MIDI note window
+
+Replaces the v0.5.0 hard‑coded C2..C6 `[0..1] → MIDI note` mapping with a per‑Parameter, per‑cell setting.
+
+- New `MidiOut.noteMin` + `MidiOut.noteMax` (defaults 36 / 84 — old sessions unchanged).
+- New "Note range" row in the Cell Inspector's MIDI Output section, only visible in Note mode AND when `midiScale || scaleToUnit` is on (the path that does the [0..1] → note mapping). Lets you set the melodic octave window: `60 → 72` for one chromatic octave starting at C4, `48 → 72` for two octaves, etc. Pretty‑name readout (`C4 – C5`) next to the inputs.
+- Engine + CellTile live readout both read the new fields with the same fallback semantics, so the on‑screen MIDI byte always matches what's on the wire.
+
+### Pitch snap — 26 scales × 12 roots
+
+Quantises the modulated / sequenced output to the nearest in‑scale semitone in BOTH the OSC and MIDI paths, so a single generative source can drive a hardware synth (MIDI) AND a Pure Data / Max patch (OSC) with the **same** melody.
+
+Where it sits in the pipeline:
+
+```
+seq + gen + modulators → Scaling clamp → scaleToUnit → PITCH SNAP → pin → finalVal
+                                                                       ↙       ↘
+                                                          OSC (stepped [0..1])  MIDI Note
+                                                                              (snapped int)
+```
+
+- **26 scales**, grouped in 6 `<optgroup>` sections: Diatonic modes (7), Minor variants (2), Pentatonic + Blues (4), Symmetric (3), Chord tones (5), World / exotic (5). Roster spans Western diatonic, jazz, pentatonic/blues, whole‑tone, octatonic, triads + 7ths, Japanese (Hirajoshi, Insen), Hungarian Minor, Phrygian Dominant, Double Harmonic.
+- **12‑root picker** (C through B with sharps/flats labelled).
+- **Live "N notes in window" readout** under the dropdowns shows the actual snapped degrees inside the configured Note range, so you can see "8 notes: C4 D4 E4 F4 G4 A4 B4 C5" at a glance. Drops to a red warning when the window has zero in‑scale notes.
+- Engine uses a **12‑bit pitch‑class mask** (one `|=` per scale interval at snap time) so the per‑tick membership test is one bitwise AND — no per‑candidate `Array.includes`.
+- **Snap re‑normalises back to [0..1]** of the Note range window so OSC stays in [0..1] but is now stepped (one position per scale degree). Round‑trips identically to MIDI: the MIDI emit path's `lo + out × (hi − lo) → round` recomputes the exact snapped note we just chose.
+- **Per‑arg**: `pitchSnap.slotIdx` (default 0) picks which arg slot gets snapped; the others pass through unchanged. Multi‑arg cells (e.g. `[note, velocity, duration]`) can have pitch quantised while velocity stays continuous.
+- **Pin override beats snap** — a pinned slot's value is the user's explicit final‑say and bypasses the snap.
+- Backwards‑compatible: `Cell.pitchSnap` is optional; v0.5.0 sessions load unchanged.
+
+### Practical example — same melody to DAW and Pure Data
+
+1. Add a `MIDI Note` Parameter (Pool → MIDI Note blueprint). Port = your DAW's IAC bus. `noteMin = 60, noteMax = 84` (C4..C6).
+2. Add a generic `OSC` Parameter pointing at Pure Data on `127.0.0.1:9000` address `/melody/pitch`.
+3. Same scene, same cell on both rows. Turn ON Sequencer + Generative (`Tide` metaphor, amount = 0.6). Turn ON `scaleToUnit`.
+4. In the MIDI Output section: enable **Scale snap**, Root = `A`, Scale = `Pentatonic Minor`.
+5. Hit Play:
+   - DAW receives `A4 C5 D5 E5 G5 A5 C6 …` — generative melody in A minor pentatonic.
+   - Pure Data receives `0.000 0.125 0.208 0.333 0.583 0.708 0.917 …` on `/melody/pitch` — same melody, normalised so your custom hardware controller sees the values directly in its [0..1] range.
+
+### Files changed since v0.5.0
+
+- `src/shared/types.ts` — `MidiOut.noteMin/noteMax`, `Cell.pitchSnap`, `ScaleId`, `SCALE_INTERVALS`, `SCALE_LABELS`, `SCALE_GROUPS`, `ROOT_LABELS`
+- `src/main/engine.ts` — `snapToScale()` helper + the per‑slot pipeline splice; pitch snap respects the cell's MIDI note window
+- `src/renderer/src/components/Inspector.tsx` — Note range row + `PitchSnapEditor` component (root/scale dropdowns + live readout)
+- `src/renderer/src/components/CellTile.tsx` — MIDI live readout reads `noteMin/noteMax` instead of the hardcoded 36/84
+- `src/renderer/src/components/SceneColumn.tsx` — color strip is now the drag handle via `useSortable`
+- `src/renderer/src/components/EditView.tsx` — `DndContext` + `SortableContext` around the scene‑columns row
+- `src/renderer/src/components/SequenceView.tsx` — `SortableContext` around the palette; pill → pill drop reorders
+- `src/renderer/src/store.ts` — new `moveScene(fromIndex, toIndex)` action
 
 ---
 

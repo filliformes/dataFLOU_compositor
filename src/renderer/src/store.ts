@@ -630,6 +630,13 @@ interface Actions {
   // Scenes
   addScene: () => void
   removeScene: (id: string) => void
+  // Reorder a scene by moving it from one position to another in the
+  // `session.scenes[]` array. Used by drag-and-drop reordering in both
+  // the Edit-view scene grid and the Sequence-view palette. The
+  // `sequence[]` array (which holds scene IDs in slot positions) is
+  // untouched — sequence slots reference scenes by ID, so reordering
+  // the palette doesn't disturb the timeline.
+  moveScene: (fromIndex: number, toIndex: number) => void
   updateScene: (id: string, patch: Partial<Scene>) => void
   setSceneMidi: (id: string, binding: Scene['midiTrigger']) => void
 
@@ -2206,6 +2213,22 @@ export const useStore = create<State>((set, get) => ({
       // Drop arm if the armed scene is the one being deleted.
       armedSceneId: st.armedSceneId === id ? null : st.armedSceneId
     })),
+  moveScene: (fromIndex, toIndex) =>
+    set((st) => {
+      const n = st.session.scenes.length
+      // Clamp + sanity-check both indices. Same index or any out-of-range
+      // input is a no-op — the dnd-kit handlers can occasionally fire
+      // drop events where over === active (cursor never moved past the
+      // activation distance) and we don't want to spuriously rewrite
+      // `session.scenes` and the undo snapshot.
+      const from = Math.max(0, Math.min(n - 1, Math.floor(fromIndex)))
+      const to = Math.max(0, Math.min(n - 1, Math.floor(toIndex)))
+      if (from === to) return st
+      const next = st.session.scenes.slice()
+      const [moved] = next.splice(from, 1)
+      next.splice(to, 0, moved)
+      return { session: { ...st.session, scenes: next } }
+    }),
   updateScene: (id, patch) =>
     set((st) => ({
       session: {

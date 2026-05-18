@@ -14,7 +14,7 @@
 //    picks the next scene (or off).
 
 import type { Cell, EngineState, LfoShape, Modulation, Scene, SequencerParams, Session } from '@shared/types'
-import { META_KNOB_COUNT } from '@shared/types'
+import { META_KNOB_COUNT, SCALE_INTERVALS } from '@shared/types'
 import {
   advanceDrift,
   autoDetectOscArg,
@@ -43,6 +43,58 @@ import type { MidiSendEvent, MidiErrorEvent } from '@shared/types'
 type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
 
 const TWO_PI = Math.PI * 2
+
+/**
+ * Snap a continuous MIDI note number to the nearest in-scale semitone
+ * for the given (`scale`, `root`) combo. Returns the snapped note as
+ * an integer.
+ *
+ * The picker walks outward symmetrically from `Math.round(floatNote)`
+ * until it finds an in-scale degree, so a value EXACTLY between two
+ * scale degrees rounds to the lower one (consistent — no jitter on
+ * the boundary). Out-of-range search is bounded at ±12 semitones
+ * (one octave); if no in-scale note exists within that radius —
+ * impossible for any non-empty scale — we fall back to the
+ * non-snapped rounded value.
+ *
+ * `intervals` is the precomputed semitone offset list from
+ * SCALE_INTERVALS (e.g. major = [0,2,4,5,7,9,11]). `root` is a
+ * pitch class 0..11 where 0 = C.
+ *
+ * The bitmask trick: we pre-shift each interval by `root` and OR them
+ * into a 12-bit `pcMask`, then test membership of a candidate note's
+ * pitch-class via a single AND. Avoids a per-candidate Array.includes
+ * inside the engine's per-tick hot loop.
+ */
+function snapToScale(floatNote: number, intervals: number[], root: number): number {
+  if (intervals.length === 0) return Math.round(floatNote)
+  // Build the 12-bit pitch-class mask for (intervals, root). Cheap to
+  // recompute every call (≤12 ORs); we could memoise on (scaleId, root)
+  // but the cost is so low this is fine.
+  let pcMask = 0
+  const rootMod = ((root % 12) + 12) % 12
+  for (const semi of intervals) {
+    pcMask |= 1 << (((semi + rootMod) % 12 + 12) % 12)
+  }
+  const baseNote = Math.round(floatNote)
+  // Walk outward: 0, +1, -1, +2, -2, … up to ±12. The first in-scale
+  // candidate wins. Ties (a value at the midpoint between two scale
+  // degrees) round DOWN by construction since `+offset` is checked
+  // BEFORE `-offset`.
+  for (let offset = 0; offset <= 12; offset++) {
+    const tryHi = baseNote + offset
+    if (tryHi >= 0 && tryHi <= 127 && (pcMask & (1 << (((tryHi % 12) + 12) % 12)))) {
+      return tryHi
+    }
+    if (offset > 0) {
+      const tryLo = baseNote - offset
+      if (tryLo >= 0 && tryLo <= 127 && (pcMask & (1 << (((tryLo % 12) + 12) % 12)))) {
+        return tryLo
+      }
+    }
+  }
+  return baseNote
+}
 
 interface TrackState {
   // Phase in LFO cycles. Reset to 0 on each trigger so shapes restart cleanly.
@@ -2278,6 +2330,53 @@ export class SceneEngine {
           out = clamp01(out)
         }
 
+        // ── Pitch snap ────────────────────────────────────────────
+        // After Scaling + scaleToUnit but BEFORE the pin override
+        // (a pin is the user's explicit final-say and should ignore
+        // the snap), quantise `out` to the nearest in-scale semitone
+        // for the configured (root, scale) pair. We need a [0..1]
+        // domain value for the note-window math, so the snap is
+        // gated on `scaleToUnit || midiScale` exactly like the
+        // MIDI emit path.
+        //
+        // After snapping, `out` is rewritten in the same [0..1]
+        // space (snappedNote → (snappedNote - lo) / (hi - lo)). That
+        // way:
+        //   - OSC sees the quantised [0..1] value (stepped, one
+        //     position per scale degree in the window).
+        //   - MIDI Note's emit-time mapping rounds back to EXACTLY
+        //     the same snappedNote we just computed — round-trip
+        //     identity guaranteed.
+        const ps = cell.pitchSnap
+        const snapSlotIdx = ps?.slotIdx ?? 0
+        if (
+          ps &&
+          ps.enabled &&
+          idx === snapSlotIdx &&
+          (cell.scaleToUnit || cell.midiScale)
+        ) {
+          // Resolve the note window from the cell's MidiOut. Use
+          // sane defaults (C2..C6) when the user hasn't configured
+          // a window yet — same behaviour as the MIDI emit path.
+          const m = cell.midiOut
+          const rawLo = typeof m?.noteMin === 'number' && Number.isFinite(m.noteMin) ? m.noteMin : 36
+          const rawHi = typeof m?.noteMax === 'number' && Number.isFinite(m.noteMax) ? m.noteMax : 84
+          const lo = Math.max(0, Math.min(127, Math.min(rawLo, rawHi)))
+          const hi = Math.max(0, Math.min(127, Math.max(rawLo, rawHi)))
+          const span = hi - lo
+          if (span > 0) {
+            const intervals = SCALE_INTERVALS[ps.scale] ?? SCALE_INTERVALS.chromatic
+            const floatNote = lo + out * span
+            const snapped = snapToScale(floatNote, intervals, ps.root | 0)
+            // Renormalise back to [0..1] of the window. Clamp guards
+            // against the snapper landing slightly outside the
+            // window on edge cases (the search radius extends ±12
+            // semitones even when the window is narrower).
+            const reNorm = (snapped - lo) / span
+            out = reNorm < 0 ? 0 : reNorm > 1 ? 1 : reNorm
+          }
+        }
+
         // Per-arg-position persistence — cell-level pin overrides
         // track-level pin overrides nothing. Three states per slot:
         //   cell.persistentSlots[idx] === true  → pinned, use cell.persistentValues[idx]
@@ -2474,12 +2573,18 @@ export class SceneEngine {
     // sendMidiNoteOff()).
     if (!isNoteEdge) return
     // Resolve the note number. Under `midiScale` / `scaleToUnit` the
-    // engine normalised to [0, 1]; map that to a musical C2..C6
-    // window. Otherwise assume the user's value field is already a
-    // MIDI note number (0..127).
+    // engine normalised to [0, 1]; map that to the user-configured
+    // note window (defaults to C2..C6 = 36..84 when unset, matching
+    // the v0.5.0 behaviour). Otherwise assume the user's value
+    // field is already a MIDI note number (0..127).
     const wantNoteMap = !!cell.midiScale || cell.scaleToUnit
+    const rawLo = typeof m.noteMin === 'number' && Number.isFinite(m.noteMin) ? m.noteMin : 36
+    const rawHi = typeof m.noteMax === 'number' && Number.isFinite(m.noteMax) ? m.noteMax : 84
+    // Tolerate swapped min/max — pick the lower as lo, the higher as hi.
+    const lo = Math.max(0, Math.min(127, Math.min(rawLo, rawHi)))
+    const hi = Math.max(0, Math.min(127, Math.max(rawLo, rawHi)))
     const rawNote = wantNoteMap
-      ? Math.round(36 + noteOrCcSourceVal * (84 - 36)) // map 0..1 → C2..C6
+      ? Math.round(lo + noteOrCcSourceVal * (hi - lo))
       : Math.round(noteOrCcSourceVal)
     const noteNum = Math.max(0, Math.min(127, rawNote))
     // Resolve velocity. Pinned velocity always reads from the cell's

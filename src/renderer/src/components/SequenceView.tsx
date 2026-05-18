@@ -13,6 +13,8 @@ import {
   useSensor,
   useSensors
 } from '@dnd-kit/core'
+import { SortableContext, rectSortingStrategy, useSortable } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '../store'
 import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import type { NextMode, Scene } from '@shared/types'
@@ -161,6 +163,22 @@ export default function SequenceView(): JSX.Element {
     }
   }
 
+  // Palette → palette drop = scene reorder. Fired in addition to
+  // `handleDragEnd` (both attached to the same DndContext); kept as a
+  // separate predicate to keep the slot-drop logic readable.
+  function handlePaletteReorder(e: DragEndEvent): void {
+    const activeId = String(e.active.id)
+    const overId = e.over ? String(e.over.id) : ''
+    if (!activeId.startsWith('scene-') || !overId.startsWith('scene-')) return
+    const fromId = activeId.slice(6)
+    const toId = overId.slice(6)
+    if (fromId === toId) return
+    const fromIdx = scenes.findIndex((s) => s.id === fromId)
+    const toIdx = scenes.findIndex((s) => s.id === toId)
+    if (fromIdx < 0 || toIdx < 0) return
+    useStore.getState().moveScene(fromIdx, toIdx)
+  }
+
   function sceneById(id: string): Scene | undefined {
     return scenes.find((s) => s.id === id)
   }
@@ -184,7 +202,13 @@ export default function SequenceView(): JSX.Element {
     <DndContext
       sensors={sensors}
       onDragStart={handleDragStart}
-      onDragEnd={handleDragEnd}
+      onDragEnd={(e) => {
+        // Palette pill dropped on another palette pill = reorder.
+        // Palette pill dropped on a slot grid = fill slot (existing).
+        // Slot dropped on a slot = swap (existing).
+        handlePaletteReorder(e)
+        handleDragEnd(e)
+      }}
       onDragCancel={() => setActiveDragId(null)}
     >
       <div className="flex flex-col h-full min-h-0">
@@ -737,27 +761,32 @@ function PaletteGrid({
     })
   }
   return (
-    <div
-      className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-wrap items-start content-start gap-1"
-      onContextMenu={onSectionContextMenu}
-      onClick={onBlankClick}
-      onDragOver={onPaletteDragOver}
-      onDrop={onPaletteDrop}
+    <SortableContext
+      items={scenes.map((s) => `scene-${s.id}`)}
+      strategy={rectSortingStrategy}
     >
-      {scenes.map((s) => (
-        <PaletteItem
-          key={s.id}
-          scene={s}
-          focused={s.id === focusedSceneId}
-          onContextMenu={(e) => {
-            // Stop the section-menu wrapper from firing when the
-            // right-click landed on a pill — the per-scene menu wins.
-            e.stopPropagation()
-            onPaletteContextMenu(s.id, e)
-          }}
-        />
-      ))}
-    </div>
+      <div
+        className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-wrap items-start content-start gap-1"
+        onContextMenu={onSectionContextMenu}
+        onClick={onBlankClick}
+        onDragOver={onPaletteDragOver}
+        onDrop={onPaletteDrop}
+      >
+        {scenes.map((s) => (
+          <PaletteItem
+            key={s.id}
+            scene={s}
+            focused={s.id === focusedSceneId}
+            onContextMenu={(e) => {
+              // Stop the section-menu wrapper from firing when the
+              // right-click landed on a pill — the per-scene menu wins.
+              e.stopPropagation()
+              onPaletteContextMenu(s.id, e)
+            }}
+          />
+        ))}
+      </div>
+    </SortableContext>
   )
 }
 
@@ -912,9 +941,18 @@ function PaletteItem({
   focused: boolean
   onContextMenu: (e: React.MouseEvent) => void
 }): JSX.Element {
-  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+  // useSortable replaces useDraggable. It still produces the same
+  // `scene-<id>` activeId on drag, so the existing slot-drop handler
+  // in SequenceView keeps working unchanged. The added behaviour is:
+  // dropping a palette pill onto another palette pill reorders the
+  // scenes via moveScene() (see SequenceView.handlePaletteReorder).
+  const { attributes, listeners, setNodeRef, isDragging, transform, transition } = useSortable({
     id: `scene-${scene.id}`
   })
+  const sortableStyle: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition
+  }
   const setFocusedScene = useStore((s) => s.setFocusedScene)
   const selectSceneRange = useStore((s) => s.selectSceneRange)
   const selectedSceneIds = useStore((s) => s.selectedSceneIds)
@@ -945,10 +983,14 @@ function PaletteItem({
         isDragging ? 'opacity-50 cursor-grab' : ''
       } ${highlighted ? 'ring-2 ring-accent' : ''}`}
       // A scene inside the multi-selection gets a deeper tint so the set
-      // reads at a glance in the palette.
+      // reads at a glance in the palette. Sortable transform/transition
+      // come from useSortable so neighbouring pills smoothly shift
+      // around the dragged one while the user drags.
       style={{
         borderColor: scene.color,
-        background: scene.color + (highlighted ? '33' : '1a')
+        background: scene.color + (highlighted ? '33' : '1a'),
+        ...sortableStyle,
+        touchAction: 'none'
       }}
       title="Click: select · Shift-click: extend · Alt-click: arm · Right-click: menu"
     >

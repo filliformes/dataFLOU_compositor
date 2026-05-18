@@ -18,8 +18,10 @@ import type {
   SeqDriftEdge,
   SeqMode,
   SeqSyncMode,
+  ScaleId,
   Track
 } from '@shared/types'
+import { SCALE_GROUPS, SCALE_LABELS, SCALE_INTERVALS, ROOT_LABELS } from '@shared/types'
 import {
   DEFAULT_MIDI_OUT,
   DIVISIONS,
@@ -1250,6 +1252,17 @@ function CellInspector(): JSX.Element {
         onVelocityChange={(v) => u({ velocity: v })}
         onPinVelocity={(p) => u({ velocityPersistent: p })}
         onPinNote={(p) => u({ notePersistent: p })}
+        onPitchSnapChange={(patch) =>
+          u({
+            pitchSnap: {
+              enabled: cell.pitchSnap?.enabled ?? false,
+              root: cell.pitchSnap?.root ?? 0,
+              scale: cell.pitchSnap?.scale ?? 'major',
+              slotIdx: cell.pitchSnap?.slotIdx ?? 0,
+              ...patch
+            }
+          })
+        }
       />
 
       <CollapsibleSection
@@ -5197,13 +5210,19 @@ function MidiOutputSection({
   onChange,
   onVelocityChange,
   onPinVelocity,
-  onPinNote
+  onPinNote,
+  onPitchSnapChange
 }: {
   cell: Cell
   onChange: (patch: Partial<MidiOut>) => void
   onVelocityChange: (v: string) => void
   onPinVelocity: (pinned: boolean) => void
   onPinNote: (pinned: boolean) => void
+  // Patch the cell.pitchSnap object — keeps the section signature
+  // tidy without exposing the full Cell setter to the MidiOut UI.
+  onPitchSnapChange: (
+    patch: Partial<NonNullable<Cell['pitchSnap']>>
+  ) => void
 }): JSX.Element {
   const m = cell.midiOut ?? DEFAULT_MIDI_OUT
   const [ports, setPorts] = useState<string[]>([])
@@ -5381,6 +5400,178 @@ function MidiOutputSection({
           </label>
         </div>
       )}
+
+      {/* Melodic window — only meaningful in Note mode AND when the
+          cell has midiScale / scaleToUnit ON (the path that maps a
+          [0..1] sequencer / modulator output to a MIDI note number).
+          Defaults to C2..C6 (36..84) when unset; the engine reads
+          these via `cell.midiOut.noteMin/noteMax`. Use this to set
+          your melodic octave window: 60..72 = one chromatic octave
+          starting at C4, 48..72 = two octaves, etc. */}
+      {m.kind === 'note' && (cell.midiScale || cell.scaleToUnit) && (
+        <div className="flex items-center gap-2 text-[10px] mt-1">
+          <span
+            className="label shrink-0"
+            title="When midiScale / scaleToUnit is on, the [0..1] output gets mapped linearly to this MIDI note window. Both ends inclusive. Tip: set Min/Max to the lowest/highest note of your target range, then use the Scaling section to clamp the raw value if you want a tighter melodic band."
+          >
+            Note range
+          </span>
+          <BoundedNumberInput
+            className="input w-14"
+            value={m.noteMin ?? 36}
+            onChange={(v) => onChange({ noteMin: v })}
+            min={0}
+            max={127}
+            integer
+            title="Lowest MIDI note. Default 36 = C2."
+          />
+          <span className="text-muted">→</span>
+          <BoundedNumberInput
+            className="input w-14"
+            value={m.noteMax ?? 84}
+            onChange={(v) => onChange({ noteMax: v })}
+            min={0}
+            max={127}
+            integer
+            title="Highest MIDI note. Default 84 = C6."
+          />
+          <span className="text-muted text-[10px]">
+            {midiNoteName(m.noteMin ?? 36)} – {midiNoteName(m.noteMax ?? 84)}
+          </span>
+        </div>
+      )}
+
+      {/* Scale snap — quantises the modulated / sequenced value to
+          the nearest in-scale semitone, in BOTH the OSC and MIDI
+          paths (snap happens in the unified pipeline, BEFORE the
+          pin override). OSC ends up emitting a stepped [0..1]
+          where each step is a scale degree of the Note range
+          window; MIDI Note emits the matching snapped note number.
+          Lets a single generative source drive a synth (MIDI) and a
+          Pure Data / Max patch (OSC) with the SAME melody. Gated
+          on (midiScale || scaleToUnit) so the engine has a [0..1]
+          domain to map. */}
+      {m.kind === 'note' && (cell.midiScale || cell.scaleToUnit) && (
+        <PitchSnapEditor
+          snap={cell.pitchSnap}
+          noteMin={m.noteMin ?? 36}
+          noteMax={m.noteMax ?? 84}
+          onChange={onPitchSnapChange}
+        />
+      )}
     </CollapsibleSection>
   )
+}
+
+// Scale snap editor — three controls (enable, root, scale) plus a
+// live readout of the in-scale notes that fall inside the configured
+// MIDI note window. The readout doubles as a sanity check: if the
+// user picks a 4-note window and a 7-note scale, they instantly see
+// "only 2 notes available" and can widen the window.
+function PitchSnapEditor({
+  snap,
+  noteMin,
+  noteMax,
+  onChange
+}: {
+  snap: Cell['pitchSnap']
+  noteMin: number
+  noteMax: number
+  onChange: (patch: Partial<NonNullable<Cell['pitchSnap']>>) => void
+}): JSX.Element {
+  const enabled = !!snap?.enabled
+  const root = snap?.root ?? 0
+  const scaleId: ScaleId = snap?.scale ?? 'major'
+  // Compute the in-scale notes that fall inside the window. Drives
+  // the readout AND helps catch the "no notes in window" footgun.
+  const intervals = SCALE_INTERVALS[scaleId] ?? SCALE_INTERVALS.chromatic
+  const lo = Math.max(0, Math.min(127, Math.min(noteMin, noteMax)))
+  const hi = Math.max(0, Math.min(127, Math.max(noteMin, noteMax)))
+  const inWindow: number[] = []
+  const rootMod = ((root % 12) + 12) % 12
+  let pcMask = 0
+  for (const semi of intervals) pcMask |= 1 << (((semi + rootMod) % 12 + 12) % 12)
+  for (let n = lo; n <= hi; n++) {
+    if (pcMask & (1 << (((n % 12) + 12) % 12))) inWindow.push(n)
+  }
+  return (
+    <div className="mt-1 border-t border-border pt-1.5 flex flex-col gap-1">
+      <label
+        className="flex items-center gap-2 text-[10px] cursor-pointer"
+        title="Quantise the modulated / sequenced output to the nearest in-scale semitone. Acts on BOTH OSC (which sees a stepped [0..1] value, one position per scale degree) and MIDI Note (which receives the snapped note number). Lets a single generative source drive an audio synth AND a Pure Data / Max patch with the same melody. Requires the Note range above + midiScale or Scale 0.0–1.0."
+      >
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => onChange({ enabled: e.target.checked })}
+        />
+        <span className="label">Scale snap</span>
+      </label>
+      {enabled && (
+        <>
+          <div className="flex items-center gap-2 text-[10px]">
+            <span className="label shrink-0" title="Tonic / root note of the scale.">
+              Root
+            </span>
+            <select
+              className="input select-compact text-[11px] py-0.5"
+              style={{ width: 84 }}
+              value={root}
+              onChange={(e) => onChange({ root: Number(e.target.value) })}
+            >
+              {ROOT_LABELS.map((label, idx) => (
+                <option key={idx} value={idx}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <span className="label shrink-0 ml-1" title="Scale / mode. Chromatic = no snap.">
+              Scale
+            </span>
+            <select
+              className="input select-compact text-[11px] py-0.5 flex-1 min-w-0"
+              value={scaleId}
+              onChange={(e) => onChange({ scale: e.target.value as ScaleId })}
+            >
+              {SCALE_GROUPS.map((g) => (
+                <optgroup key={g.label} label={g.label}>
+                  {g.scales.map((id) => (
+                    <option key={id} value={id}>
+                      {SCALE_LABELS[id]}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+          {/* Live readout — "8 notes: C4 D4 E4 F4 G4 A4 B4 C5" etc.
+              Hidden when the window has zero in-scale notes (the
+              warning below takes over). */}
+          {inWindow.length > 0 ? (
+            <div className="text-[10px] text-muted leading-tight">
+              <span className="text-text">{inWindow.length}</span>{' '}
+              note{inWindow.length === 1 ? '' : 's'} in window:{' '}
+              <span className="font-mono">
+                {inWindow.slice(0, 16).map((n) => midiNoteName(n)).join(' ')}
+                {inWindow.length > 16 ? ` … (+${inWindow.length - 16})` : ''}
+              </span>
+            </div>
+          ) : (
+            <div className="text-[10px] text-danger leading-tight">
+              No notes of {SCALE_LABELS[scaleId]} fall inside the Note
+              range. Widen Note range or pick a different scale.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// Pretty name for a MIDI note number — "C4", "F#3", etc. Octave
+// numbering follows the "middle C = C4" convention used by most DAWs.
+function midiNoteName(n: number): string {
+  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+  const safe = Math.max(0, Math.min(127, Math.round(n)))
+  return names[safe % 12] + (Math.floor(safe / 12) - 1)
 }

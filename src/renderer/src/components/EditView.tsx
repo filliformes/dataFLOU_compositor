@@ -1,4 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
+import {
+  DndContext,
+  DragEndEvent,
+  PointerSensor,
+  useSensor,
+  useSensors
+} from '@dnd-kit/core'
+import { SortableContext, horizontalListSortingStrategy } from '@dnd-kit/sortable'
 import { NOTES_ONE_LINE_HEIGHT, useStore } from '../store'
 import TrackSidebar from './TrackSidebar'
 import SceneColumn from './SceneColumn'
@@ -107,6 +115,30 @@ export default function EditView(): JSX.Element {
       document.body.focus?.()
     })
   }
+  // Scene reordering via drag-and-drop. The drag handle is the
+  // top-edge color strip of each SceneColumn (see SceneColumn.tsx) —
+  // it's spreading the dnd-kit sortable listeners so the rest of the
+  // header (inputs, buttons, MIDI chip) keeps working unchanged.
+  // Activation distance of 4 px keeps a quick click on the strip from
+  // immediately becoming a drag. We translate the dnd-kit ids back to
+  // scenes[] indices and call moveScene(); the store handles the rest.
+  const moveScene = useStore((s) => s.moveScene)
+  const sceneReorderSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } })
+  )
+  function handleSceneReorderEnd(e: DragEndEvent): void {
+    const activeId = e.active.id as string
+    const overId = e.over?.id as string | undefined
+    if (!overId || activeId === overId) return
+    if (!activeId.startsWith('scene-col:') || !overId.startsWith('scene-col:')) return
+    const fromId = activeId.slice('scene-col:'.length)
+    const toId = overId.slice('scene-col:'.length)
+    const fromIdx = scenes.findIndex((s) => s.id === fromId)
+    const toIdx = scenes.findIndex((s) => s.id === toId)
+    if (fromIdx < 0 || toIdx < 0) return
+    moveScene(fromIdx, toIdx)
+  }
+
   return (
     <div className="flex h-full min-h-0">
       <div
@@ -134,9 +166,19 @@ export default function EditView(): JSX.Element {
             />
           </div>
 
-          {scenes.map((sc) => (
-            <SceneColumn key={sc.id} sceneId={sc.id} />
-          ))}
+          <DndContext
+            sensors={sceneReorderSensors}
+            onDragEnd={handleSceneReorderEnd}
+          >
+            <SortableContext
+              items={scenes.map((sc) => `scene-col:${sc.id}`)}
+              strategy={horizontalListSortingStrategy}
+            >
+              {scenes.map((sc) => (
+                <SceneColumn key={sc.id} sceneId={sc.id} />
+              ))}
+            </SortableContext>
+          </DndContext>
           {/* Trailing "+ Scene" button removed — the one in the Buttons box
               (TrackSidebar header) is the single entry point now. */}
         </div>

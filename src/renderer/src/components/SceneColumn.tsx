@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { useSortable } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import type { NextMode } from '@shared/types'
 import { useStore } from '../store'
 import CellTile from './CellTile'
@@ -57,6 +59,29 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
       window.removeEventListener('keydown', onKey)
     }
   }, [menu])
+
+  // Sortable hook — provides drag listeners that we wire onto the
+  // top-edge color strip below (the strip becomes the drag handle).
+  // Hook order must stay stable across the scene-deleted branch, so
+  // this lives ABOVE the early return. The `id` namespace matches
+  // EditView's SortableContext items prefix.
+  const {
+    attributes: sortAttributes,
+    listeners: sortListeners,
+    setNodeRef: setSortableRef,
+    transform: sortTransform,
+    transition: sortTransition,
+    isDragging: sortIsDragging
+  } = useSortable({ id: `scene-col:${sceneId}` })
+  const sortableStyle: React.CSSProperties = {
+    transform: CSS.Transform.toString(sortTransform),
+    transition: sortTransition,
+    // Lift the dragged column above its siblings so the preview
+    // floats clearly over the static cells next door, and dim it a
+    // little so the user can read where it's about to land.
+    zIndex: sortIsDragging ? 30 : undefined,
+    opacity: sortIsDragging ? 0.85 : undefined
+  }
 
   // Defensive: during the render just after a delete, React may still call us
   // before the parent re-renders. Bail out cleanly.
@@ -143,6 +168,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
 
   return (
     <div
+      ref={setSortableRef}
       className={`shrink-0 border-r border-border flex flex-col relative ${
         isInSelection ? 'ring-1 ring-inset ring-accent/30' : ''
       }`}
@@ -155,18 +181,30 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         // column expand past it when content needs more room.
         width: 'fit-content',
         minWidth: scenesCollapsed ? SCENE_COL_COLLAPSED_MIN_W : sceneColumnWidth,
-        background: tint
+        background: tint,
+        ...sortableStyle
       }}
       onClick={onHeaderClick}
       /* onContextMenu is attached ONLY to the scene-header divs below —
          right-click on a cell should reach CellTile's own menu without
          this column handler firing too. */
     >
-      {/* 3px color strip on top — absolute so it doesn't affect layout height
-          (which would misalign cells against the track sidebar rows). */}
+      {/* 6px color strip on top — doubles as the drag handle for
+          reordering scenes in the grid. cursor-grab on hover invites
+          the user to drag; pointer-events:auto so the sortable
+          listeners actually fire (the old strip was pointer-events-
+          none for visual-only). Absolute positioning keeps it out of
+          the layout flow so cells stay aligned with the track sidebar
+          rows. The activation distance configured in EditView's
+          DndContext prevents accidental drags on a click-through. */}
       <div
-        className="absolute top-0 left-0 right-0 h-[3px] z-10 pointer-events-none"
-        style={{ background: scene.color }}
+        {...sortAttributes}
+        {...sortListeners}
+        className="absolute top-0 left-0 right-0 h-[6px] z-10 cursor-grab active:cursor-grabbing"
+        style={{ background: scene.color, touchAction: 'none' }}
+        title="Drag to reorder this scene"
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
       />
       {/* Column-width resize handle on the right edge — global. */}
       {/* Column-width resize handle is hidden while scenes are collapsed —
