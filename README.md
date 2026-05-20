@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--051)
+- [Release notes](#release-notes--055)
+  - [0.5.5](#release-notes--055)
   - [0.5.1](#release-notes--051)
   - [0.5.0](#release-notes--050)
   - [0.4.5](#release-notes--045)
@@ -63,6 +64,11 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
+- **Hardware Mode (v0.5.5)** — drive any compositor cell's args from a physical OSC controller (Trill bars, MIDI-to-OSC bridges, anything streaming UDP). Per-Instrument-template config: bind to a discovered device, pick **Reset** or **Persist** catch-mode, set catch tolerance + movement threshold, optionally narrow to specific Track instances and specific arg slots. Soft-takeover: the hardware value only takes over once it matches the currently-emitted scene value (or persists across scene changes if you want it to). Movement detection skips static/idle packets. Caught arg values render **red** in the live cell of the currently-playing scene, with a pulsing red dot in the Track sidebar + "HW Mode On" badge under the Instrument. Toggle the same Hardware Mode block from either the Pool inspector OR the grid Instrument inspector — both write the same `template.hardwareMode` blob.
+- **Per-sequence-slot overrides (v0.5.5)** — the same scene placed twice in the sequence can now have different durations AND different follow actions per placement. Click any sequencer slot → an accent-bordered **Slot N override** panel appears at the top of the right inspector. Live progress fill + countdown only paints the slot that's actually playing, not every visual instance of the scene. Loop follow-action correctly restarts on the same slot instead of disappearing.
+- **Velocity Humanize (v0.5.5)** — 0–100 % jitter slider next to the Velocity field in the Cell Inspector. Engine rolls a fresh random velocity offset on every noteOn (sequencer step OR modulator-driven note edge), so the badge value visibly jitters at the same rate as the audible notes. Live cell badge mirrors the actual emitted velocity (with fixed-width 3-char padding so the number doesn't wiggle the layout).
+- **Modulator-driven MIDI re-trigger (v0.5.5)** — Note-mode MIDI cells now fire a fresh noteOn whenever the modulator's value crosses a note boundary, not just on sequencer steps. Lets you drive a synth with a free-running LFO / Random / Chaos modulator and hear every note transition cleanly. Old behavior (one noteOn at trigger, held forever) is gone.
+- **Learned MIDI panel (v0.5.5)** — far-right column in the Monitor lists every active MIDI binding in the session (Cue GO, Morph time, Meta knobs, scene triggers, instrument group triggers, per-clip triggers). Each row shows kind + CC/note + channel. Click **Edit** to re-learn OR type a binding inline (kind / number / channel). Resizable, hidden when MIDI traffic is unticked or no bindings exist. Press **L** anywhere to toggle MIDI Learn mode.
 - **Native MIDI output (v0.5)** — `@julusian/midi` (RtMidi) lives in the main process. Each cell / track / Parameter blueprint can carry a `midiOut` config (port + channel + CC# / Note + velocity / gate). The same modulators and sequencer that drive your OSC fire MIDI in parallel. Six new MIDI Pool blueprints ship out of the box (CC, Note, CC pair, Drum, DAW macro bank, CC×8 template). Global enable toggle in the prefs sub‑toolbar.
 - **Pool drawer with four tabs** — Built‑in, User, **Scenes**, **Network**. Browse shipped Instrument Templates (OCTOCOSME, Generic XYZ, Pandore) and Parameter blueprints (RGB Light, Knob, Motor, Button, XY Pad, MIDI CC, MIDI Note, MIDI CC pair, MIDI Drum, MIDI DAW macros, MIDI CC×8); author your own; recall **Saved Scenes** across sessions; or watch the local network for OSC senders and drag any discovered device onto the grid as an Instrument with one Parameter per observed address.
 - **Capture (v0.5)** — one button (or **`C`** key) opens a popup that snapshots live OSC / MIDI traffic into the Pool. Four modes: **New Scene for Instrument** (snapshot current values into an existing Pool Instrument), **New Instrument + Scene** (build both at once), **New OSC Instrument** (just the Pool entry), **New MIDI Instrument** (every wiggled CC / Note becomes a Parameter). Live in‑popup monitor shows the full multi‑arg payload per address with type‑coloured chips + freshness dots. Resizable, X‑remove per address, per‑parameter argSpec auto‑generated from observed OSC tag strings.
@@ -541,6 +547,159 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes — 0.5.5
+
+A **performance + hardware integration** release. Forty-plus distinct fixes across engine, IPC, layout, MIDI, drag-and-drop, and sequencer. Headlines: **Hardware Mode** (drive any cell's args from a physical OSC controller with catch-mode soft-takeover), **per-sequence-slot overrides** (per-placement duration + follow-action), **velocity Humanize** that visibly rolls at the modulator's note rate, **Learned MIDI panel** with inline binding editor, and a measurable perf pass that removed the per-cell `Object.keys` hot path.
+
+### Hardware Mode
+
+Drive any compositor cell's arg slots from a physical OSC controller (Trill bar, Lemur, custom firmware sending UDP), with soft-takeover that prevents value jumps when the knob position doesn't match the currently-emitted scene value.
+
+Per-Instrument-template config (lives at `template.hardwareMode`, edited from either the Pool's Template Inspector OR the grid's Instrument Inspector — same store action, same blob):
+
+- **Enable** checkbox with a red "ON" badge when active.
+- **Device** dropdown — pulls live from the Pool's Network discovery list (whatever's broadcasting OSC at the compositor's listen port). Bind by `ip:port`.
+- **Mode** — `Reset on scene change` (default; the user has to re-catch the value of the new scene before HW takes over again) OR `Persist across scene changes` (HW keeps controlling the matching slot even after a scene flip).
+- **Catch tolerance %** — how close the hardware value has to be to the currently-emitted scene value before takeover engages. Default ~5 %.
+- **Movement Δ %** — minimum change between OSC packets to be considered "moving". Kills the continuous-static streams that a non-moving knob emits.
+- **Apply to** — shown when the template has >1 Track instance; checkboxes scope which instances HW controls.
+- **Per-Parameter arg locks** — for every multi-arg Parameter on the template, a checkbox row narrows HW control to specific slots (e.g. "HW controls slot 2 only, leave slots 0/1/3 to the scene").
+
+Engine flow (in `src/main/oscNetwork.ts` + `src/main/engine.ts`):
+
+1. `oscNetwork.setOnMessage(...)` hook fires for every incoming OSC packet at the listen port — registered once at app start, fast-paths out instantly when no template has HW Mode enabled (`engine.hasAnyHardwareModeEnabled` cached on every session update).
+2. When HW is enabled, the hook routes to `engine.handleHardwareInput(ip, port, address, numericArgs)`. Per-device-per-address movement detection caches the last value + last-change wall-clock, so a controller streaming the same value 200 Hz doesn't trigger catches on "movement" that isn't real.
+3. For each matched template's matching Track instance + matching arg slot lock, the engine compares the hardware value to the slot's current `lastSentNumeric` (the engine's most-recent computed value). If they're within `catchTolerance × range`, the slot transitions from "uncaught" → "caught" and the override engages.
+4. While caught, every subsequent hardware OSC packet refreshes `hardwareOverride[trackId|slot]`. The per-slot emit loop reads this between pitch-snap and the pin, so HW always wins (except over `argSpec.fixed` protocol prefixes + over user pins, which are still the explicit final say).
+5. Scene change fires `clearHardwareCatchIfReset()` — only clears catches when AT LEAST ONE active HW template is in `reset` mode. Persist-mode catches survive scene flips.
+6. **Note-edge int-to-float coercion** — when a slot is HW-caught AND its argSpec type is `'i'`, the engine sends as `'f'` instead so the knob's continuous 0..1 value isn't quantized to 0 or 1 on the wire.
+
+Visual feedback (renderer):
+
+- **Caught arg values render red** in the live cell of the currently-playing scene only (inactive scenes stay clean — earlier behavior was confusing because the same template's cells across all scenes lit up red).
+- **Red pulsing dot** next to any Track sidebar entry whose template has at least one caught slot.
+- **"HW Mode On" badge** in red under the Instrument template label.
+- Engine pre-buckets the catch state into `Record<trackId, sortedSlot[]>` on emit so each CellTile only does an O(1) lookup by trackId instead of scanning every key for a prefix match — measurable hot-path win when many cells are on screen.
+
+### Per-sequence-slot overrides
+
+The same scene placed twice in the sequence now behaves as two independent placements. Click any slot in the Scene Steps grid → an accent-bordered **Slot N override** panel appears at the top of the right Scene Inspector with:
+
+- **Duration override (sec)** — independent of the scene's default duration.
+- **Follow action override** — Stop / Loop / Next / Previous / First / Last / Any / Other, independent of the scene's default.
+
+Each override is per-slot, not per-scene, so `[Scene1@5s+next, Scene2, Scene1@10s+stop]` plays Scene1 for 5 s → Scene2 → Scene1 for 10 s → stop. The engine tracks `activeSequenceSlotIdx` and uses it in `armSceneAdvance` for duration AND in `advanceScene` for follow-action, both per-slot.
+
+A small accent dot on each slot's grid cell marks placements that have overrides. The Timeline view sizes each segment proportionally to its **effective** duration (override if set, else scene default).
+
+**Bug fixes related to this:**
+
+- `advanceScene` used `seq.findIndex(id => id === current.id)` to determine where to advance from — always returned the FIRST occurrence of a scene, breaking every follow-action when the same scene appeared in multiple slots. Now uses the live `activeSequenceSlotIdx`.
+- Loop follow-action used to re-trigger via `triggerScene(id)` without `sourceSlotIdx`, which nulled the slot index and caused the slot's progress bar to vanish on every loop iteration. Now preserves the active slot.
+- Multiplicator re-trigger path got the same fix.
+
+### Velocity Humanize
+
+0–100 % jitter slider next to the Velocity field in the Cell Inspector (MIDI output section). Engine math:
+
+```
+span = (humanize / 100) × 127
+jitter = (Math.random() − 0.5) × span
+velocity = clamp(0, 127, round(velocity + jitter))
+```
+
+Rolls fresh on every noteOn — which now happens at the modulator's note-edge rate, not just on sequencer steps. The engine's note-edge detector was previously only triggered by `isNoteEdge` (first-tick / step-change / ratchet-sub-pulse), so modulator-only Note cells fired one noteOn and held forever. Now `noteNumberChanged = ts.midiHeldNote !== noteNum` also triggers a noteOff + new noteOn, which is exactly the cadence the user hears.
+
+The cell's MIDI badge displays the actual emitted velocity (from `engine.lastEmittedVelocityByCell[sceneId|trackId]`), padded to fixed-width 3 chars (`  9`, ` 99`, `127`) with `whitespace-pre` + `tabular-nums` so the layout doesn't jiggle as the number crosses digit-count thresholds.
+
+`lastEmittedVelocity` is set AFTER `sendNoteOn` so a humanize-clipped-to-zero velocity (which skips the noteOn to avoid a phantom held note) doesn't lock the badge at 0.
+
+### Learned MIDI panel
+
+Far-right column of the Monitor drawer, visible only when (a) at least one MIDI binding exists in the session AND (b) the MIDI traffic column is on. Lists every active binding:
+
+- Cue GO + Morph time
+- 32 Meta knobs across 4 banks
+- Per-scene `midiTrigger`
+- Per-scene per-Instrument group triggers (`instrumentTriggers[templateId]`)
+- Per-clip `midiTrigger`
+
+Each row: source label + name + `CC NN ch N` / `C4 ch N` formatted binding. Two buttons:
+
+- **Edit** — toggles MIDI Learn mode ON and arms this binding as the target (wiggle a controller to re-learn) AND swaps the binding display for an inline editor (kind dropdown + number input + channel input). Click Edit again to exit.
+- **✕** — clears just the MIDI link (the trigger / knob stays).
+
+Resizable via a 4 px handle on the left edge (clamped against viewport width so dragging can't push the panel under the Pool). Width persists across drawer toggles via `localStorage[dataflou:monitor:learnedColPx:v1]`. Default 180 px.
+
+Global **L key** toggles MIDI Learn mode (works anywhere outside text inputs).
+
+### Drag-overlay snap-to-cursor
+
+Scene drag in the Sequence palette used to "jump left" relative to the cursor at the moment of grab — dnd-kit's default `draggingNodeRect` chases the overlay's own position as it moves, so the math drifted further from the pointer the longer the user dragged.
+
+Fix: window-level `pointermove` listener writes `{x, y}` into a `dragCursorRef`. Custom `cursorTrackOverlay` modifier reads the ref on every dnd-kit call and returns a transform that places the overlay's center exactly at the pointer, using `activeNodeRect` (stable source rect) instead of `draggingNodeRect`. Primed at drag start from `activatorEvent` so the first frame is already snapped.
+
+### Pool color sync (legacy scenes too)
+
+Editing a scene's color / name / notes / duration / follow-action / multiplicator / morph-in in the Edit view now mirrors to the linked Pool SavedScene immediately. Newly-saved scenes get the link automatically (`linkedSavedSceneId` on the Scene + `linkedSavedSceneId` on instantiation from the Pool). **Legacy scenes** saved before this feature existed get a **name-match backfill** on first edit: if exactly one SavedScene matches the scene's prior name, the link is written and the mirror engages.
+
+### Drag highlight only on the hovered slot
+
+Earlier, dnd-kit's default `rectIntersection` collision detection lit up every droppable whose rect intersected the drag overlay — when the overlay was wider than a slot (long scene names), multiple slots in different rows could light orange simultaneously, and the LEFTMOST one usually won "over". Replaced with `pointerWithin` (matches only droppables the pointer is actually inside), falling back to `closestCenter` when the pointer is in a gap between cells.
+
+Active / selected rings on SlotCells are also suppressed during any drag so the drop hover is the only highlight visible.
+
+### Collapse Instruments — narrower scene columns + per-track row growth
+
+When **Collapse Instruments** is toggled, each Scene column's value side now uses a 4-column compact value grid with `max-w-[180px]` + `overflow-hidden` so multi-arg cells wrap to multiple rows instead of stretching the column horizontally.
+
+**Per-track row height** in compact mode — computed from `track.argSpec` (non-fixed slot count): 1–4 args → 32 px (default), 5–8 → 34 px, 9–12 → 48 px, 13–16 → 62 px. Applied symmetrically in `TrackSidebar` and `SceneColumn` so heights stay aligned. Multi-arg parameters (OCTOCOSME 12-float bundles, etc.) get the vertical room they need; single-arg parameters keep the tight 32 px floor.
+
+### Pitch-snap (live MIDI scale snapping)
+
+Per-cell scale + root in the Cell Inspector. Snaps the post-modulation, pre-pin value to the nearest note in the configured scale, then renormalises back into the cell's note window (`m.noteMin..m.noteMax`).
+
+- **26 scales** grouped into Major modes, Minor modes, Pentatonic, Symmetric, Exotic.
+- **12 roots** (C through B).
+- 12-bit pitch-class bitmask per scale (OR of the scale's intervals) — snap is a constant-time search across the ±12-semitone window.
+- Per-slot snap config: `Cell.pitchSnap = { scaleId, root, slotIdx }`. Only the specified slot gets snapped; other slots emit unmodified.
+- Inspector readout shows "N notes in window" so the user can see at a glance whether their note range will land more than one scale degree on a given knob throw.
+
+### Monitor + Pool layout cleanup
+
+- **Toolbars on the same visual line** — both the Monitor's top bar (Clear / OSC / MIDI toggles) and the Pool's tab strip (POOL / Built-in / User / Scenes / Network) have `min-h-[28px]`. Column-header rows (OSC `time | kind | …`, MIDI, Pool `INSTRUMENTS` / `PARAMETERS`) all share `min-h-[20px]` + `items-center` + matching `border-b`.
+- **Pool resize clamp** — Pool's `max` width is now `paneRowWidth − MIN_MONITOR − Learned − handles`, computed via a `ResizeObserver` on the pane row. Dragging the Pool wide can't push the Learned panel + MIDI column behind it. OSC↔MIDI resize handle has its own matching clamp.
+- **Learned resize clamp** — same pattern; Learned's `max` is `paneRowWidth − Pool − OSC_MIN − MIN_MIDI − handles`. Edit / ✕ buttons can't slip under the Pool.
+- **Pane 1 has `overflow-hidden`** as a hard cap so even a misbehaving column can't bleed into the Pool.
+- **Resize handles have a pseudo-element pointer-event extension** (`::before` with ±5 px negative offsets) so the visible 4 px stripe has a ~14 px hit area. Applies to every ResizeHandle in the app.
+
+### Horizontal scroll wheel + Shift+wheel
+
+Logitech MX Master 3S (and any mouse with a native horizontal wheel) emits `deltaX` events; the global wheel handler now lets those flow through to whatever scrollable element the cursor is over — no `preventDefault` unless Ctrl (zoom) or Shift (translate to horizontal scroll) is held.
+
+**Shift+wheel** explicitly walks up from the event target to the nearest `overflow-x: auto/scroll` ancestor and applies `deltaY` as `scrollLeft +=`. Lets users without a horizontal wheel scroll Edit grid / Sequence palette wide layouts.
+
+### Performance pass
+
+The user reported general slowness; the audit (`Agent` audit) surfaced three measurable hot paths:
+
+- **CellTile `caughtKey` selector** ran `Object.keys(hardwareCaught).filter(k => k.startsWith(trackId))` per tile per store update — thousands of allocations per second with many cells on screen. Engine now pre-buckets the flat Map into `Record<trackId, sortedSlot[]>` once per emit; selector is O(1) per tile and returns a joined string for stable `Object.is` equality.
+- **Hardware Maps leaked** — `hardwareCaught` and `hardwareOverride` (keyed `${trackId}|${slot}`) were never pruned when tracks were deleted. `updateSession` now matches the existing per-track keep-set logic and deletes orphaned entries.
+- **OscMonitor buffer trim** — `splice(0, overflow)` ran on every batch push at 500 msg/sec, each splice O(N). Now lets the buffer overshoot to `MAX_ROWS × 2` (2000) before a single splice trims back to 1000. Display path slices to last `MAX_ROWS` at render time. Steady-state per-push work drops from O(N) to O(1).
+- **handleHardwareInput fast-path** — cached `hasAnyHardwareModeEnabled` boolean (computed once per `updateSession`) short-circuits the per-packet template filter when no template has HW Mode enabled session-wide. Saves a filter + array allocation per OSC packet (200 Hz+).
+
+### Misc fixes
+
+- **MIDI velocity no longer gets stuck** — `lastEmittedVelocity` moved to after the `sendNoteOn` call so velocity ≤ 0 (humanize jitter clipping) doesn't lock the badge at zero. Note-edge detector also relaxed to fire after gate-timer noteOff (was stuck silent in modulator-only mode with gate length > 0).
+- **HW-caught red highlight scoped to active scene only** — was lighting up the same slots across every scene's copy of the parameter. Inactive scenes get an empty caughtSlots Set now.
+- **HW-caught slot index off when cell has fixed argSpec prefix** — display token indices were used to look up `caughtSlots` (keyed by engine arg-slot indices). Now CellTile builds a `displayIdx → engineIdx` map (`argTokenMap`) from `track.argSpec` and passes it to CellValueGrid.
+- **MIDI badge fixed-width** — `note→vel` padded to 3-char (`  9→ 99`) so digit-count crossings don't wiggle the layout.
+- **Scene column shrink** — Follow dropdown is now sized to fit just "Previous" (its widest label); MIDI binding chip moved out of the column header into the Learned panel.
+- **Slot Override panel discoverable** — moved to the TOP of the Scene Inspector (was below Notes / Dur / Next, often invisible without scrolling), with an accent border + tinted background.
+- **MIDI Monitor `Learned` panel auto-hides** when the MIDI traffic column is unticked.
 
 ---
 
@@ -1025,8 +1184,13 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.5:
 
+- ✅ **Hardware Mode** — drive any cell's args from a physical OSC controller with catch-mode soft-takeover, per-template config, multi-instance scope, per-arg locks, RESET / PERSIST modes, live red highlighting on caught slots.
+- ✅ **Per-sequence-slot overrides** — duration + follow-action per placement; same scene in two slots can have independent timing AND independent next-actions.
+- ✅ **Velocity Humanize** — 0–100 % jitter rolling at the same rate as modulator-driven note edges, with live wire-accurate badge display.
+- ✅ **Learned MIDI panel** — every active MIDI binding listed in the Monitor's far-right column, with inline kind / number / channel editor.
+- ✅ **Pitch-snap** — 26 scales × 12 roots, per-cell per-slot, snapping after modulation before pin.
 - ✅ **Undo / redo** — 3 levels deep, debounced, available via Ctrl+Z / Ctrl+Shift+Z and toolbar buttons.
 - ✅ **MIDI output** — native (RtMidi) per cell / track / Parameter, with global enable + live Monitor.
 - ✅ **OSC fan‑out** — multi‑target Forward popover lets the compositor sit in front of Pure Data / Ableton / another machine.

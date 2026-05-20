@@ -1,7 +1,7 @@
 {
   "name": "dataflou-compositor",
-  "version": "0.5.1",
-  "description": "OSC + MIDI scene compositor — drag-reorder scenes, configurable MIDI note window, scale-snap with 26 scales (Pitch snap), native MIDI output, Capture (snapshot devices into the Pool), OSC fan-out forward, per-arg pin + per-arg scaling, undo/redo, save-on-quit, per-session GUI layout, Pool + Scene libraries, 9 sequencer modes, generative system, 8 modulators, rich themes",
+  "version": "0.5.5",
+  "description": "OSC + MIDI scene compositor — Hardware Mode (catch-mode soft-takeover from physical controllers), per-sequence-slot duration / follow-action overrides, velocity humanize with live-rolling display, modulator-driven note-edge MIDI retrigger, Learned MIDI panel with inline binding editor, drag-reorder scenes, configurable MIDI note window, pitch-snap with 26 scales, native MIDI output, Capture, OSC fan-out forward, per-arg pin + per-arg scaling, undo/redo, save-on-quit, per-session GUI layout, Pool + Scene libraries, 9 sequencer modes, generative system, 8 modulators, rich themes",
   "main": "out/main/index.js",
   "author": "Vincent Fillion",
   "scripts": {

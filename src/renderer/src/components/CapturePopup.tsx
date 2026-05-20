@@ -41,7 +41,8 @@ import type {
 } from '@shared/types'
 import {
   inferParamTypeFromArgTypes,
-  makeCell
+  makeCell,
+  randomSceneColor
 } from '@shared/factory'
 import { ResizeHandle } from './ResizeHandle'
 
@@ -1476,10 +1477,17 @@ async function saveOscCaptureAsLibraryScene(
     }
     cells[childRow.id] = cell
   }
+  // Give every captured Scene a fresh random colour so the grid stays
+  // visually distinct after multiple captures. The Pool entry itself
+  // (the Instrument tpl) keeps its name-derived deterministic colour so
+  // re-capturing the same device produces a recognisable template, but
+  // every saved-scene snapshot gets a new colour — composers usually
+  // want to read each captured moment as a separate musical event.
+  const sceneColor = randomSceneColor()
   const saved: import('@shared/types').SavedScene = {
     id: `scn_lib_${Math.random().toString(36).slice(2, 9)}`,
     name: sceneName,
-    color: tpl.color,
+    color: sceneColor,
     createdAt: Date.now(),
     origin: 'capture-osc',
     templates: [tpl],
@@ -1487,7 +1495,7 @@ async function saveOscCaptureAsLibraryScene(
     cells,
     sceneMeta: {
       name: sceneName,
-      color: tpl.color,
+      color: sceneColor,
       notes: `Captured from ${dev.ip}:${dev.port}`,
       durationSec: 8,
       nextMode: 'stop',
@@ -1593,10 +1601,15 @@ async function saveSceneForExistingInstrument(
     }
     cells[childRow.id] = cell
   }
+  // Random scene colour per capture — same rationale as the
+  // "new Instrument + Scene" mode above: distinct snapshots want
+  // distinct colours, the Instrument template's own colour is
+  // independent of the per-capture moment.
+  const sceneColor = randomSceneColor()
   const saved: import('@shared/types').SavedScene = {
     id: `scn_lib_${Math.random().toString(36).slice(2, 9)}`,
     name: sceneName,
-    color: tpl.color,
+    color: sceneColor,
     createdAt: Date.now(),
     origin: 'capture-osc',
     // No new templates — the existing one stays in the Pool. Empty
@@ -1607,7 +1620,7 @@ async function saveSceneForExistingInstrument(
     cells,
     sceneMeta: {
       name: sceneName,
-      color: tpl.color,
+      color: sceneColor,
       notes: `Captured for ${tpl.name}`,
       durationSec: 8,
       nextMode: 'stop',

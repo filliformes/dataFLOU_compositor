@@ -224,6 +224,12 @@ interface TrackState {
   // here on every tick to freeze pinned slots at their last value.
   // Grows on demand to match the sent-out array length.
   lastSentNumeric: number[]
+  // Last velocity actually pushed out on a noteOn — including any
+  // humanize jitter the engine added. The renderer reads this so the
+  // displayed velocity in the cell tile reflects what the wire saw,
+  // not the static cell.velocity field. `null` until the first
+  // noteOn has fired.
+  lastEmittedVelocity: number | null
 }
 
 function makeTrackState(): TrackState {
@@ -279,7 +285,8 @@ function makeTrackState(): TrackState {
     lastSentString: null,
     lastSentNumeric: [],
     lastStringAtSceneId: null,
-    lastStringAtStep: -1
+    lastStringAtStep: -1,
+    lastEmittedVelocity: null
   }
 }
 
@@ -708,6 +715,35 @@ export class SceneEngine {
   // numeric path; emitted throttled via emitCurrentValues().
   private liveValues: Record<string, Record<string, string>> = {}
   private lastValueEmitAt = 0
+  // ── Hardware Mode state ──────────────────────────────────────────
+  // Per-device cache of the last-seen value of each OSC address path.
+  // Key: `${ip}:${port}` (matches the Network discovery device key).
+  // Value: per-address arg arrays (numeric only — strings / blobs are
+  // ignored). Used for movement detection: a hardware input only
+  // counts as "the user is touching the control" if the new value
+  // differs from the cached one by more than movementThreshold.
+  private hardwareLastValues: Map<string, Map<string, number[]>> = new Map()
+  private hardwareLastChangeMs: Map<string, Map<string, number[]>> = new Map()
+  // Per-(trackId, slotIdx) caught state. Once a hardware control has
+  // matched the currently-emitted scene value within catchTolerance,
+  // this flag becomes true and the engine uses the hardware value
+  // for that slot until either the scene changes (in 'reset' mode)
+  // or HW Mode is disabled. Pinned slots bypass HW entirely.
+  // Key: `${trackId}|${slotIdx}`. Mirrored to renderer via engine
+  // state for the red-value / red-dot visual feedback.
+  private hardwareCaught: Map<string, boolean> = new Map()
+  // Per-(trackId, slotIdx) current override value. Updated on every
+  // hardware OSC message after movement + catch checks pass. The
+  // per-slot emit loop reads this between pitch snap and pin to
+  // override the scene's computed value.
+  private hardwareOverride: Map<string, number> = new Map()
+  // Cached flag: true when at least one template in the session has
+  // `hardwareMode.enabled === true`. `handleHardwareInput` consults
+  // this BEFORE doing any per-packet work, so when HW Mode is off
+  // session-wide (the common case), the OSC hook is effectively a
+  // no-op and doesn't allocate or scan templates on every incoming
+  // packet. Recomputed on every `updateSession`.
+  private hasAnyHardwareModeEnabled = false
 
   async start(): Promise<void> {
     await this.sender.start()
@@ -774,6 +810,10 @@ export class SceneEngine {
     if (!this.onStateChange || !this.session) return
     const active: Record<string, Record<string, boolean>> = {}
     const seq: Record<string, Record<string, number>> = {}
+    // Per-track last-emitted MIDI velocity (after humanize jitter).
+    // Keyed `${sceneId}|${trackId}` so the renderer's cell tile can
+    // resolve it by the same identity it already uses for live values.
+    const lastVel: Record<string, number> = {}
     for (const s of this.session.scenes) {
       active[s.id] = {}
       seq[s.id] = {}
@@ -787,8 +827,38 @@ export class SceneEngine {
         if (cell?.sequencer.enabled) {
           seq[ts.activeSceneId][trackId] = ts.seqStepIdx
         }
+        if (ts.lastEmittedVelocity !== null) {
+          lastVel[`${ts.activeSceneId}|${trackId}`] = ts.lastEmittedVelocity
+        }
       }
     })
+    // Bucket the hardwareCaught Map into a Record<trackId, number[]>
+    // so each CellTile only needs `state[trackId]` (O(1)) instead of
+    // scanning every key looking for a prefix match. Saves the per-tile
+    // `Object.keys` + `.startsWith` work that used to fire on every
+    // engine emit — measurable hot path with many cells on screen.
+    const hardwareCaughtByTrack: Record<string, number[]> = {}
+    this.hardwareCaught.forEach((v, k) => {
+      if (!v) return
+      const pipe = k.indexOf('|')
+      if (pipe <= 0) return
+      const trackId = k.slice(0, pipe)
+      const slotIdx = Number(k.slice(pipe + 1))
+      if (!Number.isFinite(slotIdx)) return
+      let arr = hardwareCaughtByTrack[trackId]
+      if (!arr) {
+        arr = []
+        hardwareCaughtByTrack[trackId] = arr
+      }
+      arr.push(slotIdx)
+    })
+    // Sort each track's slot list so structural identity is stable
+    // (`[0,2,3]` always serialises the same way) — lets renderer
+    // selectors do shallow equality and skip re-renders when the set
+    // didn't actually change.
+    for (const k of Object.keys(hardwareCaughtByTrack)) {
+      hardwareCaughtByTrack[k].sort((a, b) => a - b)
+    }
     this.onStateChange({
       activeBySceneAndTrack: active,
       seqStepBySceneAndTrack: seq,
@@ -797,14 +867,216 @@ export class SceneEngine {
       activeSceneStartedAt: this.activeSceneStartedAt,
       activeSequenceSlotIdx: this.activeSequenceSlotIdx,
       pausedAt: this.pauseStartedAt,
-      tickRateHz: this.session.tickRateHz
+      tickRateHz: this.session.tickRateHz,
+      hardwareCaughtByTrack,
+      lastEmittedVelocityByCell: lastVel
     })
+  }
+
+  /**
+   * Hardware Mode entry point — called by the OSC network listener
+   * for EVERY incoming OSC message. Routes the message through:
+   *
+   *   1. Find which (if any) InstrumentTemplate's hardwareMode is
+   *      enabled AND matches this device's ip:port.
+   *   2. Find which Tracks instantiated from that template the user
+   *      wants HW-controlled (appliesToTrackIds narrowing if set).
+   *   3. Match the OSC address against each Track's Parameter
+   *      addresses. Skip if no Parameter matches.
+   *   4. For each arg slot the user enabled for HW control (via
+   *      hardwareMode.args[fnId]):
+   *      a. Movement detection — value must have changed by
+   *         movementThreshold within movementWindowMs.
+   *      b. Catch — value must be within catchTolerance of the
+   *         currently-emitted scene value before override engages.
+   *      c. Once caught, store the override; the per-slot emit
+   *         loop reads it and uses it as the final value.
+   *
+   * Designed to be called at HIGH frequency (the OSC listener fires
+   * `observe()` on every UDP packet). All lookups are Map-based to
+   * keep per-message cost bounded.
+   */
+  handleHardwareInput(
+    ip: string,
+    port: number,
+    address: string,
+    numericArgs: number[]
+  ): void {
+    if (!this.session) return
+    // Fast path: avoid any per-packet work when no template has HW
+    // Mode enabled session-wide. The hook fires on EVERY incoming
+    // OSC packet (200 Hz+ from a continuous controller), so the
+    // filter + array allocation below was non-trivial overhead even
+    // when HW Mode was off. Cached on session update via
+    // `this.hasAnyHardwareModeEnabled`.
+    if (!this.hasAnyHardwareModeEnabled) return
+    const deviceKey = `${ip}:${port}`
+    const now = Date.now()
+    // Find matching templates whose HW Mode is enabled + bound to
+    // this device. Most sessions have 0-1 such templates so this
+    // scan is cheap; if it ever becomes hot we can pre-index it.
+    const matchedTemplates = this.session.pool.templates.filter((tpl) => {
+      const hw = tpl.hardwareMode
+      return (
+        !!hw &&
+        hw.enabled &&
+        hw.deviceIp === ip &&
+        hw.devicePort === port
+      )
+    })
+    if (matchedTemplates.length === 0) return
+    // Update movement state regardless of template match (so future
+    // matches don't have to re-prime). Per-device, per-address.
+    let perDevValues = this.hardwareLastValues.get(deviceKey)
+    let perDevChange = this.hardwareLastChangeMs.get(deviceKey)
+    if (!perDevValues) {
+      perDevValues = new Map()
+      this.hardwareLastValues.set(deviceKey, perDevValues)
+    }
+    if (!perDevChange) {
+      perDevChange = new Map()
+      this.hardwareLastChangeMs.set(deviceKey, perDevChange)
+    }
+    const prevVals = perDevValues.get(address) ?? []
+    const prevChange = perDevChange.get(address) ?? []
+    // Pre-compute per-slot "is moving?" flags so each template can
+    // check movement independently of which template's parameters
+    // it's working with. Movement is a property of the hardware
+    // input, not of the override target.
+    const movingPerSlot: boolean[] = []
+    for (let i = 0; i < numericArgs.length; i++) {
+      const prev = prevVals[i]
+      const prevTs = prevChange[i] ?? 0
+      const cur = numericArgs[i]
+      if (typeof prev !== 'number' || typeof cur !== 'number') {
+        movingPerSlot.push(false)
+      } else {
+        // Use any matching template's movementThreshold (they SHOULD
+        // all be similar; pick the first). MovementWindowMs gates
+        // the "treat static streams as not moving" behaviour.
+        const hw = matchedTemplates[0].hardwareMode!
+        const delta = Math.abs(cur - prev)
+        const aged = now - prevTs > hw.movementWindowMs
+        // Moving if the delta crossed the threshold OR if we've gone
+        // movementWindowMs without any change AND the new value
+        // differs from the cached one (an end-of-static-burst
+        // movement). For a controller that streams 200 Hz the same
+        // value, prev === cur for every packet → no movement.
+        const moving = delta > hw.movementThreshold && !aged
+        movingPerSlot.push(moving)
+        if (delta > 0) {
+          // Always update the cache when value changed, so the next
+          // packet sees a fresh baseline. (If we only updated on
+          // moving, a slow drift could starve the cache and trigger
+          // false movement on the eventual large delta.)
+          prevVals[i] = cur
+          prevChange[i] = now
+        }
+      }
+    }
+    // Initialise any uninitialised slots so the next packet has a
+    // baseline to compare against. Don't classify them as moving on
+    // the first observation (no delta to measure).
+    for (let i = 0; i < numericArgs.length; i++) {
+      if (typeof prevVals[i] !== 'number') {
+        prevVals[i] = numericArgs[i]
+        prevChange[i] = now
+      }
+    }
+    perDevValues.set(address, prevVals)
+    perDevChange.set(address, prevChange)
+    // For each matching template, walk its parameters + arg locks
+    // and check catch / store overrides.
+    for (const tpl of matchedTemplates) {
+      const hw = tpl.hardwareMode!
+      // Find Track instances of this template (filtered by
+      // appliesToTrackIds if narrowed). Empty narrowing = all
+      // instances of the template are HW-controllable.
+      const tracks = this.session.tracks.filter((t) => {
+        if (t.sourceTemplateId !== tpl.id) return false
+        if (!hw.appliesToTrackIds || hw.appliesToTrackIds.length === 0) return true
+        return hw.appliesToTrackIds.includes(t.id)
+      })
+      if (tracks.length === 0) continue
+      // For each track, find the Function/Parameter whose address
+      // matches this OSC message's path. Compare against the live
+      // cell.oscAddress (which inherits the function's default if
+      // not overridden).
+      for (const track of tracks) {
+        if (!this.activeSceneId) continue
+        const scene = this.session.scenes.find(
+          (s) => s.id === this.activeSceneId
+        )
+        const cell = scene?.cells[track.id]
+        if (!cell) continue
+        if (cell.oscAddress !== address) continue
+        // Resolve which arg slots the HW is locked to. Default =
+        // every slot. Narrowing via hw.args[functionId] when set.
+        const fnId = track.sourceFunctionId ?? track.id
+        const lockedSlots =
+          hw.args && hw.args[fnId] && hw.args[fnId].length > 0
+            ? hw.args[fnId]
+            : null  // null = unlocked, hardware controls all slots
+        for (let i = 0; i < numericArgs.length; i++) {
+          if (lockedSlots && !lockedSlots.includes(i)) continue
+          if (!movingPerSlot[i]) continue
+          const hwVal = numericArgs[i]
+          const catchKey = `${track.id}|${i}`
+          if (this.hardwareCaught.get(catchKey)) {
+            // Already caught — just refresh the override value.
+            this.hardwareOverride.set(catchKey, hwVal)
+            continue
+          }
+          // Not yet caught — check against currently-emitted scene
+          // value. Pull from the most recent ts.lastSentNumeric for
+          // this track. If nothing's been emitted yet, skip until
+          // the scene actually produces a value.
+          const ts = this.tracks.get(track.id)
+          const sceneVal = ts?.lastSentNumeric?.[i]
+          if (typeof sceneVal !== 'number') continue
+          // Catch tolerance is a fraction of the param's RANGE. For
+          // scaled-to-unit params the range is [0,1]; otherwise we
+          // fall back to a generous absolute tolerance derived from
+          // the value's magnitude.
+          const range = cell.scaleToUnit ? 1 : Math.max(1, Math.abs(sceneVal) * 2)
+          const tol = hw.catchTolerance * range
+          if (Math.abs(hwVal - sceneVal) <= tol) {
+            this.hardwareCaught.set(catchKey, true)
+            this.hardwareOverride.set(catchKey, hwVal)
+          }
+        }
+      }
+    }
+  }
+
+  /** Clear all hardware catch state. Called on scene change when any
+   *  active HW Mode is in 'reset' mode (the default). In 'persist'
+   *  mode the catch state survives scene changes so a knob mid-turn
+   *  keeps driving the new scene's parameter. */
+  private clearHardwareCatchIfReset(): void {
+    if (!this.session) return
+    // Only clear when AT LEAST ONE active HW template is in 'reset'
+    // mode. If every active template is 'persist', skip the clear.
+    const hasResetMode = this.session.pool.templates.some((tpl) => {
+      const hw = tpl.hardwareMode
+      return !!hw && hw.enabled && hw.mode === 'reset'
+    })
+    if (!hasResetMode) return
+    this.hardwareCaught.clear()
+    this.hardwareOverride.clear()
   }
 
   updateSession(next: Session): void {
     const prevTickRate = this.session?.tickRateHz
     const prevMidiEnabled = this.session?.midiEnabled
     this.session = next
+    // Refresh the fast-path flag for handleHardwareInput. Cheap to
+    // recompute on session updates (a few-dozen templates max), and
+    // saves the per-packet filter+allocation when HW Mode is off
+    // session-wide — which is the common case.
+    this.hasAnyHardwareModeEnabled = next.pool.templates.some(
+      (t) => t.hardwareMode?.enabled === true
+    )
     // Propagate the global MIDI on/off to the sender. Flipping off
     // closes every open port (zero CPU); flipping on lets the next
     // emit lazy-open ports as needed.
@@ -826,6 +1098,27 @@ export class SceneEngine {
     for (const t of next.tracks) {
       if (!this.tracks.has(t.id)) this.tracks.set(t.id, makeTrackState())
     }
+    // Prune Hardware Mode state for tracks that no longer exist.
+    // `hardwareCaught` / `hardwareOverride` are keyed `${trackId}|${slot}`;
+    // delete every entry whose track has been removed. Without this,
+    // long sessions with churning tracks leaked these maps forever
+    // (each removed track left its slot entries behind).
+    for (const k of Array.from(this.hardwareCaught.keys())) {
+      const pipe = k.indexOf('|')
+      const trackId = pipe > 0 ? k.slice(0, pipe) : k
+      if (!keep.has(trackId)) this.hardwareCaught.delete(k)
+    }
+    for (const k of Array.from(this.hardwareOverride.keys())) {
+      const pipe = k.indexOf('|')
+      const trackId = pipe > 0 ? k.slice(0, pipe) : k
+      if (!keep.has(trackId)) this.hardwareOverride.delete(k)
+    }
+    // `hardwareLastValues` and `hardwareLastChangeMs` are keyed by
+    // device (`${ip}:${port}`), NOT trackId — they cache per-device
+    // movement-detection state and are independent of tracks. They
+    // only grow when new devices appear; safe to leave across track
+    // changes. (Cleared explicitly on session load via stop()/start()
+    // if needed.)
     // Prune liveValues entries for scenes or tracks that no longer exist.
     // Without this, switching between sessions with lots of scenes over an
     // app lifetime leaks O(scenes × tracks) string entries in `liveValues`
@@ -1197,6 +1490,14 @@ export class SceneEngine {
     // the repeat counter. Otherwise reset to 1 (fresh play).
     if (this.activeSceneId === sceneId) this.activeSceneRepeatCount += 1
     else this.activeSceneRepeatCount = 1
+    // Hardware Mode catch lifecycle — on a NEW scene (id changed),
+    // clear catch state if any active template is in 'reset' mode
+    // (default). 'persist'-mode templates keep their catch across
+    // scene boundaries so the user can mid-turn a knob through a
+    // scene change without losing override.
+    if (this.activeSceneId !== sceneId) {
+      this.clearHardwareCatchIfReset()
+    }
     for (const trackId of Object.keys(scene.cells)) {
       // Silent per-cell emits — one coalesced emit happens after the
       // loop. Keeps IPC volume + renderer reconciliation bounded.
@@ -1227,6 +1528,20 @@ export class SceneEngine {
     // "stop" had no effect because the still-scheduled timer held a
     // reference to A's OLD data.
     const sceneId = scene.id
+    // Per-slot duration override — if the scene was triggered from a
+    // specific sequence slot AND that slot has its own duration set,
+    // use it. Otherwise fall back to the scene's own durationSec. Lets
+    // the same Scene play with different durations in different slots.
+    const slotIdx = this.activeSequenceSlotIdx
+    const slotOverride =
+      slotIdx !== null
+        ? this.session?.sequenceSlotOverrides?.[slotIdx]
+        : undefined
+    const effectiveDuration =
+      slotOverride?.durationSec !== undefined &&
+      Number.isFinite(slotOverride.durationSec)
+        ? slotOverride.durationSec
+        : scene.durationSec
     this.sceneAdvanceTimer = setTimeout(() => {
       // Re-fetch the current version of this scene off the live session.
       const cur =
@@ -1239,20 +1554,35 @@ export class SceneEngine {
       // advances; loop is unchanged (it already re-triggers forever).
       const mult = Math.max(1, Math.floor(cur.multiplicator || 1))
       if (this.activeSceneRepeatCount < mult) {
-        this.triggerScene(cur.id)
+        // Preserve the slot index so the Sequence view's per-slot
+        // progress bar restarts cleanly on the SAME slot instead of
+        // disappearing for the duration of the repeat (same issue as
+        // the 'loop' case fixed elsewhere).
+        this.triggerScene(cur.id, { sourceSlotIdx: slotIdx })
         return
       }
+      // Per-slot follow-action override — same slot lookup pattern as
+      // the duration. Lets two placements of the same scene have
+      // different follow actions (e.g. first instance loops back,
+      // second instance stops). The lookup happens at timer-fire time
+      // so live UI edits to the override take effect on the next
+      // play, not the current one.
+      const liveOverride =
+        slotIdx !== null
+          ? this.session?.sequenceSlotOverrides?.[slotIdx]
+          : undefined
+      const effectiveNextMode = liveOverride?.nextMode ?? cur.nextMode
       // Stop now *actually* stops everything. Previously the engine kept
       // the scene "alive" as long as any cell had modulation or sequencer
       // enabled — useful in theory, but the user's intent with Stop is
       // "end the scene here." Morph every active cell back to 0 over its
       // own transitionMs and clear the active-scene state.
-      if (cur.nextMode === 'stop') {
+      if (effectiveNextMode === 'stop') {
         this.stopScene(cur.id)
       } else {
-        this.advanceScene(cur)
+        this.advanceScene(cur, effectiveNextMode)
       }
-    }, Math.max(10, scene.durationSec * 1000))
+    }, Math.max(10, effectiveDuration * 1000))
   }
 
   private sceneHasOngoingActivity(sceneId: string): boolean {
@@ -1275,14 +1605,23 @@ export class SceneEngine {
     }
   }
 
-  private advanceScene(current: Scene): void {
+  private advanceScene(current: Scene, modeOverride?: Scene['nextMode']): void {
     if (!this.session) return
+    // Use the slot's override nextMode if armSceneAdvance passed one;
+    // otherwise fall back to the scene's own nextMode. Lets per-slot
+    // overrides redirect playback differently for each placement of
+    // the same scene.
+    const effectiveMode = modeOverride ?? current.nextMode
     // Loop bypasses the sequence entirely — it re-triggers the current
     // scene regardless of whether it's placed in any sequencer slot. The
     // repeat-counter increments on re-trigger, but stays capped at its own
-    // count so it keeps looping forever.
-    if (current.nextMode === 'loop') {
-      this.triggerScene(current.id)
+    // count so it keeps looping forever. Preserve activeSequenceSlotIdx
+    // so the Sequence view's per-slot status bar restarts on the SAME
+    // slot — without this the slot index nulled out on loop and the
+    // bar disappeared because TimelineSegment's `playing` check (which
+    // gates the progress fill) requires activeSequenceSlotIdx === slotIdx.
+    if (effectiveMode === 'loop') {
+      this.triggerScene(current.id, { sourceSlotIdx: this.activeSequenceSlotIdx })
       return
     }
     // Build the "walk list" for follow actions. Primary: scenes placed
@@ -1323,7 +1662,18 @@ export class SceneEngine {
     // highlight).
     let nextId: string | null = null
     let nextSlotIdx: number | null = null
-    const start = seq.findIndex((id) => id === current.id)
+    // CRITICAL: use the live activeSequenceSlotIdx when present (the
+    // ACTUAL slot the engine is currently playing) instead of
+    // findIndex(scene.id), which always returns the FIRST occurrence
+    // and breaks any sequence with the same scene placed twice
+    // (advance always walked from the first instance instead of the
+    // currently-playing one). Fallback to findIndex only when we're
+    // walking the palette (no grid slot to anchor on).
+    const liveSlot = this.activeSequenceSlotIdx
+    const start =
+      !usingPalette && liveSlot !== null && seq[liveSlot] === current.id
+        ? liveSlot
+        : seq.findIndex((id) => id === current.id)
 
     // When walking the palette, the "slot index" we pick is meaningless
     // for the Sequence view's highlight — so null it out before firing
@@ -1333,7 +1683,7 @@ export class SceneEngine {
     const slotOrNull = (idx: number | undefined): number | null =>
       usingPalette ? null : typeof idx === 'number' ? idx : null
 
-    switch (current.nextMode) {
+    switch (effectiveMode) {
       case 'next': {
         if (start < 0) {
           const pick = filledIdxs[0]
@@ -2377,6 +2727,27 @@ export class SceneEngine {
           }
         }
 
+        // ── Hardware Mode override ────────────────────────────────
+        // If the user has Hardware Mode enabled on this track's
+        // template AND this slot's catch state is `true`, the most
+        // recent hardware value wins — overrides whatever the scene
+        // / sequencer / modulator computed above. Sits AFTER pitch
+        // snap (so the snap doesn't override a knob position the
+        // user is dialing in) and BEFORE the pin (a pinned slot is
+        // the user's explicit final-say and always wins).
+        //
+        // handleHardwareInput() populates hardwareCaught + hardwareOverride
+        // on every incoming OSC packet from a bound device. This
+        // emit-loop just reads the latest snapshot.
+        const hwKey = `${trackId}|${idx}`
+        const hwActiveForSlot = this.hardwareCaught.get(hwKey) === true
+        if (hwActiveForSlot) {
+          const hwVal = this.hardwareOverride.get(hwKey)
+          if (typeof hwVal === 'number' && Number.isFinite(hwVal)) {
+            out = hwVal
+          }
+        }
+
         // Per-arg-position persistence — cell-level pin overrides
         // track-level pin overrides nothing. Three states per slot:
         //   cell.persistentSlots[idx] === true  → pinned, use cell.persistentValues[idx]
@@ -2412,8 +2783,19 @@ export class SceneEngine {
           }
         }
 
+        // Pick send type. Default = argSpec.type unless modulation
+        // / scaleToUnit force float. Hardware Mode override ALSO
+        // forces float so a continuous knob 0..1 can produce
+        // fractional values even when the captured argSpec said
+        // 'i' — user reported the knob only outputting 0 or 1 on
+        // int-typed slots before this carve-out.
         const sendType: 'i' | 'f' =
-          a.type === 'i' && !cell.modulation.enabled && !cell.scaleToUnit ? 'i' : 'f'
+          a.type === 'i' &&
+          !cell.modulation.enabled &&
+          !cell.scaleToUnit &&
+          !hwActiveForSlot
+            ? 'i'
+            : 'f'
         const finalVal = sendType === 'i' ? Math.round(out) : out
         // Cache the value we just decided to send — non-persistent
         // slots update freely. (Pinned slots are sourced from the
@@ -2568,15 +2950,18 @@ export class SceneEngine {
       this.midiSender.sendCc(m.portName, m.channel, ccNum, value)
       return
     }
-    // Note kind — only fire on edges, but ALWAYS clear a stale held
-    // note on cell stop / scene change (handled in disarm() via
-    // sendMidiNoteOff()).
-    if (!isNoteEdge) return
-    // Resolve the note number. Under `midiScale` / `scaleToUnit` the
-    // engine normalised to [0, 1]; map that to the user-configured
-    // note window (defaults to C2..C6 = 36..84 when unset, matching
-    // the v0.5.0 behaviour). Otherwise assume the user's value
-    // field is already a MIDI note number (0..127).
+    // Note kind — fire on edges OR when the computed note number
+    // CHANGED (modulator drove the OSC value across a note boundary).
+    // Without the note-number edge detector, modulator-only Note cells
+    // would fire one noteOn at trigger time and then hold forever,
+    // even as the OSC value swept up and down — and Humanize would
+    // never re-roll because there was no new noteOn. With it, each
+    // note-number change retriggers (which also re-rolls Humanize at
+    // the SAME rate as the audible MIDI notes, matching the user's
+    // "they should have the same rate" expectation).
+    //
+    // Resolve the note number FIRST so we can compare it against the
+    // held note (the edge test below depends on it).
     const wantNoteMap = !!cell.midiScale || cell.scaleToUnit
     const rawLo = typeof m.noteMin === 'number' && Number.isFinite(m.noteMin) ? m.noteMin : 36
     const rawHi = typeof m.noteMax === 'number' && Number.isFinite(m.noteMax) ? m.noteMax : 84
@@ -2587,14 +2972,32 @@ export class SceneEngine {
       ? Math.round(lo + noteOrCcSourceVal * (hi - lo))
       : Math.round(noteOrCcSourceVal)
     const noteNum = Math.max(0, Math.min(127, rawNote))
+    // Effective edge: caller-supplied (trigger / sequencer step /
+    // ratchet) OR note-number change from the last held note.
+    // `midiHeldNote === null` is treated as "different" so the cell
+    // re-triggers after a gate-timer noteOff (otherwise modulator-
+    // only cells with a non-zero gate would go silent forever once
+    // their gate elapsed — no edge would ever fire again).
+    const noteNumberChanged = ts.midiHeldNote !== noteNum
+    if (!isNoteEdge && !noteNumberChanged) return
     // Resolve velocity. Pinned velocity always reads from the cell's
     // velocity field; unpinned velocity also reads from the field
     // (full per-velocity modulation is a v0.6 feature — for v0.5
     // the velocity slot is a static or hand-edited value).
     const velRaw = parseFloat(cell.velocity ?? '100')
-    const velocity = Number.isFinite(velRaw)
+    let velocity = Number.isFinite(velRaw)
       ? Math.max(0, Math.min(127, Math.round(velRaw)))
       : 100
+    // Humanization — adds random jitter around the user's velocity
+    // value. 0..100% maps to ±(humanize / 100) × 127 / 2 of variation.
+    // Each Note On rolls a fresh random offset so repeated triggers
+    // don't sound mechanical. Disabled when humanize is 0 or unset.
+    const humanize = cell.velocityHumanize ?? 0
+    if (humanize > 0) {
+      const span = (humanize / 100) * 127
+      const jitter = (Math.random() - 0.5) * span
+      velocity = Math.max(0, Math.min(127, Math.round(velocity + jitter)))
+    }
     // Send Note Off for the previously held note BEFORE the new
     // Note On (mono per cell — no overlap).
     if (ts.midiHeldNote !== null) {
@@ -2611,10 +3014,18 @@ export class SceneEngine {
     }
     if (velocity <= 0) {
       // velocity 0 is technically Note Off — skip the Note On so
-      // we don't leave a phantom "held" note on the wire.
+      // we don't leave a phantom "held" note on the wire. Don't
+      // update lastEmittedVelocity here either: the renderer's badge
+      // should keep showing the LAST real wire value, not a phantom
+      // zero from a humanize jitter that clipped below 0.
       return
     }
     this.midiSender.sendNoteOn(m.portName, m.channel, noteNum, velocity)
+    // Cache the jittered velocity ONLY after the noteOn actually hit
+    // the wire — so the renderer's badge mirrors what was sent (and
+    // stays at the last real value during gaps, instead of getting
+    // "stuck" at a clipped zero or a stale jitter result).
+    ts.lastEmittedVelocity = velocity
     ts.midiHeldNote = noteNum
     ts.midiHeldChannel = m.channel
     ts.midiHeldPort = m.portName

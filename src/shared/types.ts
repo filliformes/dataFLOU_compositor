@@ -26,6 +26,22 @@ export type NextMode =
   | 'any'
   | 'other'
 
+// Per-slot overrides for the Sequence view. When the same scene is
+// dropped into multiple slots, each placement can override the
+// scene's duration and/or follow action without affecting the other
+// slots. The scene's OSC/MIDI cells (its actual content) stay
+// shared across slots — only the playback envelope differs.
+//
+// Each field is optional. Engine logic: read `override.durationSec ??
+// scene.durationSec` when starting playback, and `override.nextMode
+// ?? scene.nextMode` when the duration expires. A slot with an empty
+// override object (both fields undefined) is semantically identical
+// to having no override.
+export interface SequenceSlotOverride {
+  durationSec?: number
+  nextMode?: NextMode
+}
+
 // Order here matters for the Inspector dropdown order: Ramp sits second,
 // right before Envelope, so the "one-shot" options are grouped. The
 // three modular-synth-inspired additions (sh / slew / chaos) live at the
@@ -424,6 +440,18 @@ export interface Cell {
   // multi-arg Parameters but lives on the cell so the velocity
   // pin is per-clip rather than per-parameter.
   velocityPersistent?: boolean
+  // Humanization for the Note-On velocity, 0..100 (percent of full
+  // range jitter). 0 = velocity emitted verbatim from cell.velocity.
+  // 100 = velocity randomized in [0, 127] regardless of the user's
+  // value. A typical "musical" setting is 5..15%.
+  //
+  // Math (in engine.ts::emitMidiForCell): if humanize > 0, the
+  // engine adds `(rand() - 0.5) * humanize * 1.27` to the parsed
+  // velocity, then clamps to [0, 127]. So at 10% humanize, each
+  // Note On's velocity drifts up to ±6.35 from the user's value —
+  // enough to keep a synth from sounding mechanical, not enough
+  // to lose the user's intended dynamic.
+  velocityHumanize?: number
   // Pin for the value slot when in MIDI Note mode — lets the
   // user freeze the note number while sequencer/modulator drives
   // velocity (or vice versa via `velocityPersistent`).
@@ -863,6 +891,68 @@ export interface InstrumentTemplate {
   // place to store function specs. "Save as Template" flips this to
   // undefined and the user can give the entry a name.
   draft?: boolean
+  // Hardware Mode — lets a physical OSC controller (recognised via
+  // the Network discovery tab) override this Instrument's parameter
+  // values while a scene is playing. Implements soft-takeover (catch
+  // mode): the hardware control has to reach the currently-emitted
+  // value before its movement starts contributing. Movement detection
+  // filters out devices that stream constant values when idle (so
+  // dataFLOU only listens when the user is actually moving a knob).
+  hardwareMode?: HardwareModeConfig
+}
+
+// Per-Instrument Hardware Mode configuration. When enabled, dataFLOU
+// listens for OSC from `deviceIp:devicePort` (one of the senders in
+// the Network discovery list) and uses incoming values to override
+// the scene's per-arg-slot output for this Instrument's Parameters.
+//
+// Override pipeline (engine.ts, per-slot loop):
+//   1. Movement detection — value must have changed by `movementThreshold`
+//      within `movementWindowMs` to be considered "moving."
+//   2. Catch mode — until the hardware value matches the
+//      currently-emitted scene value within `catchTolerance`, the
+//      hardware is ignored. Once caught, hardware wins.
+//   3. Mode lifecycle:
+//        - 'reset' (default): scene-change clears caught state. User
+//          must re-catch the new scene's value to take over again.
+//        - 'persist': scene-change keeps caught state. If the user
+//          is mid-knob-turn when a new scene fires, hardware
+//          continues to dominate the parameter.
+//   4. Per-arg locking: by default the hardware controls all arg
+//      slots of every Parameter under this Instrument. The `args`
+//      map narrows control to specific slot indices per Parameter,
+//      so e.g. only arg[2] of /B/strips/pots is HW-controlled while
+//      the scene drives args 0-1 and 3..N.
+export interface HardwareModeConfig {
+  enabled: boolean
+  // Device discovered via the Pool's Network tab. Persisted with the
+  // session so the binding survives reload. Empty string = not yet
+  // bound (the UI shows "(pick a device)" until the user selects).
+  deviceIp: string
+  devicePort: number
+  // 'reset' (default) re-arms catch on every scene change; 'persist'
+  // keeps the caught state across scene transitions so a knob-turn
+  // mid-show keeps overriding the new scene's value until released.
+  mode: 'reset' | 'persist'
+  // Catch tolerance — fraction of the param's full range. 0.02 = 2%.
+  catchTolerance: number
+  // Movement detection — value must change by ≥ movementThreshold
+  // within `movementWindowMs` to be treated as "user is moving the
+  // control." Filters out devices that stream a static value 200+ Hz
+  // (the original OCTOCOSME firmware, for example).
+  movementThreshold: number
+  movementWindowMs: number
+  // Per-parameter arg-slot lock map. Key: InstrumentFunction.id.
+  // Value: array of arg slot indices the HW controls. Missing key OR
+  // empty array = HW controls ALL slots. Use this to surgically
+  // limit which slots of a multi-arg bundle the hardware can drive.
+  args?: Record<string, number[]>
+  // Which Track instances this HW Mode applies to. Empty / undefined
+  // = applies to EVERY Track instantiated from this template (every
+  // copy in the grid). Listing specific track ids narrows the scope
+  // to those instances only. Lets the user have two copies of the
+  // same Instrument template, one HW-driven and one scene-driven.
+  appliesToTrackIds?: string[]
 }
 
 // Standalone Parameter template — a single-Function blueprint that lives
@@ -1008,6 +1098,17 @@ export interface Scene {
   // Template (Instrument header) track id. Optional / sparse — the
   // engine only reacts to a binding when one is present.
   instrumentTriggers?: Record<string, MidiBinding>
+  // ID of the Pool SavedScene this live scene is linked to. Set in
+  // two cases:
+  //   - User clicked "Save Scene to Pool" — link points at the new
+  //     library entry. Later changes to color / name / notes on the
+  //     live scene mirror back to that entry.
+  //   - User dragged a SavedScene from the Pool onto the grid —
+  //     link points at the SavedScene the instance came from.
+  // Bidirectional sync: updateScene mirrors to the SavedScene;
+  // updateSavedScene mirrors back to the live scene if linked.
+  // Optional / sparse — most scenes don't link.
+  linkedSavedSceneId?: string
 }
 
 export interface MidiBinding {
@@ -1104,6 +1205,19 @@ export interface Session {
   // `tracks` array via the Pool drawer.
   pool: Pool
   sequence: (string | null)[] // 128-length array; only first `sequenceLength` are used
+  // Per-slot overrides for the Sequence view. Keyed by slot index
+  // (0..sequenceLength-1). Each override is a partial of the scene's
+  // own playback fields — when an override is present, the engine
+  // uses it; otherwise the scene's default applies. Lets the user
+  // drop the same Scene into multiple slots and give EACH placement
+  // its own duration / follow action while sharing the underlying
+  // OSC/MIDI cells.
+  //
+  // Sparse storage — only slots with at least one override field
+  // get an entry. Missing slots / fields fall through to the
+  // scene's defaults. Removing a slot from the sequence cleans up
+  // its override automatically (via setSequenceSlot).
+  sequenceSlotOverrides?: Record<number, SequenceSlotOverride>
   focusedSceneId: string | null
   midiInputName: string | null
   // Global MIDI OUTPUT enable. When false the engine skips every
@@ -1179,6 +1293,19 @@ export interface EngineState {
   // visual display also pauses.
   pausedAt: number | null
   tickRateHz: number
+  // Per-track Hardware Mode catch state. Keyed by trackId, value is
+  // the sorted array of arg-slot indices currently overridden by
+  // hardware. Empty / missing = no override. Lets the renderer's
+  // CellTile do a single O(1) lookup by trackId instead of iterating
+  // every key looking for a prefix match — was a measurable hot path
+  // when many cells were on screen.
+  hardwareCaughtByTrack?: Record<string, number[]>
+  // Per-cell last-emitted MIDI velocity (after humanize jitter has
+  // been applied). Key format: `${sceneId}|${trackId}`. Only present
+  // for cells that have actually fired a noteOn — undefined for cells
+  // that haven't played yet. Lets the renderer show the jittered
+  // velocity in the cell tile so Humanize "moves" visibly.
+  lastEmittedVelocityByCell?: Record<string, number>
 }
 
 // One outgoing OSC message as surfaced to the renderer (OSC monitor panel).

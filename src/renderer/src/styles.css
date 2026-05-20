@@ -934,12 +934,38 @@ html[data-show-mode='true'] [data-hide-in-show='true'] {
   }
 }
 
-/* Resize handles */
+/* Resize handles. The visible width is tiny (set inline via Tailwind
+   `w-[4px]` / `h-[4px]`) but a transparent `::before` overlay extends
+   the pointer-event hit area ±5 px on each side so the user doesn't
+   have to nail a 4-pixel target. Pseudo inherits the cursor and
+   forwards clicks to the parent (mouseDown listener on the host). */
 .resize-h {
   cursor: row-resize;
+  position: relative;
 }
 .resize-v {
   cursor: col-resize;
+  position: relative;
+}
+.resize-h::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -5px;
+  bottom: -5px;
+  /* Above neighbouring content so the cursor change + click capture
+     fire even when an adjacent button's hover zone overlaps. */
+  z-index: 5;
+}
+.resize-v::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  right: -5px;
+  z-index: 5;
 }
 .resize-h:hover,
 .resize-v:hover {

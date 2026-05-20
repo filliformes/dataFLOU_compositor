@@ -219,7 +219,9 @@ export default function PoolPane({
         // without it "Built-in" wrapped onto two rows. Right-side
         // buttons use the compact `text-[9px]` + `px-1` sizing so all
         // four can sit next to the tabs even at narrow drawer widths.
-        className="flex items-center gap-1.5 px-2 py-1 border-b border-border shrink-0 cursor-default select-none flex-nowrap"
+        // `min-h-[28px]` matches the Monitor's toolbar height so the
+        // two sit on the same visual line.
+        className="flex items-center gap-1.5 px-2 py-1 border-b border-border shrink-0 cursor-default select-none flex-nowrap min-h-[28px]"
         onDoubleClick={() => onTogglePopOut?.()}
         title={poppedOut ? 'Drag to move · Double-click to dock' : 'Double-click to pop out'}
         style={{ touchAction: titleBarHandlers ? 'none' : undefined, ...titleBarHandlers?.style }}
@@ -482,7 +484,12 @@ function SectionedList({
   return (
     <>
       {templates.length > 0 && (
-        <div className="px-2 pt-1 pb-0.5 text-[9px] uppercase tracking-wide text-muted">
+        // `min-h-[20px]` + `items-center` matches the Monitor's
+        // column-header row (OSC `time | kind | …` / MIDI `time |
+        // kind | …`) so the INSTRUMENTS divider sits on the same
+        // visual line. `border-b` mirrors the Monitor's header
+        // separator for visual symmetry.
+        <div className="flex items-center px-2 text-[9px] uppercase tracking-wide text-muted border-b border-border min-h-[20px]">
           Instruments
         </div>
       )}
@@ -505,7 +512,11 @@ function SectionedList({
         />
       ))}
       {params.length > 0 && (
-        <div className="px-2 pt-2 pb-0.5 text-[9px] uppercase tracking-wide text-muted">
+        // PARAMETERS divider — same height contract as INSTRUMENTS
+        // above. Slight `mt-1` keeps a breath of space between the
+        // Instruments list and the Parameters section without
+        // breaking the row-height match.
+        <div className="flex items-center px-2 mt-1 text-[9px] uppercase tracking-wide text-muted border-y border-border min-h-[20px]">
           Parameters
         </div>
       )}

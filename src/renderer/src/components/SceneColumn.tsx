@@ -5,7 +5,12 @@ import { CSS } from '@dnd-kit/utilities'
 import type { NextMode } from '@shared/types'
 import { useStore } from '../store'
 import CellTile from './CellTile'
-import { SCENE_COL_COLLAPSED_MIN_W, useEffectiveRowHeight, useHeaderHeight } from './EditView'
+import {
+  SCENE_COL_COLLAPSED_MIN_W,
+  compactRowHeightForTrack,
+  useEffectiveRowHeight,
+  useHeaderHeight
+} from './EditView'
 import { ResizeHandle } from './ResizeHandle'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import { BoundedNumberInput } from './BoundedNumberInput'
@@ -20,7 +25,10 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   const removeScenes = useStore((s) => s.removeScenes)
   const setFocusedScene = useStore((s) => s.setFocusedScene)
   const selectSceneRange = useStore((s) => s.selectSceneRange)
-  const setSceneMidi = useStore((s) => s.setSceneMidi)
+  // setSceneMidi + noteName were dropped along with the MIDI binding chip
+  // that used to live in the scene header. MIDI Learn mode still binds
+  // via the trigger button overlay; bindings are listed + editable in
+  // the Monitor drawer's "Learned" tab.
   const engineActiveScene = useStore((s) => s.engine.activeSceneId)
   const activeSceneStartedAt = useStore((s) => s.engine.activeSceneStartedAt)
   const midiLearnMode = useStore((s) => s.midiLearnMode)
@@ -32,6 +40,11 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   const sceneColumnWidth = useStore((s) => s.sceneColumnWidth)
   const setSceneColumnWidth = useStore((s) => s.setSceneColumnWidth)
   const scenesCollapsedRaw = useStore((s) => s.scenesCollapsed)
+  // tracksCollapsed lowers each column's minWidth floor so the
+  // narrower 2-column cell-value grid (set in CellValueGrid) actually
+  // takes effect visually. Without this, the user's sceneColumnWidth
+  // floor kept the column wide even when cells could fit smaller.
+  const tracksCollapsedForWidth = useStore((s) => s.tracksCollapsed)
   const showMode = useStore((s) => s.showMode)
   const isArmed = useStore((s) => s.armedSceneId === sceneId)
   // Show mode forces collapsed-header layout regardless of the user's pref.
@@ -169,6 +182,13 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   return (
     <div
       ref={setSortableRef}
+      // `data-scene-column-id` is consumed by EditView.onGridDrop to
+      // figure out WHICH position the user dropped a saved-scene
+      // payload onto. Avoids threading a per-column drop handler
+      // through every scene + lets the drop hit work on the empty
+      // gutter between columns too (the handler walks all elements
+      // with this attribute and picks an insert index by drop X).
+      data-scene-column-id={sceneId}
       className={`shrink-0 border-r border-border flex flex-col relative ${
         isInSelection ? 'ring-1 ring-inset ring-accent/30' : ''
       }`}
@@ -179,8 +199,17 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         // becomes a MINIMUM width (so single-value scenes still
         // honour the manual size) and `fit-content` lets the
         // column expand past it when content needs more room.
+        // When Instruments are collapsed (tracksCollapsed), drop the
+        // floor to 96 px so the 2-column cell grid actually shrinks
+        // the column visibly. The user's manual `sceneColumnWidth`
+        // is still respected as an upper bound on the floor — if
+        // they've already pulled it below 96 we honour that value.
         width: 'fit-content',
-        minWidth: scenesCollapsed ? SCENE_COL_COLLAPSED_MIN_W : sceneColumnWidth,
+        minWidth: scenesCollapsed
+          ? SCENE_COL_COLLAPSED_MIN_W
+          : tracksCollapsedForWidth
+            ? Math.min(96, sceneColumnWidth)
+            : sceneColumnWidth,
         background: tint,
         ...sortableStyle
       }}
@@ -342,11 +371,16 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           <span className="label ml-1">Next</span>
           <select
             // select-compact swaps the bulky native dropdown arrow (~20 px
-            // on Windows, ~24 px on macOS) for a small 8 px SVG chevron —
-            // reclaims enough room that even "Previous" + chevron fit in
-            // ~70 px without the overflowing-column look we had with the
-            // native control. min-w-0 lets flex-1 shrink naturally.
-            className="input select-compact flex-1 min-w-0 text-[11px] py-0.5"
+            // on Windows, ~24 px on macOS) for a small 8 px SVG chevron.
+            // Width hugs the widest entry ("Previous") + chevron — about
+            // 78 px — so the dropdown never widens the scene column.
+            // (Previous design used flex-1 which let the dropdown grow
+            // alongside any MIDI chip and push the column wide.) The MIDI
+            // chip itself was removed from the header — the new "Learned"
+            // tab in the MIDI Monitor is the canonical place to view +
+            // edit MIDI bindings.
+            className="input select-compact text-[11px] py-0.5"
+            style={{ width: 78 }}
             value={scene.nextMode}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
@@ -373,40 +407,6 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             <option value="any">Any</option>
             <option value="other">Other</option>
           </select>
-          {/* MIDI binding chip — folded inline with DUR/NEXT so the
-              scene header doesn't carry a separate orphan line for
-              every bound scene. Compact "MIDI" prefix + note/CC
-              label + channel; click ✕ to clear. Hidden when nothing
-              is bound to this scene. */}
-          {scene.midiTrigger && (
-            <span
-              className="flex items-center gap-0.5 text-[9px] text-muted shrink-0 px-1 rounded border border-border ml-1 whitespace-nowrap"
-              title={`MIDI: ${
-                scene.midiTrigger.kind === 'note'
-                  ? noteName(scene.midiTrigger.number)
-                  : `CC${scene.midiTrigger.number}`
-              } on channel ${scene.midiTrigger.channel + 1}`}
-              onClick={(e) => e.stopPropagation()}
-              onMouseDown={(e) => e.stopPropagation()}
-            >
-              <span className="text-text">
-                {scene.midiTrigger.kind === 'note'
-                  ? noteName(scene.midiTrigger.number)
-                  : `CC${scene.midiTrigger.number}`}
-              </span>
-              <span>ch{scene.midiTrigger.channel + 1}</span>
-              <button
-                className="text-muted hover:text-danger leading-none"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setSceneMidi(sceneId, undefined)
-                }}
-                title="Clear MIDI binding"
-              >
-                ✕
-              </button>
-            </span>
-          )}
         </div>
 
         {/* Notes resize handle on the bottom border of the header — identical
@@ -436,13 +436,20 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           ? tracks.find((tt) => tt.id === t.parentTrackId)
           : null
         const dimmed = t.enabled === false || parent?.enabled === false
+        // Per-track row height — in compact (Tracks Collapsed)
+        // mode this grows for multi-arg parameters so the cell's
+        // value grid can render its full content. Non-collapsed
+        // mode uses the global `rowHeight` slider for every row.
+        const perTrackH = tracksCollapsedForWidth
+          ? compactRowHeightForTrack(t.argSpec)
+          : rowHeight
         return t.kind === 'template' ? (
           <div
             key={t.id}
             className={`border-b border-border shrink-0 bg-panel/40 ${
               dimmed ? 'opacity-40' : ''
             }`}
-            style={{ height: rowHeight }}
+            style={{ height: perTrackH }}
           >
             <InstrumentTriggerCell sceneId={sceneId} templateRowId={t.id} />
           </div>
@@ -450,7 +457,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           <div
             key={t.id}
             className={`border-b border-border shrink-0 ${dimmed ? 'opacity-40' : ''}`}
-            style={{ height: rowHeight }}
+            style={{ height: perTrackH }}
           >
             <CellTile sceneId={sceneId} trackId={t.id} />
           </div>
@@ -681,10 +688,9 @@ function SceneTriggerButton({
   )
 }
 
-function noteName(n: number): string {
-  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-  return names[n % 12] + (Math.floor(n / 12) - 1)
-}
+// `noteName` helper removed along with the inline MIDI binding chip.
+// The "Learned" tab in the Monitor drawer has its own copy of this
+// helper for rendering bound bindings.
 
 // Group-trigger cell rendered at the intersection of a Template
 // (Instrument) header row and a Scene column. Templates carry no

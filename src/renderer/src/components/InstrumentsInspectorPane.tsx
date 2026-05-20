@@ -130,6 +130,12 @@ function TemplateInspector({
           />
         </Field>
 
+        {/* Hardware Mode — sits directly under the name as the user
+            specified. Visible (and editable) even on built-in
+            templates because HW Mode is a per-session preference,
+            not a definitional change to the template. */}
+        <HardwareModeSection template={template} />
+
         <Field label="Description">
           <UncontrolledTextInput
             className="input text-[11px] py-0.5 w-full"
@@ -1342,6 +1348,264 @@ function Field({
       <span className="label">{label}</span>
       {children}
     </label>
+  )
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Hardware Mode section — appears in the Pool's Instrument Template
+// Inspector under the Name field. Lets the user bind a physical OSC
+// controller (recognised via the Network discovery tab) to this
+// Instrument so the controller can override scene playback in
+// real time, with soft-takeover ("catch") so values can't snap.
+//
+// The engine reads `template.hardwareMode` on every incoming OSC
+// packet (via handleHardwareInput in engine.ts) — see that file for
+// the actual override pipeline. This UI is purely the config
+// surface.
+// ──────────────────────────────────────────────────────────────────
+export function HardwareModeSection({
+  template
+}: {
+  template: InstrumentTemplate
+}): JSX.Element {
+  const setHardwareMode = useStore((s) => s.setTemplateHardwareMode)
+  const networkDevices = useStore((s) => s.networkDevices)
+  const tracks = useStore((s) => s.session.tracks)
+  const hw = template.hardwareMode ?? {
+    enabled: false,
+    deviceIp: '',
+    devicePort: 0,
+    mode: 'reset' as const,
+    catchTolerance: 0.02,
+    movementThreshold: 0.005,
+    movementWindowMs: 300
+  }
+  const deviceKey = hw.deviceIp ? `${hw.deviceIp}:${hw.devicePort}` : ''
+  // Which Track instances are spawned from this template — the
+  // "applies to" selector listing.
+  const trackInstances = tracks.filter(
+    (t) => t.sourceTemplateId === template.id
+  )
+  const appliesToAll =
+    !hw.appliesToTrackIds || hw.appliesToTrackIds.length === 0
+  return (
+    <div className="border border-border rounded p-1.5 flex flex-col gap-1.5 bg-panel2/30">
+      <label className="flex items-center gap-1.5 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={!!hw.enabled}
+          onChange={(e) =>
+            setHardwareMode(template.id, { enabled: e.target.checked })
+          }
+        />
+        <span className="label" style={{ color: hw.enabled ? 'rgb(var(--c-danger))' : undefined }}>
+          Hardware Mode
+        </span>
+        {hw.enabled && (
+          <span
+            className="text-[9px] font-bold"
+            style={{ color: 'rgb(var(--c-danger))' }}
+          >
+            ON
+          </span>
+        )}
+      </label>
+      {hw.enabled && (
+        <>
+          {/* Device picker — pulls discovered senders from Network tab.
+              Empty list = nothing has broadcast OSC at us yet; the
+              hint text tells the user where to look. */}
+          <Field label="Device (Network discovery)">
+            <select
+              className="input text-[11px] py-0.5 w-full"
+              value={deviceKey}
+              onChange={(e) => {
+                const v = e.target.value
+                if (!v) {
+                  setHardwareMode(template.id, { deviceIp: '', devicePort: 0 })
+                  return
+                }
+                const lastColon = v.lastIndexOf(':')
+                const ip = v.slice(0, lastColon)
+                const port = Number(v.slice(lastColon + 1))
+                setHardwareMode(template.id, {
+                  deviceIp: ip,
+                  devicePort: port
+                })
+              }}
+            >
+              <option value="">— pick a discovered device —</option>
+              {networkDevices.map((d) => (
+                <option key={d.id} value={`${d.ip}:${d.port}`}>
+                  {d.ip}:{d.port} ({d.addresses.length} addr)
+                </option>
+              ))}
+            </select>
+            {networkDevices.length === 0 && (
+              <span className="text-[9px] text-muted italic mt-0.5">
+                No devices discovered yet. Make sure the controller is
+                broadcasting OSC to dataFLOU's listen port — check the
+                Network tab in the Pool drawer.
+              </span>
+            )}
+          </Field>
+          {/* Mode — 'reset' (default) re-arms catch on every scene
+              change; 'persist' lets a mid-show knob-turn keep
+              overriding through scene transitions. */}
+          <Field label="Catch lifecycle">
+            <select
+              className="input text-[11px] py-0.5 w-full"
+              value={hw.mode}
+              onChange={(e) =>
+                setHardwareMode(template.id, {
+                  mode: e.target.value as 'reset' | 'persist'
+                })
+              }
+            >
+              <option value="reset">Reset on scene change (default)</option>
+              <option value="persist">Persist across scene changes</option>
+            </select>
+          </Field>
+          {/* Tolerances — sensible defaults shown; advanced users can
+              tighten / loosen. */}
+          <div className="grid grid-cols-2 gap-1">
+            <Field label="Catch tol (% range)">
+              <BoundedNumberInput
+                className="input text-[11px] py-0.5 w-full"
+                value={Math.round(hw.catchTolerance * 1000) / 10}
+                onChange={(v) =>
+                  setHardwareMode(template.id, {
+                    catchTolerance: Math.max(0, Math.min(100, v)) / 100
+                  })
+                }
+                min={0}
+                max={100}
+              />
+            </Field>
+            <Field label="Movement Δ (% range)">
+              <BoundedNumberInput
+                className="input text-[11px] py-0.5 w-full"
+                value={Math.round(hw.movementThreshold * 1000) / 10}
+                onChange={(v) =>
+                  setHardwareMode(template.id, {
+                    movementThreshold: Math.max(0, Math.min(100, v)) / 100
+                  })
+                }
+                min={0}
+                max={100}
+              />
+            </Field>
+          </div>
+          {/* Multi-instance selector — empty list = all instances of
+              this template are HW-controllable. Listing specific
+              track IDs narrows the scope. */}
+          {trackInstances.length > 1 && (
+            <Field label="Apply to">
+              <div className="flex flex-col gap-0.5">
+                <label className="flex items-center gap-1 text-[10px]">
+                  <input
+                    type="checkbox"
+                    checked={appliesToAll}
+                    onChange={(e) => {
+                      setHardwareMode(template.id, {
+                        appliesToTrackIds: e.target.checked ? [] : trackInstances.map((t) => t.id)
+                      })
+                    }}
+                  />
+                  <span>All instances ({trackInstances.length})</span>
+                </label>
+                {!appliesToAll &&
+                  trackInstances.map((t) => (
+                    <label
+                      key={t.id}
+                      className="flex items-center gap-1 text-[10px] pl-3"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={hw.appliesToTrackIds!.includes(t.id)}
+                        onChange={(e) => {
+                          const next = e.target.checked
+                            ? [...(hw.appliesToTrackIds ?? []), t.id]
+                            : (hw.appliesToTrackIds ?? []).filter(
+                                (id) => id !== t.id
+                              )
+                          setHardwareMode(template.id, {
+                            appliesToTrackIds: next
+                          })
+                        }}
+                      />
+                      <span>{t.name}</span>
+                    </label>
+                  ))}
+              </div>
+            </Field>
+          )}
+          {/* Per-function arg lock — granular. For each Parameter,
+              user can pick specific arg slots HW controls. Empty
+              row = HW controls ALL slots of that Parameter. */}
+          <Field label="Per-parameter arg slot lock">
+            <div className="flex flex-col gap-0.5">
+              {template.functions
+                .filter((fn) => (fn.argSpec?.length ?? 0) > 1)
+                .map((fn) => {
+                  const locked = hw.args?.[fn.id] ?? []
+                  const argCount = fn.argSpec!.length
+                  return (
+                    <div
+                      key={fn.id}
+                      className="flex items-center gap-1 text-[10px]"
+                    >
+                      <span className="text-muted shrink-0" style={{ width: 80 }}>
+                        {fn.name}
+                      </span>
+                      {Array.from({ length: argCount }).map((_, i) => (
+                        <label
+                          key={i}
+                          className="flex items-center gap-0.5"
+                          title={`Slot ${i}: ${fn.argSpec![i]?.name ?? 'arg ' + i}`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={locked.length === 0 || locked.includes(i)}
+                            onChange={(e) => {
+                              const isAll = locked.length === 0
+                              const startList = isAll
+                                ? Array.from({ length: argCount }, (_, k) => k)
+                                : locked
+                              const next = e.target.checked
+                                ? [...startList, i].filter(
+                                    (v, idx, a) => a.indexOf(v) === idx
+                                  )
+                                : startList.filter((v) => v !== i)
+                              const allChecked = next.length === argCount
+                              setHardwareMode(template.id, {
+                                args: {
+                                  ...(hw.args ?? {}),
+                                  // Empty array = "all" (the default).
+                                  // Storing [0..N-1] explicitly is equivalent
+                                  // semantically — we normalise to empty.
+                                  [fn.id]: allChecked ? [] : next
+                                }
+                              })
+                            }}
+                          />
+                          <span className="tabular-nums">{i}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )
+                })}
+              {template.functions.every((fn) => (fn.argSpec?.length ?? 0) <= 1) && (
+                <span className="text-[9px] text-muted italic">
+                  All Parameters are single-arg — hardware controls each
+                  Parameter's only slot. No per-slot lock UI needed.
+                </span>
+              )}
+            </div>
+          </Field>
+        </>
+      )}
+    </div>
   )
 }
 

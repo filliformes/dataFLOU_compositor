@@ -141,12 +141,35 @@ export default function App(): JSX.Element {
   // never needs re-registering.
   useEffect(() => {
     function onWheel(e: WheelEvent): void {
-      if (!e.ctrlKey) return
-      e.preventDefault()
-      const cur = useStore.getState().uiScale
-      const dir = e.deltaY > 0 ? -1 : 1
-      const next = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, cur + dir * UI_SCALE_STEP))
-      if (next !== cur) useStore.getState().setUiScale(next)
+      // Ctrl+wheel = UI zoom.
+      if (e.ctrlKey) {
+        e.preventDefault()
+        const cur = useStore.getState().uiScale
+        const dir = e.deltaY > 0 ? -1 : 1
+        const next = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, cur + dir * UI_SCALE_STEP))
+        if (next !== cur) useStore.getState().setUiScale(next)
+        return
+      }
+      // Shift+wheel = horizontal scroll on the nearest overflow-x
+      // container. Lets users without a horizontal scroll wheel
+      // navigate wide views (Edit grid, Sequence timeline). For
+      // users WITH a horizontal scroll wheel (Logitech MX Master
+      // etc.), `deltaX` flows through to the native scroller below
+      // — no preventDefault when ctrl/shift aren't held, so the
+      // browser handles deltaX itself.
+      if (e.shiftKey && e.deltaY !== 0 && e.deltaX === 0) {
+        let el = e.target as Element | null
+        while (el && el !== document.body) {
+          const style = window.getComputedStyle(el)
+          const ox = style.overflowX
+          if ((ox === 'auto' || ox === 'scroll') && el.scrollWidth > el.clientWidth) {
+            ;(el as HTMLElement).scrollLeft += e.deltaY
+            e.preventDefault()
+            return
+          }
+          el = el.parentElement
+        }
+      }
     }
     // `passive: false` required so preventDefault actually stops any
     // browser-side Ctrl+wheel behavior.
@@ -475,6 +498,23 @@ export default function App(): JSX.Element {
         e.preventDefault()
         const st = useStore.getState()
         st.setOscMonitorOpen(!st.oscMonitorOpen)
+        return
+      }
+      // L → toggle MIDI Learn mode. Same effect as clicking the MIDI
+      // Learn button in the TopBar. Hardware performers can flip in
+      // and out of learn mode without reaching for the mouse.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'l'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setMidiLearnMode(!st.midiLearnMode)
         return
       }
       // P → toggle Pool visibility inside the OSC Monitor. If the

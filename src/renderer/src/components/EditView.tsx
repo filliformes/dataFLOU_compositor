@@ -54,6 +54,29 @@ export function useEffectiveRowHeight(): number {
   return collapsed ? 32 : rowH
 }
 
+// Per-track row height for the collapsed (Tracks Collapsed) mode.
+// Grows above the 32px base when the parameter has > 4 non-fixed
+// argSpec slots so the 4-column compact value grid actually fits
+// instead of being clipped by `overflow-hidden` on the value side.
+// Counts NON-FIXED slots only (fixed-arg slots are stripped from the
+// rendered display — see `formatCellDisplayValue`).
+//
+// Math: 4-cols × 14 px (font ~9px + 2 px rowGap + a little headroom)
+// + 6 px container padding. 12 args → 3 rows → 48 px. 16 args → 4
+// rows → 62 px.
+export function compactRowHeightForTrack(
+  argSpec: { fixed?: unknown }[] | undefined
+): number {
+  if (!argSpec || argSpec.length === 0) return 32
+  let count = 0
+  for (const s of argSpec) {
+    if (!s || s.fixed === undefined) count += 1
+  }
+  if (count <= 4) return 32
+  const rows = Math.ceil(count / 4)
+  return Math.max(32, rows * 14 + 6)
+}
+
 export default function EditView(): JSX.Element {
   const scenes = useStore((s) => s.session.scenes)
   const selectedCell = useStore((s) => s.selectedCell)
@@ -97,7 +120,27 @@ export default function EditView(): JSX.Element {
     try {
       const payload = JSON.parse(raw) as PoolSavedSceneDragPayload
       const st = useStore.getState()
-      const newSceneId = st.instantiateSavedScene(payload.savedSceneId)
+      // Position-aware drop: walk every rendered scene column in
+      // document order, compare its horizontal centre to the drop X,
+      // and insert BEFORE the first column whose centre is to the
+      // right of the cursor. If none qualifies (drop landed past the
+      // last column or there are no columns yet), `insertIdx` stays
+      // at `cols.length` so we append. Bonus: also matches DOM
+      // order to the store's `session.scenes` order, which is
+      // guaranteed since SortableContext preserves it.
+      const cols = e.currentTarget.querySelectorAll<HTMLElement>(
+        '[data-scene-column-id]'
+      )
+      const dropX = e.clientX
+      let insertIdx = cols.length
+      for (let i = 0; i < cols.length; i++) {
+        const rect = cols[i].getBoundingClientRect()
+        if (dropX < rect.left + rect.width / 2) {
+          insertIdx = i
+          break
+        }
+      }
+      const newSceneId = st.instantiateSavedScene(payload.savedSceneId, insertIdx)
       if (newSceneId) st.setFocusedScene(newSceneId)
     } catch {
       /* malformed payload — ignore */

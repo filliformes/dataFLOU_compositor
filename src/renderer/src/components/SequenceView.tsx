@@ -3,15 +3,19 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  closestCenter,
   DndContext,
   DragEndEvent,
   DragOverlay,
   DragStartEvent,
   PointerSensor,
+  pointerWithin,
   useDraggable,
   useDroppable,
   useSensor,
-  useSensors
+  useSensors,
+  type CollisionDetection,
+  type Modifier
 } from '@dnd-kit/core'
 import { SortableContext, rectSortingStrategy, useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
@@ -24,6 +28,51 @@ import {
   POOL_SAVED_SCENE_DRAG_MIME,
   type PoolSavedSceneDragPayload
 } from './PoolPane'
+
+// Hybrid collision detection: pointer-within first (matches only
+// droppables under the cursor), then closestCenter as a fallback when
+// the pointer is in a gap between cells. Prevents the "far away slot
+// in a different row lights up orange during drag" bug, where the
+// default rectIntersection picked the wrong droppable when the drag
+// overlay's rect spanned multiple cells.
+const collisionDetectionSequence: CollisionDetection = (args) => {
+  const within = pointerWithin(args)
+  if (within.length > 0) return within
+  return closestCenter(args)
+}
+
+// Live cursor tracking for the drag overlay. The earlier modifier
+// used dnd-kit's `draggingNodeRect` to compute a one-shot offset,
+// but that rect updates AS the overlay moves — so the math drifted
+// further from the cursor the longer the user dragged. Switching
+// to a window-level pointermove listener that writes into a ref
+// gives the modifier the LIVE pointer position on every call,
+// independent of dnd-kit's internal state.
+const dragCursorRef: { current: { x: number; y: number } | null } = { current: null }
+
+// Direct-positioning modifier: ignores dnd-kit's accumulated drag
+// transform entirely and computes the result purely from
+// (liveCursor − sourceRect.left − width/2), so the overlay's CENTER
+// pins to the pointer regardless of how far the user has dragged.
+// Uses `activeNodeRect` (the source's STABLE rect captured at drag
+// start) rather than `draggingNodeRect` (the moving overlay rect),
+// which is what caused the previous drift.
+const cursorTrackOverlay: Modifier = ({
+  transform,
+  activeNodeRect,
+  draggingNodeRect
+}) => {
+  const cursor = dragCursorRef.current
+  // We need a rect for the overlay's size. Prefer the dragging rect
+  // (overlay's actual rendered size); fall back to the source's rect.
+  const sizeRect = draggingNodeRect ?? activeNodeRect
+  if (!cursor || !activeNodeRect || !sizeRect) return transform
+  return {
+    ...transform,
+    x: cursor.x - activeNodeRect.left - sizeRect.width / 2,
+    y: cursor.y - activeNodeRect.top - sizeRect.height / 2
+  }
+}
 
 export default function SequenceView(): JSX.Element {
   const scenes = useStore((s) => s.session.scenes)
@@ -54,6 +103,25 @@ export default function SequenceView(): JSX.Element {
   // floating preview. Null when nothing is active. Strings are dnd-kit ids
   // like `scene-<id>` (palette → slot) or `slot-<N>` (slot → slot swap).
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
+  // Live cursor tracking — feeds `cursorTrackOverlay` modifier with
+  // the exact pointer position on each pointermove. Without this,
+  // the overlay drifted away from the cursor as the user dragged
+  // because dnd-kit's `draggingNodeRect` moves with the overlay
+  // (chasing its own tail).
+  useEffect(() => {
+    if (!activeDragId) {
+      dragCursorRef.current = null
+      return
+    }
+    const onMove = (e: PointerEvent): void => {
+      dragCursorRef.current = { x: e.clientX, y: e.clientY }
+    }
+    window.addEventListener('pointermove', onMove, { capture: true })
+    return () => {
+      window.removeEventListener('pointermove', onMove, { capture: true } as EventListenerOptions)
+      dragCursorRef.current = null
+    }
+  }, [activeDragId])
   // Right-click context menu for scenes — shared across PaletteItem
   // and SlotCell. Menu items: "Arm as next" (toggles armedSceneId) and
   // "Delete Scene" (with confirm). Slot cells fire a CustomEvent so we
@@ -110,6 +178,15 @@ export default function SequenceView(): JSX.Element {
 
   function handleDragStart(e: DragStartEvent): void {
     setActiveDragId(String(e.active.id))
+    // Prime the cursor ref with the activator event's position so the
+    // very first overlay frame (before any pointermove fires) is
+    // already snapped to the click point. Without this, the overlay
+    // briefly lands at the source's centre before the first
+    // pointermove repositions it.
+    const aev = e.activatorEvent as PointerEvent
+    if (aev && Number.isFinite(aev.clientX) && Number.isFinite(aev.clientY)) {
+      dragCursorRef.current = { x: aev.clientX, y: aev.clientY }
+    }
   }
 
   function handleDragEnd(e: DragEndEvent): void {
@@ -201,6 +278,16 @@ export default function SequenceView(): JSX.Element {
   return (
     <DndContext
       sensors={sensors}
+      // Pointer-first collision detection. The previous default
+      // (`rectIntersection`) lit up every droppable whose rect
+      // intersected the drag overlay — when the overlay was wider than
+      // a slot (long scene names), multiple slots in different rows
+      // could highlight simultaneously, and the LEFTMOST one usually
+      // won "over" instead of the one under the cursor. `pointerWithin`
+      // only matches droppables the pointer is actually inside;
+      // `closestCenter` is the fallback for when the pointer is in a
+      // gap (between cells) so the user still sees a target.
+      collisionDetection={collisionDetectionSequence}
       onDragStart={handleDragStart}
       onDragEnd={(e) => {
         // Palette pill dropped on another palette pill = reorder.
@@ -324,6 +411,14 @@ export default function SequenceView(): JSX.Element {
                       activeSceneId === sceneId && activeSlotIdx === i
                     }
                     onClear={clearMode ? () => setSequenceSlot(i, null) : undefined}
+                    // During a drag, suppress the active (orange) and
+                    // selected (grey) rings on slots NOT under the
+                    // cursor. Only the slot being hovered over (via
+                    // dnd-kit's useDroppable isOver) lights up — the
+                    // user wanted a clean drag preview, not a wash
+                    // of leftover highlights from previous selection
+                    // / playback state.
+                    dragging={activeDragId !== null}
                   />
                 ))}
               </div>
@@ -338,8 +433,12 @@ export default function SequenceView(): JSX.Element {
       {/* Drag preview — floats with the cursor during drag, so the user
           can see the scene they're moving before dropping it. The overlay
           is portaled by dnd-kit to document.body, so it doesn't get
-          clipped by the column / grid overflow. */}
-      <DragOverlay dropAnimation={null}>
+          clipped by the column / grid overflow. `snapCenterToCursor`
+          forces the overlay to centre on the pointer (rather than
+          preserving the "where I grabbed" offset, which interacts
+          badly with SortableContext transforms and made the overlay
+          jump leftward on grab). */}
+      <DragOverlay dropAnimation={null} modifiers={[cursorTrackOverlay]}>
         {(() => {
           const s = draggedScene()
           if (!s) return null
@@ -812,6 +911,10 @@ function SequenceTimeline({
   const setSelectedSlot = useStore((s) => s.setSelectedSequenceSlot)
   const selectSlotRange = useStore((s) => s.selectSequenceSlotRange)
   const setFocusedScene = useStore((s) => s.setFocusedScene)
+  // Per-slot duration overrides — used when computing the timeline's
+  // total length so the "Total: 12.5s" readout reflects what
+  // playback will actually take, not just the sum of scene defaults.
+  const slotOverrides = useStore((s) => s.session.sequenceSlotOverrides)
   const occupied = visible
     .map((sceneId, i) => ({ sceneId, i, scene: sceneId ? sceneById(sceneId) : undefined }))
     .filter((e): e is { sceneId: string; i: number; scene: Scene } => !!e.scene)
@@ -822,7 +925,12 @@ function SequenceTimeline({
       </div>
     )
   }
-  const totalSec = occupied.reduce((sum, e) => sum + e.scene.durationSec, 0)
+  const totalSec = occupied.reduce((sum, e) => {
+    const ov = slotOverrides?.[e.i]?.durationSec
+    const dur =
+      ov !== undefined && Number.isFinite(ov) ? ov : e.scene.durationSec
+    return sum + dur
+  }, 0)
   return (
     <div className="flex flex-col gap-2">
       <div className="text-muted text-[10px]">
@@ -882,8 +990,27 @@ function TimelineSegment({
   onClick: (e: React.MouseEvent) => void
   onContextMenu: (e: React.MouseEvent) => void
 }): JSX.Element {
-  const playing = useStore((s) => s.engine.activeSceneId === scene.id)
-  const { remainingMs, progress } = useSceneCountdown(scene.id, scene.durationSec)
+  // Only the source slot (slotIdx === activeSequenceSlotIdx) is
+  // considered "playing" for fill-progress purposes — each timeline
+  // segment is now an independent instance. Earlier behaviour filled
+  // every instance of the playing scene at the same rate, which was
+  // confusing when the same scene appeared in multiple slots.
+  const playing = useStore(
+    (s) =>
+      s.engine.activeSceneId === scene.id &&
+      s.engine.activeSequenceSlotIdx === slotIdx
+  )
+  // Effective duration honours the slot override so the timeline
+  // segment's progress + remaining-time readout match what the
+  // engine's armSceneAdvance is actually counting down to.
+  const overrideDur = useStore(
+    (s) => s.session.sequenceSlotOverrides?.[slotIdx]?.durationSec
+  )
+  const effectiveDur =
+    overrideDur !== undefined && Number.isFinite(overrideDur)
+      ? overrideDur
+      : scene.durationSec
+  const { remainingMs, progress } = useSceneCountdown(scene.id, effectiveDur)
   return (
     <div
       onClick={onClick}
@@ -896,18 +1023,23 @@ function TimelineSegment({
             : ''
       }`}
       style={{
-        flex: scene.durationSec,
+        // Width is proportional to the EFFECTIVE duration — per-slot
+        // override if present, else the scene's default. Lets the same
+        // scene placed twice (one slot overridden longer) show as two
+        // differently-sized timeline segments.
+        flex: effectiveDur,
         background: scene.color + '55',
         borderLeft: `3px solid ${scene.color}`,
         color: 'rgb(var(--c-text))'
       }}
-      title={`${scene.name} — ${scene.durationSec}s (slot ${slotIdx + 1})`}
+      title={`${scene.name} — ${effectiveDur}s (slot ${slotIdx + 1})${
+        overrideDur !== undefined ? ' — slot override' : ''
+      }`}
     >
-      {/* Progress fill — orange wash from left to right while the
-          scene is playing. Shown on EVERY instance of the active
-          scene, not just the source slot, so the user sees the
-          countdown wherever the scene is placed. The accent ring
-          (above) still only marks the source slot. */}
+      {/* Progress fill — orange wash from left to right ONLY on the
+          source slot. Other timeline segments containing the same
+          scene stay blank so the user can see WHERE in the sequence
+          playback currently is. */}
       {playing && (
         <div
           className="absolute left-0 top-0 bottom-0 pointer-events-none"
@@ -919,9 +1051,17 @@ function TimelineSegment({
           aria-hidden
         />
       )}
+      {overrideDur !== undefined && (
+        <span
+          className="absolute top-[2px] left-1 w-1.5 h-1.5 rounded-full z-10"
+          style={{ background: 'rgb(var(--c-accent))' }}
+          title="This slot has its own duration override"
+          aria-hidden
+        />
+      )}
       <span className="relative z-10 truncate">{scene.name}</span>
       <span className="absolute top-[2px] right-1 text-[8px] text-muted tabular-nums z-10">
-        {scene.durationSec}s
+        {effectiveDur}s
       </span>
       {playing && (
         <span className="absolute bottom-[2px] right-1 text-[9px] font-mono tabular-nums text-accent z-10">
@@ -1076,6 +1216,12 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
         )}
       </div>
 
+      {/* Per-slot override editor — shown at the TOP when a sequence
+          slot is selected so the user can find it without scrolling.
+          Hidden otherwise. Lets each placement of the same scene have
+          its own duration + follow action while sharing cells. */}
+      <SlotOverridePanel sceneId={scene.id} nextModes={nextModes} />
+
       <div className="flex items-center gap-2">
         <input
           type="color"
@@ -1197,16 +1343,140 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
   )
 }
 
+// Per-slot override editor. Reads `selectedSequenceSlot` from the
+// store; hides itself when no slot is selected, OR when the selected
+// slot doesn't hold this scene (so the user can't accidentally edit
+// the wrong slot's override). Shows two override fields with
+// "(scene default)" placeholders that the user can fill in to
+// diverge from the scene's own duration / nextMode.
+function SlotOverridePanel({
+  sceneId,
+  nextModes
+}: {
+  sceneId: string
+  nextModes: { id: NextMode; label: string }[]
+}): JSX.Element | null {
+  const selectedSlot = useStore((s) => s.selectedSequenceSlot)
+  const sequence = useStore((s) => s.session.sequence)
+  const overrides = useStore((s) => s.session.sequenceSlotOverrides)
+  const scene = useStore((s) =>
+    s.session.scenes.find((sc) => sc.id === sceneId)
+  )
+  const setOverride = useStore((s) => s.setSequenceSlotOverride)
+  const clearOverride = useStore((s) => s.clearSequenceSlotOverride)
+  if (selectedSlot === null || selectedSlot === undefined) return null
+  // Only show the override editor when the selected slot actually
+  // holds this scene — prevents the panel from being misleading when
+  // the user clicks a slot of a different scene.
+  if (sequence[selectedSlot] !== sceneId) return null
+  if (!scene) return null
+  const current = overrides?.[selectedSlot]
+  const hasOverride = !!current && Object.keys(current).length > 0
+  return (
+    <div
+      className="rounded p-2 flex flex-col gap-2"
+      style={{
+        border: '1px solid rgb(var(--c-accent) / 0.6)',
+        background: 'rgb(var(--c-accent) / 0.08)'
+      }}
+    >
+      <div className="flex items-center justify-between">
+        <span
+          className="label flex items-center gap-1.5"
+          style={{ color: 'rgb(var(--c-accent))' }}
+        >
+          Slot {selectedSlot + 1} override
+          {hasOverride && (
+            <span
+              className="inline-block w-1.5 h-1.5 rounded-full"
+              style={{ background: 'rgb(var(--c-accent))' }}
+              title="This slot has an override"
+            />
+          )}
+        </span>
+        {hasOverride && (
+          <button
+            className="btn text-[10px] py-0.5 px-1.5"
+            onClick={() => clearOverride(selectedSlot)}
+            title="Remove all overrides for this slot — playback falls back to the scene defaults."
+          >
+            Reset to scene
+          </button>
+        )}
+      </div>
+      <div className="text-[10px] text-muted leading-tight">
+        This placement of <b>{scene.name}</b> can override the scene's
+        duration and follow action. Leave a field empty to use the
+        scene's defaults below.
+      </div>
+      <div className="flex items-center gap-3">
+        <div className="flex items-center gap-1.5">
+          <span className="label">Dur</span>
+          <input
+            className="input w-16 text-[12px] py-0.5"
+            type="text"
+            inputMode="numeric"
+            placeholder={String(scene.durationSec)}
+            value={current?.durationSec !== undefined ? String(current.durationSec) : ''}
+            onChange={(e) => {
+              const raw = e.target.value.trim()
+              if (raw === '') {
+                setOverride(selectedSlot, { durationSec: undefined })
+                return
+              }
+              const n = Number(raw)
+              if (!Number.isFinite(n)) return
+              setOverride(selectedSlot, {
+                durationSec: Math.max(0.5, Math.min(300, n))
+              })
+            }}
+            title="Per-slot duration override. Empty = use the scene's default."
+          />
+          <span className="text-muted text-[11px]">s</span>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <span className="label">Next</span>
+          <select
+            className="input text-[12px] py-0.5 min-w-[96px]"
+            value={current?.nextMode ?? ''}
+            onChange={(e) =>
+              setOverride(selectedSlot, {
+                nextMode:
+                  e.target.value === '' ? undefined : (e.target.value as NextMode)
+              })
+            }
+            title="Per-slot follow action override. '(scene default)' = use the scene's nextMode."
+          >
+            <option value="">(scene default: {scene.nextMode})</option>
+            {nextModes.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function SlotCell({
   index,
   scene,
   active,
-  onClear
+  onClear,
+  dragging
 }: {
   index: number
   scene: Scene | undefined
   active: boolean
   onClear?: () => void
+  // True while ANY drag is in progress in the parent DndContext.
+  // Used to suppress the active / selected rings on non-hovered
+  // slots so the drag preview shows only the slot directly under
+  // the cursor.
+  dragging?: boolean
 }): JSX.Element {
   const { setNodeRef: setDropRef, isOver } = useDroppable({ id: `slot-${index}` })
   const {
@@ -1287,7 +1557,21 @@ function SlotCell({
       }
       className={`relative h-12 rounded border text-[10px] flex flex-col items-center justify-center overflow-hidden ${
         isOver ? 'border-accent' : scene ? '' : 'border-border bg-panel/30'
-      } ${active ? 'ring-2 ring-accent' : slotSelected ? 'ring-2 ring-text/40' : ''} ${
+      } ${
+        // Suppress active / selected rings while ANY drag is in
+        // progress — the drop hover (isOver, above) is the only
+        // highlight the user wants to see during drag. Without this
+        // suppression a previously-selected slot 30+ cells away kept
+        // its grey ring, and the currently-playing slot kept its
+        // orange ring, confusing the drop target visually.
+        dragging
+          ? ''
+          : active
+            ? 'ring-2 ring-accent'
+            : slotSelected
+              ? 'ring-2 ring-text/40'
+              : ''
+      } ${
         isDragging ? 'opacity-50' : ''
       } ${
         onClear && scene ? 'cursor-pointer hover:brightness-75' : scene ? 'cursor-grab' : ''
@@ -1296,7 +1580,12 @@ function SlotCell({
     >
       {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none" />}
       {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
-      {scene && <SlotProgressFill scene={scene} />}
+      {scene && <SlotProgressFill scene={scene} slotIdx={index} />}
+      {/* Per-slot override indicator — small accent dot in the
+          top-right corner when this slot has its own duration or
+          follow-action override set. Lets the user see at a glance
+          which placements diverge from the scene's defaults. */}
+      <SlotOverrideDot slotIdx={index} />
       <div className="absolute top-0 left-0.5 text-[8px] text-muted z-10">{index + 1}</div>
       {scene && (
         <div className="font-medium truncate max-w-full px-1 relative z-10">{scene.name}</div>
@@ -1305,17 +1594,71 @@ function SlotCell({
   )
 }
 
-// Live progress fill shown on every slot whose scene is the active
-// scene — paints the pill orange from left to right over the scene's
-// durationSec. Independent of `active` (which is "this is the
-// SOURCE slot"); the fill shows on every visual instance of the
-// playing scene so the user sees what's happening even when they
-// fired the scene from the palette / a follow action and no source
-// slot was tracked. useSceneCountdown is gated on activeSceneId so
-// 100 idle slots cost nothing — only the playing one ticks.
-function SlotProgressFill({ scene }: { scene: Scene }): JSX.Element | null {
-  const playing = useStore((s) => s.engine.activeSceneId === scene.id)
-  const { progress } = useSceneCountdown(scene.id, scene.durationSec)
+// Live progress fill shown ONLY on the source slot — the slot whose
+// index matches the engine's `activeSequenceSlotIdx`. Earlier
+// behaviour filled every visual instance of the playing scene at
+// the same rate, which was confusing when the same scene appeared
+// in multiple slots: both copies filled in sync even though only
+// one was actually driving playback.
+//
+// Now: each slot is an independent instance. The currently-playing
+// slot fills with orange; any other instances of the same scene
+// elsewhere in the sequence stay blank until they become the
+// active source slot.
+//
+// useSceneCountdown is gated on activeSceneId so 100 idle slots
+// cost nothing — only the source slot's progress actually ticks.
+// Tiny accent-coloured dot in the slot's top-right corner. Visible
+// when the slot has a per-slot duration / nextMode override set, so
+// the user sees at a glance which placements diverge from the
+// scene's defaults. Click the slot to inspect/edit the override
+// in the SceneInfoPanel's SlotOverridePanel section.
+function SlotOverrideDot({
+  slotIdx
+}: {
+  slotIdx: number
+}): JSX.Element | null {
+  const override = useStore(
+    (s) => s.session.sequenceSlotOverrides?.[slotIdx]
+  )
+  if (!override) return null
+  const hasFields = Object.keys(override).length > 0
+  if (!hasFields) return null
+  return (
+    <span
+      className="absolute top-[2px] right-[2px] w-1.5 h-1.5 rounded-full z-10 pointer-events-none"
+      style={{ background: 'rgb(var(--c-accent))' }}
+      title={`Override: ${
+        override.durationSec !== undefined ? `${override.durationSec}s` : ''
+      } ${override.nextMode ?? ''}`.trim()}
+      aria-hidden
+    />
+  )
+}
+
+function SlotProgressFill({
+  scene,
+  slotIdx
+}: {
+  scene: Scene
+  slotIdx: number
+}): JSX.Element | null {
+  const playing = useStore(
+    (s) =>
+      s.engine.activeSceneId === scene.id &&
+      s.engine.activeSequenceSlotIdx === slotIdx
+  )
+  // Effective duration: per-slot override if set, else the scene's
+  // default. Matches the engine's armSceneAdvance lookup so the
+  // progress bar fills at the same rate as the actual timer.
+  const overrideDur = useStore(
+    (s) => s.session.sequenceSlotOverrides?.[slotIdx]?.durationSec
+  )
+  const effectiveDur =
+    overrideDur !== undefined && Number.isFinite(overrideDur)
+      ? overrideDur
+      : scene.durationSec
+  const { progress } = useSceneCountdown(scene.id, effectiveDur)
   if (!playing) return null
   return (
     <div

@@ -14,10 +14,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type {
+  MidiBinding,
   MidiErrorEvent,
   MidiSendEvent,
   OscErrorEvent,
-  OscEvent
+  OscEvent,
+  Session
 } from '@shared/types'
 import { useStore } from '../store'
 import PoolPane from './PoolPane'
@@ -83,30 +85,43 @@ let bumpPending = false
 // disposing the previous round's listeners, every reload would
 // double-bind the IPC channels and duplicate every Monitor row.
 // We capture each unsubscribe and run them on `import.meta.hot.dispose`.
+// Trim helper: only splice when the buffer has grown WELL past the
+// cap. Doing splice() on every push was O(rows-removed) per push;
+// letting the buffer overshoot to ~2× before trimming amortises one
+// splice across MAX_ROWS additions, turning the steady-state work
+// from O(n) per push to O(1) per push (with an occasional O(n)
+// trim). Display path uses `oscBuffer.slice(-MAX_ROWS)` when reading
+// to keep the visual cap at MAX_ROWS.
+const BUF_HIGH_WATERMARK = MAX_ROWS * 2
+function trimBuffer<T>(buf: T[]): void {
+  if (buf.length >= BUF_HIGH_WATERMARK) {
+    buf.splice(0, buf.length - MAX_ROWS)
+  }
+}
 const ipcOffFns: Array<() => void> = []
 if (typeof window !== 'undefined' && window.api) {
   const offOsc = window.api.onOscEvents?.((batch) => {
     if (bufferPaused) return
     for (const e of batch) oscBuffer.push({ kind: 'ok', ...e })
-    if (oscBuffer.length > MAX_ROWS) oscBuffer.splice(0, oscBuffer.length - MAX_ROWS)
+    trimBuffer(oscBuffer)
     scheduleBump()
   })
   const offOscErr = window.api.onOscErrors?.((batch) => {
     if (bufferPaused) return
     for (const e of batch) oscBuffer.push({ kind: 'err', ...e })
-    if (oscBuffer.length > MAX_ROWS) oscBuffer.splice(0, oscBuffer.length - MAX_ROWS)
+    trimBuffer(oscBuffer)
     scheduleBump()
   })
   const offMidi = window.api.onMidiEvents?.((batch) => {
     if (bufferPaused) return
     for (const e of batch) midiBuffer.push({ rowKind: 'ok', ...e })
-    if (midiBuffer.length > MAX_ROWS) midiBuffer.splice(0, midiBuffer.length - MAX_ROWS)
+    trimBuffer(midiBuffer)
     scheduleBump()
   })
   const offMidiErr = window.api.onMidiErrors?.((batch) => {
     if (bufferPaused) return
     for (const e of batch) midiBuffer.push({ rowKind: 'err', ...e })
-    if (midiBuffer.length > MAX_ROWS) midiBuffer.splice(0, midiBuffer.length - MAX_ROWS)
+    trimBuffer(midiBuffer)
     scheduleBump()
   })
   if (offOsc) ipcOffFns.push(offOsc)
@@ -237,6 +252,246 @@ function clampColWidth(v: unknown, fallback: number): number {
   return fallback
 }
 
+// ── Learned MIDI bindings panel — types + helpers ───────────────────
+// Persisted width of the Learned column (px). Defaults to 180 — narrow
+// enough not to crowd the OSC/MIDI logs but wide enough for "CC NN
+// ch NN" plus the Edit/X buttons. User can drag wider up to 600.
+const LEARNED_COL_KEY = 'dataflou:monitor:learnedColPx:v1'
+const LEARNED_COL_MIN = 140
+const LEARNED_COL_MAX = 600
+const LEARNED_COL_DEFAULT = 180
+function loadLearnedColPx(): number {
+  try {
+    const raw = localStorage.getItem(LEARNED_COL_KEY)
+    if (raw) {
+      const n = Number(raw)
+      if (Number.isFinite(n) && n >= LEARNED_COL_MIN && n <= LEARNED_COL_MAX)
+        return Math.round(n)
+    }
+  } catch {
+    /* ignore */
+  }
+  return LEARNED_COL_DEFAULT
+}
+
+// One row in the Learned panel. `editTarget` is what we pass to
+// setMidiLearnTarget when the user clicks Edit — re-learning rebinds.
+// `onDelete` is a tiny lambda that calls the appropriate clear
+// action; this avoids a giant switch at render time.
+type LearnedBinding = {
+  id: string
+  label: string
+  source: string // sub-label: 'Scene', 'Clip', 'Meta', 'Cue GO', etc.
+  binding: MidiBinding
+  editTarget:
+    | { kind: 'scene'; id: string }
+    | { kind: 'cell'; sceneId: string; trackId: string }
+    | { kind: 'metaKnob'; index: number }
+    | { kind: 'instrument'; sceneId: string; templateRowId: string }
+    | { kind: 'go' }
+    | { kind: 'morphTime' }
+    | null
+  onDelete: () => void
+  // Apply a manually-edited binding (note/CC number and channel can
+  // both be typed inline). Lets the user fix typos or pick a precise
+  // CC number without going through a learn pass. Each call updates
+  // the appropriate store binding for this row's source.
+  onUpdate: (next: MidiBinding) => void
+}
+
+// Walk the session and enumerate every MIDI binding that's currently
+// set. Returns rows ready for display, with edit/delete handlers
+// bound to the right store actions. Sort: transport first, then
+// metas, then scenes (and within scenes: scene-fire → instrument →
+// per-clip), so the list reads top-down from "global controls" to
+// "specific clip triggers."
+function collectLearnedBindings(
+  session: Session,
+  trackNameById: Record<string, string>,
+  templateNameById: Record<string, string>,
+  store: {
+    setSceneMidi: (id: string, b: MidiBinding | undefined) => void
+    setInstrumentTriggerMidi: (
+      sceneId: string,
+      templateRowId: string,
+      b: MidiBinding | undefined
+    ) => void
+    updateCell: (
+      sceneId: string,
+      trackId: string,
+      patch: { midiTrigger?: MidiBinding | undefined }
+    ) => void
+    setGoMidi: (b: MidiBinding | undefined) => void
+    setMorphTimeMidi: (b: MidiBinding | undefined) => void
+    setMetaKnobMidi: (knobIdx: number, binding: MidiBinding | null) => void
+  }
+): LearnedBinding[] {
+  const out: LearnedBinding[] = []
+  // Transport.
+  if (session.goMidi) {
+    out.push({
+      id: 'transport-go',
+      label: 'Cue GO',
+      source: 'Transport',
+      binding: session.goMidi,
+      editTarget: { kind: 'go' },
+      onDelete: () => store.setGoMidi(undefined),
+      onUpdate: (next) => store.setGoMidi(next)
+    })
+  }
+  if (session.morphTimeMidi) {
+    out.push({
+      id: 'transport-morph',
+      label: 'Morph time',
+      source: 'Transport',
+      binding: session.morphTimeMidi,
+      editTarget: { kind: 'morphTime' },
+      onDelete: () => store.setMorphTimeMidi(undefined),
+      onUpdate: (next) => store.setMorphTimeMidi(next)
+    })
+  }
+  // Meta knobs.
+  session.metaController?.knobs?.forEach((knob, idx) => {
+    if (!knob.midiCc) return
+    out.push({
+      id: `meta-knob-${idx}`,
+      label: knob.name?.trim() || `Knob ${idx + 1}`,
+      source: 'Meta knob',
+      binding: knob.midiCc,
+      editTarget: { kind: 'metaKnob', index: idx },
+      onDelete: () => store.setMetaKnobMidi(idx, null),
+      onUpdate: (next) => store.setMetaKnobMidi(idx, next)
+    })
+  })
+  // Per-scene bindings (fire, instrument-fire, per-clip).
+  for (const scene of session.scenes) {
+    if (scene.midiTrigger) {
+      out.push({
+        id: `scene-${scene.id}`,
+        label: scene.name || '(unnamed)',
+        source: 'Scene',
+        binding: scene.midiTrigger,
+        editTarget: { kind: 'scene', id: scene.id },
+        onDelete: () => store.setSceneMidi(scene.id, undefined),
+        onUpdate: (next) => store.setSceneMidi(scene.id, next)
+      })
+    }
+    if (scene.instrumentTriggers) {
+      for (const [templateRowId, binding] of Object.entries(
+        scene.instrumentTriggers
+      )) {
+        out.push({
+          id: `instr-${scene.id}-${templateRowId}`,
+          label: `${scene.name} / ${templateNameById[templateRowId] ?? '(?)'}`,
+          source: 'Instrument',
+          binding,
+          editTarget: {
+            kind: 'instrument',
+            sceneId: scene.id,
+            templateRowId
+          },
+          onDelete: () =>
+            store.setInstrumentTriggerMidi(scene.id, templateRowId, undefined),
+          onUpdate: (next) =>
+            store.setInstrumentTriggerMidi(scene.id, templateRowId, next)
+        })
+      }
+    }
+    for (const [trackId, cell] of Object.entries(scene.cells)) {
+      if (!cell.midiTrigger) continue
+      out.push({
+        id: `cell-${scene.id}-${trackId}`,
+        label: `${scene.name} / ${trackNameById[trackId] ?? '(?)'}`,
+        source: 'Clip',
+        binding: cell.midiTrigger,
+        editTarget: { kind: 'cell', sceneId: scene.id, trackId },
+        onDelete: () =>
+          store.updateCell(scene.id, trackId, { midiTrigger: undefined }),
+        onUpdate: (next) =>
+          store.updateCell(scene.id, trackId, { midiTrigger: next })
+      })
+    }
+  }
+  return out
+}
+
+// Pretty-print a MIDI binding: "CC#43 ch3" or "C4 ch1". Channel is
+// stored 0..15 in the binding; UI is 1..16.
+function formatBinding(b: MidiBinding): string {
+  const ch = `ch${b.channel + 1}`
+  if (b.kind === 'cc') return `CC ${b.number} ${ch}`
+  // Note name: C-2..G8 via the standard "MIDI 60 = C4" convention.
+  const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+  const safe = Math.max(0, Math.min(127, b.number))
+  const name = NAMES[safe % 12] + (Math.floor(safe / 12) - 1)
+  return `${name} ${ch}`
+}
+
+// Inline editor for a single Learned binding's note/CC number and
+// channel. Used in the Learned panel when a row is in edit mode.
+// kind toggle (CC / Note), number 0..127, channel 1..16 (display
+// is 1..16, storage 0..15). Each change immediately calls onChange
+// with the new binding — no commit button needed; the parent persists
+// to the appropriate store binding setter.
+function LearnedBindingInlineEditor({
+  binding,
+  onChange
+}: {
+  binding: MidiBinding
+  onChange: (next: MidiBinding) => void
+}): JSX.Element {
+  return (
+    <span className="flex items-center gap-1 font-mono">
+      <select
+        className="input text-[9px] py-0 px-1"
+        value={binding.kind}
+        onChange={(e) =>
+          onChange({ ...binding, kind: e.target.value as 'note' | 'cc' })
+        }
+        title="Binding kind — CC (continuous controller) or Note (key)"
+      >
+        <option value="cc">CC</option>
+        <option value="note">N</option>
+      </select>
+      <input
+        type="number"
+        className="input text-[9px] py-0 px-1 tabular-nums"
+        style={{ width: 44 }}
+        min={0}
+        max={127}
+        value={binding.number}
+        onChange={(e) => {
+          const n = Number(e.target.value)
+          if (!Number.isFinite(n)) return
+          onChange({
+            ...binding,
+            number: Math.max(0, Math.min(127, Math.round(n)))
+          })
+        }}
+        title={binding.kind === 'cc' ? 'CC number (0..127)' : 'Note number (0..127, 60 = C4)'}
+      />
+      <span className="text-muted text-[9px]">ch</span>
+      <input
+        type="number"
+        className="input text-[9px] py-0 px-1 tabular-nums"
+        style={{ width: 32 }}
+        min={1}
+        max={16}
+        value={binding.channel + 1}
+        onChange={(e) => {
+          const n = Number(e.target.value)
+          if (!Number.isFinite(n)) return
+          onChange({
+            ...binding,
+            channel: Math.max(0, Math.min(15, Math.round(n) - 1))
+          })
+        }}
+        title="MIDI channel (1..16)"
+      />
+    </span>
+  )
+}
+
 export default function OscMonitor(): JSX.Element | null {
   const open = useStore((s) => s.oscMonitorOpen)
   const setOpen = useStore((s) => s.setOscMonitorOpen)
@@ -322,6 +577,27 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   const [poolWidthPx, setPoolWidthPxState] = useState<number>(() =>
     loadPoolWidthPx()
   )
+  // Outer pane-row ref — used to measure available width so the Pool's
+  // resize max can be clamped dynamically against the Learned panel +
+  // a min Monitor area. Without this clamp the user can drag the Pool
+  // wide enough that the Learned panel (flex 0 0 Npx) overflows behind
+  // it — visible in the screenshot the user posted.
+  const paneRowRef = useRef<HTMLDivElement | null>(null)
+  const [paneRowWidth, setPaneRowWidth] = useState<number>(0)
+  useEffect(() => {
+    const el = paneRowRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) {
+        const w = e.contentRect.width
+        if (Number.isFinite(w)) setPaneRowWidth(Math.round(w))
+      }
+    })
+    ro.observe(el)
+    // Prime immediately so the first paint has a measurement.
+    setPaneRowWidth(Math.round(el.getBoundingClientRect().width))
+    return () => ro.disconnect()
+  }, [])
   function setPoolWidthPx(v: number): void {
     const clamped = Math.max(200, Math.min(1200, v))
     setPoolWidthPxState(clamped)
@@ -360,6 +636,69 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
       return next
     })
   }
+  // ── Learned bindings panel ────────────────────────────────────────
+  // Read everything we need from the session up front; recompute the
+  // binding list whenever the session changes via useMemo. Persisted
+  // width so the user's preferred Learned column size survives the
+  // drawer being closed + reopened.
+  const session = useStore((s) => s.session)
+  const setMidiLearnMode = useStore((s) => s.setMidiLearnMode)
+  const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
+  const setSceneMidi = useStore((s) => s.setSceneMidi)
+  const setInstrumentTriggerMidi = useStore((s) => s.setInstrumentTriggerMidi)
+  const updateCellStore = useStore((s) => s.updateCell)
+  const setGoMidi = useStore((s) => s.setGoMidi)
+  const setMorphTimeMidi = useStore((s) => s.setMorphTimeMidi)
+  const setMetaKnobMidi = useStore((s) => s.setMetaKnobMidi)
+  const [learnedColPx, setLearnedColPxState] = useState<number>(() =>
+    loadLearnedColPx()
+  )
+  // Which Learned-row is currently in inline-edit mode. Click "Edit"
+  // on a row to enter (toggles MIDI Learn on with this binding as
+  // the target — so wiggling a MIDI control rebinds). Click again
+  // to exit (turns Learn off). While editing, the binding's
+  // CC/Note number + channel can be typed manually instead of
+  // waiting for a MIDI message.
+  const [editingBindingId, setEditingBindingId] = useState<string | null>(
+    null
+  )
+  function setLearnedColPx(v: number): void {
+    const clamped = Math.max(LEARNED_COL_MIN, Math.min(LEARNED_COL_MAX, Math.round(v)))
+    setLearnedColPxState(clamped)
+    try {
+      localStorage.setItem(LEARNED_COL_KEY, String(clamped))
+    } catch {
+      /* ignore */
+    }
+  }
+  const learnedBindings = useMemo(() => {
+    const trackNames: Record<string, string> = {}
+    session.tracks.forEach((t) => {
+      trackNames[t.id] = t.name
+    })
+    const templateNames: Record<string, string> = {}
+    session.tracks.forEach((t) => {
+      if (t.kind === 'template') templateNames[t.id] = t.name
+    })
+    return collectLearnedBindings(session, trackNames, templateNames, {
+      setSceneMidi: (id, b) => setSceneMidi(id, b),
+      setInstrumentTriggerMidi: (sceneId, templateRowId, b) =>
+        setInstrumentTriggerMidi(sceneId, templateRowId, b),
+      updateCell: (sceneId, trackId, patch) =>
+        updateCellStore(sceneId, trackId, patch),
+      setGoMidi: (b) => setGoMidi(b),
+      setMorphTimeMidi: (b) => setMorphTimeMidi(b),
+      setMetaKnobMidi: (knobIdx, b) => setMetaKnobMidi(knobIdx, b)
+    })
+  }, [
+    session,
+    setSceneMidi,
+    setInstrumentTriggerMidi,
+    updateCellStore,
+    setGoMidi,
+    setMorphTimeMidi,
+    setMetaKnobMidi
+  ])
   // Buffers live at module scope (top of this file) so closing +
   // reopening the drawer keeps the captured history visible. We just
   // re-render this component on every coalesced bump via the
@@ -376,6 +715,85 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   useEffect(() => {
     bufferPaused = paused
   }, [paused])
+
+  // ── Pool max width clamp ────────────────────────────────────────
+  // The pane row holds: [Monitor (flex-1)] | [ResizeHandle 4px] |
+  // [Learned (optional, fixed)] | [ResizeHandle 4px] | [Pool (fixed)].
+  // Compute the largest Pool width that still leaves a usable Monitor
+  // pane (MIN_MONITOR px) when Learned is visible. Without this the
+  // Pool could be dragged so wide that the Learned panel overflowed
+  // behind it.
+  const learnedVisible = learnedBindings.length > 0 && showMidi
+  const MIN_MONITOR = 220
+  const RESIZE_HANDLE_PX = 4
+  const effectivePoolMax = useMemo(() => {
+    if (paneRowWidth <= 0) return 1200
+    const reserved =
+      MIN_MONITOR +
+      RESIZE_HANDLE_PX + // between Pool and (Monitor or Learned)
+      (learnedVisible ? learnedColPx + RESIZE_HANDLE_PX : 0)
+    return Math.max(200, Math.min(1200, paneRowWidth - reserved))
+  }, [paneRowWidth, learnedVisible, learnedColPx])
+  // If the effective max shrinks (e.g. window resized smaller, or
+  // Learned panel appeared), shrink the stored pool width to match
+  // so the layout never breaks. This is the clamp the user actually
+  // sees: dragging the resize bar can't push past effectivePoolMax,
+  // and an unrelated viewport shrink retroactively narrows the Pool.
+  useEffect(() => {
+    if (poolWidthPx > effectivePoolMax) {
+      setPoolWidthPx(effectivePoolMax)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectivePoolMax])
+
+  // ── OSC column max width clamp ───────────────────────────────────
+  // Same idea as `effectivePoolMax` but for the OSC ↔ MIDI resize
+  // handle. The Monitor pane's interior is partitioned:
+  //   [OSC fixed-px] | [4px handle] | [MIDI flex] | ([4px handle] |
+  //                                                 [Learned fixed-px])?
+  // Without a dynamic cap the OSC col could be widened past Pane 1
+  // until the MIDI + Learned cols got pushed behind the Pool.
+  const MIN_MIDI = 200
+  const OSC_MIN = 160
+  const effectiveOscMax = useMemo(() => {
+    if (paneRowWidth <= 0) return 1600
+    const pane1Width =
+      paneRowWidth - (poolHidden ? 0 : poolWidthPx + RESIZE_HANDLE_PX)
+    const reserved =
+      MIN_MIDI +
+      RESIZE_HANDLE_PX + // OSC/MIDI handle
+      (learnedVisible ? learnedColPx + RESIZE_HANDLE_PX : 0)
+    return Math.max(OSC_MIN, Math.min(1600, pane1Width - reserved))
+  }, [paneRowWidth, poolHidden, poolWidthPx, learnedVisible, learnedColPx])
+  useEffect(() => {
+    if (oscColPx > effectiveOscMax) {
+      setOscColPx(effectiveOscMax)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveOscMax])
+
+  // ── Learned column max width clamp ───────────────────────────────
+  // Same pattern: limit Learned so OSC + handle + MIN_MIDI + handle
+  // + Learned + handle + Pool all fit inside paneRowWidth. Without
+  // it, dragging Learned wider would push its right edge (Edit / X
+  // buttons) past Pane 1's overflow-hidden boundary and the buttons
+  // would slip behind the Pool.
+  const effectiveLearnedMax = useMemo(() => {
+    if (paneRowWidth <= 0) return LEARNED_COL_MAX
+    const reserved =
+      (poolHidden ? 0 : poolWidthPx + RESIZE_HANDLE_PX) +
+      OSC_MIN +
+      RESIZE_HANDLE_PX + // OSC/MIDI handle
+      MIN_MIDI +
+      RESIZE_HANDLE_PX // MIDI/Learned handle
+    return Math.max(LEARNED_COL_MIN, Math.min(LEARNED_COL_MAX, paneRowWidth - reserved))
+  }, [paneRowWidth, poolHidden, poolWidthPx])
+  useEffect(() => {
+    if (learnedColPx > effectiveLearnedMax) {
+      setLearnedColPx(effectiveLearnedMax)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveLearnedMax])
 
   // Subscribe to module-scope bump notifications so the component
   // re-renders when new batches arrive. The actual IPC listeners
@@ -426,9 +844,13 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   }
 
   const rows = useMemo(() => {
-    if (!filter.trim()) return oscBuffer
+    // Cap the visible window at MAX_ROWS even when the underlying
+    // buffer overshoots to BUF_HIGH_WATERMARK before being trimmed.
+    // `slice(-MAX_ROWS)` is O(MAX_ROWS) and only fires on bump.
+    const view = oscBuffer.length > MAX_ROWS ? oscBuffer.slice(-MAX_ROWS) : oscBuffer
+    if (!filter.trim()) return view
     const f = filter.trim().toLowerCase()
-    return oscBuffer.filter(
+    return view.filter(
       (e) =>
         e.address.toLowerCase().includes(f) ||
         `${e.ip}:${e.port}`.includes(f)
@@ -442,9 +864,10 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // name, the message kind, or "ch N" — same UX as OSC's ip:port +
   // address filter but adapted to the MIDI fields.
   const midiRows = useMemo(() => {
-    if (!filter.trim()) return midiBuffer
+    const view = midiBuffer.length > MAX_ROWS ? midiBuffer.slice(-MAX_ROWS) : midiBuffer
+    if (!filter.trim()) return view
     const f = filter.trim().toLowerCase()
-    return midiBuffer.filter((e) => {
+    return view.filter((e) => {
       if (e.portName.toLowerCase().includes(f)) return true
       if (`ch${e.channel}`.toLowerCase().includes(f)) return true
       if (e.rowKind === 'ok') {
@@ -489,13 +912,22 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
           ResizeHandle sits on the boundary so the user can pull the
           Pool narrower (giving the Monitor toolbar more room — its
           buttons must always be visible) or wider. */}
-      <div className="flex-1 min-h-0 flex relative">
-        {/* Pane 1 — Monitor (OSC + MIDI in parallel columns). */}
-        <div className="flex flex-col min-h-0 border-r border-border flex-1 min-w-0">
+      <div ref={paneRowRef} className="flex-1 min-h-0 flex relative">
+        {/* Pane 1 — Monitor (OSC + MIDI in parallel columns).
+            `overflow-hidden` is the hard cap that keeps the MIDI /
+            Learned columns from bleeding rightward into the Pool when
+            the user enlarges the window — without it, the OSC column's
+            fixed-px width + the MIDI column's flex-grow could push
+            past Pane 1's right edge if the inner content's intrinsic
+            min-width exceeded the allotted space. */}
+        <div className="flex flex-col min-h-0 border-r border-border flex-1 min-w-0 overflow-hidden">
           {/* Single combined toolbar. Order:
               ✕ close · Monitor label · OSC + MIDI checkboxes ·
-              counts · filter · Live · Clear. */}
-          <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0">
+              counts · filter · Live · Clear.
+              `min-h-[28px]` keeps this row's height locked to the
+              Pool title bar's height so the two toolbars sit on the
+              same visual line (per the "uniformize toolbar" request). */}
+          <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0 min-h-[28px]">
             <button
               className="btn text-[11px] py-0 leading-tight px-1.5 shrink-0"
               onClick={onClose}
@@ -564,8 +996,12 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
           {/* Dual-column body. When both columns are visible, the
               OSC column takes `oscColFrac` of the width and the MIDI
               column gets the rest — split by a vertical ResizeHandle.
-              When only one column is on, it takes the full width. */}
-          <div className="flex-1 min-h-0 flex relative">
+              When only one column is on, it takes the full width.
+              `min-w-0` lets the flex children shrink below their
+              intrinsic content width so MIDI/Learned can't push past
+              Pane 1's boundary (which is anchored to Pool's left
+              edge). */}
+          <div className="flex-1 min-h-0 min-w-0 flex relative">
             {showOsc && (
               <div
                 className="flex flex-col min-h-0"
@@ -578,7 +1014,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                     edges. Drag a label's right edge to widen / narrow
                     that column. All log rows below pick up the same
                     widths. */}
-                <div className="flex gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none">
+                <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
                   <ColHeader
                     label="time"
                     width={oscCols.time}
@@ -672,7 +1108,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                 value={oscColPx}
                 onChange={setOscColPx}
                 min={160}
-                max={1600}
+                max={effectiveOscMax}
                 className="w-[4px] cursor-col-resize z-10 bg-border/40 hover:bg-accent/40"
                 title="Drag to resize OSC vs MIDI columns"
               />
@@ -680,7 +1116,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
             {showMidi && (
               <div className="flex flex-col min-h-0" style={{ flex: '1 1 0' }}>
                 {/* MIDI header — same per-column resize pattern as OSC. */}
-                <div className="flex gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none">
+                <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
                   <ColHeader
                     label="time"
                     width={midiCols.time}
@@ -784,6 +1220,127 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                 Both columns are hidden — toggle OSC or MIDI in the toolbar above to view traffic.
               </div>
             )}
+            {/* "Learned" panel — far right of the MIDI Monitor. Only
+                rendered when (a) at least one MIDI binding exists in
+                the session AND (b) the MIDI column toolbar checkbox
+                is on (no point showing learned MIDI bindings when
+                the user has hidden MIDI traffic entirely). Resizable
+                via the ResizeHandle on its left edge. Lists every
+                binding with its source label, CC/Note + channel, and
+                edit / delete buttons. Width persists via
+                localStorage. */}
+            {learnedBindings.length > 0 && showMidi && (
+              <>
+                <ResizeHandle
+                  direction="col"
+                  value={learnedColPx}
+                  onChange={setLearnedColPx}
+                  min={LEARNED_COL_MIN}
+                  max={effectiveLearnedMax}
+                  inverse
+                  className="shrink-0 w-[4px] bg-border/30 hover:bg-accent cursor-col-resize"
+                  title="Drag to resize Learned panel"
+                />
+                <div
+                  className="flex flex-col min-h-0"
+                  style={{ flex: `0 0 ${learnedColPx}px` }}
+                >
+                  <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
+                    <span className="font-semibold text-text">Learned</span>
+                    <span className="text-muted">
+                      {learnedBindings.length} binding
+                      {learnedBindings.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]">
+                    {learnedBindings.map((b) => {
+                      const isEditing = editingBindingId === b.id
+                      return (
+                        <div
+                          key={b.id}
+                          className={`flex items-center gap-1 px-2 py-[2px] group ${
+                            isEditing ? 'bg-accent/10' : 'hover:bg-panel2'
+                          }`}
+                        >
+                          <div className="flex flex-col min-w-0 flex-1">
+                            <span className="truncate text-text" title={b.label}>
+                              {b.label}
+                            </span>
+                            <span className="text-[9px] text-muted flex items-center gap-1">
+                              <span className="uppercase tracking-wider">
+                                {b.source}
+                              </span>
+                              <span>·</span>
+                              {isEditing ? (
+                                <LearnedBindingInlineEditor
+                                  binding={b.binding}
+                                  onChange={b.onUpdate}
+                                />
+                              ) : (
+                                <span className="text-accent">
+                                  {formatBinding(b.binding)}
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                          <button
+                            className={`btn text-[9px] py-0 px-1 ${
+                              isEditing
+                                ? 'bg-accent text-black border-accent'
+                                : 'opacity-50 group-hover:opacity-100'
+                            }`}
+                            title={
+                              isEditing
+                                ? 'Exit edit mode — disables MIDI Learn for this binding.'
+                                : 'Toggle edit mode — turns MIDI Learn on (wiggle a control to rebind) AND lets you type the note/CC + channel directly.'
+                            }
+                            onClick={() => {
+                              if (isEditing) {
+                                // Exit — clear edit state + clear learn
+                                // target + turn learn mode off.
+                                setEditingBindingId(null)
+                                setMidiLearnTarget(null)
+                                setMidiLearnMode(false)
+                              } else {
+                                // Enter — set this binding as the learn
+                                // target (so a MIDI wiggle still rebinds)
+                                // AND arm the inline editor for manual
+                                // entry.
+                                setEditingBindingId(b.id)
+                                if (b.editTarget) setMidiLearnTarget(b.editTarget)
+                                setMidiLearnMode(true)
+                              }
+                            }}
+                          >
+                            {isEditing ? 'Done' : 'Edit'}
+                          </button>
+                          <button
+                            className="btn text-[9px] py-0 px-1 opacity-50 group-hover:opacity-100"
+                            style={{
+                              color: 'rgb(var(--c-danger))',
+                              borderColor: 'rgb(var(--c-danger))'
+                            }}
+                            title="Delete this MIDI binding (the bound trigger / knob stays — just the MIDI link is removed)"
+                            onClick={() => {
+                              // Clear edit mode for this row if we
+                              // happen to be editing it when deleted.
+                              if (editingBindingId === b.id) {
+                                setEditingBindingId(null)
+                                setMidiLearnTarget(null)
+                                setMidiLearnMode(false)
+                              }
+                              b.onDelete()
+                            }}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -804,7 +1361,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
               value={poolWidthPx}
               onChange={setPoolWidthPx}
               min={200}
-              max={1200}
+              max={effectivePoolMax}
               inverse
               className="w-[4px] cursor-col-resize z-10 -mr-[2px] -ml-[2px]"
               title="Drag to resize the Pool · narrower Pool = more room for the Monitor toolbar"

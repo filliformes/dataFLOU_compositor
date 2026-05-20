@@ -428,6 +428,20 @@ export class OscNetworkListener {
     })
   }
 
+  // Optional per-message hook fired BEFORE the device-map update.
+  // Used by the engine for Hardware Mode to react to every OSC
+  // packet in real time (no 50ms flush latency). The hook receives
+  // only numeric arg values — strings/blobs are stripped so the
+  // engine doesn't have to mass-coerce on the hot path.
+  private onMessageHook:
+    | ((ip: string, port: number, address: string, numericArgs: number[]) => void)
+    | null = null
+  setOnMessage(
+    fn: (ip: string, port: number, address: string, numericArgs: number[]) => void
+  ): void {
+    this.onMessageHook = fn
+  }
+
   private observe(
     ip: string,
     port: number,
@@ -439,6 +453,26 @@ export class OscNetworkListener {
     // mutating the device map after the user has explicitly stopped
     // listening.
     if (!this.enabled) return
+    // Fire the per-message hook FIRST so Hardware Mode reacts at the
+    // packet's actual arrival time, not at the 50ms device-map
+    // flush cadence. Engine handler is responsible for its own
+    // filtering (per-template ip:port match + per-slot lock).
+    if (this.onMessageHook) {
+      // Extract just numeric values into a flat array. Trill /
+      // pots / faders are float; switches are int. Anything else
+      // (strings like the OCTOCOSME IP prefix) becomes NaN which
+      // the engine treats as non-finite and skips.
+      const nums: number[] = msg.args.map((a) =>
+        typeof a.value === 'number'
+          ? a.value
+          : typeof a.value === 'boolean'
+            ? a.value
+              ? 1
+              : 0
+            : Number.NaN
+      )
+      this.onMessageHook(ip, port, msg.address, nums)
+    }
     const key = `${ip}:${port}`
     const now = Date.now()
     let dev = this.devices.get(key)

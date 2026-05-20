@@ -20,7 +20,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useStore } from '../store'
-import { useHeaderHeight } from './EditView'
+import { compactRowHeightForTrack, useHeaderHeight } from './EditView'
 import { ResizeHandle } from './ResizeHandle'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import {
@@ -310,7 +310,14 @@ export default function TrackSidebar(): JSX.Element {
 
       {tracks.map((t) => {
         const isSelected = selectedTrackIds.includes(t.id)
-        const effectiveRowH = tracksCollapsed ? 32 : rowHeight
+        // Per-track row height in compact mode — grows when the
+        // parameter has more args than fit in a single 4-col grid
+        // row so the cell side can render its full value list
+        // instead of being clipped. Non-collapsed mode keeps the
+        // global rowHeight (driven by the slider).
+        const effectiveRowH = tracksCollapsed
+          ? compactRowHeightForTrack(t.argSpec)
+          : rowHeight
         const isTemplate = t.kind === 'template'
         // A track is "effectively disabled" when its own enabled flag
         // is false OR its parent Template's flag is false. Children
@@ -391,20 +398,31 @@ export default function TrackSidebar(): JSX.Element {
               setMenu({ x: e.clientX, y: e.clientY, targets, anchorTrackId: t.id })
             }}
           >
-            <UncontrolledTextInput
-              className={`input ${
-                tracksCollapsed
-                  ? 'text-[11px] py-0.5 flex-1'
-                  : isTemplate
-                    ? 'text-[12px] font-bold'
-                    : 'text-[12px] font-medium'
-              }`}
-              value={t.name}
-              onClick={(e) => e.stopPropagation()}
-              onMouseDown={(e) => e.stopPropagation()}
-              onChange={(v) => renameTrack(t.id, v)}
-              placeholder={isTemplate ? 'Template name' : 'Parameter name'}
-            />
+            <div className="flex items-center gap-1">
+              <UncontrolledTextInput
+                className={`input flex-1 min-w-0 ${
+                  tracksCollapsed
+                    ? 'text-[11px] py-0.5'
+                    : isTemplate
+                      ? 'text-[12px] font-bold'
+                      : 'text-[12px] font-medium'
+                }`}
+                value={t.name}
+                onClick={(e) => e.stopPropagation()}
+                onMouseDown={(e) => e.stopPropagation()}
+                onChange={(v) => renameTrack(t.id, v)}
+                placeholder={isTemplate ? 'Template name' : 'Parameter name'}
+              />
+              {/* Hardware Mode caught indicator — small red dot to the
+                  right of the Parameter name when ANY of that track's
+                  arg slots is currently caught (i.e. the hardware
+                  control has matched the scene's value and is now
+                  overriding it). Per user request: "add a little red
+                  dot next to the name of the caught parameter." Only
+                  meaningful on Function rows; Template rows already
+                  show the "HW Mode On" badge below. */}
+              {!isTemplate && <TrackHwCaughtDot trackId={t.id} />}
+            </div>
             {/* TEMPLATE label + +PARAM trigger share the baseline
                 row under the name input. Both use text-[9px] so they
                 read as one strip. The trigger keeps a button outline
@@ -412,7 +430,23 @@ export default function TrackSidebar(): JSX.Element {
                 clickable, but stays the same height as the label. */}
             {isTemplate && !tracksCollapsed && (
               <div className="flex items-center justify-between text-[9px] text-muted leading-none -mt-0.5">
-                <span>TEMPLATE</span>
+                <span className="flex items-center gap-2">
+                  <span>TEMPLATE</span>
+                  {/* Hardware Mode active badge — visible in red right
+                      under the Instrument's name when its Pool template
+                      has hardwareMode.enabled. Per user request: "HW
+                      Mode On should appear under the Instruments' name,
+                      in the grid, in red." */}
+                  {tplForColor?.hardwareMode?.enabled && (
+                    <span
+                      className="font-bold"
+                      style={{ color: 'rgb(var(--c-danger))' }}
+                      title={`Hardware Mode bound to ${tplForColor.hardwareMode.deviceIp}:${tplForColor.hardwareMode.devicePort}`}
+                    >
+                      HW Mode On
+                    </span>
+                  )}
+                </span>
                 <button
                   data-hide-in-show="true"
                   className="text-[9px] leading-none px-1 py-[1px] rounded-sm border border-border text-muted hover:text-text hover:border-text"
@@ -597,5 +631,30 @@ export default function TrackSidebar(): JSX.Element {
           document.body
         )}
     </div>
+  )
+}
+
+// Hardware Mode catch indicator for a Parameter row. Subscribes to
+// engine.hardwareCaught (a flat Record<string, true> keyed by
+// `${trackId}|${slotIdx}`) and renders a small red dot to the right
+// of the Parameter name when at least one slot is currently caught.
+// Pulses subtly so it's visible at a glance during a performance.
+function TrackHwCaughtDot({ trackId }: { trackId: string }): JSX.Element | null {
+  // Single O(1) lookup — engine pre-buckets hardwareCaught by trackId
+  // so we don't have to scan every key looking for a prefix match.
+  // Selector returns a boolean so Zustand's Object.is equality skips
+  // re-renders when the catch state didn't actually change.
+  const anyCaught = useStore((s) => {
+    const arr = s.engine.hardwareCaughtByTrack?.[trackId]
+    return !!arr && arr.length > 0
+  })
+  if (!anyCaught) return null
+  return (
+    <span
+      className="inline-block w-2 h-2 rounded-full shrink-0 animate-pulse"
+      style={{ background: 'rgb(var(--c-danger))' }}
+      title="Hardware Mode is overriding at least one arg slot of this Parameter."
+      aria-hidden
+    />
   )
 }

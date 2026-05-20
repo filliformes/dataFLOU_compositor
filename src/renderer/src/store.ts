@@ -25,6 +25,7 @@ import type {
   SeqMode,
   SeqSyncMode,
   SequencerParams,
+  SequenceSlotOverride,
   Session,
   Track,
   TrackKind
@@ -487,6 +488,13 @@ interface Actions {
   // FROM. CRUD against it is what the Pool drawer drives.
   addTemplate: () => string                      // returns new template id
   updateTemplate: (id: string, patch: Partial<InstrumentTemplate>) => void
+  // Patch the Hardware Mode config on a template. Works on builtin
+  // templates too (HW Mode is a user preference, not a definitional
+  // change). Partial — only the keys you pass are updated.
+  setTemplateHardwareMode: (
+    id: string,
+    patch: Partial<NonNullable<InstrumentTemplate['hardwareMode']>>
+  ) => void
   duplicateTemplate: (id: string) => string | null
   removeTemplate: (id: string) => void
   addFunctionToTemplate: (templateId: string) => string | null  // returns new fn id
@@ -656,6 +664,14 @@ interface Actions {
 
   // Sequence matrix
   setSequenceSlot: (index: number, sceneId: string | null) => void
+  // Per-slot duration / follow-action overrides. Lets the same scene
+  // dropped in multiple slots have different playback envelopes
+  // without affecting the scene itself or other slots.
+  setSequenceSlotOverride: (
+    index: number,
+    patch: Partial<SequenceSlotOverride>
+  ) => void
+  clearSequenceSlotOverride: (index: number) => void
 
   // UI
   selectCell: (sceneId: string, trackId: string) => void
@@ -865,7 +881,16 @@ interface Actions {
   // missing Pool templates + missing sidebar tracks, then creates a
   // new Scene with cells linked to the new tracks. Returns the new
   // scene id so the caller can focus it.
-  instantiateSavedScene: (savedSceneId: string) => string | null
+  // `insertAtIndex` — when provided, splice the new Scene into
+  // `session.scenes` at that position instead of appending at the
+  // end. Used by the Edit-view grid drop handler so the user can
+  // drop a saved Scene between two existing columns and have it
+  // land there visually. Indices are clamped to [0, scenes.length];
+  // omit (or pass `undefined`) to keep the legacy "append" behaviour.
+  instantiateSavedScene: (
+    savedSceneId: string,
+    insertAtIndex?: number
+  ) => string | null
   // Duplicate an in-session Scene. Clones every cell on the same
   // tracks (same trackIds, no new sidebar rows), names the copy
   // "<orig> (copy)". Returns the new scene id.
@@ -1360,6 +1385,40 @@ export const useStore = create<State>((set, get) => ({
             ...st.session.pool,
             templates: st.session.pool.templates.map((tt) =>
               tt.id === id ? { ...tt, ...patch } : tt
+            )
+          }
+        }
+      }
+    }),
+  // Hardware Mode setter — unlike updateTemplate, this DOES work on
+  // builtin templates because HW Mode is a per-session user preference
+  // (which device a controller is bound to, which arg slots it can
+  // drive), not a definitional change. The builtin template's
+  // identity / functions / OSC addresses remain untouched; only the
+  // hardwareMode field is patched. Persisted with the session.
+  setTemplateHardwareMode: (id, patch) =>
+    set((st) => {
+      const t = st.session.pool.templates.find((tt) => tt.id === id)
+      if (!t) return st
+      const cur = t.hardwareMode
+      const merged: NonNullable<InstrumentTemplate['hardwareMode']> = {
+        enabled: false,
+        deviceIp: '',
+        devicePort: 0,
+        mode: 'reset',
+        catchTolerance: 0.02,
+        movementThreshold: 0.005,
+        movementWindowMs: 300,
+        ...cur,
+        ...patch
+      }
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            ...st.session.pool,
+            templates: st.session.pool.templates.map((tt) =>
+              tt.id === id ? { ...tt, hardwareMode: merged } : tt
             )
           }
         }
@@ -2229,13 +2288,94 @@ export const useStore = create<State>((set, get) => ({
       next.splice(to, 0, moved)
       return { session: { ...st.session, scenes: next } }
     }),
-  updateScene: (id, patch) =>
+  updateScene: (id, patch) => {
+    // Capture the PRIOR scene state before the patch so we can use
+    // the old name as the legacy-match key (the user might be renaming
+    // right now — we want to find the SavedScene by what it WAS).
+    const prior = get().session.scenes.find((s) => s.id === id)
     set((st) => ({
       session: {
         ...st.session,
         scenes: st.session.scenes.map((s) => (s.id === id ? { ...s, ...patch } : s))
       }
-    })),
+    }))
+    // Bidirectional Pool sync: if this scene is linked to a Pool
+    // SavedScene (via linkedSavedSceneId), mirror the user-visible
+    // header fields to that SavedScene so the Pool entry stays in
+    // sync. Skips the mirror when the patch doesn't touch any of
+    // those specific fields (e.g. cell edits or instrumentTriggers
+    // shouldn't dirty the SavedScene).
+    const HEADER_KEYS = [
+      'color',
+      'name',
+      'notes',
+      'durationSec',
+      'nextMode',
+      'multiplicator',
+      'morphInMs'
+    ] as const
+    const touchesHeader = HEADER_KEYS.some((k) => k in patch)
+    if (!touchesHeader) return
+    const after = get()
+    let scene = after.session.scenes.find((s) => s.id === id)
+    if (!scene) return
+    // Legacy backfill: scenes saved BEFORE the linkedSavedSceneId
+    // field existed won't have it. Match the prior scene name (since
+    // the user might be renaming RIGHT NOW) against the SavedScene
+    // library; if exactly one matches, lazily link it. This keeps
+    // pre-existing saved scenes mirroring without forcing the user to
+    // re-save them.
+    if (!scene.linkedSavedSceneId) {
+      const matchName = prior?.name ?? scene.name
+      const matches = after.sceneLibrary.filter(
+        (sv) => (sv.sceneMeta?.name ?? sv.name) === matchName
+      )
+      if (matches.length === 1) {
+        const link = matches[0].id
+        set((st) => ({
+          session: {
+            ...st.session,
+            scenes: st.session.scenes.map((s) =>
+              s.id === id ? { ...s, linkedSavedSceneId: link } : s
+            )
+          }
+        }))
+        scene = { ...scene, linkedSavedSceneId: link }
+      }
+    }
+    if (!scene.linkedSavedSceneId) return
+    const saved = after.sceneLibrary.find(
+      (sv) => sv.id === scene!.linkedSavedSceneId
+    )
+    if (!saved) return
+    // Pull the new live values straight off the scene (already
+    // updated by the set() above) — typed correctly, no `unknown`.
+    const updatedSaved: typeof saved = {
+      ...saved,
+      color: scene.color,
+      name: scene.name,
+      sceneMeta: {
+        ...saved.sceneMeta,
+        name: scene.name,
+        color: scene.color,
+        notes: scene.notes,
+        durationSec: scene.durationSec,
+        nextMode: scene.nextMode,
+        multiplicator: scene.multiplicator,
+        morphInMs: scene.morphInMs
+      }
+    }
+    set((s) => ({
+      sceneLibrary: s.sceneLibrary.map((sv) =>
+        sv.id === updatedSaved.id ? updatedSaved : sv
+      )
+    }))
+    try {
+      void window.api?.sceneLibrarySave?.(updatedSaved)
+    } catch (e) {
+      console.warn('[updateScene] linked SavedScene sync failed:', (e as Error).message)
+    }
+  },
   setSceneMidi: (id, binding) =>
     set((st) => ({
       session: {
@@ -2423,7 +2563,47 @@ export const useStore = create<State>((set, get) => ({
     set((st) => {
       const seq = [...st.session.sequence]
       seq[index] = sceneId
-      return { session: { ...st.session, sequence: seq } }
+      // When a slot is cleared (sceneId === null), drop any override
+      // it carried. Otherwise the override would orphan and cause
+      // confusing behaviour if a different scene later landed in the
+      // same slot.
+      let nextOverrides = st.session.sequenceSlotOverrides
+      if (sceneId === null && nextOverrides && nextOverrides[index]) {
+        nextOverrides = { ...nextOverrides }
+        delete nextOverrides[index]
+      }
+      return {
+        session: {
+          ...st.session,
+          sequence: seq,
+          sequenceSlotOverrides: nextOverrides
+        }
+      }
+    }),
+  setSequenceSlotOverride: (index, patch) =>
+    set((st) => {
+      const cur = st.session.sequenceSlotOverrides?.[index] ?? {}
+      const merged = { ...cur, ...patch }
+      // Strip undefined keys so an override of `{ durationSec: undefined }`
+      // erases the field (rather than carrying a noise entry).
+      for (const k of Object.keys(merged) as (keyof typeof merged)[]) {
+        if (merged[k] === undefined) delete merged[k]
+      }
+      const next = { ...(st.session.sequenceSlotOverrides ?? {}) }
+      if (Object.keys(merged).length === 0) {
+        // Empty override = no override; drop the key entirely.
+        delete next[index]
+      } else {
+        next[index] = merged
+      }
+      return { session: { ...st.session, sequenceSlotOverrides: next } }
+    }),
+  clearSequenceSlotOverride: (index) =>
+    set((st) => {
+      if (!st.session.sequenceSlotOverrides?.[index]) return st
+      const next = { ...st.session.sequenceSlotOverrides }
+      delete next[index]
+      return { session: { ...st.session, sequenceSlotOverrides: next } }
     }),
 
   selectCell: (sceneId, trackId) =>
@@ -3186,6 +3366,21 @@ export const useStore = create<State>((set, get) => ({
       console.error('[saveSceneToLibrary] failed:', (e as Error).message)
       return null
     }
+    // Link the live scene to the just-created SavedScene so later
+    // updates to the live scene's color / name / notes mirror back
+    // to the Pool entry. Sets linkedSavedSceneId on the scene; the
+    // matching updateScene + updateSavedScene flows will then read
+    // this link to keep the two in sync.
+    set((s) => ({
+      session: {
+        ...s.session,
+        scenes: s.session.scenes.map((sc) =>
+          sc.id === sceneId
+            ? { ...sc, linkedSavedSceneId: saved.id }
+            : sc
+        )
+      }
+    }))
     return saved.id
   },
 
@@ -3230,7 +3425,7 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  instantiateSavedScene: (savedSceneId) => {
+  instantiateSavedScene: (savedSceneId, insertAtIndex) => {
     const st = get()
     const saved = st.sceneLibrary.find((s) => s.id === savedSceneId)
     if (!saved) return null
@@ -3300,17 +3495,38 @@ export const useStore = create<State>((set, get) => ({
       nextMode: saved.sceneMeta.nextMode,
       multiplicator: saved.sceneMeta.multiplicator,
       morphInMs: saved.sceneMeta.morphInMs,
-      cells: newCells
+      cells: newCells,
+      // Link the new live scene back to the SavedScene it came from
+      // so later edits (color / name / notes) on the grid scene
+      // mirror to the Pool entry. Same link is used by saveSceneToLibrary
+      // when the user saves a scene that came from the Pool — the
+      // existing entry updates in place instead of creating a duplicate.
+      linkedSavedSceneId: savedSceneId
     }
     // Mark this scene as coming from the library so App.tsx's
     // auto-save effect doesn't create a duplicate library entry
     // when it sees session.scenes grow. See `sceneIdsFromLibrary`.
     sceneIdsFromLibrary.add(newSceneId)
-    set((s) => ({
+    set((s) => {
+      // Compute the spliced `scenes` array. When the caller passed an
+      // explicit `insertAtIndex`, clamp it to [0, length] and splice
+      // the new scene in at that spot; otherwise append. The drop-on-
+      // grid handler uses this to drop a scene between two existing
+      // columns (the column's bounding-rect midpoint decides the
+      // index).
+      let nextScenes: Scene[]
+      if (typeof insertAtIndex === 'number' && Number.isFinite(insertAtIndex)) {
+        const idx = Math.max(0, Math.min(s.session.scenes.length, Math.floor(insertAtIndex)))
+        nextScenes = s.session.scenes.slice()
+        nextScenes.splice(idx, 0, newScene)
+      } else {
+        nextScenes = [...s.session.scenes, newScene]
+      }
+      return {
       session: {
         ...s.session,
         tracks: [...s.session.tracks, ...newTracks],
-        scenes: [...s.session.scenes, newScene],
+        scenes: nextScenes,
         pool: {
           ...s.session.pool,
           templates: [...s.session.pool.templates, ...newPoolTemplates]
@@ -3327,7 +3543,8 @@ export const useStore = create<State>((set, get) => ({
       // saved scene clears any active Pool selection.
       poolSelection: null,
       selectedSavedSceneIds: []
-    }))
+      }
+    })
     return newSceneId
   },
 

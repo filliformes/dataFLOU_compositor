@@ -200,6 +200,15 @@ app.whenReady().then(async () => {
     mainWindow?.webContents.send('network:devices', payload)
   })
 
+  // Hardware Mode — pipe every incoming OSC message into the engine
+  // so it can react at packet-arrival time (sub-millisecond, not the
+  // 50ms device-map flush). The engine filters by which templates
+  // have Hardware Mode enabled + bound to this device's ip:port —
+  // most packets are no-ops and return early.
+  networkListener.setOnMessage((ip, port, address, numericArgs) => {
+    engine.handleHardwareInput(ip, port, address, numericArgs)
+  })
+
   // Wrapper that catches thrown errors inside an IPC handler, logs
   // them with the channel name, and returns undefined to the renderer
   // instead of propagating a generic IPC failure. Without this, a

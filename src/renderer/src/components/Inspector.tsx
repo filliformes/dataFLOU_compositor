@@ -37,6 +37,7 @@ import {
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import { DrawCanvas } from './DrawCanvas'
+import { HardwareModeSection } from './InstrumentsInspectorPane'
 import {
   ArpVisual,
   ChaosVisual,
@@ -272,6 +273,16 @@ function TrackInspector(): JSX.Element {
   const children = useStore((s) =>
     s.session.tracks.filter((t) => t.parentTrackId === trackId)
   )
+  // Look up the source template so the grid-side inspector can show
+  // the same Hardware Mode controls as the Pool's TemplateInspector.
+  // Mirrors the same store action (setTemplateHardwareMode) so edits
+  // on either surface stay in sync — they're operating on the same
+  // `session.pool.templates[i].hardwareMode` blob.
+  const templateForRow = useStore((s) =>
+    track?.kind === 'template' && track.sourceTemplateId
+      ? s.session.pool.templates.find((t) => t.id === track.sourceTemplateId)
+      : undefined
+  )
 
   if (!track) return <div className="p-4 text-muted text-[12px]">Track removed.</div>
 
@@ -328,6 +339,18 @@ function TrackInspector(): JSX.Element {
           </label>
         </div>
       </Section>
+
+      {/* Hardware Mode — only for Template (Instrument) rows. Shows
+          the same controls as the Pool's TemplateInspector. Both
+          surfaces edit the SAME template.hardwareMode blob via
+          setTemplateHardwareMode, so flipping the toggle here is
+          identical to flipping it in the Pool. Lets the user enable
+          HW Mode without leaving the grid. HardwareModeSection
+          carries its own "Hardware Mode" enable-label so we don't
+          wrap in a Section (would be a redundant double-title). */}
+      {isTemplate && templateForRow && (
+        <HardwareModeSection template={templateForRow} />
+      )}
 
       {/* Parameter list — only for Template (Instrument) rows. Each
           child gets its own enable/disable toggle, mirroring the
@@ -1250,6 +1273,11 @@ function CellInspector(): JSX.Element {
           u({ midiOut: { ...(cell.midiOut ?? DEFAULT_MIDI_OUT), ...patch } })
         }
         onVelocityChange={(v) => u({ velocity: v })}
+        onVelocityHumanizeChange={(pct) =>
+          u({
+            velocityHumanize: Math.max(0, Math.min(100, Math.round(pct)))
+          })
+        }
         onPinVelocity={(p) => u({ velocityPersistent: p })}
         onPinNote={(p) => u({ notePersistent: p })}
         onPitchSnapChange={(patch) =>
@@ -5209,6 +5237,7 @@ function MidiOutputSection({
   cell,
   onChange,
   onVelocityChange,
+  onVelocityHumanizeChange,
   onPinVelocity,
   onPinNote,
   onPitchSnapChange
@@ -5216,6 +5245,7 @@ function MidiOutputSection({
   cell: Cell
   onChange: (patch: Partial<MidiOut>) => void
   onVelocityChange: (v: string) => void
+  onVelocityHumanizeChange: (pct: number) => void
   onPinVelocity: (pinned: boolean) => void
   onPinNote: (pinned: boolean) => void
   // Patch the cell.pitchSnap object — keeps the section signature
@@ -5364,40 +5394,77 @@ function MidiOutputSection({
           can modulate / sequence ONE while keeping the OTHER
           locked. */}
       {m.kind === 'note' && (
-        <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center mt-1">
-          <span className="text-[10px] text-muted" title="MIDI note 0..127">
-            Note (= Value)
-          </span>
-          <span className="font-mono text-[11px] text-right text-muted">
-            see Value field above ↑
-          </span>
-          <label className="flex items-center gap-1 text-[10px] shrink-0">
-            <input
-              type="checkbox"
-              checked={!!cell.notePersistent}
-              onChange={(e) => onPinNote(e.target.checked)}
-              title="Pin — freeze the note number; sequencer / modulator only drives Velocity below."
+        <div className="flex flex-col gap-1 mt-1 text-[10px]">
+          {/* Note row — same vertical alignment as the velocity row below. */}
+          <div className="flex items-center gap-2">
+            <span className="text-muted shrink-0" title="MIDI note 0..127">
+              Note (= Value)
+            </span>
+            <span className="font-mono text-[11px] text-muted flex-1 text-right">
+              see Value field above ↑
+            </span>
+            <label className="flex items-center gap-1 shrink-0">
+              <input
+                type="checkbox"
+                checked={!!cell.notePersistent}
+                onChange={(e) => onPinNote(e.target.checked)}
+                title="Pin — freeze the note number; sequencer / modulator only drives Velocity below."
+              />
+              <span>pin</span>
+            </label>
+          </div>
+
+          {/* Velocity row — compact input + Humanize slider + pin
+              all on one line. Velocity capped at 3 chars (max value
+              127). Humanize slider 0..100% randomises the Note On
+              velocity around the user's value on each trigger; engine
+              applies the jitter inside emitMidiForCell. */}
+          <div className="flex items-center gap-2">
+            <span className="text-muted shrink-0" title="MIDI velocity 0..127">
+              Velocity
+            </span>
+            <UncontrolledTextInput
+              className="input font-mono text-center"
+              style={{ width: 40 }}
+              value={cell.velocity ?? '100'}
+              onChange={(v) => onVelocityChange(v.trim() || '0')}
+              placeholder="100"
+              maxLength={3}
             />
-            <span>pin</span>
-          </label>
-          <span className="text-[10px] text-muted" title="MIDI velocity 0..127">
-            Velocity
-          </span>
-          <UncontrolledTextInput
-            className="input font-mono"
-            value={cell.velocity ?? '100'}
-            onChange={(v) => onVelocityChange(v.trim() || '0')}
-            placeholder="100"
-          />
-          <label className="flex items-center gap-1 text-[10px] shrink-0">
+            <span
+              className="text-muted shrink-0"
+              title="Humanize: random ± variation around the velocity, applied per Note On. 0 = exact velocity. 100 = full random in 0..127."
+            >
+              Humanize
+            </span>
             <input
-              type="checkbox"
-              checked={!!cell.velocityPersistent}
-              onChange={(e) => onPinVelocity(e.target.checked)}
-              title="Pin — freeze the velocity; sequencer / modulator only drives the note number above."
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={cell.velocityHumanize ?? 0}
+              onChange={(e) =>
+                onVelocityHumanizeChange(Number(e.target.value))
+              }
+              className="flex-1 min-w-0"
+              title="Random jitter around the velocity (0..100%)"
             />
-            <span>pin</span>
-          </label>
+            <span
+              className="text-muted tabular-nums shrink-0"
+              style={{ width: 26 }}
+            >
+              {cell.velocityHumanize ?? 0}%
+            </span>
+            <label className="flex items-center gap-1 shrink-0">
+              <input
+                type="checkbox"
+                checked={!!cell.velocityPersistent}
+                onChange={(e) => onPinVelocity(e.target.checked)}
+                title="Pin — freeze the velocity; sequencer / modulator only drives the note number above."
+              />
+              <span>pin</span>
+            </label>
+          </div>
         </div>
       )}
 

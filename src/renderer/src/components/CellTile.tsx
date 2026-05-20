@@ -65,10 +65,14 @@ function formatCellDisplayValue(
   return out.join(' ')
 }
 
-// How many tokens per row in the value grid. Past 4, tokens wrap to
-// a new row instead of stretching the column horizontally — keeps a
-// 12-float OCTOCOSME cell readable inside a normal-width column.
+// How many tokens per row in the value grid. Past this count, tokens
+// wrap to a new row instead of stretching the column horizontally —
+// keeps a 12-float OCTOCOSME cell readable inside a normal-width
+// column. The "collapsed" variant uses 4 columns so 8-12 arg cells
+// stack into 2–3 rows that fit the compact row height instead of
+// overflowing onto the next parameter row.
 const CELL_TOKENS_PER_ROW = 4
+const CELL_TOKENS_PER_ROW_COLLAPSED = 4
 
 // Cell value renderer. Splits the post-formatter display string back
 // into tokens and lays them out in an auto-sizing CSS grid with up
@@ -80,57 +84,89 @@ const CELL_TOKENS_PER_ROW = 4
 // color, same as before.
 function CellValueGrid({
   display,
-  isLiveDisplay
+  isLiveDisplay,
+  caughtSlots,
+  collapsed,
+  tokenMap
 }: {
   display: string
   isLiveDisplay: boolean
+  // Set of arg-slot indices currently overridden by Hardware Mode
+  // (engine.hardwareCaught for this track). Tokens at these indices
+  // render in red; everything else uses the normal live/idle color.
+  // Empty set = no HW override active for this cell.
+  caughtSlots: Set<number>
+  // True when the user has toggled "Collapse Instruments". Forces a
+  // narrower wrap point so multi-arg cells stack onto two rows and
+  // the Scene column can shrink horizontally.
+  collapsed: boolean
+  // Maps display-token index → engine arg-slot index. Needed because
+  // `formatCellDisplayValue` strips fixed argSpec slots from the
+  // display (e.g. an IP prefix), so the i-th rendered token can
+  // correspond to engine slot i, i+1, etc. depending on how many
+  // fixed slots came before it. Without the map, HW-caught colouring
+  // landed on the WRONG token whenever the parameter had a fixed
+  // prefix — user reported "red on args that aren't played, no red
+  // on args that ARE". When undefined, identity mapping is used.
+  tokenMap?: number[]
 }): JSX.Element {
   const tokens = display.trim().split(/\s+/).filter((t) => t.length > 0)
+  // Resolve a single token's color: HW-caught (red) > live (accent) > idle (default).
+  // `engineIdx` translates the rendered token's position back into
+  // the engine's arg-slot space — see `tokenMap` doc above.
+  const tokenColor = (i: number): string | undefined => {
+    const engineIdx = tokenMap?.[i] ?? i
+    return caughtSlots.has(engineIdx)
+      ? 'rgb(var(--c-danger))'
+      : isLiveDisplay
+        ? 'rgb(var(--c-accent))'
+        : undefined
+  }
   if (tokens.length === 0) {
     return (
-      <span
-        className={`text-[14px] font-mono font-semibold ${
-          isLiveDisplay ? 'text-accent' : ''
-        }`}
-      >
+      <span className="text-[14px] font-mono font-semibold" style={{ color: tokenColor(0) }}>
         &nbsp;
       </span>
     )
   }
-  // ≤4 tokens: single line — keeps the legacy compact look so simple
-  // single-arg or vec3/vec4 cells don't suddenly take more vertical
-  // space than they used to.
-  if (tokens.length <= CELL_TOKENS_PER_ROW) {
+  const tokensPerRow = collapsed ? CELL_TOKENS_PER_ROW_COLLAPSED : CELL_TOKENS_PER_ROW
+  // Few tokens AND not in collapsed mode: keep the legacy single-line
+  // look (larger font, no grid) so a one-arg or vec3 cell doesn't
+  // suddenly grow vertically. In collapsed mode we always use the
+  // compact grid so even a 4-token cell gets a narrower footprint.
+  if (!collapsed && tokens.length <= tokensPerRow) {
     return (
-      <span
-        className={`text-[14px] font-mono font-semibold whitespace-nowrap ${
-          isLiveDisplay ? 'text-accent' : ''
-        }`}
-      >
-        {tokens.join(' ')}
+      <span className="text-[14px] font-mono font-semibold whitespace-nowrap">
+        {tokens.map((t, i) => (
+          <span key={i} style={{ color: tokenColor(i) }}>
+            {i > 0 ? ' ' : ''}
+            {t}
+          </span>
+        ))}
       </span>
     )
   }
-  // >4 tokens: render as a 4-column CSS grid. `auto` columns size to
-  // the widest token in each column (so floats with different
-  // magnitudes line up vertically). Compact font + tight line height
-  // + zero row gap so a 12-arg OCTOCOSME bundle (3 rows of 4) fits
-  // in the default row height without cropping the bottom row.
-  // User can still drag the row-height slider for even more
-  // headroom on deeply-nested cells.
+  // Multi-token grid. Columns auto-size to widest token (so floats
+  // align vertically). Compact font + tight line height so a 12-arg
+  // OCTOCOSME bundle still fits in the row. In collapsed mode the
+  // grid uses 2 columns instead of 4 — that's what shrinks the
+  // Scene column width.
   return (
     <div
-      className={`grid gap-x-1.5 font-mono text-[9px] font-semibold w-full leading-none ${
-        isLiveDisplay ? 'text-accent' : ''
-      }`}
+      className="grid gap-x-1.5 font-mono text-[9px] font-semibold w-full leading-none"
       style={{
-        gridTemplateColumns: `repeat(${CELL_TOKENS_PER_ROW}, minmax(0, auto))`,
+        gridTemplateColumns: `repeat(${tokensPerRow}, minmax(0, auto))`,
         justifyContent: 'start',
         rowGap: '2px'
       }}
     >
       {tokens.map((t, i) => (
-        <span key={i} className="truncate py-px" title={t}>
+        <span
+          key={i}
+          className="truncate py-px"
+          title={t}
+          style={{ color: tokenColor(i) }}
+        >
           {t}
         </span>
       ))}
@@ -177,6 +213,33 @@ export default function CellTile({
     (s) => s.engine.seqStepBySceneAndTrack[sceneId]?.[trackId]
   )
   const liveValue = useStore((s) => s.engine.currentValueBySceneAndTrack[sceneId]?.[trackId])
+  // Hardware Mode catch set for this cell — Set<number> of arg-slot
+  // indices currently overridden by hardware. CellValueGrid colors
+  // those tokens red.
+  //
+  // Engine pre-buckets hardware catches into `hardwareCaughtByTrack`
+  // (Record<trackId, sortedSlot[]>), so this selector is a single
+  // O(1) lookup by trackId. Scoped to the ACTIVE scene only —
+  // hardwareCaught is per-(track,slot), but only the active scene's
+  // cells are actually being overridden, so coloring inactive scenes'
+  // tokens red was misleading.
+  //
+  // Selector returns a JOINED STRING ("0,2,5") instead of the array
+  // itself — Zustand uses Object.is, and the engine re-allocates the
+  // array on every emit even when content is unchanged. A string
+  // compares by value so the cell only re-renders when the caught set
+  // actually changes. Sorted on the engine side, so the string is
+  // stable.
+  const caughtKey = useStore((s) => {
+    if (s.engine.activeSceneId !== sceneId) return ''
+    const arr = s.engine.hardwareCaughtByTrack?.[trackId]
+    if (!arr || arr.length === 0) return ''
+    return arr.join(',')
+  })
+  const caughtSlots = useMemo(() => {
+    if (!caughtKey) return new Set<number>()
+    return new Set(caughtKey.split(',').map((s) => Number(s)))
+  }, [caughtKey])
 
   // What text gets painted in the cell tile's value slot. Three branches:
   //   1. Cell is playing AND the engine has emitted a live value for it
@@ -249,6 +312,26 @@ export default function CellTile({
   // out to fit `0.7895432 0.7895432 …`. The Inspector keeps full
   // precision; this is the grid tile's display only.
   const displayValue = formatCellDisplayValue(rawDisplayValue, track?.argSpec)
+  // Display-token → engine-arg-slot mapping. `formatCellDisplayValue`
+  // strips fixed argSpec entries from the display (e.g. an IP prefix
+  // sits at engine slot 0 but is hidden in the tile), so the rendered
+  // token at display index N can correspond to engine slot N + k
+  // where k is the count of fixed slots that appear before it. Used
+  // by CellValueGrid to colour HW-caught tokens correctly — without
+  // this remap, a fixed-prefix Parameter shifted the red highlight
+  // onto the wrong arg (and missed the truly-caught one).
+  const argTokenMap = useMemo(() => {
+    const spec = track?.argSpec
+    const tokens = rawDisplayValue.trim().split(/\s+/).filter((t) => t.length > 0)
+    if (!spec || spec.length === 0) return tokens.map((_, i) => i)
+    const map: number[] = []
+    for (let i = 0; i < tokens.length; i++) {
+      const s = spec[i]
+      if (s && s.fixed !== undefined) continue
+      map.push(i)
+    }
+    return map
+  }, [rawDisplayValue, track?.argSpec])
   // Whether the displayed value comes from the engine (live) or from
   // either the generative preview or the static seed. Drives the
   // accent-tinted styling so live values pop visually.
@@ -584,6 +667,11 @@ export default function CellTile({
   const sceneColorStyle = { ['--scene-color' as string]: scene?.color ?? 'transparent' } as React.CSSProperties
 
   // Compact (Tracks Collapsed) layout: trigger + OSC address + value, one line.
+  // BUT: the value side uses CellValueGrid with `collapsed=true` so
+  // multi-arg cells wrap to two-or-more rows of compact tokens
+  // instead of stretching the Scene column out horizontally. With
+  // single-arg cells, CellValueGrid renders a single token at the
+  // normal size — the row height looks unchanged.
   if (compact) {
     return (
       <>
@@ -610,13 +698,26 @@ export default function CellTile({
         <span className="text-[10px] text-muted truncate flex-1 min-w-0">
           {cell.oscAddress}
         </span>
-        <span
-          className={`text-[12px] font-mono font-semibold whitespace-nowrap shrink-0 text-right ${
-            isLiveDisplay ? 'text-accent' : ''
-          }`}
+        {/* Values side — fixed-width slot with the 4-column compact
+            grid so a 12-arg cell stacks into 3 rows that fit the
+            row height instead of overflowing onto the next
+            parameter. `max-w-[180px]` caps how much of the row the
+            value side can claim; the column's `fit-content` then
+            sizes to (address + 180 px) instead of (address + 13 ×
+            token-width). `overflow-hidden` clips anything that
+            still doesn't fit (vs. the previous version where the
+            grid bled into the row below). */}
+        <div
+          className={`shrink-0 max-w-[180px] overflow-hidden h-full flex items-center ${isLiveDisplay ? 'text-accent' : ''}`}
         >
-          {displayValue}
-        </span>
+          <CellValueGrid
+            display={displayValue}
+            isLiveDisplay={isLiveDisplay}
+            caughtSlots={caughtSlots}
+            collapsed
+            tokenMap={argTokenMap}
+          />
+        </div>
       </div>
       {filledMenu && (
         <FilledCellMenu
@@ -725,6 +826,9 @@ export default function CellTile({
         <CellValueGrid
           display={displayValue}
           isLiveDisplay={isLiveDisplay}
+          caughtSlots={caughtSlots}
+          collapsed={compact}
+          tokenMap={argTokenMap}
         />
       </div>
       {/* Modulator / sequencer / timing / transport-badge footer.
@@ -811,6 +915,8 @@ export default function CellTile({
         <div className="flex flex-col items-end shrink-0 gap-0.5">
           <ClipMidiLiveValue
             cell={cell}
+            sceneId={sceneId}
+            trackId={trackId}
             displayValue={isLiveDisplay ? displayValue : null}
           />
           <ClipTransportBadge
@@ -1039,14 +1145,39 @@ function FilledCellMenu({
 // blend with the orange OSC live value above the row.
 function ClipMidiLiveValue({
   cell,
+  sceneId,
+  trackId,
   displayValue
 }: {
   cell: import('@shared/types').Cell
+  sceneId: string
+  trackId: string
   // Live OSC display string — null when the cell isn't playing yet
   // (we don't render a frozen "what would the byte be" tease when
   // nothing's emitting).
   displayValue: string | null
 }): JSX.Element | null {
+  // Engine-broadcast last-emitted velocity (after humanize jitter).
+  // Updates at the SAME rate as the wire's actual noteOn events:
+  //   - sequencer mode → per step
+  //   - modulator mode → per note-number change (the engine's
+  //     emitMidiForCell now detects modulator-driven note edges, so
+  //     lastEmittedVelocity refreshes on every audible note change)
+  // Earlier we did a client-side per-tick roll, but that updated at
+  // ~20 Hz regardless of the wire's actual note rate — visually the
+  // badge "wiggled" while the modulator's notes only changed every
+  // few hundred ms. The user explicitly asked for matching rates,
+  // so the engine value is now the single source of truth.
+  // Subscribed unconditionally (rules of hooks); only consumed in
+  // the Note-mode branch below.
+  const liveVelocity = useStore(
+    (s) => s.engine.lastEmittedVelocityByCell?.[`${sceneId}|${trackId}`]
+  )
+  const humanize = cell.velocityHumanize ?? 0
+  const velRawBase = parseFloat(cell.velocity ?? '100')
+  const velBase = Number.isFinite(velRawBase)
+    ? Math.max(0, Math.min(127, Math.round(velRawBase)))
+    : 100
   const m = cell.midiOut
   if (!m || !m.enabled || !m.portName) return null
   if (displayValue == null) return null
@@ -1084,28 +1215,45 @@ function ClipMidiLiveValue({
       ? Math.round(lo + firstNum * (hi - lo))
       : Math.round(firstNum)
     const note = Math.max(0, Math.min(127, noteMap))
-    const velRaw = parseFloat(cell.velocity ?? '100')
-    const vel = Number.isFinite(velRaw)
-      ? Math.max(0, Math.min(127, Math.round(velRaw)))
-      : 100
+    // Displayed velocity = engine's last actually-emitted value when
+    // available (rolls per noteOn = per note-edge under modulator OR
+    // sequencer); falls back to the static base before the first
+    // noteOn fires.
+    const vel =
+      typeof liveVelocity === 'number' && Number.isFinite(liveVelocity)
+        ? liveVelocity
+        : velBase
+    // Pad both numbers to 3 chars so the badge keeps a stable visual
+    // width — without padding, a swing from 9 → 100 → 9 would jiggle
+    // the surrounding layout under humanize/modulator. `whitespace-pre`
+    // preserves the leading spaces; `tabular-nums` keeps each digit
+    // the same width.
+    const notePad = String(note).padStart(3, ' ')
+    const velPad = String(vel).padStart(3, ' ')
     return (
       <span
-        className="text-[10px] font-mono font-semibold leading-none tabular-nums"
+        className="text-[10px] font-mono font-semibold leading-none tabular-nums whitespace-pre"
         style={{ color: 'rgb(195 150 240)' }} /* violet — matches MIDI badge */
-        title={`MIDI Note ${note}, velocity ${vel} on ch${m.channel}`}
+        title={
+          humanize > 0
+            ? `MIDI Note ${note}, velocity ${vel} on ch${m.channel} (humanize ${humanize}% — base ${velBase})`
+            : `MIDI Note ${note}, velocity ${vel} on ch${m.channel}`
+        }
       >
-        {note}→{vel}
+        {notePad}→{velPad}
       </span>
     )
   }
-  // CC mode — single byte 0..127.
+  // CC mode — single byte 0..127. Padded to 3 chars so the badge
+  // doesn't wiggle as values cross 9 / 99 / 100 thresholds.
+  const ccPad = String(ccByte).padStart(3, ' ')
   return (
     <span
-      className="text-[10px] font-mono font-semibold leading-none tabular-nums"
+      className="text-[10px] font-mono font-semibold leading-none tabular-nums whitespace-pre"
       style={{ color: 'rgb(120 220 200)' }} /* teal — matches OSC/MIDI mix */
       title={`MIDI CC ${m.cc ?? 0} = ${ccByte} on ch${m.channel}`}
     >
-      {ccByte}
+      {ccPad}
     </span>
   )
 }
