@@ -1,6 +1,6 @@
 // Shared types used by main, preload, and renderer.
 
-export type LfoShape = 'sine' | 'triangle' | 'sawtooth' | 'square' | 'rndStep' | 'rndSmooth'
+export type LfoShape = 'sine' | 'triangle' | 'sawtooth' | 'square' | 'rndStep' | 'rndSmooth' | 'spastic'
 // NextMode — the "follow action" executed when a scene's duration ends
 // AND the per-scene play counter has reached `multiplicator`.
 // Modelled on Ableton Live's clip follow actions.
@@ -416,6 +416,13 @@ export interface Cell {
   // proper 0..127 MIDI range, or use both together so a scaleToUnit-
   // normalised colour byte maps cleanly to MIDI.
   midiScale?: boolean
+  // If true, every per-arg numeric output is rounded to integer AFTER
+  // Scale 0.0–1.0 but BEFORE MIDI Scale. Lets the user force integer
+  // OSC values regardless of the argSpec.type — useful for receivers
+  // that expect ints in slots the compositor would otherwise drive as
+  // floats (Spastic LFO + scaleToUnit, etc.). Per-cell toggle; applied
+  // to each arg independently.
+  intScale?: boolean
   // Timing section enable. When false (default), the cell's
   // `delayMs` + `transitionMs` are bypassed at trigger (treated as 0)
   // and the Inspector's Timing section renders collapsed. When true

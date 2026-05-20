@@ -662,6 +662,13 @@ function lfo(shape: LfoShape, phase: number, state: TrackState, tickIdx: number)
       // there). Here we just return the held value.
       return state.rndStepValue
     }
+    case 'spastic': {
+      // Same held-value pattern as rndStep, but tick() resamples to
+      // exactly ±1 on every wrap (see the spastic branch in the
+      // resample block). Held value persists between wraps so the
+      // unipolar pipeline reads stable 0/1 across the whole step.
+      return state.rndStepValue
+    }
     case 'rndSmooth': {
       // Cosine ease across the full period: k goes 0 → 1 monotonically
       // as p goes 0 → 1, so the output reaches `next` exactly at the wrap.
@@ -1904,10 +1911,16 @@ export class SceneEngine {
         const wraps = Math.floor(ts.phase) - Math.floor(prevPhase)
         if (wraps > 0) {
           const rng = ts.seqRng ?? Math.random
+          // `spastic` is rndStep quantised to exactly {-1, +1} — under
+          // unipolar mode + 100% depth + base 0, this gives the user
+          // a binary 0/1 LFO with naturally varying run lengths (back-
+          // to-back same samples extend the run). Other shapes resample
+          // to continuous [-1, 1] floats on every wrap as before.
+          const spastic = cell.modulation.shape === 'spastic'
           for (let w = 0; w < wraps; w++) {
             ts.rndSmoothPrev = ts.rndSmoothNext
             ts.rndSmoothNext = rng() * 2 - 1
-            ts.rndStepValue = rng() * 2 - 1
+            ts.rndStepValue = spastic ? (rng() < 0.5 ? -1 : 1) : rng() * 2 - 1
           }
           ts.rndStepLastTick = this.tickIdx
         }
@@ -2678,6 +2691,18 @@ export class SceneEngine {
             }
           }
           out = clamp01(out)
+        }
+
+        // ── Int Scale ─────────────────────────────────────────────
+        // Round to integer AFTER `scaleToUnit` but BEFORE pitch-snap /
+        // HW override / pin / MIDI Scale. Per-cell toggle applied to
+        // every arg slot independently. Combined with scaleToUnit it
+        // produces a binary 0/1 OSC output (useful with the Spastic
+        // LFO); without scaleToUnit it rounds the raw value to its
+        // nearest integer (e.g. a 0..127 modulated value emits as
+        // discrete int steps).
+        if (cell.intScale) {
+          out = Math.round(out)
         }
 
         // ── Pitch snap ────────────────────────────────────────────

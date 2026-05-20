@@ -2740,12 +2740,14 @@ export const useStore = create<State>((set, get) => ({
   setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 320, 640) }),
   setSequencePaused: (paused) => set({ sequencePaused: paused }),
   setMidiLearnMode: (on) =>
-    // Always clear midiLearnTarget when the mode flips — whether
-    // turning on (entering learn mode without a specific target
-    // pre-selected) or off (cancelling). The previous `on ? null : null`
-    // ternary was a half-finished conditional; collapsed to a single
-    // null for clarity.
-    set({ midiLearnMode: on, midiLearnTarget: null }),
+    // Clear midiLearnTarget ONLY when turning OFF (cancelling).
+    // Turning ON must PRESERVE the target so callers can pre-set it
+    // before flipping mode on — e.g. the Learned panel's Edit button
+    // does `setMidiLearnTarget(b.editTarget); setMidiLearnMode(true)`
+    // and was getting its target wiped by an over-eager clear here.
+    // After a successful bind, midi.ts itself clears the target while
+    // mode stays on (Ableton-style: keep mapping the next control).
+    set(on ? { midiLearnMode: true } : { midiLearnMode: false, midiLearnTarget: null }),
   setMidiLearnTarget: (t) => set({ midiLearnTarget: t }),
   setTheme: (t) => set({ theme: t }),
   // By default each toggle is independent (scenes only OR messages only).

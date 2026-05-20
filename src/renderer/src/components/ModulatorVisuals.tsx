@@ -70,10 +70,18 @@ export function LfoVisual({
   // to a single flat random value. We keep at least 8 visible stairs
   // for rnd shapes, and let cycles drive density at higher rates.
   const isRandom =
-    modulation.shape === 'rndStep' || modulation.shape === 'rndSmooth'
+    modulation.shape === 'rndStep' ||
+    modulation.shape === 'rndSmooth' ||
+    modulation.shape === 'spastic'
   const visibleStairs = isRandom ? Math.max(8, cycles * 8) : cycles * 8
   const rndSteps = Math.max(2, Math.round(visibleStairs))
-  const rndVals = Array.from({ length: rndSteps + 2 }, () => rng() * 2 - 1)
+  // Spastic samples to exactly ±1 — every other rnd shape is continuous
+  // [-1, 1] floats. Visual matches the wire shape so the user can see
+  // the binary stair pattern instead of a noisy float curve.
+  const rndVals =
+    modulation.shape === 'spastic'
+      ? Array.from({ length: rndSteps + 2 }, () => (rng() < 0.5 ? -1 : 1))
+      : Array.from({ length: rndSteps + 2 }, () => rng() * 2 - 1)
   for (let i = 0; i < N; i++) {
     const t = i / (N - 1)
     // For rnd shapes, the "global" time used to step through rndVals
@@ -165,9 +173,12 @@ function lfoSample(
       return p * 2 - 1
     case 'square':
       return p < 0.5 ? 1 : -1
-    case 'rndStep': {
+    case 'rndStep':
+    case 'spastic': {
       // Pick the rnd-table entry indexed by the integer part of the
       // global cycle position — flat steps that hop on the boundary.
+      // Spastic uses the same lookup; its table was already filled with
+      // ±1 values so the rendered stairs sit on the rails.
       const idx = Math.floor(globalT) % rndVals.length
       return rndVals[idx]
     }

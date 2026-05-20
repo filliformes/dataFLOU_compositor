@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--055)
+- [Release notes](#release-notes--056)
+  - [0.5.6](#release-notes--056)
   - [0.5.5](#release-notes--055)
   - [0.5.1](#release-notes--051)
   - [0.5.0](#release-notes--050)
@@ -547,6 +548,47 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes — 0.5.6
+
+A small follow-up to v0.5.5 with two new authoring tools and one MIDI-input bug fix.
+
+### Int Scale (per-cell, per-arg)
+
+New checkbox next to **Scale 0.0–1.0** and **MIDI Scale** in the Cell Inspector. When ticked, every numeric arg's final value is rounded to integer **AFTER** `Scale 0.0–1.0` (which clamps to `[0,1]`) but **BEFORE** `MIDI Scale` (which multiplies by 127). Per-cell toggle; applied to each arg independently.
+
+- With **Scale 0.0–1.0 ON** + **Int Scale ON** → binary `0` / `1` OSC output (useful with the new Spastic LFO below).
+- With **Scale 0.0–1.0 OFF** + **Int Scale ON** → rounds the raw modulated value to its nearest integer (e.g. a `0..127` Random modulator emits discrete int steps).
+- With **Int Scale + MIDI Scale ON** → integer OSC value AND MIDI byte (after the `× 127` map).
+
+Engine: applied in the per-slot emit loop with `out = Math.round(out)` right after the `scaleToUnit` clamp, before pitch-snap / HW override / pin. Live — takes effect mid-play.
+
+### Spastic LFO shape
+
+New LFO shape added to the **Shape** dropdown in the LFO modulator inspector, between **Random Smoothed** and the future shapes. It's `rndStep` quantised to exactly `{-1, +1}` on every wrap — never a value in between.
+
+- Under **Unipolar mode** + **depth 100 %** + **base 0**, output is binary `0` / `1`.
+- Step rate is set by the LFO **Rate** slider (Hz or BPM-synced).
+- "Different step lengths" emerge organically: back-to-back identical samples (50 % probability each step) extend the run, so a sequence like `0 1 1 0 0 0 1 0 1 1 …` plays as runs of 1, 2, 3, 1, 1, 2 steps — naturally polyrhythmic.
+- Engine: same held-value pattern as `rndStep` (uses `ts.rndStepValue`); the resample block at every LFO phase wrap chooses `−1` or `+1` randomly when `cell.modulation.shape === 'spastic'`.
+- ModulatorVisuals: the SVG preview renders the binary stair pattern on the rails so the user can see the chosen sequence at-a-glance before playing.
+
+**Tip:** pair Spastic LFO + Int Scale + Scale 0.0–1.0 to get a hard `0` / `1` gate at the LFO's rate — handy for triggering kicks / accents / button-style hardware destinations.
+
+### MIDI Learn fix
+
+`setMidiLearnMode(on)` was unconditionally clearing `midiLearnTarget` on every flip, regardless of `on=true` or `on=false`. This wiped the Learned-panel Edit flow's pre-set target (`setMidiLearnTarget(b.editTarget); setMidiLearnMode(true)` → target instantly null → no MIDI message ever bound). Now:
+
+- `on === true` → only sets `midiLearnMode: true`, leaves target as-is.
+- `on === false` → clears both (cancellation semantics intact).
+
+After a successful bind, `midi.ts` itself still clears the target while leaving mode on (Ableton-style "keep mapping the next control" behaviour) — unchanged.
+
+### Misc
+
+- Diagnostic `[MIDI]` logging stripped from `midi.ts` (was added during the v0.5.5 → v0.5.6 testing window).
 
 ---
 

@@ -1128,6 +1128,20 @@ function CellInspector(): JSX.Element {
                 <span>Scale</span>
               </span>
             </label>
+            <label
+              className="flex items-center gap-1 text-[10px] shrink-0"
+              title="Round every arg's value to integer AFTER Scale 0.0–1.0 but BEFORE MIDI Scale. With scaleToUnit on, this snaps to 0 or 1 (binary). Without it, rounds the raw value to its nearest integer. Live."
+            >
+              <input
+                type="checkbox"
+                checked={!!cell.intScale}
+                onChange={(e) => u({ intScale: e.target.checked })}
+              />
+              <span className="flex flex-col leading-[1.05] text-center">
+                <span>Int</span>
+                <span>Scale</span>
+              </span>
+            </label>
             {cell.sequencer.enabled && cell.sequencer.generative ? (
               <span className="text-success text-[10px]">
                 (seed — generative mode on)
@@ -1191,6 +1205,20 @@ function CellInspector(): JSX.Element {
               />
               <span className="flex flex-col leading-[1.05] text-center">
                 <span>MIDI</span>
+                <span>Scale</span>
+              </span>
+            </label>
+            <label
+              className="flex items-center gap-1 text-[10px] shrink-0"
+              title="Round every arg's value to integer AFTER Scale 0.0–1.0 but BEFORE MIDI Scale. With scaleToUnit on, this snaps to 0 or 1 (binary). Without it, rounds the raw value to its nearest integer. Live."
+            >
+              <input
+                type="checkbox"
+                checked={!!cell.intScale}
+                onChange={(e) => u({ intScale: e.target.checked })}
+              />
+              <span className="flex flex-col leading-[1.05] text-center">
+                <span>Int</span>
                 <span>Scale</span>
               </span>
             </label>
@@ -2273,6 +2301,7 @@ function LfoEditor({
         <option value="square">Square</option>
         <option value="rndStep">Random Stepped</option>
         <option value="rndSmooth">Random Smoothed</option>
+        <option value="spastic">Spastic (binary 0/1)</option>
       </select>
       <span />
 
