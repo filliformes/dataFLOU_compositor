@@ -13,6 +13,7 @@
 // "Add Instrument" sidebar rows) are hidden until "Save as Template".
 
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useStore } from '../store'
 import type {
   DiscoveredOscDevice,
@@ -1360,6 +1361,40 @@ function SavedSceneRow({
   onInstantiate: () => void
   onRemove: () => void
 }): JSX.Element {
+  // Right-click context menu — Rename + Update from Grid.
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  // Inline-rename state. When non-null, the name span swaps for a
+  // text input prefilled with this draft. Enter / blur commits; Esc
+  // discards.
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const updateSavedScene = useStore((s) => s.updateSavedScene)
+  const updateSavedSceneFromGrid = useStore((s) => s.updateSavedSceneFromGrid)
+  // Live grid scene linked to this SavedScene — drives whether
+  // "Update and save" is enabled or greyed out.
+  const linkedGridScene = useStore((s) =>
+    s.session.scenes.find((sc) => sc.linkedSavedSceneId === scene.id)
+  )
+  useEffect(() => {
+    if (!menu) return
+    const close = (): void => setMenu(null)
+    const onEsc = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setMenu(null)
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onEsc)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onEsc)
+    }
+  }, [menu])
+  function commitRename(): void {
+    if (renaming === null) return
+    const trimmed = renaming.trim()
+    if (trimmed && trimmed !== scene.name) {
+      void updateSavedScene(scene.id, { name: trimmed })
+    }
+    setRenaming(null)
+  }
   function onDragStart(e: React.DragEvent): void {
     const payload: PoolSavedSceneDragPayload = { savedSceneId: scene.id }
     e.dataTransfer.setData(POOL_SAVED_SCENE_DRAG_MIME, JSON.stringify(payload))
@@ -1371,6 +1406,11 @@ function SavedSceneRow({
     <div
       draggable
       onDragStart={onDragStart}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        setMenu({ x: e.clientX, y: e.clientY })
+      }}
       onClick={(e) => {
         if (e.ctrlKey || e.metaKey) onToggleSelect()
         else onSelect()
@@ -1394,7 +1434,27 @@ function SavedSceneRow({
       title="Click to inspect · Ctrl/⌘-click to add to a multi-selection (Del deletes the set) · Drag onto the grid · Double-click to instantiate."
     >
       <span className="w-5 shrink-0" />
-      <span className="font-semibold truncate">{scene.name}</span>
+      {renaming !== null ? (
+        <input
+          autoFocus
+          className="input text-[12px] py-0 px-1 font-semibold min-w-0 flex-1"
+          value={renaming}
+          onChange={(e) => setRenaming(e.target.value)}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              commitRename()
+            } else if (e.key === 'Escape') {
+              setRenaming(null)
+            }
+          }}
+          onBlur={commitRename}
+        />
+      ) : (
+        <span className="font-semibold truncate">{scene.name}</span>
+      )}
       {scene.origin && scene.origin !== 'manual' && (
         <span
           className="text-[9px] text-muted shrink-0 px-1 rounded-sm border border-border"
@@ -1433,6 +1493,48 @@ function SavedSceneRow({
       >
         ✕
       </button>
+      {menu &&
+        createPortal(
+          <div
+            className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[200px]"
+            style={{ left: menu.x, top: menu.y }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {/* Rename — swaps the name span into an inline input. */}
+            <button
+              className="w-full text-left px-3 py-1 hover:bg-panel2"
+              onClick={() => {
+                setMenu(null)
+                setRenaming(scene.name)
+              }}
+            >
+              Rename
+            </button>
+            {/* Update and save — overwrites THIS SavedScene's full
+                payload from the linked grid scene's current state.
+                Greyed out when no grid scene is linked. */}
+            <button
+              className={`w-full text-left px-3 py-1 ${
+                linkedGridScene ? 'hover:bg-panel2' : 'opacity-40 cursor-not-allowed'
+              }`}
+              disabled={!linkedGridScene}
+              onClick={() => {
+                setMenu(null)
+                if (linkedGridScene) {
+                  void updateSavedSceneFromGrid(scene.id)
+                }
+              }}
+              title={
+                linkedGridScene
+                  ? `Overwrite this Saved Scene with the latest state of "${linkedGridScene.name}" from the grid.`
+                  : 'No live grid scene is linked to this Saved Scene. Drag this Saved Scene onto the grid first to establish the link.'
+              }
+            >
+              Update and save
+            </button>
+          </div>,
+          document.body
+        )}
     </div>
   )
 }

@@ -96,6 +96,73 @@ function snapToScale(floatNote: number, intervals: number[], root: number): numb
   return baseNote
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Two-stage modulator — the SECOND stage needs its own copy of all
+// the modulator-state fields the first stage uses (phase, S&H held
+// value, attractor trajectory, etc.) so both stages can run in
+// parallel without trampling each other. We keep this struct
+// separate from TrackState so the per-tick advance + eval helpers
+// can be parameterised over either view via structural subtyping.
+// ─────────────────────────────────────────────────────────────────
+interface Mod2State {
+  phase: number
+  rndStepLastTick: number
+  rndStepValue: number
+  rndSmoothPrev: number
+  rndSmoothNext: number
+  shHeld: number
+  shPrev: number
+  shLastAdvanceAt: number
+  slewValue: number
+  slewTarget: number
+  slewLastAdvanceAt: number
+  chaosX: number
+  chaosLastAdvanceAt: number
+  attractorW: number
+  attractorX: number
+  attractorY: number
+  attractorZ: number
+  attractorRawX: number
+  attractorRawY: number
+  attractorRawZ: number
+  attractorRawW: number
+  attractorLastUpdateMs: number
+  attractorSpeed: number
+  // Stage 2's own PRNG so consuming the random stream doesn't shift
+  // Mod 1's behaviour — toggling Mod 2 on/off must not change what
+  // Mod 1 produces given the same cell value seed.
+  rng: (() => number) | null
+}
+
+function makeMod2State(): Mod2State {
+  return {
+    phase: 0,
+    rndStepLastTick: -1,
+    rndStepValue: 0,
+    rndSmoothPrev: 0,
+    rndSmoothNext: 0,
+    shHeld: 0,
+    shPrev: 0,
+    shLastAdvanceAt: 0,
+    slewValue: 0,
+    slewTarget: 0,
+    slewLastAdvanceAt: 0,
+    chaosX: 0.5,
+    chaosLastAdvanceAt: 0,
+    attractorW: 0.5,
+    attractorX: 0.5,
+    attractorY: 0.5,
+    attractorZ: 0.5,
+    attractorRawX: 0.1,
+    attractorRawY: 0,
+    attractorRawZ: 0,
+    attractorRawW: 0,
+    attractorLastUpdateMs: 0,
+    attractorSpeed: 0,
+    rng: null
+  }
+}
+
 interface TrackState {
   // Phase in LFO cycles. Reset to 0 on each trigger so shapes restart cleanly.
   phase: number
@@ -190,6 +257,34 @@ interface TrackState {
   // a small perturbation on each trigger so identical cells diverge.
   chaosX: number
   chaosLastAdvanceAt: number
+  // Strange Attractor state — 4 channels (W/X/Y/Z) so 3D attractors
+  // can fan out X/Y/Z + speed and 4D types map W/X/Y/Z natively.
+  // All values pre-normalised to [0, 1] after each integration step;
+  // raw integration uses a separate scratchpad on the modulator.
+  // `attractorLastUpdateMs` is hrtime ms so step deltas are stable
+  // independent of the engine's tick rate.
+  attractorW: number
+  attractorX: number
+  attractorY: number
+  attractorZ: number
+  // Raw (un-normalised) state — kept so each tick's integration
+  // continues from the previous trajectory point in the attractor's
+  // native units rather than from the [0,1]-clamped renderable values.
+  attractorRawX: number
+  attractorRawY: number
+  attractorRawZ: number
+  attractorRawW: number
+  attractorLastUpdateMs: number
+  // Instantaneous speed (Euclidean norm of (dx,dy,dz) per integration
+  // step) normalised to [0, 1] — used as the 4th channel for 3D
+  // attractor types. EMA-smoothed so it doesn't look spasmodic.
+  attractorSpeed: number
+  // Per-slot Variation factor — stable random in [-1, 1] sampled at
+  // trigger time, scaled later by the per-slot variation% in the
+  // emit loop. Fixed for the lifetime of the trigger so each slot's
+  // modulator amplitude has a consistent character (vs jittery
+  // tick-to-tick noise). Array length matches the cell's arg count.
+  routingVariationFactors: number[]
   // Active cell ref (source of params)
   activeSceneId: string | null
   stopping: boolean
@@ -230,6 +325,14 @@ interface TrackState {
   // not the static cell.velocity field. `null` until the first
   // noteOn has fired.
   lastEmittedVelocity: number | null
+  // ── Two-stage modulator state ───────────────────────────────────
+  // Parallel modulator-state slot used when `cell.modulation2` is
+  // enabled. Same fields as the Mod 1 modulator-state subset on
+  // TrackState, kept separate so both stages can run independent
+  // LFOs / S&H / Attractor trajectories at the same time. Always
+  // allocated even when Mod 2 is off (cheap struct; saves a guard
+  // on every tick).
+  m2: Mod2State
 }
 
 function makeTrackState(): TrackState {
@@ -273,6 +376,21 @@ function makeTrackState(): TrackState {
     slewLastAdvanceAt: 0,
     chaosX: 0.5,
     chaosLastAdvanceAt: 0,
+    // Attractor — start at a non-fixed-point seed so the trajectory
+    // doesn't immediately converge. Lorenz / Rössler / etc. seeds
+    // are explicitly chosen to land on the chaotic regime; the
+    // per-attractor reseed at trigger time overrides these.
+    attractorW: 0.5,
+    attractorX: 0.5,
+    attractorY: 0.5,
+    attractorZ: 0.5,
+    attractorRawX: 0.1,
+    attractorRawY: 0,
+    attractorRawZ: 0,
+    attractorRawW: 0,
+    attractorLastUpdateMs: 0,
+    attractorSpeed: 0,
+    routingVariationFactors: [],
     activeSceneId: null,
     stopping: false,
     armed: false,
@@ -286,7 +404,8 @@ function makeTrackState(): TrackState {
     lastSentNumeric: [],
     lastStringAtSceneId: null,
     lastStringAtStep: -1,
-    lastEmittedVelocity: null
+    lastEmittedVelocity: null,
+    m2: makeMod2State()
   }
 }
 
@@ -644,7 +763,16 @@ function computeCycleRanges(
   )
 }
 
-function lfo(shape: LfoShape, phase: number, state: TrackState, tickIdx: number): number {
+function lfo(
+  shape: LfoShape,
+  phase: number,
+  // Only reads the stepped/smooth random scratch slots. Typed
+  // structurally so both TrackState (Mod 1) and Mod2State (Mod 2)
+  // can be passed without a refactor — they each carry these three
+  // fields, even though their broader shapes differ.
+  state: { rndStepValue: number; rndSmoothPrev: number; rndSmoothNext: number },
+  tickIdx: number
+): number {
   // phase in [0,1). Returns [-1, 1]
   const p = phase - Math.floor(phase)
   switch (shape) {
@@ -718,6 +846,17 @@ export class SceneEngine {
   private pauseStartedAt: number | null = null
   private sceneAdvanceTimer: NodeJS.Timeout | null = null
   private onStateChange: ((s: EngineState) => void) | null = null
+  // ── Two-stage modulator: live Mod 1 preview ─────────────────────
+  // The renderer's Inspector tells the engine which cell it's watching
+  // via setSelectedCellForLive(); the engine then emits effective
+  // Mod 1 values for that cell at ~30 Hz so the Inspector sliders /
+  // numbers can animate while Modulation 2 is driving. Cleared to
+  // null when the user collapses the Inspector or clicks elsewhere.
+  private selectedCellForLive: { sceneId: string; trackId: string } | null = null
+  private onMod1Live:
+    | ((sample: import('@shared/types').Mod1LiveSample | null) => void)
+    | null = null
+  private lastMod1LiveEmitAt = 0
   // Latest computed output per (sceneId, trackId). Populated every tick by the
   // numeric path; emitted throttled via emitCurrentValues().
   private liveValues: Record<string, Record<string, string>> = {}
@@ -787,6 +926,26 @@ export class SceneEngine {
 
   setOnStateChange(cb: (s: EngineState) => void): void {
     this.onStateChange = cb
+  }
+
+  // Inspector tells us which cell is open so we can stream its
+  // effective Modulation 1 (post-Mod 2 patch) at ~30 Hz. Pass null
+  // to stop the stream (e.g. user clicks elsewhere). Calling with a
+  // new selection clears the throttle timer so the first sample fires
+  // immediately for snappy feedback.
+  setSelectedCellForLive(sel: { sceneId: string; trackId: string } | null): void {
+    this.selectedCellForLive = sel
+    this.lastMod1LiveEmitAt = 0
+    // If the new selection has no Modulation 2 enabled, push a null
+    // sample right away so the Inspector clears any stale live values.
+    if (sel === null && this.onMod1Live) {
+      this.onMod1Live(null)
+    }
+  }
+  setOnMod1Live(
+    cb: ((sample: import('@shared/types').Mod1LiveSample | null) => void) | null
+  ): void {
+    this.onMod1Live = cb
   }
 
   /** Forward every successful OSC send to `cb`. Pass null to detach. */
@@ -1076,6 +1235,14 @@ export class SceneEngine {
   updateSession(next: Session): void {
     const prevTickRate = this.session?.tickRateHz
     const prevMidiEnabled = this.session?.midiEnabled
+    // Detect "fresh session load" so we can prime the HW catch state
+    // from `next.hardwareState` exactly once. Heuristic: the engine's
+    // own catch map is currently EMPTY (which is true at boot and
+    // after an explicit `stop()`, but also after every catch has
+    // been released — fine, priming an empty session into an empty
+    // map is a no-op). Subsequent updateSession calls (autosave,
+    // undo, in-flight session edits) leave the live map alone.
+    const liveMapEmpty = this.hardwareCaught.size === 0
     this.session = next
     // Refresh the fast-path flag for handleHardwareInput. Cheap to
     // recompute on session updates (a few-dozen templates max), and
@@ -1084,6 +1251,24 @@ export class SceneEngine {
     this.hasAnyHardwareModeEnabled = next.pool.templates.some(
       (t) => t.hardwareMode?.enabled === true
     )
+    // Restore persisted HW catch state on a fresh session load. The
+    // override VALUES are not restored — they self-heal on the next
+    // OSC packet from the bound device (handleHardwareInput refreshes
+    // hardwareOverride every packet). What we restore is the BINARY
+    // "this slot is caught" so the renderer's red highlight comes
+    // back immediately, and the engine substitutes the HW value
+    // (once it arrives) instead of waiting for a fresh re-catch.
+    if (liveMapEmpty && next.hardwareState?.caughtByTrack) {
+      const map = next.hardwareState.caughtByTrack
+      for (const trackId of Object.keys(map)) {
+        const slots = map[trackId] ?? []
+        for (const slotIdx of slots) {
+          if (Number.isFinite(slotIdx)) {
+            this.hardwareCaught.set(`${trackId}|${slotIdx}`, true)
+          }
+        }
+      }
+    }
     // Propagate the global MIDI on/off to the sender. Flipping off
     // closes every open port (zero CPU); flipping on lets the next
     // emit lazy-open ports as needed.
@@ -1324,8 +1509,15 @@ export class SceneEngine {
       // Fresh S&H sample at trigger so the first tick has a real value
       // rather than zero (avoids a dead-air slot on the downbeat).
       // seqRng (cell-seed-driven) keeps these reproducible across
-      // re-triggers — same as rndStep/rndSmooth above.
-      ts.shHeld = seedRng() * 2 - 1
+      // re-triggers — same as rndStep/rndSmooth above. Distribution
+      // skew honoured here too so the very first sample respects the
+      // user's centre-hug / edge-weight setting.
+      {
+        const shDist = cell.modulation.sh.distribution
+        const seedDraw = seedRng()
+        const u = shDist !== undefined && shDist !== 0.5 ? warpDistribution(seedDraw, shDist) : seedDraw
+        ts.shHeld = u * 2 - 1
+      }
       ts.shPrev = 0
       ts.shLastAdvanceAt = now()
       // Slew: start at current center target to avoid a pop, pick a new
@@ -1339,6 +1531,154 @@ export class SceneEngine {
       // clear of both.
       ts.chaosX = 0.1 + seedRng() * 0.8
       ts.chaosLastAdvanceAt = now()
+      // Routing per-slot Variation factors — stable random in [-1, 1]
+      // sampled once per trigger from the seqRng so each clip's slot
+      // characters are reproducible. The actual scale (× variation%)
+      // happens in the per-slot emit loop. Sized to the cell's arg
+      // count so the array indices line up with `cell.routing.variations`.
+      {
+        const trackForSlots = this.session?.tracks.find((tt) => tt.id === trackId)
+        const slotCount = Math.max(
+          1,
+          trackForSlots?.argSpec?.length ?? parseValueTokens(cell.value).length
+        )
+        const factors: number[] = new Array(slotCount)
+        for (let i = 0; i < slotCount; i++) factors[i] = seedRng() * 2 - 1
+        ts.routingVariationFactors = factors
+      }
+      // Strange Attractor: reseed near a known chaotic-band starting
+      // point with a tiny per-trigger jitter (so identical cells
+      // diverge after a few seconds). Each attractor type has its
+      // own preferred inner-region seed.
+      {
+        const ap = cell.modulation.attractor
+        const jitter = (): number => (seedRng() - 0.5) * 0.2
+        switch (ap?.type ?? 'lorenz') {
+          case 'aizawa':
+            ts.attractorRawX = 0.1 + jitter()
+            ts.attractorRawY = jitter()
+            ts.attractorRawZ = 0.01 + jitter() * 0.5
+            ts.attractorRawW = 0
+            break
+          case 'thomas':
+            ts.attractorRawX = 0.5 + jitter()
+            ts.attractorRawY = 0.5 + jitter()
+            ts.attractorRawZ = 0.5 + jitter()
+            ts.attractorRawW = 0
+            break
+          case 'rossler':
+            ts.attractorRawX = 0.1 + jitter()
+            ts.attractorRawY = jitter()
+            ts.attractorRawZ = jitter()
+            ts.attractorRawW = 0
+            break
+          case 'rossler4d':
+            ts.attractorRawX = 0.5 + jitter()
+            ts.attractorRawY = jitter()
+            ts.attractorRawZ = jitter()
+            ts.attractorRawW = jitter()
+            break
+          case 'lu4d':
+            ts.attractorRawX = 0.5 + jitter()
+            ts.attractorRawY = 0.5 + jitter()
+            ts.attractorRawZ = 0.5 + jitter()
+            ts.attractorRawW = jitter()
+            break
+          default:
+            // lorenz
+            ts.attractorRawX = 1 + jitter()
+            ts.attractorRawY = 1 + jitter()
+            ts.attractorRawZ = 1 + jitter()
+            ts.attractorRawW = 0
+            break
+        }
+        ts.attractorX = 0.5
+        ts.attractorY = 0.5
+        ts.attractorZ = 0.5
+        ts.attractorW = 0.5
+        ts.attractorSpeed = 0
+        ts.attractorLastUpdateMs = 0
+      }
+      // ── Mod 2 trigger reseed ────────────────────────────────────
+      // Same reseed pattern as Mod 1 above, but writing into ts.m2.
+      // Mod 2 has its own PRNG so consuming its random stream doesn't
+      // affect Mod 1's reproducibility. Seeded from a derived string
+      // (cell.value + '_m2') so the seed still rides the cell's
+      // identity — same Value produces the same Mod 2 trajectory on
+      // re-trigger, but it's independent of Mod 1's RNG.
+      {
+        const m2 = ts.m2
+        m2.rng = mulberry32(hashSeedString(cell.value + '_m2'))
+        const rngM2 = m2.rng
+        m2.phase = 0
+        m2.rndStepLastTick = -1
+        m2.rndStepValue = rngM2() * 2 - 1
+        m2.rndSmoothPrev = 0
+        m2.rndSmoothNext = rngM2() * 2 - 1
+        const m2Cfg = cell.modulation2
+        const shDist2 = m2Cfg?.sh.distribution
+        const seedDraw2 = rngM2()
+        const u2 =
+          shDist2 !== undefined && shDist2 !== 0.5
+            ? warpDistribution(seedDraw2, shDist2)
+            : seedDraw2
+        m2.shHeld = u2 * 2 - 1
+        m2.shPrev = 0
+        m2.shLastAdvanceAt = now()
+        m2.slewValue = 0
+        m2.slewTarget = rngM2() * 2 - 1
+        m2.slewLastAdvanceAt = now()
+        m2.chaosX = 0.1 + rngM2() * 0.8
+        m2.chaosLastAdvanceAt = now()
+        // Strange Attractor — reseed near the chaotic band for Mod
+        // 2's chosen attractor type. Same per-type seeds as Mod 1.
+        const ap2 = m2Cfg?.attractor
+        const jitter2 = (): number => (rngM2() - 0.5) * 0.2
+        switch (ap2?.type ?? 'lorenz') {
+          case 'aizawa':
+            m2.attractorRawX = 0.1 + jitter2()
+            m2.attractorRawY = jitter2()
+            m2.attractorRawZ = 0.01 + jitter2() * 0.5
+            m2.attractorRawW = 0
+            break
+          case 'thomas':
+            m2.attractorRawX = 0.5 + jitter2()
+            m2.attractorRawY = 0.5 + jitter2()
+            m2.attractorRawZ = 0.5 + jitter2()
+            m2.attractorRawW = 0
+            break
+          case 'rossler':
+            m2.attractorRawX = 0.1 + jitter2()
+            m2.attractorRawY = jitter2()
+            m2.attractorRawZ = jitter2()
+            m2.attractorRawW = 0
+            break
+          case 'rossler4d':
+            m2.attractorRawX = 0.5 + jitter2()
+            m2.attractorRawY = jitter2()
+            m2.attractorRawZ = jitter2()
+            m2.attractorRawW = jitter2()
+            break
+          case 'lu4d':
+            m2.attractorRawX = 0.5 + jitter2()
+            m2.attractorRawY = 0.5 + jitter2()
+            m2.attractorRawZ = 0.5 + jitter2()
+            m2.attractorRawW = jitter2()
+            break
+          default:
+            m2.attractorRawX = 1 + jitter2()
+            m2.attractorRawY = 1 + jitter2()
+            m2.attractorRawZ = 1 + jitter2()
+            m2.attractorRawW = 0
+            break
+        }
+        m2.attractorX = 0.5
+        m2.attractorY = 0.5
+        m2.attractorZ = 0.5
+        m2.attractorW = 0.5
+        m2.attractorSpeed = 0
+        m2.attractorLastUpdateMs = 0
+      }
       ts.lastSentString = null
       ts.lastStringAtSceneId = null
       ts.lastStringAtStep = -1
@@ -1860,7 +2200,7 @@ export class SceneEngine {
 
     for (const [trackId, ts] of this.tracks.entries()) {
       if (!ts.armed && !ts.stopping) continue
-      const cell = this.getActiveCell(trackId)
+      let cell = this.getActiveCell(trackId)
       if (!cell) continue
       // Resolve the session-side Track entry for engine-aware flags
       // (enabled, persistentSlots, oscEnabled) read further down the
@@ -1896,6 +2236,119 @@ export class SceneEngine {
         }
       }
       ts.prevScaleToUnit = cell.scaleToUnit
+
+      // ── Two-stage modulator — Mod 2 advance + apply ──────────────
+      // Mod 2 runs every tick when enabled. We advance its parallel
+      // state, evaluate its bipolar [-1, +1] signal, then build an
+      // "effective Mod 1" Modulation by applying Mod 2's signal to
+      // Mod 1's Rate / Depth / context-aware Shape per the user's
+      // targets + targetMode. The rest of the tick loop reads from
+      // `cell.modulation`, so we swap the cell reference to the
+      // patched version — Mod 1's stored Modulation is NEVER mutated.
+      // When Mod 2 is off, we skip everything (zero overhead).
+      //
+      // We also stash the ORIGINAL Modulation 1 in
+      // `mod1OriginalForSlots` so the per-slot loop can fall back to
+      // it when a slot has Modulation 2 routed off in the Routing
+      // matrix (see routing.modulation2[idx] checks below).
+      let mod1OriginalForSlots: Modulation = cell.modulation
+      if (cell.modulation2?.enabled) {
+        mod1OriginalForSlots = cell.modulation
+        advanceMod2State(
+          cell.modulation2,
+          ts.m2,
+          dt,
+          t,
+          this.session.globalBpm,
+          this.tickIdx
+        )
+        // Scene duration (seconds) for envelope-as-Mod2. Best-effort
+        // — falls back to 1 s if we can't resolve it cheaply (the
+        // duration is mainly used by Envelope which is a rare Mod 2
+        // pick anyway).
+        const sceneDurSec = 1
+        const mod2NormBipolar = evalMod2Bipolar(
+          cell.modulation2,
+          ts.m2,
+          ts.triggerTime,
+          t,
+          this.session.globalBpm,
+          this.tickIdx,
+          sceneDurSec
+        )
+        const effMod1 = applyMod2ToMod1(
+          cell.modulation,
+          cell.modulation2,
+          mod2NormBipolar
+        )
+        // Shallow-clone the cell with the patched modulation so any
+        // downstream code reading `cell.modulation` sees the
+        // effective version. The original cell in the session stays
+        // untouched.
+        cell = { ...cell, modulation: effMod1 }
+        // ── Live preview emit ─────────────────────────────────────
+        // If the Inspector is watching this exact (scene, track), send
+        // the effective Mod 1 to it at ~30 Hz. Throttled so we don't
+        // bury the renderer in IPC chatter at high tick rates. Only
+        // emits the params Mod 2 can target — see Mod1LiveSample.
+        const sel = this.selectedCellForLive
+        if (
+          this.onMod1Live &&
+          sel &&
+          sel.trackId === trackId &&
+          ts.activeSceneId === sel.sceneId &&
+          t - this.lastMod1LiveEmitAt >= 33
+        ) {
+          this.lastMod1LiveEmitAt = t
+          const sample: import('@shared/types').Mod1LiveSample = {
+            sceneId: sel.sceneId,
+            trackId: sel.trackId,
+            rateHz: effMod1.rateHz,
+            depthPct: effMod1.depthPct
+          }
+          // Populate the type-specific Shape readout so the Inspector
+          // can overlay the live value on the relevant control.
+          switch (effMod1.type) {
+            case 'lfo':
+              sample.lfoShape = effMod1.shape
+              break
+            case 'sh':
+              sample.shDistribution = effMod1.sh.distribution
+              break
+            case 'random':
+              sample.randomDistribution = effMod1.random.distribution
+              break
+            case 'attractor':
+              sample.attractorChaos = effMod1.attractor?.chaos
+              // Also surface the effective speed so the AttractorEditor
+              // can animate its Speed slider when Modulation 2 →
+              // Rate target is on.
+              sample.attractorSpeed = effMod1.attractor?.speed
+              break
+            case 'chaos':
+              sample.chaosR = effMod1.chaos.r
+              break
+            case 'slew':
+              sample.slewRiseMs = effMod1.slew.riseMs
+              sample.slewFallMs = effMod1.slew.fallMs
+              break
+            case 'envelope':
+              sample.envelopeSustain = effMod1.envelope.sustainLevel
+              break
+            case 'ramp':
+              sample.rampCurvePct = effMod1.ramp.curvePct
+              // Effective ramp length (ms) — Modulation 2's Rate
+              // target inverts time, so this can feel completely
+              // different from the stored rampMs.
+              sample.rampMs = effMod1.ramp.rampMs
+              break
+            case 'arpeggiator':
+              sample.arpMode = effMod1.arpeggiator.arpMode
+              break
+          }
+          this.onMod1Live(sample)
+        }
+      }
 
       // Advance LFO phase (only for LFO modulation; envelope uses real time).
       if (cell.modulation.enabled && cell.modulation.type === 'lfo') {
@@ -1935,11 +2388,20 @@ export class SceneEngine {
         if (effHz > 0) {
           const rng = ts.seqRng ?? Math.random
           const period = 1000 / effHz
+          // Distribution skew (0..1) — same warp as the Random
+          // modulator. Pulls samples toward centre (>0.5), pushes
+          // toward edges (<0.5), or passes through uniform (=0.5).
+          const dist = cell.modulation.sh.distribution
+          const drawShVal = (): number => {
+            if (dist === undefined || dist === 0.5) return rng() * 2 - 1
+            const warped = warpDistribution(rng(), dist) // [0, 1]
+            return warped * 2 - 1
+          }
           while (t - ts.shLastAdvanceAt >= period) {
             ts.shLastAdvanceAt += period
             if (rng() < Math.max(0, Math.min(1, cell.modulation.sh.probability))) {
               ts.shPrev = ts.shHeld
-              ts.shHeld = rng() * 2 - 1
+              ts.shHeld = drawShVal()
             }
             // If the die rolls against us, no change — held + prev stay put.
           }
@@ -1998,6 +2460,243 @@ export class SceneEngine {
         }
       }
 
+      // Strange Attractor — continuous ODE integration. Unlike the
+      // 1-D logistic Chaos above, the trajectory is bounded but never
+      // periodic, and the channels (X/Y/Z[/W]) are CORRELATED, giving
+      // an "organic, intentional" feel — exactly what installation
+      // work asks for.
+      //
+      // Per-tick integration with adaptive sub-steps so high `speed`
+      // settings don't unphysically jump across the attractor in one
+      // big step (which would diverge most of these systems). All raw
+      // state lives in `attractorRaw*`; the renderable `attractor*`
+      // mirror is the same trajectory normalised into [0, 1] per axis.
+      if (
+        cell.modulation.enabled &&
+        cell.modulation.type === 'attractor' &&
+        !ts.stopping &&
+        cell.modulation.attractor
+      ) {
+        const ap = cell.modulation.attractor
+        if (ts.attractorLastUpdateMs === 0) ts.attractorLastUpdateMs = t
+        const dtMs = Math.max(0, t - ts.attractorLastUpdateMs)
+        ts.attractorLastUpdateMs = t
+        // Total integration time this tick (in attractor "seconds").
+        // 1× speed = 60 ms of wall-clock maps to 0.012 of integration
+        // time — slow enough that Lorenz reads as a clear, lazy
+        // butterfly at 0.5×, frenetic at 10×.
+        const tIntegrate = Math.min(0.5, dtMs * 0.0002 * Math.max(0.05, ap.speed))
+        // Sub-steps so the largest single integration is <= 0.005 to
+        // keep Euler stable. Most attractors are robust to slightly
+        // larger but ~0.005 is the safe floor.
+        const subSteps = Math.max(1, Math.ceil(tIntegrate / 0.005))
+        const h = tIntegrate / subSteps
+        let x = ts.attractorRawX
+        let y = ts.attractorRawY
+        let z = ts.attractorRawZ
+        let w = ts.attractorRawW
+        const chaosKnob = Math.max(0, Math.min(1, ap.chaos))
+        let dx = 0
+        let dy = 0
+        let dz = 0
+        let dw = 0
+        for (let s = 0; s < subSteps; s++) {
+          switch (ap.type) {
+            case 'lorenz': {
+              // Canonical Lorenz at σ=10, β=8/3, ρ varied by chaos
+              // knob from 14 (limit cycle) → 28 (classic butterfly)
+              // → 50 (jagged wings).
+              const sigma = 10
+              const beta = 8 / 3
+              const rho = 14 + chaosKnob * 36
+              dx = sigma * (y - x)
+              dy = x * (rho - z) - y
+              dz = x * y - beta * z
+              break
+            }
+            case 'rossler': {
+              // Canonical Rössler at a=b=0.2, c varied by chaos.
+              const a = 0.2
+              const b = 0.2
+              const c = 4 + chaosKnob * 10 // 4..14, chaotic ~5.7+
+              dx = -y - z
+              dy = x + a * y
+              dz = b + z * (x - c)
+              break
+            }
+            case 'aizawa': {
+              // Aizawa: smooth toroidal trajectory with a spiral hole.
+              const a = 0.95
+              const b = 0.7
+              const c = 0.6
+              const d = 3.5
+              const e = 0.25
+              const f = 0.1 + chaosKnob * 0.3
+              dx = (z - b) * x - d * y
+              dy = d * x + (z - b) * y
+              dz = c + a * z - (z * z * z) / 3 - (x * x + y * y) * (1 + e * z) + f * z * (x * x * x)
+              break
+            }
+            case 'thomas': {
+              // Thomas' cyclically symmetric attractor.
+              const b = 0.05 + chaosKnob * 0.3 // damping; lower = more chaotic
+              dx = Math.sin(y) - b * x
+              dy = Math.sin(z) - b * y
+              dz = Math.sin(x) - b * z
+              break
+            }
+            case 'rossler4d': {
+              // 4D hyperchaotic Rössler.
+              const a = 0.25
+              const b = 3
+              const c = 0.05 + chaosKnob * 0.15
+              const d = 0.5
+              dx = -y - z
+              dy = x + a * y + w
+              dz = b + x * z
+              dw = -c * z + d * w
+              break
+            }
+            case 'lu4d': {
+              // 4D Lü hyperchaotic. Tight, dense trajectory.
+              const a = 36
+              const b = 3
+              const c = 20
+              const d = 1 + chaosKnob * 2.5 // bifurcation knob
+              dx = a * (y - x) + w
+              dy = c * y - x * z
+              dz = x * y - b * z
+              dw = -x * z + d * w
+              break
+            }
+          }
+          x += h * dx
+          y += h * dy
+          z += h * dz
+          w += h * dw
+          // Inside-loop safety clamps. Aizawa (and to a lesser extent
+          // Lorenz/Rössler at extreme chaos values) can produce a
+          // single huge dx after a state escape, which then feeds
+          // back as x → ±∞ → NaN within the same tick. Clamping to
+          // ±SAFE_MAX after every sub-step keeps the trajectory in
+          // the realm where dy / dz computations remain finite. The
+          // bound is well above every attractor's natural extent so
+          // it never affects the canonical orbits.
+          const SAFE_MAX = 200
+          if (!Number.isFinite(x) || Math.abs(x) > SAFE_MAX)
+            x = Number.isFinite(x) ? Math.sign(x) * SAFE_MAX : 0.1
+          if (!Number.isFinite(y) || Math.abs(y) > SAFE_MAX)
+            y = Number.isFinite(y) ? Math.sign(y) * SAFE_MAX : 0
+          if (!Number.isFinite(z) || Math.abs(z) > SAFE_MAX)
+            z = Number.isFinite(z) ? Math.sign(z) * SAFE_MAX : 0
+          if (!Number.isFinite(w) || Math.abs(w) > SAFE_MAX)
+            w = Number.isFinite(w) ? Math.sign(w) * SAFE_MAX : 0
+        }
+        // End-of-loop divergence guard — if the trajectory is still
+        // way out after clamping, reseed to a canonical inner point.
+        if (
+          !Number.isFinite(x) ||
+          !Number.isFinite(y) ||
+          !Number.isFinite(z) ||
+          !Number.isFinite(w)
+        ) {
+          x = 0.1
+          y = 0
+          z = 0
+          w = 0
+        }
+        ts.attractorRawX = x
+        ts.attractorRawY = y
+        ts.attractorRawZ = z
+        ts.attractorRawW = w
+        // Normalise to [0, 1] per axis using known canonical bounds
+        // for each attractor. The mapping is intentionally generous
+        // so chaos-knob extremes still land mostly in-range. NaN/Inf
+        // protection at the top returns the midpoint instead of
+        // letting a degenerate value reach the renderer / per-slot
+        // emit math.
+        const norm01 = (v: number, range: number): number => {
+          if (!Number.isFinite(v)) return 0.5
+          const u = 0.5 + v / (2 * range)
+          return u < 0 ? 0 : u > 1 ? 1 : u
+        }
+        // Per-attractor half-ranges (v in ±range maps to [0, 1] of
+        // output). Tuned against published phase-space bounds for
+        // each system at chaos=0.5. Aizawa z can reach ~2 so the
+        // z-range is widened from the previous 1.5. 4D systems have
+        // larger w-ranges because they're hyperchaotic.
+        let rngX = 25
+        let rngY = 30
+        let rngZ = 30
+        let rngW = 10
+        switch (ap.type) {
+          case 'lorenz':
+            // Classic ρ=28: x,y ∈ ±20, z ∈ [0, 50]. Widened so
+            // chaos=1 (ρ=50) still fits.
+            rngX = 30
+            rngY = 30
+            rngZ = 50
+            break
+          case 'rossler':
+            // At c=5.7: x,y ∈ ±10, z ∈ [0, 25]. Widened for c=14.
+            rngX = 15
+            rngY = 15
+            rngZ = 25
+            break
+          case 'aizawa':
+            // Aizawa: x,y ∈ ±1.5, z ∈ [-0.5, 2]. The previous 1.5
+            // range on z was too tight (z reaches 2) — value got
+            // pinned at 1.0 and bracketed the NaN region. Bumping
+            // to 2 fixes the clip.
+            rngX = 1.5
+            rngY = 1.5
+            rngZ = 2
+            break
+          case 'thomas':
+            // Bounded: x,y,z ∈ ±5 across the chaos sweep.
+            rngX = 5
+            rngY = 5
+            rngZ = 5
+            break
+          case 'rossler4d':
+            // Hyperchaotic Rössler 4D: x,y ∈ ±15, z ∈ [0, 35], w
+            // can swing wider. Previous ranges were too tight.
+            rngX = 15
+            rngY = 15
+            rngZ = 30
+            rngW = 50
+            break
+          case 'lu4d':
+            // Lü 4D hyperchaotic: aggressive constants → large
+            // raw values. Previous estimates were close but z + w
+            // tended to clip. Widened.
+            rngX = 50
+            rngY = 50
+            rngZ = 80
+            rngW = 150
+            break
+        }
+        ts.attractorX = norm01(x, rngX)
+        ts.attractorY = norm01(y, rngY)
+        ts.attractorZ = norm01(z, rngZ)
+        // For 3D attractors, the W channel is the speed of the
+        // trajectory (|d/dt|) — gives a "breathing" 4th channel
+        // that's correlated with the X/Y/Z motion. EMA-smoothed so
+        // it doesn't pulse spasmodically every tick.
+        if (ap.type === 'rossler4d' || ap.type === 'lu4d') {
+          ts.attractorW = norm01(w, rngW)
+        } else {
+          const speedRaw = Math.sqrt(dx * dx + dy * dy + dz * dz)
+          // Soft-clip to a reasonable normalised range. Different
+          // attractors have wildly different natural speeds; the
+          // arctan keeps it bounded with a gentle knee.
+          const speedN = Math.atan(speedRaw / 30) / (Math.PI / 2)
+          // EMA smoothing — α=0.1 = ~10-tick time constant.
+          ts.attractorSpeed = ts.attractorSpeed * 0.9 + speedN * 0.1
+          ts.attractorW = ts.attractorSpeed
+        }
+      }
+
       // Random Generator path — bypasses the normal token logic. Emits
       // a new OSC payload on its own rate, seeded from the cell's Value.
       // Number of samples per tick scales with the number of whitespace-
@@ -2039,10 +2738,60 @@ export class SceneEngine {
               if (rndSpan <= 1e-9) return 0
               return Math.max(0, Math.min(1, (v - rndLo) / rndSpan))
             }
+            // Pin + fixed-arg respect for the Random emit. The per-
+            // slot loop (which handles these for every OTHER emit
+            // path) gets skipped via the `continue` at the bottom of
+            // the Random branch, so we have to apply the same
+            // overrides here before sendMany. Three cases per slot:
+            //   - argSpec.fixed → emit the declared fixed value
+            //   - cell.persistentSlots[i] === true → use cell pin
+            //   - cell.persistentSlots[i] === undefined && track pinned → use track pin
+            //   - otherwise → random sample (existing behaviour)
+            const cellPinArr = cell.persistentSlots
+            const cellPinVals = cell.persistentValues
+            const trackPinArr = track?.persistentSlots
+            const trackPinVals = track?.persistentValues
+            const argSpecRnd = track?.argSpec
             const args: Array<{
               type: 'i' | 'f' | 's' | 'T' | 'F'
               value: number | string | boolean
-            }> = ts.randCurrent.map((v) => {
+            }> = ts.randCurrent.map((v, i) => {
+              // 1. Fixed argSpec slot — emit the declared value.
+              const spec = argSpecRnd?.[i]
+              if (spec?.fixed !== undefined) {
+                return formatFixedAsOscArg(spec)
+              }
+              // 2. Pin resolution (cell beats track; explicit false
+              //    overrides track default to "unpinned").
+              const cellOverride = cellPinArr?.[i]
+              let pinnedRaw: string | undefined
+              let isPinned = false
+              if (cellOverride === true) {
+                isPinned = true
+                pinnedRaw = cellPinVals?.[i]
+              } else if (cellOverride === false) {
+                isPinned = false
+              } else if (trackPinArr?.[i] === true) {
+                isPinned = true
+                pinnedRaw = trackPinVals?.[i]
+              }
+              if (isPinned && pinnedRaw !== undefined) {
+                const parsed = parseFloat(pinnedRaw)
+                if (Number.isFinite(parsed)) {
+                  // Honour scaleToUnit on the pinned value too — same
+                  // contract as the per-slot loop's pin branch.
+                  const pinnedFinal = cell.scaleToUnit
+                    ? Math.max(0, Math.min(1, parsed))
+                    : parsed
+                  // Match output type to what Random would have emitted:
+                  // float for float-mode or scaleToUnit; int otherwise.
+                  if (rnd.valueType === 'float' || cell.scaleToUnit) {
+                    return { type: 'f' as const, value: pinnedFinal }
+                  }
+                  return { type: 'i' as const, value: Math.round(pinnedFinal) }
+                }
+              }
+              // 3. Default — random-generated value (the original logic).
               if (rnd.valueType === 'float') {
                 if (cell.scaleToUnit) {
                   return { type: 'f' as const, value: normalise(v) }
@@ -2111,7 +2860,36 @@ export class SceneEngine {
       // any step advance (sequencer enabled or not) qualifies as a
       // Note On edge for cells with MIDI Note kind.
       let stepChanged = false
-      if (cell.sequencer.enabled && !ts.stopping) {
+      if (cell.sequencer.enabled && !ts.stopping && cell.sequencer.mode === 'adresse') {
+        // Adresse mode — clock is bypassed entirely; the playhead is
+        // READ from the modulator's normalised output. floor(mod * N)
+        // picks the active step, so a smooth modulator (LFO, Strange
+        // Attractor) scrubs through the step values like a quantised
+        // wavetable scanner; a stepped modulator (S&H, Random)
+        // teleports between steps. Inspired by the Buchla 245
+        // sequential voltage source.
+        const stepsA = effectiveSteps(cell)
+        let modAddrUnit = 0.5
+        if (cell.modulation.enabled) {
+          const norm = computeModNorm(
+            cell.modulation,
+            ts,
+            this.tickIdx,
+            (t - ts.triggerTime) / 1000,
+            this.currentSceneDurationSec(ts.activeSceneId),
+            this.session.globalBpm
+          )
+          // Map bipolar -1..1 to 0..1; unipolar already 0..1.
+          modAddrUnit = cell.modulation.mode === 'bipolar' ? (norm + 1) / 2 : norm
+        }
+        const clampedAddr = Math.max(0, Math.min(0.99999, modAddrUnit))
+        const newIdx = Math.max(0, Math.min(stepsA - 1, Math.floor(clampedAddr * stepsA)))
+        if (newIdx !== ts.seqStepIdx) {
+          ts.seqLastStepIdx = ts.seqStepIdx
+          ts.seqStepIdx = newIdx
+          stepChanged = true
+        }
+      } else if (cell.sequencer.enabled && !ts.stopping) {
         // Resolve the step duration based on the sequencer's Sync mode.
         //   'bpm'   — lock to the session's global BPM
         //   'tempo' — use the sequencer's per-clip bpm slider
@@ -2495,6 +3273,35 @@ export class SceneEngine {
           )
         }
       }
+      // Routing matrix per-slot "Modulation 2" gate. When Modulation 2
+      // is enabled AND any slot has its Modulation 2 routing ticked
+      // OFF, we compute a SECOND modNorm using the ORIGINAL
+      // Modulation 1 (pre-Mod 2-apply). Per-slot the loop below
+      // picks which one drives that slot. We bail out of the
+      // computation when nothing routes to "original" so the common
+      // path stays a single computeModNorm call.
+      let modNormOriginal = modNorm
+      const anySlotBypassesMod2 =
+        cell.modulation2?.enabled === true &&
+        Array.isArray(cell.routing?.modulation2) &&
+        cell.routing!.modulation2!.some((b) => b === false)
+      if (anySlotBypassesMod2) {
+        if (
+          cell.modulation.enabled &&
+          !ts.stopping &&
+          cell.modulation.type !== 'envelope' &&
+          cell.modulation.type !== 'ramp'
+        ) {
+          modNormOriginal = computeModNorm(
+            mod1OriginalForSlots,
+            ts,
+            this.tickIdx,
+            (t - ts.triggerTime) / 1000,
+            this.currentSceneDurationSec(ts.activeSceneId),
+            this.session.globalBpm
+          )
+        }
+      }
 
       // Per-token targets (numeric) — baseline for center computation.
       // When scaleToUnit is on AND a sequencer is active, DON'T pre-
@@ -2559,18 +3366,79 @@ export class SceneEngine {
           liveParts.push(String(a.value))
           continue
         }
-        const target = stepTargets[idx] ?? 0
-        // Center: with sequencer, center jumps to step value (still honoring
-        // the initial morph-in after trigger). Without sequencer, center
-        // follows the morph from fromCenter[idx] → toCenter[idx].
+        // Routing matrix lookups. `routing.sequencer[i]` and
+        // `routing.modulator[i]` each default to `true` (= routed).
+        // The user can untick either to gate that direction OUT for
+        // the slot — sequencer-off means "use cell.value seed
+        // instead of the step value"; modulator-off means "skip the
+        // modulator contribution to `out`". argSpec.fixed and pin
+        // still beat both routings (handled elsewhere).
+        //
+        // Per-slot Delay (ms) acts as a SECOND gate on both
+        // directions: the slot is considered "not routed yet" until
+        // `delay` ms have elapsed since the trigger. After that the
+        // user's tick state takes over.
+        const slotDelayMs = cell.routing?.delays?.[idx] ?? 0
+        const slotPostDelay =
+          slotDelayMs <= 0 || t - ts.triggerTime >= slotDelayMs
+        const routingSeqOn =
+          slotPostDelay && cell.routing?.sequencer?.[idx] !== false
+        const routingModOn =
+          slotPostDelay && cell.routing?.modulator?.[idx] !== false
+        // Variation multiplier — stable random in [-1, 1] sampled at
+        // trigger, scaled by the user's 0..100% knob. 0% = identical
+        // across slots; 100% = each slot's modulator amplitude varies
+        // randomly in [0×, 2×] the base contribution. Adds slight
+        // de-tune across multi-arg cells without affecting the
+        // direction (a positive factor brightens, negative darkens).
+        const variationPct = cell.routing?.variations?.[idx] ?? 0
+        const variationFactor =
+          variationPct > 0
+            ? 1 + (ts.routingVariationFactors[idx] ?? 0) * (variationPct / 100)
+            : 1
+        // When the sequencer is on AND routed for this slot, use the
+        // step value as the target. Otherwise (sequencer off OR
+        // unrouted), fall back to the cell.value seed parsed from
+        // the user's static value field.
+        const seqDrivesSlot = cell.sequencer.enabled && routingSeqOn
+        const seedArg = perToken[idx]
+        const seedVal =
+          seedArg && (seedArg.type === 'i' || seedArg.type === 'f')
+            ? (seedArg.value as number)
+            : 0
+        const target = seqDrivesSlot ? stepTargets[idx] ?? 0 : seedVal
+        // Center: with sequencer driving this slot, center jumps to
+        // step value (still honoring the initial morph-in after
+        // trigger). Otherwise center follows the morph between the
+        // cell.value seed endpoints.
         let center: number
-        if (cell.sequencer.enabled) {
+        if (seqDrivesSlot) {
           const from = ts.fromCenter[idx] ?? 0
           center = morphP < 1 ? from + (target - from) * morphP : target
         } else {
           const from = ts.fromCenter[idx] ?? 0
           const to = ts.toCenter[idx] ?? target
           center = from + (to - from) * morphP
+        }
+
+        // Scaling PRE — clamp the raw seed BEFORE the modulator /
+        // sequencer ever sees it. The whole downstream chain then
+        // operates within the clamped band. Counterpart to the POST
+        // clamp further down (which clamps the FINAL `out`).
+        if (cell.scalingEnabled && (cell.scalingMode ?? 'post') === 'pre') {
+          const sMin = cell.scalingMin?.[idx]
+          const sMax = cell.scalingMax?.[idx]
+          if (
+            typeof sMin === 'number' &&
+            Number.isFinite(sMin) &&
+            typeof sMax === 'number' &&
+            Number.isFinite(sMax)
+          ) {
+            const lo = sMin <= sMax ? sMin : sMax
+            const hi = sMin <= sMax ? sMax : sMin
+            if (center < lo) center = lo
+            else if (center > hi) center = hi
+          }
         }
 
         // scaleToUnit auto-range — instead of blunt clamp([0, 1]),
@@ -2602,7 +3470,13 @@ export class SceneEngine {
         }
 
         let out = center
-        if (cell.modulation.enabled && !ts.stopping) {
+        // Routing-modulator OFF for this slot short-circuits every
+        // modulator branch below — `out` stays at `center` (the
+        // seed / step value). We still enter the block so the
+        // sequencer's step-change side effects (e.g. liveDisplay)
+        // fire normally elsewhere; just the contribution to `out`
+        // is suppressed.
+        if (cell.modulation.enabled && !ts.stopping && routingModOn) {
           if (cell.modulation.type === 'envelope') {
             // Multiplicative envelope, depth-mixed. depth=0% → no effect
             // (output = center); depth=100% → full VCA shape (out = center * env).
@@ -2637,13 +3511,72 @@ export class SceneEngine {
             }
             const stepVal =
               ladder[Math.max(0, Math.min(N - 1, ts.arpStepIdx))] ?? dryCenter
-            const depth01 = cell.modulation.depthPct / 100
+            // Routing.modulation2 per-slot gate: pick the original
+            // (pre-Mod 2) depthPct for this slot when Mod 2 routing
+            // is unticked. Default (undefined / true) keeps the
+            // effective depth — current behavior.
+            const slotMod2On =
+              cell.modulation2?.enabled !== true ||
+              cell.routing?.modulation2?.[idx] !== false
+            const depthSlot = slotMod2On
+              ? cell.modulation.depthPct
+              : mod1OriginalForSlots.depthPct
+            const depth01 = depthSlot / 100
             // depth=100% replaces base with arp value; depth=0% leaves base.
-            out = dryCenter * (1 - depth01) + stepVal * depth01
+            // Routing-modulator OFF for this slot → bypass the arp
+            // contribution entirely, emit the dry centre. Variation
+            // scales the arp-vs-dry mix amount.
+            out = routingModOn
+              ? dryCenter * (1 - depth01 * variationFactor) +
+                stepVal * depth01 * variationFactor
+              : dryCenter
           } else {
+            // Routing.modulation2 per-slot gate — see arpeggiator
+            // branch above for the same idea. When the slot has
+            // Modulation 2 routed OFF, the magnitude uses the
+            // original (pre-Mod 2) depthPct and the modNorm comes
+            // from the original-Modulation-1 computation we ran
+            // earlier in the tick.
+            const slotMod2On =
+              cell.modulation2?.enabled !== true ||
+              cell.routing?.modulation2?.[idx] !== false
+            const depthSlot = slotMod2On
+              ? cell.modulation.depthPct
+              : mod1OriginalForSlots.depthPct
             const magnitude =
-              Math.max(Math.abs(center), 1) * (cell.modulation.depthPct / 100)
-            out = center + modNorm * magnitude
+              Math.max(Math.abs(center), 1) * (depthSlot / 100)
+            const modNormForSlot = slotMod2On ? modNorm : modNormOriginal
+            // Strange Attractor — per-slot channel fan-out. Slot 0
+            // gets X (the primary motion axis); slot 1 Y, slot 2 Z,
+            // slot 3 W (= speed-breath for 3D types, native W for
+            // 4D). Slots ≥ 4 keep the last channel. Mode (uni / bi)
+            // travels through the channel helper.
+            const slotModNorm =
+              cell.modulation.type === 'attractor'
+                ? attractorChannelFor(ts, idx, cell.modulation.mode)
+                : modNormForSlot
+            // Adresse mode `hijack` (default) — the modulator is
+            // CONSUMED entirely as the playhead position; the step
+            // value emits as-is, NO additional modulation. `parallel`
+            // adds the modulator on top of the addressed step.
+            const adresseMode = cell.sequencer.adresseMode ?? 'hijack'
+            const adresseHijack =
+              cell.sequencer.enabled &&
+              cell.sequencer.mode === 'adresse' &&
+              adresseMode === 'hijack'
+            // Routing gates the modulator contribution out for this
+            // slot when the user unticked the Modulator row in the
+            // Routing matrix. Combined with the sequencer-routing
+            // toggle above, the user can dial individual slots
+            // independent of either driver.
+            // Per-slot Variation multiplier scales the contribution
+            // so multi-arg cells get "similar but slightly different"
+            // motion across slots.
+            if (adresseHijack || !routingModOn) {
+              out = center
+            } else {
+              out = center + slotModNorm * magnitude * variationFactor
+            }
           }
         }
         // Smart scaleToUnit auto-range.
@@ -2652,13 +3585,18 @@ export class SceneEngine {
         //   normalised above before modulation; final clamp01 keeps
         //   modulator wobble inside [0, 1]).
         // - Modulator + scaleToUnit (no sequencer): predict the
-        // Per-arg post-modulation Scaling clamp. Tames extreme
-        // values from generative sequencers / random modulators by
-        // pinning each slot's output to a user-configured
-        // [min, max] band BEFORE scaleToUnit + MIDI scale do their
-        // own normalisation. Disabled by default; arrays index
-        // parallel to argSpec slots, missing entries skip the clamp.
-        if (cell.scalingEnabled) {
+        // Per-arg Scaling clamp. Modes:
+        //   POST (default) — clamps `out` AFTER modulator + sequencer
+        //                    but BEFORE scaleToUnit + MIDI Scale. Tames
+        //                    extreme outputs from generative sources.
+        //   PRE            — handled earlier in the per-slot loop on
+        //                    `center` (the raw seed) so the entire
+        //                    downstream chain operates within the
+        //                    clamped band. Skipped here.
+        // Disabled by default. Arrays index parallel to argSpec slots;
+        // missing entries skip the clamp.
+        const scalingModeNow = cell.scalingMode ?? 'post'
+        if (cell.scalingEnabled && scalingModeNow === 'post') {
           const sMin = cell.scalingMin?.[idx]
           const sMax = cell.scalingMax?.[idx]
           if (
@@ -3284,15 +4222,45 @@ function numericBasesFromRaw(raw: string): number[] {
  * Values are in raw "rng-space" (pre-rounding / pre-scale); the caller rounds
  * to int / quantizes to the OSC type + applies Scale 0.0-1.0 clamping.
  */
+// Symmetric power-law warp on a uniform [0, 1] draw, parameterised by
+// a "distribution" knob in [0, 1]:
+//   0.0  → edge-weighted (values pushed toward 0 and 1)
+//   0.5  → uniform (raw rng, pass-through)
+//   1.0  → centre-hugging (values pulled toward 0.5)
+// Implementation: anchor at 0.5, take distance |u - 0.5| ∈ [0, 0.5],
+// re-shape the distance with x^k (centre-hug, k > 1) or x^(1/k)
+// (edge-spread, k > 1), then re-attach the original sign side. Smooth
+// at u = 0.5 and continuous at u = 0/1.
+function warpDistribution(u: number, distribution: number): number {
+  const d = Math.max(0, Math.min(1, distribution))
+  if (d === 0.5) return u
+  const c = u - 0.5 // [-0.5, 0.5]
+  const sign = c < 0 ? -1 : 1
+  const absC = Math.abs(c) * 2 // [0, 1]
+  // k = 1..4 strength. d=1 → strong centre-hug, d=0 → strong edge-weight.
+  const strength = 1 + Math.abs(d - 0.5) * 6
+  const warped = d > 0.5 ? Math.pow(absC, strength) : Math.pow(absC, 1 / strength)
+  return 0.5 + sign * warped * 0.5
+}
+
 function sampleRandom(
   rng: () => number,
-  rnd: { valueType: 'int' | 'float' | 'colour'; min: number; max: number },
+  rnd: {
+    valueType: 'int' | 'float' | 'colour'
+    min: number
+    max: number
+    distribution?: number
+  },
   tokenCount: number
 ): number[] {
   const lo = Math.min(rnd.min, rnd.max)
   const hi = Math.max(rnd.min, rnd.max)
   const range = hi - lo
-  const pick = (): number => lo + rng() * range
+  const dist = rnd.distribution
+  const pick = (): number => {
+    const u = dist !== undefined && dist !== 0.5 ? warpDistribution(rng(), dist) : rng()
+    return lo + u * range
+  }
   const total = rnd.valueType === 'colour' ? 3 * Math.max(1, tokenCount) : Math.max(1, tokenCount)
   const out: number[] = new Array(total)
   for (let i = 0; i < total; i++) out[i] = pick()
@@ -3404,10 +4372,61 @@ function computeModNorm(
     if (m.mode === 'bipolar') return raw
     return ts.chaosX // already 0..1
   }
+  if (m.type === 'attractor') {
+    // Default channel = X. Multi-arg cells get per-slot channels via
+    // `attractorChannelFor(ts, slotIdx, mode)` in the per-slot emit
+    // loop; single-arg / single-channel readers use this fallback.
+    return attractorChannelFor(ts, 1, m.mode)
+  }
   // LFO (default fallthrough)
   const raw = lfo(m.shape, ts.phase, ts, tickIdx) // -1..1
   if (m.mode === 'bipolar') return raw
   return (raw + 1) / 2 // 0..1
+}
+
+// Resolve which attractor channel feeds a given arg slot.
+//   slotIdx 0 → W (4D) or X (3D, since W=speed sits at slot 3)
+//   slotIdx 1 → X
+//   slotIdx 2 → Y
+//   slotIdx 3 → Z
+//   slotIdx 4+ → Z (graceful degrade — keeps the last channel mod
+//                  active rather than zeroing)
+// For 3D attractors the user-facing mental model is X/Y/Z fan-out to
+// the first three slots + a "speed breath" on slot 3. For 4D the
+// canonical channel labels W/X/Y/Z all participate. Mode (uni/bi)
+// just maps the stored [0,1] value into the right output range.
+function attractorChannelFor(
+  ts: TrackState,
+  slotIdx: number,
+  mode: 'unipolar' | 'bipolar'
+): number {
+  let v01 = 0.5
+  // Slot mapping. Slot 0 wants the "first" channel: X for 3D
+  // attractors, W for 4D. We don't carry attractor type here, but
+  // the 3D vs 4D distinction was already encoded at integration
+  // time — when type was 4D, ts.attractorW holds the canonical W
+  // channel; when 3D, ts.attractorW holds the speed. Slot 0 takes
+  // X in both cases so the user-facing fan-out is consistent
+  // (slot 0 = primary motion).
+  switch (slotIdx) {
+    case 0:
+      v01 = ts.attractorX
+      break
+    case 1:
+      v01 = ts.attractorY
+      break
+    case 2:
+      v01 = ts.attractorZ
+      break
+    case 3:
+      v01 = ts.attractorW
+      break
+    default:
+      v01 = ts.attractorZ
+      break
+  }
+  if (mode === 'unipolar') return v01
+  return v01 * 2 - 1 // bipolar
 }
 
 // ADSR with A, D, S (hold), R. Times in seconds (converted from ms or scene %).
@@ -3503,4 +4522,618 @@ function computeRampGain(
   // Inverted mode flips the ramp vertically so it falls 1 → 0 instead
   // of rising 0 → 1 (curve shape preserved, just mirrored).
   return mode === 'inverted' ? 1 - shaped : shaped
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Two-stage modulator — helper functions
+//
+// Mod 2's per-tick advance + eval mirror Mod 1's code but read/write
+// from a `Mod2State` (see top of file) instead of the TrackState's
+// modulator-state fields. They're concentrated here so the per-tick
+// loop above stays readable: one call advances Mod 2's state, one
+// returns its bipolar [-1, +1] norm value, and one builds an
+// "effective Mod 1" Modulation by applying Mod 2's output to Mod 1's
+// Rate / Depth / context-aware Shape per the user's targets +
+// targetMode.
+//
+// Supported Mod 2 types (subset of full ModType): LFO, S&H, Slew,
+// Chaos, Strange Attractor. The remaining types (Envelope, Ramp,
+// Arpeggiator, Random) are time/note/multi-channel constructs that
+// don't map cleanly to "continuous bipolar modulator signal", and
+// are treated as no-op when assigned to Mod 2 (eval returns 0).
+// ─────────────────────────────────────────────────────────────────
+
+function advanceMod2State(
+  m: import('@shared/types').Modulation,
+  m2: Mod2State,
+  dt: number,
+  t: number,
+  bpm: number,
+  tickIdx: number
+): void {
+  if (!m.enabled) return
+  // LFO — same phase advance + stepped/smooth shape resampling as
+  // the Mod 1 LFO block above, just writing into m2 fields.
+  if (m.type === 'lfo') {
+    const effHz = effectiveLfoHz(m, bpm)
+    const prevPhase = m2.phase
+    m2.phase += effHz * dt
+    const wraps = Math.floor(m2.phase) - Math.floor(prevPhase)
+    if (wraps > 0) {
+      const rng = m2.rng ?? Math.random
+      const spastic = m.shape === 'spastic'
+      for (let w = 0; w < wraps; w++) {
+        m2.rndSmoothPrev = m2.rndSmoothNext
+        m2.rndSmoothNext = rng() * 2 - 1
+        m2.rndStepValue = spastic ? (rng() < 0.5 ? -1 : 1) : rng() * 2 - 1
+      }
+      m2.rndStepLastTick = tickIdx
+    }
+    return
+  }
+  // S&H — clock-driven hold/draw with optional distribution warp.
+  if (m.type === 'sh') {
+    const effHz = effectiveLfoHz(m, bpm)
+    if (effHz > 0) {
+      const rng = m2.rng ?? Math.random
+      const period = 1000 / effHz
+      const dist = m.sh.distribution
+      const drawShVal = (): number => {
+        if (dist === undefined || dist === 0.5) return rng() * 2 - 1
+        const warped = warpDistribution(rng(), dist)
+        return warped * 2 - 1
+      }
+      while (t - m2.shLastAdvanceAt >= period) {
+        m2.shLastAdvanceAt += period
+        if (rng() < Math.max(0, Math.min(1, m.sh.probability))) {
+          m2.shPrev = m2.shHeld
+          m2.shHeld = drawShVal()
+        }
+      }
+    }
+    return
+  }
+  // Slew — clock-driven target + one-pole IIR low-pass per tick.
+  if (m.type === 'slew') {
+    const effHz = effectiveLfoHz(m, bpm)
+    if (effHz > 0) {
+      const rng = m2.rng ?? Math.random
+      const period = 1000 / effHz
+      while (t - m2.slewLastAdvanceAt >= period) {
+        m2.slewLastAdvanceAt += period
+        if (m.slew.randomTarget) {
+          m2.slewTarget = rng() * 2 - 1
+        } else {
+          m2.slewTarget = m2.slewTarget >= 0 ? -1 : 1
+        }
+      }
+    }
+    const goingUp = m2.slewTarget > m2.slewValue
+    const halfLifeMs = Math.max(1, goingUp ? m.slew.riseMs : m.slew.fallMs)
+    const alpha = 1 - Math.pow(2, (-dt * 1000) / halfLifeMs)
+    m2.slewValue += (m2.slewTarget - m2.slewValue) * alpha
+    return
+  }
+  // Chaos — logistic map iterate at clock rate.
+  if (m.type === 'chaos') {
+    const effHz = effectiveLfoHz(m, bpm)
+    if (effHz > 0) {
+      const period = 1000 / effHz
+      const r = Math.max(3.4, Math.min(4.0, m.chaos.r))
+      const rng = m2.rng ?? Math.random
+      while (t - m2.chaosLastAdvanceAt >= period) {
+        m2.chaosLastAdvanceAt += period
+        let x = m2.chaosX
+        x = r * x * (1 - x)
+        if (!Number.isFinite(x) || x <= 0 || x >= 1) x = 0.1 + rng() * 0.8
+        m2.chaosX = x
+      }
+    }
+    return
+  }
+  // Strange Attractor — same ODE integration as Mod 1's block, just
+  // updating m2.attractor* fields. Code intentionally duplicated
+  // rather than abstracted so each branch can stay small + fast.
+  if (m.type === 'attractor' && m.attractor) {
+    const ap = m.attractor
+    if (m2.attractorLastUpdateMs === 0) m2.attractorLastUpdateMs = t
+    const dtMs = Math.max(0, t - m2.attractorLastUpdateMs)
+    m2.attractorLastUpdateMs = t
+    const tIntegrate = Math.min(0.5, dtMs * 0.0002 * Math.max(0.05, ap.speed))
+    const subSteps = Math.max(1, Math.ceil(tIntegrate / 0.005))
+    const h = tIntegrate / subSteps
+    let x = m2.attractorRawX
+    let y = m2.attractorRawY
+    let z = m2.attractorRawZ
+    let w = m2.attractorRawW
+    const chaosKnob = Math.max(0, Math.min(1, ap.chaos))
+    const SAFE_MAX = 200
+    let lastDx = 0
+    let lastDy = 0
+    let lastDz = 0
+    for (let s = 0; s < subSteps; s++) {
+      let dx = 0
+      let dy = 0
+      let dz = 0
+      let dw = 0
+      switch (ap.type) {
+        case 'aizawa': {
+          const a = 0.95
+          const b = 0.7
+          const c = 0.6
+          const d = 3.5
+          const e = 0.25 + chaosKnob * 0.5
+          const f = 0.1
+          dx = (z - b) * x - d * y
+          dy = d * x + (z - b) * y
+          dz = c + a * z - (z * z * z) / 3 - (x * x + y * y) * (1 + e * z) + f * z * x * x * x
+          break
+        }
+        case 'thomas': {
+          const b = 0.1 + chaosKnob * 0.3
+          dx = Math.sin(y) - b * x
+          dy = Math.sin(z) - b * y
+          dz = Math.sin(x) - b * z
+          break
+        }
+        case 'rossler': {
+          const a = 0.2
+          const b = 0.2
+          const c = 5 + chaosKnob * 8
+          dx = -y - z
+          dy = x + a * y
+          dz = b + z * (x - c)
+          break
+        }
+        case 'rossler4d': {
+          const a = 0.25
+          const b = 3
+          const c = 0.5 + chaosKnob * 0.5
+          const d = 0.05
+          dx = -y - z
+          dy = x + a * y + w
+          dz = b + x * z
+          dw = -c * z + d * w
+          break
+        }
+        case 'lu4d': {
+          const a = 36
+          const b = 3
+          const c = 20
+          const d = 1.3 + chaosKnob * 0.5
+          dx = a * (y - x) + w
+          dy = c * y - x * z
+          dz = x * y - b * z
+          dw = -x * z + d * w
+          break
+        }
+        default: {
+          // lorenz
+          const sigma = 10
+          const rho = 28 + chaosKnob * 12
+          const beta = 8 / 3
+          dx = sigma * (y - x)
+          dy = x * (rho - z) - y
+          dz = x * y - beta * z
+          break
+        }
+      }
+      x += h * dx
+      y += h * dy
+      z += h * dz
+      w += h * dw
+      if (!Number.isFinite(x) || Math.abs(x) > SAFE_MAX) x = (Math.random() - 0.5) * 2
+      if (!Number.isFinite(y) || Math.abs(y) > SAFE_MAX) y = (Math.random() - 0.5) * 2
+      if (!Number.isFinite(z) || Math.abs(z) > SAFE_MAX) z = (Math.random() - 0.5) * 2
+      if (!Number.isFinite(w) || Math.abs(w) > SAFE_MAX) w = (Math.random() - 0.5) * 2
+      lastDx = dx
+      lastDy = dy
+      lastDz = dz
+    }
+    m2.attractorRawX = x
+    m2.attractorRawY = y
+    m2.attractorRawZ = z
+    m2.attractorRawW = w
+    // Normalise to [0, 1]. Per-attractor scales chosen empirically
+    // to keep the canonical orbit inside [0, 1] without saturating.
+    const norm01 = (v: number, scale: number): number => {
+      if (!Number.isFinite(v)) return 0.5
+      return Math.max(0, Math.min(1, (v / scale + 1) / 2))
+    }
+    switch (ap.type) {
+      case 'aizawa':
+        m2.attractorX = norm01(m2.attractorRawX, 1.5)
+        m2.attractorY = norm01(m2.attractorRawY, 1.5)
+        m2.attractorZ = norm01(m2.attractorRawZ, 2)
+        break
+      case 'thomas':
+        m2.attractorX = norm01(m2.attractorRawX, 5)
+        m2.attractorY = norm01(m2.attractorRawY, 5)
+        m2.attractorZ = norm01(m2.attractorRawZ, 5)
+        break
+      case 'rossler':
+        m2.attractorX = norm01(m2.attractorRawX, 15)
+        m2.attractorY = norm01(m2.attractorRawY, 15)
+        m2.attractorZ = norm01(m2.attractorRawZ, 30)
+        break
+      case 'rossler4d':
+        m2.attractorX = norm01(m2.attractorRawX, 15)
+        m2.attractorY = norm01(m2.attractorRawY, 15)
+        m2.attractorZ = norm01(m2.attractorRawZ, 30)
+        m2.attractorW = norm01(m2.attractorRawW, 50)
+        break
+      case 'lu4d':
+        m2.attractorX = norm01(m2.attractorRawX, 50)
+        m2.attractorY = norm01(m2.attractorRawY, 50)
+        m2.attractorZ = norm01(m2.attractorRawZ, 80)
+        m2.attractorW = norm01(m2.attractorRawW, 150)
+        break
+      default:
+        m2.attractorX = norm01(m2.attractorRawX, 30)
+        m2.attractorY = norm01(m2.attractorRawY, 30)
+        m2.attractorZ = norm01(m2.attractorRawZ, 50)
+        break
+    }
+    // 3D-only: store speed in W channel (Euclidean norm of last
+    // derivative, EMA-smoothed). 4D types overwrote W above.
+    if (ap.type !== 'rossler4d' && ap.type !== 'lu4d') {
+      const speed = Math.sqrt(lastDx * lastDx + lastDy * lastDy + lastDz * lastDz)
+      const normSpeed = Math.max(0, Math.min(1, speed / 100))
+      m2.attractorSpeed = m2.attractorSpeed * 0.9 + normSpeed * 0.1
+      m2.attractorW = m2.attractorSpeed
+    }
+    return
+  }
+  // Envelope / Ramp / Arpeggiator / Random → handled by evalMod2Bipolar
+  // directly (no per-tick state advance needed beyond what Mod 1
+  // already does on the shared triggerTime).
+}
+
+function evalMod2Bipolar(
+  m: import('@shared/types').Modulation,
+  m2: Mod2State,
+  triggerTimeMs: number,
+  nowMs: number,
+  bpm: number,
+  tickIdx: number,
+  sceneDurSec: number
+): number {
+  if (!m.enabled) return 0
+  const elapsedSec = (nowMs - triggerTimeMs) / 1000
+  switch (m.type) {
+    case 'envelope': {
+      const g = computeEnvelopeGain(m.envelope, elapsedSec, sceneDurSec)
+      // Force bipolar interpretation for stage-2 use regardless of
+      // m.mode — we want symmetric ± swing around Mod 1's base
+      // values, not an asymmetric "always pulls toward higher".
+      return 2 * g - 1
+    }
+    case 'sh': {
+      let raw: number
+      if (m.sh.smooth) {
+        const effHz = effectiveLfoHz(m, bpm)
+        const periodMs = effHz > 0 ? 1000 / effHz : 1
+        const into = nowMs - m2.shLastAdvanceAt
+        const k =
+          0.5 -
+          0.5 * Math.cos(Math.max(0, Math.min(1, into / periodMs)) * Math.PI)
+        raw = m2.shPrev * (1 - k) + m2.shHeld * k
+      } else {
+        raw = m2.shHeld
+      }
+      return raw
+    }
+    case 'slew':
+      return m2.slewValue
+    case 'chaos':
+      return m2.chaosX * 2 - 1
+    case 'attractor':
+      // Use X channel by default — single bipolar value drives the
+      // targeting math. (4-channel fan-out would be for Mod 1's
+      // per-slot output, but at this stage we just need ONE number.)
+      return m2.attractorX * 2 - 1
+    case 'lfo': {
+      const raw = lfo(m.shape, m2.phase, m2, tickIdx)
+      return raw
+    }
+    case 'ramp':
+    case 'arpeggiator':
+    case 'random':
+      // Not supported as Mod 2 — treat as no-op so the user doesn't
+      // get surprising "Mod 2 silently zeroed Mod 1" behaviour.
+      return 0
+    default:
+      return 0
+  }
+}
+
+// Build an "effective Mod 1" Modulation by applying Mod 2's bipolar
+// signal (in [-1, +1]) to Mod 1's Rate, Depth, and a context-aware
+// "Shape" parameter, per the targeting fields on `m2cfg`. The
+// returned Modulation shares all referenced sub-objects (envelope,
+// arpeggiator, etc.) with the input — only the patched scalar fields
+// differ. Cheap to call every tick.
+function applyMod2ToMod1(
+  m1: import('@shared/types').Modulation,
+  m2cfg: import('@shared/types').Modulation,
+  mod2NormBipolar: number
+): import('@shared/types').Modulation {
+  const targets = m2cfg.targets
+  if (!targets) return m1
+  // Fast path — if no target is enabled, skip the per-tick clones.
+  // The user-facing toggle UI defaults amounts > 0 but enable=false,
+  // so this branch fires whenever the Mod 2 section is "on" but the
+  // user hasn't checked any target yet.
+  if (
+    targets.rate?.enabled !== true &&
+    targets.depth?.enabled !== true &&
+    targets.shape?.enabled !== true
+  ) {
+    return m1
+  }
+  const mode = m2cfg.targetMode ?? 'multiplicative'
+  let out: import('@shared/types').Modulation = m1
+  // ── Rate ─────────────────────────────────────────────────────────
+  // "Rate" maps to whatever drives modulator speed for the current
+  // type. For LFO / S&H / Slew / Chaos / Random / Arp the rate
+  // control is `rateHz` (or its BPM-synced equivalent, which is also
+  // resolved from rateHz). For Strange Attractor the rate control is
+  // `attractor.speed` — patching rateHz on an attractor is a silent
+  // no-op because the attractor integration block never reads it.
+  // We patch BOTH fields (the LFO-family field AND the attractor
+  // speed) so the user's "Rate" knob always has an audible effect
+  // regardless of Mod 1's type.
+  if (targets.rate?.enabled) {
+    const amt = (targets.rate.amount ?? 0) / 100
+    // LFO-family rate (rateHz) — used by LFO, S&H, Slew, Chaos,
+    // Random, Arpeggiator. Clamp to the engine's 0.01..20 Hz band.
+    const baseRate = m1.rateHz
+    let nextRate: number
+    if (mode === 'additive') {
+      // Bipolar swing ±(20 Hz × amount) around the base, clamped to
+      // a sane LFO band. 20 Hz is the engine's upper LFO limit; the
+      // additive math feels right when the swing is a fixed slice of
+      // the legal range.
+      nextRate = baseRate + mod2NormBipolar * 20 * amt
+    } else {
+      // multiplicative + mix
+      nextRate = baseRate * (1 + mod2NormBipolar * amt)
+    }
+    nextRate = Math.max(0.01, Math.min(20, nextRate))
+    out = { ...out, rateHz: nextRate }
+    // Strange Attractor — patch `attractor.speed` too. The engine
+    // ignores rateHz for attractor and reads `attractor.speed`
+    // exclusively; without this branch the Rate knob would be a
+    // silent no-op when Modulation 1 = Strange Attractor.
+    if (m1.type === 'attractor' && m1.attractor) {
+      const baseSpeed = m1.attractor.speed
+      let nextSpeed: number
+      if (mode === 'additive') {
+        // Speed sits in [0.05, 10] roughly; ±5× amount feels like
+        // the LFO Rate's ±20 Hz at amount 100%.
+        nextSpeed = baseSpeed + mod2NormBipolar * 5 * amt
+      } else {
+        nextSpeed = baseSpeed * (1 + mod2NormBipolar * amt)
+      }
+      nextSpeed = Math.max(0.05, Math.min(10, nextSpeed))
+      out = {
+        ...out,
+        attractor: { ...m1.attractor, speed: nextSpeed }
+      }
+    }
+    // Ramp — patch `ramp.rampMs` AND `ramp.totalMs`. Both are time
+    // params (ms); rampMs feeds sync='free', totalMs feeds
+    // sync='freeSync', so patching both lets the user pick either
+    // sync mode and still feel the Rate target. INVERTED scaling:
+    // higher Rate = SHORTER time, so the user's mental model "Rate
+    // up = modulator faster" stays consistent across types.
+    if (m1.type === 'ramp') {
+      // Inverted multiplier: mod2 = +1 with amount = 100 % → time × 0
+      // (clamped to safe min); mod2 = -1 → time × 2 (twice as slow).
+      const factor =
+        mode === 'additive'
+          ? 1 - mod2NormBipolar * amt
+          : 1 - mod2NormBipolar * amt
+      const clampedFactor = Math.max(0.01, factor)
+      const nextRampMs = Math.max(
+        0.1,
+        Math.min(300000, m1.ramp.rampMs * clampedFactor)
+      )
+      const nextTotalMs = Math.max(
+        0.1,
+        Math.min(300000, (m1.ramp.totalMs ?? m1.ramp.rampMs) * clampedFactor)
+      )
+      out = {
+        ...out,
+        ramp: { ...m1.ramp, rampMs: nextRampMs, totalMs: nextTotalMs }
+      }
+    }
+  }
+  // ── Depth ────────────────────────────────────────────────────────
+  if (targets.depth?.enabled) {
+    const amt = (targets.depth.amount ?? 0) / 100
+    const baseDepth = m1.depthPct
+    let nextDepth: number
+    if (mode === 'additive') {
+      // ±(100 × amount) around base, clamped to 0..100.
+      nextDepth = baseDepth + mod2NormBipolar * 100 * amt
+    } else {
+      // multiplicative + mix
+      nextDepth = baseDepth * (1 + mod2NormBipolar * amt)
+    }
+    nextDepth = Math.max(0, Math.min(100, nextDepth))
+    out = { ...out, depthPct: nextDepth }
+  }
+  // ── Shape — context-aware per Mod 1's type ───────────────────────
+  if (targets.shape?.enabled) {
+    const amt = (targets.shape.amount ?? 0) / 100
+    // Use mod2 in [0, 1] for distribution-like targets, [-1, +1]
+    // (signed) for symmetric morphs.
+    const u01 = (mod2NormBipolar + 1) * 0.5
+    switch (m1.type) {
+      case 'lfo': {
+        // Morph the existing shape via a "shape index" sweep over
+        // the ordered shape list. Crude but musical — moves through
+        // sine → tri → square → saw → rev-saw → stepped → smooth
+        // → spastic as mod2 swings. Centre = current shape.
+        const order: import('@shared/types').LfoShape[] = [
+          'sine',
+          'triangle',
+          'square',
+          'sawtooth',
+          'rndStep',
+          'rndSmooth',
+          'spastic'
+        ]
+        const curIdx = Math.max(0, order.indexOf(m1.shape))
+        const offset = Math.round(mod2NormBipolar * amt * (order.length - 1))
+        const nextIdx = Math.max(0, Math.min(order.length - 1, curIdx + offset))
+        out = { ...out, shape: order[nextIdx] }
+        break
+      }
+      case 'sh': {
+        const baseDist = m1.sh.distribution ?? 0.5
+        let nextDist: number
+        if (mode === 'multiplicative' || mode === 'mix') {
+          nextDist = baseDist + (u01 - 0.5) * amt
+        } else {
+          nextDist = baseDist + mod2NormBipolar * amt * 0.5
+        }
+        nextDist = Math.max(0, Math.min(1, nextDist))
+        out = { ...out, sh: { ...(out.sh ?? m1.sh), distribution: nextDist } }
+        break
+      }
+      case 'attractor': {
+        const baseChaos = m1.attractor?.chaos ?? 0.5
+        let nextChaos: number
+        if (mode === 'multiplicative' || mode === 'mix') {
+          nextChaos = baseChaos * (1 + mod2NormBipolar * amt)
+        } else {
+          nextChaos = baseChaos + mod2NormBipolar * amt
+        }
+        nextChaos = Math.max(0, Math.min(1, nextChaos))
+        // Spread from `out.attractor` (which carries any Rate-target
+        // patch to `speed` made earlier in this function) rather than
+        // `m1.attractor`. Reading from `m1` would overwrite the
+        // already-patched speed back to its base value — Speed and
+        // Chaos targets must compose.
+        out = {
+          ...out,
+          attractor: {
+            ...(out.attractor ?? m1.attractor ?? { type: 'lorenz', speed: 1, chaos: 0.5 }),
+            chaos: nextChaos
+          }
+        }
+        break
+      }
+      case 'chaos': {
+        const baseR = m1.chaos.r
+        // r is a stability knob in [3.4, 4.0]; multiplicative is too
+        // jumpy at this narrow range, so always additive for chaos.r.
+        const nextR = Math.max(3.4, Math.min(4.0, baseR + mod2NormBipolar * amt * 0.6))
+        out = { ...out, chaos: { ...(out.chaos ?? m1.chaos), r: nextR } }
+        break
+      }
+      case 'random': {
+        const baseDist = m1.random.distribution ?? 0.5
+        const nextDist = Math.max(0, Math.min(1, baseDist + (u01 - 0.5) * amt))
+        out = {
+          ...out,
+          random: { ...(out.random ?? m1.random), distribution: nextDist }
+        }
+        break
+      }
+      case 'slew': {
+        // No obvious "shape" knob — morph between rise and fall
+        // times symmetrically so positive mod2 lengthens both.
+        const factor = 1 + mod2NormBipolar * amt
+        const rise = Math.max(1, m1.slew.riseMs * factor)
+        const fall = Math.max(1, m1.slew.fallMs * factor)
+        out = {
+          ...out,
+          slew: { ...(out.slew ?? m1.slew), riseMs: rise, fallMs: fall }
+        }
+        break
+      }
+      case 'envelope': {
+        // Envelope's continuous "personality" knob is sustainLevel
+        // (0..1). Multiplicative around the base feels natural —
+        // amount 100 % with mod2 = +1 doubles sustain, mod2 = -1
+        // zeros it. Additive uses the full 0..1 range as the swing.
+        const baseSus = m1.envelope.sustainLevel
+        let nextSus: number
+        if (mode === 'additive') {
+          nextSus = baseSus + mod2NormBipolar * amt
+        } else {
+          nextSus = baseSus * (1 + mod2NormBipolar * amt)
+        }
+        nextSus = Math.max(0, Math.min(1, nextSus))
+        out = {
+          ...out,
+          envelope: {
+            ...(out.envelope ?? m1.envelope),
+            sustainLevel: nextSus
+          }
+        }
+        break
+      }
+      case 'ramp': {
+        // Ramp's "Curve" param is signed: -100 (ease-in / slow start)
+        // to +100 (ease-out / fast start), 0 = linear. Always additive
+        // because the base sits around 0 and a multiplicative swing
+        // doesn't move past the sign barrier cleanly. ±100 × amount
+        // around the base, clamped to the legal range.
+        const baseCurve = m1.ramp.curvePct ?? 0
+        const nextCurve = Math.max(
+          -100,
+          Math.min(100, baseCurve + mod2NormBipolar * 100 * amt)
+        )
+        // Spread from `out.ramp` so the Rate target's earlier patch
+        // of rampMs / totalMs survives the curve patch. Reading from
+        // `m1.ramp` would silently overwrite both back to their base
+        // values.
+        out = {
+          ...out,
+          ramp: { ...(out.ramp ?? m1.ramp), curvePct: nextCurve }
+        }
+        break
+      }
+      case 'arpeggiator': {
+        // Arpeggiator's continuous-ish knob is the Mode picker — an
+        // ordered enum of musical-feeling step patterns. We map
+        // mod2's [-1, +1] swing across the enum, centred on the base
+        // mode's index. Amount = 100 % covers the full enum span;
+        // smaller amounts keep nearby modes. Cosmetic note: mode
+        // changes happen at the per-tick eval rate, which can be
+        // fast — typically the user dials amount low.
+        const order: import('@shared/types').ArpMode[] = [
+          'up',
+          'down',
+          'upDown',
+          'downUp',
+          'exclusion',
+          'walk',
+          'drunk',
+          'random'
+        ]
+        const baseIdx = Math.max(0, order.indexOf(m1.arpeggiator.arpMode))
+        const span = order.length - 1
+        const offset = Math.round(mod2NormBipolar * amt * span)
+        const nextIdx = Math.max(0, Math.min(span, baseIdx + offset))
+        out = {
+          ...out,
+          arpeggiator: {
+            ...(out.arpeggiator ?? m1.arpeggiator),
+            arpMode: order[nextIdx]
+          }
+        }
+        break
+      }
+      default:
+        // Any future modulator type without a shape param falls here
+        // silently. Add a case above when you add a new ModType.
+        break
+    }
+  }
+  return out
 }

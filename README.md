@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--056)
+- [Release notes](#release-notes--057)
+  - [0.5.7](#release-notes--057)
   - [0.5.6](#release-notes--056)
   - [0.5.5](#release-notes--055)
   - [0.5.1](#release-notes--051)
@@ -65,7 +66,17 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
-- **Hardware Mode (v0.5.5)** — drive any compositor cell's args from a physical OSC controller (Trill bars, MIDI-to-OSC bridges, anything streaming UDP). Per-Instrument-template config: bind to a discovered device, pick **Reset** or **Persist** catch-mode, set catch tolerance + movement threshold, optionally narrow to specific Track instances and specific arg slots. Soft-takeover: the hardware value only takes over once it matches the currently-emitted scene value (or persists across scene changes if you want it to). Movement detection skips static/idle packets. Caught arg values render **red** in the live cell of the currently-playing scene, with a pulsing red dot in the Track sidebar + "HW Mode On" badge under the Instrument. Toggle the same Hardware Mode block from either the Pool inspector OR the grid Instrument inspector — both write the same `template.hardwareMode` blob.
+- **Two-stage modulator — Modulation 2 (v0.5.7)** — every clip now carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode). Same Type picker as Mod 1 (LFO / S&H / Slew / Chaos / Strange Attractor / Envelope). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value — Mod 2's modulation breathes around whatever you author. Mod 2 also gets its own Routing-matrix column for per-slot gating.
+- **Hardware Mode (v0.5.5)** — drive any compositor cell's args from a physical OSC controller (Trill bars, MIDI-to-OSC bridges, anything streaming UDP). Per-Instrument-template config: bind to a discovered device, pick **Reset** or **Persist** catch-mode, set catch tolerance + movement threshold, optionally narrow to specific Track instances and specific arg slots. Soft-takeover: the hardware value only takes over once it matches the currently-emitted scene value (or persists across scene changes if you want it to). Movement detection skips static/idle packets. Caught arg values render **red** in the live cell of the currently-playing scene, with a pulsing red dot in the Track sidebar + "HW Mode On" badge under the Instrument. Toggle the same Hardware Mode block from either the Pool inspector OR the grid Instrument inspector — both write the same `template.hardwareMode` blob. **Session persistence (v0.5.7)**: the caught-slot map (per-track arg indices currently overridden by hardware) is saved with the session and restored on load, so a power-cycle no longer wipes which slots are bound.
+- **Strange Attractor modulator (v0.5.7)** — new modulator type drawing from 6 well-known chaotic ODEs: **Lorenz, Aizawa, Thomas, Rössler, Rössler-4D, Lü-4D**. Per-tick Euler integration with adaptive sub-steps + per-step `±200` clamps + NaN guards so high-Speed × high-Chaos never blows up. Three knobs: **Type, Speed, Chaos**. Each tick produces a bounded, correlated 3-channel (or 4-channel for 4D types) trajectory; multi-arg cells fan out as slot 0 = X, slot 1 = Y, slot 2 = Z, slot 3 = W (= speed for 3D types, native W for 4D). Live SVG visual previews the 2-D projection of the orbit. Mod 2's Rate target patches `attractor.speed`, not `rateHz`.
+- **Routing matrix (v0.5.7)** — new collapsible section at the bottom of the Cell Inspector. Per-slot 3-column toggle grid (Mod / Mod 2 / Seq) plus **Delay (ms)** and **Variation (%)** columns. Untick a tick to gate the driver out for that slot (slot reads its cell.value seed instead of the modulated value). Click+drag across ticks to paint several at once. Bulk ⇆ buttons toggle a whole column. Delay staggers a slot's modulator/sequencer onset after each trigger. Variation introduces a per-trigger random ±scaling so multi-arg cells stay "similar but a bit different" across slots (with a small SVG knob next to the % input). Modulation 2 column greys out when Mod 2 is disabled on the cell.
+- **Address sequencer mode (v0.5.7)** — 10th sequencer mode. The Modulator's output is interpreted as a **CV-style playhead address** into a row of step values: `stepIdx = floor(modUnipolar01 * stepsA)`. Three sub-modes: **Hijack** (default, Mod consumed entirely as playhead; the addressed step value emits as-is), **Parallel** (Mod still drives normal modulation on top of the addressed step), and Stage-2 (reserved for v0.5.8). Pairs especially well with LFO and S&H Modulation 1 types.
+- **Distribution knob on Random + S&H modulators (v0.5.7)** — a "0 % = edges only · 50 % = uniform · 100 % = centre-hugging" warp on every fresh sample (Buchla 266 Stored Random Voltages style). Applied at trigger-time seeding AND every per-tick draw. Mod 2's Shape target on these types sweeps Distribution.
+- **Scaling PRE/POST switch (v0.5.7)** — the per-arg post-modulation Scaling section can now be applied either AFTER modulators + sequencer (POST — default, clamps the final output) or BEFORE them (PRE — the whole modulator/sequencer chain operates inside the clamped band). Switch lives in the Scaling section header.
+- **Editable pinned values broadcast to clips (v0.5.7)** — pinned slots in the Parameter Inspector are now an inline text field instead of a static display. Edit the captured value live; engine picks it up immediately. The "Send to clips" button now **also** stamps the new pinned values into every clip's `value` string at the pinned positions, so the grid display stays in sync with what the engine emits.
+- **Parameter row right-click menu (v0.5.7)** — Parameter rows now get their own context menu (Duplicate Parameter / Delete Parameter), distinct from the Instrument template menu.
+- **Ctrl+C / Ctrl+V clipboard (v0.5.7)** — internal clipboard for Instruments, Parameters, and clips. Copy from the row sidebar or grid → paste at the current selection. Suppressed inside editable inputs.
+- **Saved Scene right-click menu (v0.5.7)** — Pool · Scenes tab gets Rename (inline) + "Update from Grid" so the linked scene's contents are refreshed from the current grid in one click. Unique-name suffix `_N` on duplicate saves.
 - **Per-sequence-slot overrides (v0.5.5)** — the same scene placed twice in the sequence can now have different durations AND different follow actions per placement. Click any sequencer slot → an accent-bordered **Slot N override** panel appears at the top of the right inspector. Live progress fill + countdown only paints the slot that's actually playing, not every visual instance of the scene. Loop follow-action correctly restarts on the same slot instead of disappearing.
 - **Velocity Humanize (v0.5.5)** — 0–100 % jitter slider next to the Velocity field in the Cell Inspector. Engine rolls a fresh random velocity offset on every noteOn (sequencer step OR modulator-driven note edge), so the badge value visibly jitters at the same rate as the audible notes. Live cell badge mirrors the actual emitted velocity (with fixed-width 3-char padding so the number doesn't wiggle the layout).
 - **Modulator-driven MIDI re-trigger (v0.5.5)** — Note-mode MIDI cells now fire a fresh noteOn whenever the modulator's value crosses a note boundary, not just on sequencer steps. Lets you drive a synth with a free-running LFO / Random / Chaos modulator and hear every note transition cleanly. Old behavior (one noteOn at trigger, held forever) is gone.
@@ -80,8 +91,8 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **Per‑arg post‑modulation Scaling (v0.5)** — new collapsible section in the Cell Inspector between Values and Timing. Clamps each arg's output to a user‑chosen `[min, max]` band AFTER modulators / sequencer but BEFORE Scale 0.0–1.0 and MIDI Scale. Lets you tame extreme values from a Random / Chaos / Generative source without rewriting the whole sequencer. Per‑cell, per‑arg.
 - **3‑deep undo / redo (v0.5)** — Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Snapshot ring buffer (3 past + 3 future), 500 ms coalesce so typing bursts count as one undoable edit. Buttons live in the prefs sub‑toolbar with depth indicators. History resets on session load.
 - **Smart Scale 0.0 – 1.0** — auto‑ranges each parameter's actual min/max into `[0, 1]` instead of blunt‑clamping. Works for sequencer cycles, modulator outputs, even multi‑arg colour channels.
-- **Eight modulation types with live visualisations** — **LFO**, **Ramp** (Normal / Inverted / Loop), **Envelope (ADSR)**, **Arpeggiator** (with mode‑aware playback patterns), **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet); per‑modulator preview SVG redraws as you tweak.
-- **Nine sequencer modes** — **Steps**, **Euclidean**, **Polyrhythm** (two interlocking rings), **Density** (per‑step probability), **Cellular** (1‑D Wolfram automaton with Seed LFO), **Drift** (Brownian playhead), **Ratchet** (sub‑pulse bursts with 7 shaping modes), **Bounce** (geometrically accelerating step duration), **Draw** (free‑form curve up to 1024 steps). Each has its own inspector preview.
+- **Nine modulation types with live visualisations** — **LFO**, **Ramp** (Normal / Inverted / Loop), **Envelope (ADSR)**, **Arpeggiator** (with mode‑aware playback patterns), **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map), and **Strange Attractor** (v0.5.7 — Lorenz / Aizawa / Thomas / Rössler / Rössler-4D / Lü-4D, 3-/4-channel fan-out). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet); per‑modulator preview SVG redraws as you tweak. Each cell can stack a SECOND modulator (Modulation 2) that modulates Modulation 1's Rate / Depth / context-aware Shape — see top of the feature list.
+- **Ten sequencer modes** — **Steps**, **Euclidean**, **Polyrhythm** (two interlocking rings), **Density** (per‑step probability), **Cellular** (1‑D Wolfram automaton with Seed LFO), **Drift** (Brownian playhead), **Ratchet** (sub‑pulse bursts with 7 shaping modes), **Bounce** (geometrically accelerating step duration), **Draw** (free‑form curve up to 1024 steps), and **Address** (v0.5.7 — CV-style playhead driven by the Modulator's output, three sub-modes). Each has its own inspector preview.
 - **Generative mode** — flip a switch on any sequencer and the engine reinterprets the step values through a per‑mode musical rule (Tide, Accent, Voicing, Wave, Crowd, Terrain, Scatter, Bounce). Variation knob controls how far values stray from the user's base.
 - **Hold vs Last** rest behaviour — choose whether a muted step keeps emitting the last value (Hold) or replays the previous step's value (Last). Default Hold.
 - **Transitions** morph the previous clip's value into the new one over a configurable time, even while the LFO keeps running.
@@ -506,7 +517,8 @@ By default, sessions saved via the Save‑before‑quit / Save‑before‑new fl
 ```
 src/
 ├── main/
-│   ├── engine.ts            # fixed-tick scene engine, 9 sequencer modes, 8 modulators,
+│   ├── engine.ts            # fixed-tick scene engine, 10 sequencer modes, 9 modulators,
+│   │                          # two-stage modulator (Mod 2 → Mod 1's rate/depth/shape),
 │   │                          # cell pin precedence (cell > track > argSpec fixed),
 │   │                          # per-arg post-modulation Scaling clamp (10–300 Hz)
 │   ├── osc.ts               # UDP OSC sender
@@ -548,6 +560,190 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes — 0.5.7
+
+The biggest single release since v0.5. Headlines: a **Two-stage modulator** (every clip's Modulation 1 can now be modulated by a SECOND modulator, with **live overlay** of the effective values on the Inspector controls so you SEE the modulation breathe in real time); a new **Strange Attractor** modulator drawing from 6 chaotic ODEs (Lorenz / Aizawa / Thomas / Rössler / Rössler-4D / Lü-4D) with multi-channel slot fan-out; a per-cell **Routing matrix** (Mod / Mod 2 / Seq × N slots, plus Delay + Variation columns); a CV-addressed **Address** sequencer mode; editable **pinned values** that broadcast to clips; **Distribution** knob on Random + S&H; **Scaling PRE/POST** switch; **Hardware Mode session persistence**; **Ctrl+C/V** clipboard; right-click menus for Parameters + Saved Scenes; and a long tail of UX polish.
+
+### Two-stage modulator — Modulation 2
+
+Every cell gets an optional second-stage modulator that modulates Modulation 1's three most expressive knobs: **Rate, Depth, and a context-aware "Shape" parameter** whose meaning depends on Modulation 1's current type. Modulation 1's stored values are NEVER mutated — each tick the engine builds an "effective Modulation 1" by applying Mod 2's bipolar [-1, +1] signal to a fresh copy.
+
+- **Same Type picker as Modulation 1** — LFO, S&H, Slew, Chaos, Strange Attractor, Envelope all work as a second-stage signal. Random / Ramp / Arpeggiator are disabled in the picker (note/time-targeted, not continuous).
+- **Targets sub-block** in the Modulation 2 section — math-mode dropdown (**Multiplicative** / **Additive** / **Mix**) + three enable checkboxes + per-target amount knobs. Each target can be on/off independently.
+- **Context-aware Shape label** — the third target row's label live-updates with Mod 1's type:
+  - LFO → **Shape** (sweeps the shape index across sine → triangle → square → sawtooth → rndStep → rndSmooth → spastic)
+  - S&H → **Distribution** (centre-hug ↔ uniform ↔ edge-weight warp)
+  - Strange Attractor → **Chaos** (the attractor's bifurcation knob)
+  - Chaos → **r** (logistic-map stability, 3.4..4.0)
+  - Random → **Distribution**
+  - Slew → **Slew Time** (stretches Rise + Fall together)
+  - Envelope → **Sustain** (sustain level 0..1)
+  - Ramp → **Curve** (-100 ↔ +100 ease-in/out)
+  - Arpeggiator → **Mode** (cycles through `up → down → upDown → downUp → exclusion → walk → drunk → random`)
+- **Rate target is type-aware** — for LFO/S&H/Slew/Chaos/Random/Arp it patches `rateHz`; for **Strange Attractor** it patches `attractor.speed`; for **Ramp** it patches `ramp.rampMs` + `ramp.totalMs` (inverted: higher Rate signal = shorter ramp time, so "faster" reads consistently across types).
+- **Per-slot Mod 2 routing column** in the Routing matrix (see Routing section below) — untick a slot to bypass Modulation 2's effect on that arg.
+
+Engine side: a parallel `Mod2State` slot on every TrackState holds Mod 2's modulator-state fields (phase, S&H held, Slew value, Chaos x, Attractor X/Y/Z/W, etc.) + its own seeded PRNG so Mod 2's RNG doesn't shift Mod 1's reproducibility. Trigger-time reseed mirrors Mod 1's. `applyMod2ToMod1` produces the effective Mod 1 with sane clamps per type (rate ∈ [0.01, 20] Hz, speed ∈ [0.05, 10], depth ∈ [0, 100], chaos.r ∈ [3.4, 4.0], distribution ∈ [0, 1], rampMs ∈ [0.1, 300000], etc.). The Shape branches all spread from `out.X ?? m1.X` so Rate + Shape targets compose correctly (Speed + Chaos both animate at once when both are enabled).
+
+### Live modulation feedback in the Inspector
+
+The engine streams the effective Modulation 1 values for the currently-watched cell to the renderer at ~30 Hz via a new `engine:mod1Live` IPC channel. Inspector controls overlay the live values on top of the stored authoring values: slider thumbs track the engine's actual effective Hz / depth / shape, number readouts show 1-decimal live values + a "Live: X · Base: Y" tooltip, the affected control gets an accent-tinted outline (`.live-overlay` CSS class). **Editing still writes the base** — drag a slider or type into a number, Mod 2 then breathes around the new authored value.
+
+Covered: LFO (Rate/Depth/Shape), Sample & Hold (Rate/Depth/Distribution), Slew (Rate/Depth/Rise/Fall), Chaos (Rate/Depth/r), Strange Attractor (Speed/Depth/Chaos), Envelope (Sustain/Depth), Ramp (Ramp time/Curve/Depth), Arpeggiator (Rate/Depth/Mode), Random (Rate/Depth/Distribution). Rate + Depth flow through the shared `CompactRateControls` + `CompactDepthMode` helpers so adding a new modulator type automatically inherits the overlay.
+
+`Mod1LiveSample` (in `src/shared/types.ts`) is a small typed envelope with just the params Mod 2 can target; renderer stores it in a Zustand slice and the Inspector's `CellInspector` notifies the engine which (sceneId, trackId) to watch on mount + when Mod 2's enabled flag changes.
+
+### Strange Attractor modulator
+
+Ninth modulator type. Per-tick Euler integration of one of six chaotic ODE systems, with adaptive sub-steps so high Speed × high Chaos stays stable:
+
+- **Lorenz** (sigma=10, rho=28+chaos×12, beta=8/3) — the canonical butterfly
+- **Aizawa** — slow, organic, with a per-tick SAFE_MAX=200 clamp on `(x³)` term to avoid NaN propagation
+- **Thomas** — sin-driven cyclically symmetric attractor, slow + dreamy
+- **Rössler** — 3-D ribbon attractor, classic
+- **Rössler 4-D** — hyperchaotic 4-D, faster integration step `h=0.003` with `skip=400` `N=2000` in the visualizer
+- **Lü 4-D** — hyperchaotic 4-D with sub-attractor structure
+
+Three knobs: **Type** (dropdown), **Speed** (0.05..10×), **Chaos** (the canonical bifurcation knob for each system). Per-tick: raw integration in native units, then per-axis normalize to [0, 1] with per-type scales (Aizawa z up to 2, Rössler-4D w up to 50, Lü-4D w up to 150, etc.) and finite-check guards returning 0.5 on non-finite input. Multi-arg cells fan out by slot index:
+
+- 3-D types: slot 0 = X, slot 1 = Y, slot 2 = Z, slot 3 = EMA-smoothed |velocity| (the "speed breath")
+- 4-D types: slot 0 = X, slot 1 = Y, slot 2 = Z, slot 3 = W (native 4th channel)
+
+`AttractorVisual` renders a 2-D projection of the trajectory live in the Inspector; falls back to "attractor diverged — try lower chaos" if the system explodes.
+
+### Routing matrix per-cell
+
+New collapsible section at the bottom of the Cell Inspector. Per-slot toggle grid plus two number-input columns:
+
+```
+slot name | Mod | Mod 2 | Seq | Delay | Var
+```
+
+- **Mod** — Modulation 1's per-slot gate. Untick → that slot emits its `cell.value` seed instead of the modulated value.
+- **Mod 2** (v0.5.7) — Modulation 2's per-slot gate. Untick → that slot reads the ORIGINAL Modulation 1 params (Depth + Shape revert; Rate is shared globally and can't be "unmodulated" per-slot because the engine keeps a single phase). Greyed out when Mod 2 is disabled on the cell.
+- **Seq** — Sequencer's per-slot gate.
+- **Delay (ms)** — stagger a slot's modulator + sequencer onset after each trigger. Lets multi-arg cells "ripple" their modulation across the bundle (slot 0 starts immediately, slot 1 at +100 ms, slot 2 at +200 ms…).
+- **Var (%)** — float 0..100 (2 decimals, e.g. 65.50 %). Per-trigger random ±scaling of the modulator output for that slot, sampled once at trigger from the cell-seeded PRNG so the personality is reproducible. Includes a tiny PD-vradio-style 16-px rotary knob next to the number input (drag vertically, Shift = fine, double-click = 0).
+
+Click + drag across ticks to paint several at once. Bulk ⇆ buttons at the top of each tick column toggle the whole column. Section header has a chevron-style collapse toggle (`CollapsibleViewSection`); body defaults to expanded.
+
+Beaten by `argSpec.fixed` (always emits the declared value) and per-slot Pin (frozen at captured value, routing ignored).
+
+Engine side: when any slot has `routing.modulation2[idx] === false` AND Modulation 2 is enabled, the engine runs `computeModNorm` a SECOND time against the ORIGINAL Mod 1 (`mod1OriginalForSlots`) and the per-slot emit loop picks `modNormForSlot` and `depthSlot` (effective vs original) per the routing tick. Same logic applies to the Arpeggiator branch.
+
+### Address sequencer mode
+
+Tenth sequencer mode (renamed from "Adresse" mid-development per French → English consistency; old session JSONs migrate at load).
+
+The Modulator's output is interpreted as a **CV playhead address** into the row of step values:
+
+```
+stepIdx = floor(modUnipolar01 * stepsA)
+```
+
+Three sub-modes:
+
+- **Hijack** (default) — the Modulator is CONSUMED entirely as the playhead position; the addressed step value emits as-is, no additional modulation on top.
+- **Parallel** — the addressed step value AND the modulator both contribute (modulator on top of the addressed step).
+- **Stage-2** — reserved for v0.5.8 (will let Modulation 2 do the addressing while Modulation 1 modulates).
+
+Pairs well with LFO (smooth sweep through steps) and S&H (jumpy random reach into the step row). Ramp + Arpeggiator are weird matches because they don't sweep continuously by nature (documented in the mode-picker tooltip).
+
+### Live preview infrastructure
+
+- New shared type `Mod1LiveSample` — typed envelope of the live effective-Mod-1 values (rateHz, depthPct + per-type shape field).
+- New IPC channel `engine:mod1Live` (main → renderer) — emits a sample every ~33 ms while a cell is being watched.
+- New IPC handler `engine:setSelectedCellForLive` (renderer → main) — Inspector tells the engine which (sceneId, trackId) to stream for. `null` to stop.
+- Renderer Zustand slice `mod1Live` + `setMod1Live` action; subscriber wired in `App.tsx`. `CellInspector` updates the engine selection on mount + when `modulation2.enabled` flips, clears on unmount.
+- Engine: ~30 Hz throttle (`lastMod1LiveEmitAt`); only emits when the watched cell matches AND Mod 2 is enabled on the cell — zero overhead when the user isn't watching.
+
+### Editable pinned values + Send to clips broadcast
+
+The Parameter Inspector's pinned-slot list (`PersistentSlotList`) used to display pinned values as static text. Now each pinned row swaps in an inline `UncontrolledTextInput` so the captured value can be edited in place. The engine reads `track.persistentValues[i]` every emit, so changes take effect immediately.
+
+The **"Send to clips"** button on the Parameter Inspector now ALSO rewrites every clip's `value` string at the pinned positions (using the track's argSpec to pad short value strings to full length). Cells with an explicit per-cell `persistentSlots[i] === false` override are left alone. Auto-created clips on previously-empty scenes get the pinned tokens stamped in too. Confirm dialog adds a "Pinned values (N) will also be written to each clip's value tokens." note when pins exist.
+
+Store: new action `setTrackPersistentValue(id, slotIdx, value)` guards against editing slots that aren't currently pinned (typo can't accidentally pin a fresh slot).
+
+### Distribution knob — Random + Sample & Hold
+
+New continuous knob on both Random Generator and S&H modulators, in the same place across both editors. 0..1 unit warp:
+
+- **0 %** — edge-weighted (samples cluster at the rails)
+- **50 %** — uniform (passthrough)
+- **100 %** — centre-hugging
+
+Inspired by Buchla 266 "Stored Random Voltages". Applied at every fresh draw — both at trigger-time seeding AND every per-tick sample. Engine: `warpDistribution(u01, dist)` helper, called from both `sampleRandom` (Random) and the S&H clock-tick block. Modulation 2's Shape target on either type sweeps the Distribution knob.
+
+### Scaling PRE/POST switch
+
+The per-arg Scaling section (clamps each arg's output to a user-chosen `[min, max]` band) was POST-only (clamp after modulators + sequencer, before Scale 0.0–1.0 and MIDI Scale). Now configurable via a PRE/POST select in the Scaling section header:
+
+- **POST** (default) — legacy behavior. Clamps the final output. Tames extreme values from generative sources.
+- **PRE** — clamps the seed value BEFORE modulators + sequencer pick it up. The whole downstream modulation operates inside the band, which can produce more musical results when you want the modulator to "live inside" a tight range rather than getting clipped at the boundaries.
+
+Default is POST so old sessions behave identically.
+
+The Scaling section's description text is now in the section title's hover tooltip rather than a visible paragraph, freeing vertical space in the Inspector.
+
+### Hardware Mode session persistence
+
+The `hardwareCaught` map (per-track arg indices currently overridden by hardware) is now saved with the session under `session.hardwareState.caughtByTrack` and restored on load. Previously a power-cycle wiped which slots were bound; now you can save a performance, reopen, and Hardware Mode is exactly where you left it. Engine reads + writes on session load via `updateSession`; cleanup on track removal preserves the catch state for surviving tracks.
+
+### Ctrl+C / Ctrl+V — internal clipboard
+
+App-wide keyboard handler (in `App.tsx`) for Ctrl+C (or Cmd+C) / Ctrl+V on:
+
+- **Cells** in the grid (single or multi-selection)
+- **Parameter** rows in the sidebar
+- **Instrument** templates in the sidebar
+
+Internal clipboard (lives in the Zustand store, NOT the system clipboard) so the copied content keeps its full session shape (modulation, sequencer, routing, etc.) without serializing through the OS clipboard's text format. Suppressed when focus is inside an editable target (input, textarea, contenteditable) so the OS-level Ctrl+C still works for text. Paste creates new IDs so each paste is a fresh instance.
+
+Store actions: `copyToClipboard()`, `pasteFromClipboard()`, plus `clipboard` state.
+
+### Parameter row right-click menu
+
+Right-clicking a row in the Track sidebar now branches the context menu based on whether the row is a Parameter (child of an Instrument template) or the Instrument template itself:
+
+- **Parameter rows** — Duplicate Parameter / Delete Parameter
+- **Instrument (template) rows** — Duplicate Instrument / Delete Instrument plus existing items (Save as Template / Show Pool / etc.)
+
+Store actions: `duplicateFunctionTrack(id)`, `duplicateInstrumentTrack(id)`.
+
+### Saved Scene right-click menu
+
+The Pool · Scenes tab's Saved Scene rows now get a context menu (right-click):
+
+- **Rename** — inline `<input>` swap on the row label
+- **Update from Grid** — rebuilds the Saved Scene's contents from the currently-linked scene in the grid (so you can dial in a scene, then sync it back to the library entry in one click). Uses `linkedSavedSceneId` (legacy scenes get back-filled by name match on session load).
+
+Saving a scene with a name conflict auto-suffixes `_N` (incrementing) so the library stays unique without surprise overwrites.
+
+### Two-stage helpers in the engine
+
+New helpers (bottom of `src/main/engine.ts`):
+
+- `advanceMod2State(m, m2, dt, t, bpm, tickIdx)` — per-tick state advance for Mod 2 (LFO / S&H / Slew / Chaos / Strange Attractor; Envelope handled in eval directly).
+- `evalMod2Bipolar(m, m2, triggerTimeMs, nowMs, bpm, tickIdx, sceneDurSec)` — returns bipolar [-1, +1] regardless of Mod 2's own `mode` (forces symmetric swing — Mod 2 isn't an OSC output, it's a modulator of a modulator, so unipolar doesn't make sense).
+- `applyMod2ToMod1(m1, m2cfg, mod2NormBipolar)` — builds an effective Mod 1 with per-target patches. Fast-path early-return when no target has `enabled: true`.
+
+The `lfo()` function's signature was relaxed from `state: TrackState` to a structural `{ rndStepValue, rndSmoothPrev, rndSmoothNext }` so both `ts` (Mod 1) and `ts.m2` (Mod 2) can be passed.
+
+### Smaller fixes + polish
+
+- **Inspector resize handle CSS regression** — `.resize-h:not(.absolute):not(.fixed):not(.sticky)` to scope position-relative override (Tailwind utility order had made my rule win unintentionally).
+- **Aizawa NaN propagation** — per-sub-step `SAFE_MAX = 200` clamp on x/y/z/w + finite-check guards; widened Aizawa z-range from 1.5 → 2 to match canonical orbit.
+- **Rössler-4D / Lü-4D visuals** — slower integration (`h=0.003`, `skip=400`, `N=2000`) so the hyperchaotic systems actually render visible structure; empty-pts fallback "attractor diverged — try lower chaos".
+- **Random modulator pin awareness** — Random's dedicated emit path now respects per-slot pins + `argSpec.fixed` (was bypassing them).
+- **Modulation 2 Rate target on Strange Attractor** — earlier audit pass found Rate target was patching `rateHz` only (silent no-op for attractor). Fixed: patches `attractor.speed` too when Mod 1 type is attractor.
+- **`applyMod2ToMod1` Rate/Shape composition** — Shape branch's nested spreads now read from `out.X ?? m1.X` so the Rate branch's earlier patches survive (Speed + Chaos compose correctly).
+- **Float Variation** — Routing matrix Variation column accepts 2-decimal floats (e.g. 65.50 %); knob + input both use the same float math.
+- **Targets dropdown sized to content** — `width: fit-content` instead of fixed 110 px so "Multiplicative" reads cleanly on macOS' wider system font.
+- **Mod 2 Targets row** — narrow 56-px number inputs sized to fit "100.00", knob + checkbox sit adjacent, dropdown auto-widths.
 
 ---
 

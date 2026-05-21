@@ -26,6 +26,8 @@ const api: ExposedApi = {
   setTickRate: (hz) => ipcRenderer.invoke('engine:setTickRate', hz),
   updateSession: (s: Session) => ipcRenderer.invoke('engine:updateSession', s),
   sendMetaValue: (knobIdx, v) => ipcRenderer.invoke('engine:sendMetaValue', knobIdx, v),
+  setSelectedCellForLive: (sel) =>
+    ipcRenderer.invoke('engine:setSelectedCellForLive', sel),
 
   sessionSaveAs: (s: Session) => ipcRenderer.invoke('session:saveAs', s),
   sessionSave: (s: Session, path: string) => ipcRenderer.invoke('session:saveTo', s, path),
@@ -62,6 +64,14 @@ const api: ExposedApi = {
       cb(batch)
     ipcRenderer.on('engine:midiErrors', h)
     return () => ipcRenderer.off('engine:midiErrors', h)
+  },
+  onMod1Live: (cb) => {
+    const h = (
+      _e: Electron.IpcRendererEvent,
+      sample: import('@shared/types').Mod1LiveSample | null
+    ): void => cb(sample)
+    ipcRenderer.on('engine:mod1Live', h)
+    return () => ipcRenderer.off('engine:mod1Live', h)
   },
 
   // ── MIDI output ──────────────────────────────────────────────────

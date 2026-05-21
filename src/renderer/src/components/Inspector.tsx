@@ -10,6 +10,8 @@ import type {
   LfoShape,
   LfoSync,
   MidiOut,
+  Modulation,
+  ModulationTargetMode,
   ModType,
   MultMode,
   ParamArgSpec,
@@ -24,6 +26,7 @@ import type {
 import { SCALE_GROUPS, SCALE_LABELS, SCALE_INTERVALS, ROOT_LABELS } from '@shared/types'
 import {
   DEFAULT_MIDI_OUT,
+  DEFAULT_MODULATION2,
   DIVISIONS,
   cellularInitialRow,
   euclidean,
@@ -40,6 +43,7 @@ import { DrawCanvas } from './DrawCanvas'
 import { HardwareModeSection } from './InstrumentsInspectorPane'
 import {
   ArpVisual,
+  AttractorVisual,
   ChaosVisual,
   EnvelopeVisual,
   LfoVisual,
@@ -256,6 +260,7 @@ function TrackInspector(): JSX.Element {
   const sendTrackDefaultsToClips = useStore((s) => s.sendTrackDefaultsToClips)
   const setTrackEnabled = useStore((s) => s.setTrackEnabled)
   const setTrackPersistentSlot = useStore((s) => s.setTrackPersistentSlot)
+  const setTrackPersistentValue = useStore((s) => s.setTrackPersistentValue)
   const scenesCount = useStore((s) => s.session.scenes.length)
   const cellsCount = useStore((s) =>
     s.session.scenes.reduce((n, sc) => n + (sc.cells[trackId] ? 1 : 0), 0)
@@ -415,10 +420,13 @@ function TrackInspector(): JSX.Element {
             onToggle={(idx, persistent, capturedValue) =>
               setTrackPersistentSlot(trackId, idx, persistent, capturedValue)
             }
+            onEditValue={(idx, value) =>
+              setTrackPersistentValue(trackId, idx, value)
+            }
           />
           <div className="text-[10px] text-muted mt-1 leading-snug">
             {cellOnFocused
-              ? "Pin captures the value shown next to it and the engine emits THAT value forever — modulators don't drive it, scene triggers don't overwrite it. To change a pinned value, untick first, edit the clip, then re-pin."
+              ? 'Pin captures the value shown next to it and the engine emits THAT value forever — modulators don\'t drive it, scene triggers don\'t overwrite it. Edit pinned values inline; the engine picks them up live. Click "Send to clips" below to also stamp the pinned values into every clip\'s value string.'
               : 'No clip on the focused scene yet — the values above are the argSpec defaults. Pinning here works once a clip exists.'}
           </div>
         </Section>
@@ -469,10 +477,18 @@ function TrackInspector(): JSX.Element {
       <button
         className="btn-accent"
         onClick={() => {
+          const pinnedCount = (track.persistentSlots ?? []).filter(
+            (b) => b === true
+          ).length
+          const pinnedSuffix =
+            pinnedCount > 0
+              ? `\n\nPinned values (${pinnedCount}) will also be written into each clip's value tokens.`
+              : ''
           const msg =
-            cellsCount === scenesCount
+            (cellsCount === scenesCount
               ? `Apply this ${noun.toLowerCase()}'s defaults to all ${cellsCount} clip(s) on this row? Overwrites existing values.`
-              : `Apply this ${noun.toLowerCase()}'s defaults to all ${scenesCount} scenes on this row? Overwrites the ${cellsCount} existing clip(s) and auto-creates clips on the ${scenesCount - cellsCount} empty scene(s).`
+              : `Apply this ${noun.toLowerCase()}'s defaults to all ${scenesCount} scenes on this row? Overwrites the ${cellsCount} existing clip(s) and auto-creates clips on the ${scenesCount - cellsCount} empty scene(s).`) +
+            pinnedSuffix
           if (scenesCount === 0) return
           if (confirm(msg)) sendTrackDefaultsToClips(trackId)
         }}
@@ -483,6 +499,7 @@ function TrackInspector(): JSX.Element {
 
       <div className="text-[10px] text-muted leading-snug">
         Only fields with a value get sent. Leave a field blank to skip it.
+        Pinned values, when present, are also broadcast to every clip on this row.
       </div>
     </div>
   )
@@ -726,6 +743,12 @@ function CellScalingSection({
   return (
     <CollapsibleSection
       title="Scaling"
+      titleTooltip={
+        'Clamps each value to [min, max].\n\n' +
+        'POST (default): AFTER modulators / sequencer but BEFORE Scale 0.0–1.0 and MIDI Scale. Tames extreme outputs (a Random / Chaos source overshooting, an LFO swinging too wide, etc.).\n\n' +
+        'PRE: BEFORE modulators / sequencer pick up the value — clamps the seed first so the entire downstream chain operates within your band.\n\n' +
+        'Pinned slots bypass either mode.'
+      }
       enabled={enabled}
       onToggle={(v) => {
         // Toggling ON: seed default min/max from argSpec for every
@@ -748,14 +771,23 @@ function CellScalingSection({
           onChange({ scalingEnabled: v })
         }
       }}
+      headerRight={
+        enabled ? (
+          <select
+            className="input text-[10px] py-0 px-1 leading-tight"
+            value={cell.scalingMode ?? 'post'}
+            onChange={(e) =>
+              onChange({ scalingMode: e.target.value as 'pre' | 'post' })
+            }
+            title="PRE: clamp the raw seed BEFORE modulator + sequencer.\nPOST (default): clamp the final value AFTER modulator + sequencer, before Scale 0.0–1.0 + MIDI Scale."
+            onClick={(e) => e.stopPropagation()}
+          >
+            <option value="post">POST</option>
+            <option value="pre">PRE</option>
+          </select>
+        ) : undefined
+      }
     >
-      <div className="text-[10px] text-muted leading-snug">
-        Clamps each value to [min, max] AFTER modulators / sequencer
-        but BEFORE Scale 0.0–1.0 and MIDI Scale. Use it to tame
-        extreme outputs (a Random / Chaos source overshooting your
-        target band, an LFO swinging too wide, etc.). Pinned slots
-        bypass this clamp.
-      </div>
       <div className="grid grid-cols-[1fr_auto_auto] gap-x-2 gap-y-1 items-center">
         <span className="text-[9px] uppercase tracking-wide text-muted">
           Slot
@@ -812,6 +844,510 @@ function CellScalingSection({
   )
 }
 
+// Routing matrix — per-slot gates for the Modulator and Sequencer.
+// Renders a 2-row × N-column grid where rows = {Modulator, Sequencer}
+// and columns = each NON-FIXED arg slot of the cell. Default state
+// is "all checked" (current legacy behavior — both drivers affect
+// every slot). Unticking a cell prevents that direction from
+// touching the slot at engine emit time.
+//
+// Engine precedence (lower index wins):
+//   argSpec.fixed → declared value, routing ignored
+//   Pin           → pinned value, routing ignored
+//   Routing       → gates Modulator + Sequencer contributions
+//
+// Always rendered (not collapsible behind an enable flag) so the
+// user can dial individual slots without having to "turn it on"
+// first — the default-all-checked state IS the unconfigured state.
+//
+// ─────────────────────────────────────────────────────────────────
+// RoutingMiniKnob — 16-px circular knob used inside the Routing
+// matrix's Variation column. Two views, one value: this knob and
+// the adjacent BoundedNumberInput both drive the same 0..100 %
+// `variations[idx]` field, so the user can scrub OR type.
+//
+// Interaction model copied from MetaKnob (the bigger Meta
+// Controller dial) but stripped down: vertical drag = adjust,
+// Shift = 4× fine, double-click = reset to 0. 200 px of vertical
+// travel maps to the full 0..100 % range, matching MetaKnob feel.
+// SVG arc + indicator are accent-tinted so the knob picks up any
+// active theme automatically.
+// ─────────────────────────────────────────────────────────────────
+function RoutingMiniKnob({
+  value,
+  onChange,
+  title
+}: {
+  value: number // 0..100
+  onChange: (v: number) => void
+  title?: string
+}): JSX.Element {
+  const dragRef = useRef<{
+    startY: number
+    startValue: number
+    pointerId: number
+  } | null>(null)
+  const size = 16
+  const cx = size / 2
+  const cy = size / 2
+  const radius = size / 2 - 2
+  const startDeg = 225
+  const sweep = 270
+  const norm = Math.max(0, Math.min(1, value / 100))
+  const currentDeg = startDeg + norm * sweep
+  const rad = (deg: number): number => ((deg - 90) * Math.PI) / 180
+  const arcStart = rad(startDeg)
+  const arcEnd = rad(currentDeg)
+  const largeArc = currentDeg - startDeg > 180 ? 1 : 0
+  const bgEnd = rad(startDeg + sweep)
+  const bgLarge = sweep > 180 ? 1 : 0
+  const indicatorInner = radius - 3
+  const indicatorOuter = radius
+  function onPointerDown(e: React.PointerEvent<SVGSVGElement>): void {
+    if (e.button !== 0) return
+    try {
+      ;(e.currentTarget as unknown as Element).setPointerCapture?.(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    dragRef.current = {
+      startY: e.clientY,
+      startValue: value,
+      pointerId: e.pointerId
+    }
+    document.body.style.cursor = 'ns-resize'
+  }
+  function onPointerMove(e: React.PointerEvent<SVGSVGElement>): void {
+    const d = dragRef.current
+    if (!d || e.pointerId !== d.pointerId) return
+    const dy = d.startY - e.clientY // drag up = increase
+    const sensitivity = e.shiftKey ? 4 : 1
+    const delta = (dy / (200 * sensitivity)) * 100
+    // 0.01 % resolution — matches the BoundedNumberInput's step and
+    // the parent's two-decimal rounding so the knob can dial in
+    // values like 65.50 % without "snap to integer" steps.
+    const raw = Math.max(0, Math.min(100, d.startValue + delta))
+    const next = Math.round(raw * 100) / 100
+    if (next !== value) onChange(next)
+  }
+  function onPointerUp(e: React.PointerEvent<SVGSVGElement>): void {
+    const d = dragRef.current
+    if (!d || e.pointerId !== d.pointerId) return
+    try {
+      ;(e.currentTarget as unknown as Element).releasePointerCapture?.(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    dragRef.current = null
+    document.body.style.cursor = ''
+  }
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      className="cursor-ns-resize select-none shrink-0"
+      style={{ touchAction: 'none' }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onDoubleClick={() => onChange(0)}
+    >
+      <title>{title ?? `Variation ${value}% — drag vertically · shift = fine · dbl-click = 0`}</title>
+      {/* Background track */}
+      <path
+        d={`M ${cx + radius * Math.cos(arcStart)} ${cy + radius * Math.sin(arcStart)} A ${radius} ${radius} 0 ${bgLarge} 1 ${cx + radius * Math.cos(bgEnd)} ${cy + radius * Math.sin(bgEnd)}`}
+        fill="none"
+        stroke="rgb(var(--c-panel3))"
+        strokeWidth={2}
+        strokeLinecap="round"
+      />
+      {/* Value arc */}
+      {norm > 0.001 && (
+        <path
+          d={`M ${cx + radius * Math.cos(arcStart)} ${cy + radius * Math.sin(arcStart)} A ${radius} ${radius} 0 ${largeArc} 1 ${cx + radius * Math.cos(arcEnd)} ${cy + radius * Math.sin(arcEnd)}`}
+          fill="none"
+          stroke="rgb(var(--c-accent))"
+          strokeWidth={2}
+          strokeLinecap="round"
+        />
+      )}
+      {/* Indicator line */}
+      <line
+        x1={cx + indicatorInner * Math.cos(rad(currentDeg))}
+        y1={cy + indicatorInner * Math.sin(rad(currentDeg))}
+        x2={cx + indicatorOuter * Math.cos(rad(currentDeg))}
+        y2={cy + indicatorOuter * Math.sin(rad(currentDeg))}
+        stroke="rgb(var(--c-accent))"
+        strokeWidth={1.5}
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
+function CellRoutingSection({
+  cell,
+  track,
+  onChange
+}: {
+  cell: Cell
+  track: Track | undefined
+  onChange: (patch: Partial<Cell>) => void
+}): JSX.Element {
+  // Slot list — same shape as CellScalingSection above: non-fixed
+  // argSpec entries for multi-arg cells, or a single synthetic
+  // "Value" row for single-arg cells.
+  type SlotMeta = { name: string; idx: number }
+  const slots: SlotMeta[] = []
+  if (track?.argSpec && track.argSpec.length > 0) {
+    track.argSpec.forEach((a, i) => {
+      if (a.fixed !== undefined) return
+      slots.push({ name: a.name || `${i + 1}`, idx: i })
+    })
+  } else {
+    slots.push({ name: 'Value', idx: 0 })
+  }
+  // Read current per-slot booleans, default true (= routed).
+  const modOn = (i: number): boolean => cell.routing?.modulator?.[i] !== false
+  const mod2On = (i: number): boolean =>
+    cell.routing?.modulation2?.[i] !== false
+  const seqOn = (i: number): boolean => cell.routing?.sequencer?.[i] !== false
+  // Whether the Modulation 2 column is active — gates the new column
+  // visually + functionally. When Modulation 2 is disabled on the
+  // cell, the column is greyed out + the ticks are no-ops (the
+  // engine ignores them anyway, but we want the UI to read as
+  // "irrelevant right now" rather than "go ahead and change me").
+  const mod2Enabled = cell.modulation2?.enabled === true
+  // Set a tick to an explicit value (used by both click and the
+  // click+drag paint mode). Lazily initialises the arrays so old
+  // sessions don't carry empty arrays around.
+  function setTick(
+    direction: 'modulator' | 'modulation2' | 'sequencer',
+    slotIdx: number,
+    value: boolean
+  ): void {
+    const curMod = cell.routing?.modulator ? cell.routing.modulator.slice() : []
+    const curMod2 = cell.routing?.modulation2
+      ? cell.routing.modulation2.slice()
+      : []
+    const curSeq = cell.routing?.sequencer ? cell.routing.sequencer.slice() : []
+    const arr =
+      direction === 'modulator'
+        ? curMod
+        : direction === 'modulation2'
+          ? curMod2
+          : curSeq
+    arr[slotIdx] = value
+    onChange({
+      routing: {
+        modulator: direction === 'modulator' ? curMod : cell.routing?.modulator,
+        modulation2:
+          direction === 'modulation2' ? curMod2 : cell.routing?.modulation2,
+        sequencer: direction === 'sequencer' ? curSeq : cell.routing?.sequencer,
+        delays: cell.routing?.delays,
+        variations: cell.routing?.variations
+      }
+    })
+  }
+  // Bulk "all on / all off" per row — quick way to disable an entire
+  // driver without unticking each slot.
+  function setAll(
+    direction: 'modulator' | 'modulation2' | 'sequencer',
+    value: boolean
+  ): void {
+    const arr: boolean[] = new Array(slots.length)
+    for (const s of slots) arr[s.idx] = value
+    onChange({
+      routing: {
+        modulator: direction === 'modulator' ? arr : cell.routing?.modulator,
+        modulation2:
+          direction === 'modulation2' ? arr : cell.routing?.modulation2,
+        sequencer: direction === 'sequencer' ? arr : cell.routing?.sequencer,
+        delays: cell.routing?.delays,
+        variations: cell.routing?.variations
+      }
+    })
+  }
+  // Per-slot Delay (ms) and Variation (%) — write helpers that
+  // grow / shrink the backing arrays lazily.
+  function setDelayAt(slotIdx: number, value: number): void {
+    const arr = cell.routing?.delays ? cell.routing.delays.slice() : []
+    arr[slotIdx] = Math.max(0, Math.round(value))
+    onChange({
+      routing: {
+        modulator: cell.routing?.modulator,
+        sequencer: cell.routing?.sequencer,
+        delays: arr,
+        variations: cell.routing?.variations
+      }
+    })
+  }
+  function setVariationAt(slotIdx: number, value: number): void {
+    const arr = cell.routing?.variations ? cell.routing.variations.slice() : []
+    // Two-decimal float — "up to 4 digits" in the user's words
+    // (e.g. 65.50 %). Round here so the displayed token matches what's
+    // stored, and so the engine doesn't tickle float-noise into the
+    // variation factor.
+    const clamped = Math.min(100, Math.max(0, value))
+    arr[slotIdx] = Math.round(clamped * 100) / 100
+    onChange({
+      routing: {
+        modulator: cell.routing?.modulator,
+        sequencer: cell.routing?.sequencer,
+        delays: cell.routing?.delays,
+        variations: arr
+      }
+    })
+  }
+  const delayAt = (i: number): number => cell.routing?.delays?.[i] ?? 0
+  const variationAt = (i: number): number => cell.routing?.variations?.[i] ?? 0
+  // Click+drag paint mode. When the user mouses DOWN on a tick we
+  // remember which direction they're painting and what value they're
+  // painting in (the opposite of the tick they hit). As long as the
+  // mouse button is held, entering any other tick in the SAME
+  // direction sets it to that captured value too. Releases anywhere
+  // on the window clear the state.
+  const [dragMode, setDragMode] = useState<{
+    direction: 'modulator' | 'modulation2' | 'sequencer'
+    setTo: boolean
+  } | null>(null)
+  useEffect(() => {
+    if (!dragMode) return
+    const onUp = (): void => setDragMode(null)
+    window.addEventListener('mouseup', onUp)
+    return () => window.removeEventListener('mouseup', onUp)
+  }, [dragMode])
+  // Hover-only description for the section heading. Lives on the
+  // section wrapper (CollapsibleViewSection renders the title as a
+  // <span> with no `title` attr) so hovering anywhere on the header
+  // row surfaces it.
+  const sectionTitleTooltip =
+    'Per-slot routing matrix. Columns:\n' +
+    '  Mod    — Modulation 1 → this slot (untick → slot uses cell.value seed)\n' +
+    '  Mod 2  — Modulation 2 → Modulation 1 ON THIS SLOT (untick → slot reads\n' +
+    '            the ORIGINAL Modulation 1 params, bypassing Modulation 2)\n' +
+    '  Seq    — Sequencer → this slot\n' +
+    '  Delay  — ms before Mod / Seq engage after each trigger\n' +
+    '  Var    — random 0..100 % scaling of the modulator amplitude per trigger\n\n' +
+    'Default (all ticked, Delay 0, Variation 0) = previous behaviour.\n\n' +
+    'Beaten by:\n' +
+    '  - argSpec.fixed (protocol prefixes always emit their declared value)\n' +
+    '  - Pin (a pinned slot ignores routing entirely and emits the captured value)\n\n' +
+    'Tip: click a tick and drag across the column to paint several at once.\n\n' +
+    'Click the section title to collapse / expand.'
+  return (
+    <div title={sectionTitleTooltip}>
+    <CollapsibleViewSection
+      title="Routing"
+      rightContent={
+        <span className="text-[10px] text-muted">
+          {slots.length === 1 ? '1 slot' : `${slots.length} slots`}
+        </span>
+      }
+    >
+      {/* Per-row routing matrix. One ROW per arg slot. Columns:
+          [slot-name | Mod | Seq | Delay-ms | Variation-%]. The two
+          tick columns are adjacent (PD-vradio-style filled squares)
+          and the whole grid is horizontally centred inside the
+          Inspector so the name column hugs the ticks. Click+drag on
+          ticks paints in the same direction. Theme-aware via CSS
+          variables (c-accent for filled, c-border for empty). */}
+      <div
+        className="grid gap-x-1.5 gap-y-0.5 items-center text-[10px] mx-auto"
+        style={{
+          // Columns: [slot name | Mod | Modulation 2 | Seq | Delay | Var].
+          // Modulation 2 sits BETWEEN Mod and Seq per the user's
+          // request so the "what modulates what" reading order is
+          // Mod 1 → Mod 2 → Sequencer, left-to-right.
+          gridTemplateColumns: 'auto 22px 22px 22px 56px 76px'
+        }}
+        onMouseLeave={() => {
+          // If the user leaves the matrix while still painting we
+          // keep dragMode (window mouseup clears it) — they may come
+          // back. No-op here on purpose.
+        }}
+      >
+        {/* Header row — column labels + bulk-toggle */}
+        <span className="text-muted text-[9px] uppercase tracking-wide text-right pr-1">
+          All
+        </span>
+        <button
+          className="routing-bulk"
+          onClick={() => {
+            const allOn = slots.every((s) => modOn(s.idx))
+            setAll('modulator', !allOn)
+          }}
+          title="Toggle every Modulation 1 slot on / off"
+        >
+          ⇆
+        </button>
+        <button
+          className="routing-bulk"
+          onClick={() => {
+            const allOn = slots.every((s) => mod2On(s.idx))
+            setAll('modulation2', !allOn)
+          }}
+          title={
+            mod2Enabled
+              ? 'Toggle every Modulation 2 slot on / off'
+              : 'Modulation 2 is disabled on this cell — enable it in the Modulation 2 section above'
+          }
+          disabled={!mod2Enabled}
+          style={mod2Enabled ? undefined : { opacity: 0.4, cursor: 'default' }}
+        >
+          ⇆
+        </button>
+        <button
+          className="routing-bulk"
+          onClick={() => {
+            const allOn = slots.every((s) => seqOn(s.idx))
+            setAll('sequencer', !allOn)
+          }}
+          title="Toggle every Sequencer slot on / off"
+        >
+          ⇆
+        </button>
+        <span className="text-muted text-[9px] uppercase tracking-wide text-center">
+          Delay
+        </span>
+        <span className="text-muted text-[9px] uppercase tracking-wide text-center">
+          Var
+        </span>
+        <span />
+        <span className="text-muted text-[9px] uppercase tracking-wide text-center">
+          Mod
+        </span>
+        <span
+          className={`text-[9px] uppercase tracking-wide text-center ${mod2Enabled ? 'text-muted' : 'text-muted/40'}`}
+          title={
+            mod2Enabled
+              ? 'Modulation 2 routing per slot'
+              : 'Modulation 2 disabled on this cell — column is inert until you enable it.'
+          }
+        >
+          Mod 2
+        </span>
+        <span className="text-muted text-[9px] uppercase tracking-wide text-center">
+          Seq
+        </span>
+        <span className="text-muted text-[9px] uppercase tracking-wide text-center">
+          ms
+        </span>
+        <span className="text-muted text-[9px] uppercase tracking-wide text-center">
+          %
+        </span>
+        {/* One row per arg slot */}
+        {slots.map((s) => (
+          <Fragment key={s.idx}>
+            <span className="truncate text-right pr-1" title={s.name}>
+              {s.name}
+            </span>
+            <button
+              className={`routing-tick ${modOn(s.idx) ? 'routing-tick-on' : ''}`}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                const next = !modOn(s.idx)
+                setTick('modulator', s.idx, next)
+                setDragMode({ direction: 'modulator', setTo: next })
+              }}
+              onMouseEnter={() => {
+                if (
+                  dragMode &&
+                  dragMode.direction === 'modulator' &&
+                  modOn(s.idx) !== dragMode.setTo
+                ) {
+                  setTick('modulator', s.idx, dragMode.setTo)
+                }
+              }}
+              title={`Modulation 1 → ${s.name}${modOn(s.idx) ? ' (routed)' : ' (gated off)'} · drag to paint`}
+              aria-pressed={modOn(s.idx)}
+            />
+            {/* Modulation 2 per-slot gate. Inert when Modulation 2 is
+                disabled on the cell (still renders so the column
+                layout doesn't jump when the user toggles it). */}
+            <button
+              className={`routing-tick ${mod2On(s.idx) ? 'routing-tick-on' : ''}`}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                if (!mod2Enabled) return
+                const next = !mod2On(s.idx)
+                setTick('modulation2', s.idx, next)
+                setDragMode({ direction: 'modulation2', setTo: next })
+              }}
+              onMouseEnter={() => {
+                if (!mod2Enabled) return
+                if (
+                  dragMode &&
+                  dragMode.direction === 'modulation2' &&
+                  mod2On(s.idx) !== dragMode.setTo
+                ) {
+                  setTick('modulation2', s.idx, dragMode.setTo)
+                }
+              }}
+              disabled={!mod2Enabled}
+              style={mod2Enabled ? undefined : { opacity: 0.35, cursor: 'default' }}
+              title={
+                mod2Enabled
+                  ? `Modulation 2 → ${s.name}${mod2On(s.idx) ? ' (active)' : ' (bypassed — slot reads original Modulation 1)'} · drag to paint`
+                  : 'Modulation 2 is disabled on this cell — enable it in the Modulation 2 section above first'
+              }
+              aria-pressed={mod2On(s.idx)}
+            />
+            <button
+              className={`routing-tick ${seqOn(s.idx) ? 'routing-tick-on' : ''}`}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                const next = !seqOn(s.idx)
+                setTick('sequencer', s.idx, next)
+                setDragMode({ direction: 'sequencer', setTo: next })
+              }}
+              onMouseEnter={() => {
+                if (
+                  dragMode &&
+                  dragMode.direction === 'sequencer' &&
+                  seqOn(s.idx) !== dragMode.setTo
+                ) {
+                  setTick('sequencer', s.idx, dragMode.setTo)
+                }
+              }}
+              title={`Sequencer → ${s.name}${seqOn(s.idx) ? ' (routed)' : ' (gated off)'} · drag to paint`}
+              aria-pressed={seqOn(s.idx)}
+            />
+            <BoundedNumberInput
+              className="input w-full text-center tabular-nums px-1 py-0 text-[10px] leading-tight"
+              value={delayAt(s.idx)}
+              onChange={(v) => setDelayAt(s.idx, v)}
+              min={0}
+              max={60000}
+              integer
+              title={`Delay (ms) before Mod / Seq engage on ${s.name} after each trigger`}
+            />
+            <div className="flex items-center gap-1 w-full">
+              <RoutingMiniKnob
+                value={variationAt(s.idx)}
+                onChange={(v) => setVariationAt(s.idx, v)}
+                title={`Variation on ${s.name} — drag vertically · shift = fine · dbl-click resets to 0`}
+              />
+              <BoundedNumberInput
+                className="input flex-1 min-w-0 text-center tabular-nums px-1 py-0 text-[10px] leading-tight"
+                value={variationAt(s.idx)}
+                onChange={(v) => setVariationAt(s.idx, v)}
+                min={0}
+                max={100}
+                step={0.01}
+                title={`Variation (%) — random ± scaling of the modulator depth on ${s.name}, reseeded per trigger (decimals allowed, e.g. 65.50)`}
+              />
+            </div>
+          </Fragment>
+        ))}
+      </div>
+    </CollapsibleViewSection>
+    </div>
+  )
+}
+
 // track's argSpec — shows the current value (from the focused
 // scene's cell when not pinned, or the captured pinned value when
 // pinned) + a checkbox that pins/unpins the slot. Pin captures the
@@ -822,13 +1358,20 @@ function PersistentSlotList({
   cellValue,
   persistentSlots,
   persistentValues,
-  onToggle
+  onToggle,
+  onEditValue
 }: {
   argSpec: ParamArgSpec[]
   cellValue: string
   persistentSlots: boolean[]
   persistentValues: string[]
   onToggle: (idx: number, persistent: boolean, capturedValue?: string) => void
+  // Optional inline edit handler — when provided, pinned values
+  // become editable text inputs and typing fires onEditValue with
+  // the new token. The Parameter Inspector passes this; the cell
+  // inspector (which doesn't use a PersistentSlotList right now)
+  // omits it. Default-undefined keeps both call sites compatible.
+  onEditValue?: (idx: number, value: string) => void
 }): JSX.Element {
   const tokens = cellValue.trim().split(/\s+/).filter((t) => t.length > 0)
   return (
@@ -884,19 +1427,40 @@ function PersistentSlotList({
             >
               {a.name}
             </span>
-            <span
-              className={`font-mono text-[11px] text-right truncate ${
-                pinned ? 'text-accent' : ''
-              }`}
-              title={
-                pinned
-                  ? `pinned at ${pinnedVal || '(empty)'}`
-                  : displayVal || '(empty)'
-              }
-            >
-              {pinned && '🔒 '}
-              {displayVal || '—'}
-            </span>
+            {pinned && onEditValue ? (
+              // Inline editor — clicking the field lets the user
+              // type a new pinned value. The engine picks it up the
+              // next time it emits this track (live), and "Send to
+              // clips" stamps the value into every clip's value
+              // string. Padlock prefix kept so the row still reads
+              // as "this is pinned".
+              <span
+                className="flex items-center gap-1 justify-end font-mono text-[11px] text-accent"
+                title={`Pinned value — edit and click "Send to clips" to broadcast to all clips on this row`}
+              >
+                <span aria-hidden>🔒</span>
+                <UncontrolledTextInput
+                  className="input font-mono text-[11px] text-right tabular-nums w-20 px-1 py-0 leading-tight"
+                  value={pinnedVal}
+                  onChange={(v) => onEditValue(i, v)}
+                  title="Pinned value — engine emits this verbatim. Send to clips broadcasts it to every clip on this row."
+                />
+              </span>
+            ) : (
+              <span
+                className={`font-mono text-[11px] text-right truncate ${
+                  pinned ? 'text-accent' : ''
+                }`}
+                title={
+                  pinned
+                    ? `pinned at ${pinnedVal || '(empty)'}`
+                    : displayVal || '(empty)'
+                }
+              >
+                {pinned && '🔒 '}
+                {displayVal || '—'}
+              </span>
+            )}
             <label
               className="flex items-center gap-1 text-[10px] shrink-0"
               title={
@@ -955,6 +1519,31 @@ function CellInspector(): JSX.Element {
   function uSeq(patch: Partial<typeof c.sequencer>): void {
     u({ sequencer: { ...c.sequencer, ...patch } })
   }
+
+  // Tell the engine which cell to stream live Modulation 1 updates
+  // for. The IPC runs only when Modulation 2 is enabled on this cell
+  // — when it's off there's nothing live to overlay. Clears on
+  // unmount so the engine stops emitting when the user closes /
+  // navigates away from the Inspector.
+  useEffect(() => {
+    const api = window.api as typeof window.api & {
+      setSelectedCellForLive?: (
+        sel: { sceneId: string; trackId: string } | null
+      ) => Promise<void>
+    }
+    if (!api.setSelectedCellForLive) return
+    if (c.modulation2?.enabled) {
+      api.setSelectedCellForLive({
+        sceneId: sel.sceneId,
+        trackId: sel.trackId
+      })
+    } else {
+      api.setSelectedCellForLive(null)
+    }
+    return () => {
+      api.setSelectedCellForLive?.(null)
+    }
+  }, [sel.sceneId, sel.trackId, c.modulation2?.enabled])
 
   return (
     <div className="p-3 flex flex-col gap-3 text-[12px]">
@@ -1360,6 +1949,7 @@ function CellInspector(): JSX.Element {
               <option value="sh">Sample &amp; Hold</option>
               <option value="slew">Slew</option>
               <option value="chaos">Chaos</option>
+              <option value="attractor">Strange Attractor</option>
             </select>
           ) : null
         }
@@ -1378,10 +1968,14 @@ function CellInspector(): JSX.Element {
           <SampleHoldEditor cell={c} u={u} />
         ) : cell.modulation.type === 'slew' ? (
           <SlewEditor cell={c} u={u} />
-        ) : (
+        ) : cell.modulation.type === 'chaos' ? (
           <ChaosEditor cell={c} u={u} />
+        ) : (
+          <AttractorEditor cell={c} u={u} />
         )}
       </CollapsibleSection>
+
+      <Mod2Section cell={c} u={u} />
 
       <CollapsibleSection
         title="Sequencer"
@@ -1503,7 +2097,8 @@ function CellInspector(): JSX.Element {
                 'Drift: Brownian playhead wanders the step row.\n' +
                 'Ratchet: each step may burst into 2..N retriggers.\n' +
                 'Bounce: real ball-bounce physics — accelerating intervals + decaying amplitude.\n' +
-                'Draw: sketch an automation curve directly with the mouse.'
+                'Draw: sketch an automation curve directly with the mouse.\n' +
+                'Address: clock is bypassed — the cell\'s modulator picks the step (Buchla 245 style). Pairs best with smooth modulators (LFO, Strange Attractor, Slew, Chaos, S&H, Envelope).'
               }
             >
               <option value="steps">Steps (cycle)</option>
@@ -1515,7 +2110,44 @@ function CellInspector(): JSX.Element {
               <option value="ratchet">Ratchet</option>
               <option value="bounce">Bounce (physics)</option>
               <option value="draw">Draw (curve)</option>
+              <option value="adresse">Address</option>
             </select>
+          )}
+
+          {/* Adresse sub-mode picker — only shown when mode = adresse.
+              Hijack (default) consumes the modulator entirely; Parallel
+              uses Mod 1 for BOTH the address AND extra modulation;
+              Stage 2 (requires two-stage modulator, ships in v0.5.8)
+              keeps Mod 1 modulating the value while Mod 2 picks the
+              address. Falls back to hijack when stage2 isn't wired. */}
+          {cell.sequencer.mode === 'adresse' && (
+            <>
+              <span className="label">Sub-mode</span>
+              <select
+                className="input text-[11px] py-0.5 min-w-0 col-span-2"
+                value={cell.sequencer.adresseMode ?? 'hijack'}
+                onChange={(e) =>
+                  uSeq({ adresseMode: e.target.value as 'hijack' | 'parallel' | 'stage2' })
+                }
+                title={
+                  'Hijack: Mod 1 ONLY picks the playhead, step value emits as-is.\n' +
+                  'Parallel: Mod 1 picks the playhead AND modulates the resulting step value.\n' +
+                  'Stage 2: requires Two-stage modulator (v0.5.8+) — Mod 2 picks, Mod 1 modulates.\n\n' +
+                  'Pairs best with continuous modulators: LFO, S&H, Envelope, Strange Attractor, Slew, Chaos.\n' +
+                  'Ramp is one-shot (sweeps the steps once then holds at the last).\n' +
+                  'Arpeggiator outputs are quantised to the ladder pattern (uses only a few steps).'
+                }
+              >
+                <option value="hijack">Hijack — Mod 1 picks only</option>
+                <option value="parallel">Parallel — Mod 1 picks + modulates</option>
+                <option value="stage2" disabled>
+                  Stage 2 (requires Two-stage Mod, v0.5.8)
+                </option>
+              </select>
+              <div className="col-span-3 text-[10px] text-muted italic leading-snug">
+                Best with continuous modulators (LFO, S&amp;H, Envelope, Strange Attractor, Slew, Chaos). Ramp sweeps once then holds; Arp jumps between only a few steps.
+              </div>
+            </>
           )}
 
           {/* Steps slider — hidden in Draw mode (Resolution IS the
@@ -2262,6 +2894,13 @@ function CellInspector(): JSX.Element {
           </select>
         </div>
       </CollapsibleSection>
+
+      {/* Routing matrix — per-slot gates for the Modulator and
+          Sequencer. Default state (all checked) reproduces the
+          legacy behavior. Unchecking a cell prevents that direction
+          from touching the slot, which then emits its cell.value
+          seed. Pin still beats both (argSpec.fixed beats Pin). */}
+      <CellRoutingSection cell={c} track={track} onChange={u} />
     </div>
   )
 }
@@ -2270,15 +2909,409 @@ function CellInspector(): JSX.Element {
 // so they can build partial patches against `cell.modulation`.
 type CellUpdate = (patch: Partial<import('@shared/types').Cell>) => void
 
-function LfoEditor({
+// ─────────────────────────────────────────────────────────────────
+// Mod 2 section — second-stage modulator.
+//
+// Renders the same Type picker + sub-editors as Mod 1 by passing a
+// "Mod 2 view" of the cell down: the sub-editors read `cell.modulation`
+// and write `u({ modulation: ... })`, so we present them a cell whose
+// `modulation` field IS cell.modulation2, and a `u` that re-routes
+// `modulation` patches to `modulation2`. The sub-editors don't know
+// they're editing the second stage — that's the trick.
+//
+// On top of the existing modulator UI, this section adds:
+//   - A Targets sub-block: math-mode dropdown + 3 enable checkboxes +
+//     3 amount knobs (Rate / Depth / context-aware Shape). The Shape
+//     label is taken from Mod 1's type — "Shape" for LFO, "Distribution"
+//     for S&H / Random, "Chaos" for Attractor, etc.
+// ─────────────────────────────────────────────────────────────────
+function Mod2Section({
   cell,
   u
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
 }): JSX.Element {
+  const m2 = cell.modulation2 ?? { ...DEFAULT_MODULATION2, enabled: false }
+  // Translate updates: any patch whose key is `modulation` should
+  // actually write `modulation2`. Other keys pass through untouched.
+  const u2: CellUpdate = (patch) => {
+    const { modulation, ...rest } = patch
+    const next: Partial<import('@shared/types').Cell> = { ...rest }
+    if (modulation !== undefined) next.modulation2 = modulation
+    u(next)
+  }
+  // Mod 2 view of the cell — the sub-editor reads `modulation` so we
+  // shove modulation2 into that slot. cell-level fields (value, etc.)
+  // are unchanged.
+  const m2Cell: Cell = { ...cell, modulation: m2 }
+  // Patch helper for the Targets sub-block — keeps `targets` rooted
+  // on modulation2 so the engine reads them from the right place.
+  function patchTargets(
+    branch: 'rate' | 'depth' | 'shape',
+    next: { enabled?: boolean; amount?: number }
+  ): void {
+    const cur = m2.targets ?? {}
+    const prev = cur[branch] ?? { enabled: false, amount: 0 }
+    u({
+      modulation2: {
+        ...m2,
+        targets: {
+          ...cur,
+          [branch]: { ...prev, ...next }
+        }
+      }
+    })
+  }
+  function patchTargetMode(mode: ModulationTargetMode): void {
+    u({ modulation2: { ...m2, targetMode: mode } })
+  }
+  // Context-aware label for the third target. Reads Modulation 1's
+  // current type so the label changes live as the user switches
+  // Modulation 1's type. Each label names the ACTUAL knob being
+  // modulated on Mod 1, prefixed with the Mod 1 type so the user can
+  // tell at a glance which underlying param is being driven —
+  // e.g. "LFO · Shape" makes it obvious that this is Mod 1's LFO
+  // shape, NOT Mod 2's own Shape dropdown a few rows above.
+  function shapeLabelForMod1(): { label: string; tooltip: string; usable: boolean } {
+    switch (cell.modulation.type) {
+      case 'lfo':
+        return {
+          label: 'LFO · Shape',
+          tooltip:
+            "Sweep Modulation 1's LFO shape (sine → triangle → square → sawtooth → rndStep → rndSmooth → spastic) as Modulation 2 swings.",
+          usable: true
+        }
+      case 'sh':
+        return {
+          label: 'S&H · Distribution',
+          tooltip:
+            "Sweep Modulation 1's Sample & Hold distribution (centre-hug ↔ uniform ↔ edge-weight) as Modulation 2 swings.",
+          usable: true
+        }
+      case 'attractor':
+        return {
+          label: 'Attractor · Chaos',
+          tooltip:
+            "Sweep Modulation 1's Strange Attractor chaos knob as Modulation 2 swings.",
+          usable: true
+        }
+      case 'chaos':
+        return {
+          label: 'Chaos · r',
+          tooltip:
+            "Sweep Modulation 1's logistic-map r parameter (3.4..4.0) as Modulation 2 swings.",
+          usable: true
+        }
+      case 'random':
+        return {
+          label: 'Random · Distribution',
+          tooltip:
+            "Sweep Modulation 1's Random Generator distribution warp as Modulation 2 swings.",
+          usable: true
+        }
+      case 'slew':
+        return {
+          label: 'Slew · Rise/Fall',
+          tooltip:
+            "Stretch / compress Modulation 1's Slew rise + fall times symmetrically as Modulation 2 swings.",
+          usable: true
+        }
+      case 'envelope':
+        return {
+          label: 'Envelope · Sustain',
+          tooltip:
+            "Sweep Modulation 1's Envelope Sustain Level (0..1) as Modulation 2 swings. Multiplicative around the base; ±100 % amount fully drains or doubles the held level.",
+          usable: true
+        }
+      case 'ramp':
+        return {
+          label: 'Ramp · Curve',
+          tooltip:
+            "Sweep Modulation 1's Ramp Curve (-100..+100, signed) as Modulation 2 swings. Additive: ±100 × amount around the base, so negative pulls toward ease-in, positive toward ease-out.",
+          usable: true
+        }
+      case 'arpeggiator':
+        return {
+          label: 'Arpeggiator · Mode',
+          tooltip:
+            "Cycle Modulation 1's Arpeggiator Mode (up → down → upDown → downUp → exclusion → walk → drunk → random) as Modulation 2 swings. Mode picks happen at the eval rate — keep amount low if the resulting pattern jitter is too busy.",
+          usable: true
+        }
+      default:
+        return {
+          label: 'Shape',
+          tooltip:
+            'No continuous shape parameter on this Modulation 1 type — Shape target is a no-op.',
+          usable: false
+        }
+    }
+  }
+  const shapeMeta = shapeLabelForMod1()
+  return (
+    <CollapsibleSection
+      title="Modulation 2"
+      titleTooltip={
+        "Second-stage modulator. Its bipolar output modulates Modulation 1's\n" +
+        'Rate, Depth, and a context-aware third parameter (called\n' +
+        '"Shape" here — actually LFO shape morph, S&H distribution,\n' +
+        "Attractor chaos, etc., depending on Modulation 1's type).\n\n" +
+        "Modulation 1's stored values aren't mutated — each tick the engine\n" +
+        'builds an "effective Modulation 1" from Modulation 2\'s signal +\n' +
+        'the targets below.\n\n' +
+        'Types: LFO, S&H, Slew, Chaos, Strange Attractor work as\n' +
+        "second-stage signals. Envelope, Ramp, Arp, Random are not\n" +
+        "available — they're note/time-targeted, not continuous."
+      }
+      enabled={m2.enabled}
+      onToggle={(v) => u({ modulation2: { ...m2, enabled: v } })}
+      headerRight={
+        m2.enabled ? (
+          <select
+            className="input text-[11px] py-0.5"
+            style={{ width: 148 }}
+            value={m2.type}
+            onChange={(e) => {
+              const nextType = e.target.value as ModType
+              u({ modulation2: { ...m2, type: nextType } })
+            }}
+            onClick={(e) => e.stopPropagation()}
+            title="Modulation 2 type. Continuous-signal types (LFO/S&H/Slew/Chaos/Attractor) recommended."
+          >
+            <option value="lfo">LFO</option>
+            <option value="sh">Sample &amp; Hold</option>
+            <option value="slew">Slew</option>
+            <option value="chaos">Chaos</option>
+            <option value="attractor">Strange Attractor</option>
+            <option value="envelope">Envelope</option>
+            <option value="ramp" disabled>
+              Ramp (n/a)
+            </option>
+            <option value="arpeggiator" disabled>
+              Arpeggiator (n/a)
+            </option>
+            <option value="random" disabled>
+              Random (n/a)
+            </option>
+          </select>
+        ) : null
+      }
+    >
+      {/* Modulator sub-editor — same components Mod 1 uses, pointed
+          at modulation2 via the u2/m2Cell translation above. The
+          isMod2 prop suppresses the "live effective Mod 1" overlay
+          inside these editors — they're editing Mod 2 itself, not
+          watching Mod 1 animate. */}
+      {m2.type === 'lfo' ? (
+        <LfoEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'sh' ? (
+        <SampleHoldEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'slew' ? (
+        <SlewEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'chaos' ? (
+        <ChaosEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'attractor' ? (
+        <AttractorEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'envelope' ? (
+        <EnvelopeEditor cell={m2Cell} u={u2} isMod2 />
+      ) : (
+        <div className="text-[11px] text-muted italic">
+          This modulator type isn&apos;t supported as a second stage.
+          Pick LFO, S&amp;H, Slew, Chaos or Strange Attractor.
+        </div>
+      )}
+
+      {/* ── Targets sub-block ─────────────────────────────────────── */}
+      <Mod2TargetsBlock
+        m2={m2}
+        onPatchTarget={patchTargets}
+        onPatchMode={patchTargetMode}
+        shapeLabel={shapeMeta.label}
+        shapeTooltip={shapeMeta.tooltip}
+        shapeUsable={shapeMeta.usable}
+      />
+    </CollapsibleSection>
+  )
+}
+
+function Mod2TargetsBlock({
+  m2,
+  onPatchTarget,
+  onPatchMode,
+  shapeLabel,
+  shapeTooltip,
+  shapeUsable
+}: {
+  m2: Modulation
+  onPatchTarget: (
+    branch: 'rate' | 'depth' | 'shape',
+    next: { enabled?: boolean; amount?: number }
+  ) => void
+  onPatchMode: (mode: ModulationTargetMode) => void
+  shapeLabel: string
+  shapeTooltip: string
+  // When Modulation 1's current type has no continuous shape
+  // parameter (Envelope / Ramp / Arpeggiator), the third target row
+  // greys out and ignores the user's clicks — the engine is a no-op
+  // for those types anyway. Default true keeps backwards
+  // compatibility with any future caller that omits it.
+  shapeUsable: boolean
+}): JSX.Element {
+  const mode = m2.targetMode ?? 'multiplicative'
+  const rate = m2.targets?.rate ?? { enabled: false, amount: 0 }
+  const depth = m2.targets?.depth ?? { enabled: false, amount: 0 }
+  const shape = m2.targets?.shape ?? { enabled: false, amount: 0 }
+  return (
+    <div className="flex flex-col gap-2 pt-2 border-t border-border mt-1">
+      <div className="flex items-center gap-2">
+        <span
+          className="label"
+          title={
+            'How Modulation 2 modulates Modulation 1\'s targets:\n\n' +
+            'Multiplicative — base × (1 + mod2 × amount). Smooth, musical, works for everything.\n' +
+            'Additive       — base + mod2 × range × amount. Fixed-range swing, easier to predict.\n' +
+            'Mix            — rate + depth multiplicative; shape additive.'
+          }
+        >
+          Targets
+        </span>
+        <select
+          // Auto-width via inline style + w-auto so the select shrinks
+          // to its widest entry ("Multiplicative") plus the native
+          // dropdown arrow chrome. Previous fixed 110 px clipped
+          // "Multiplicative" on macOS' wider system font.
+          className="input text-[10px] py-0.5 w-auto"
+          style={{ width: 'fit-content' }}
+          value={mode}
+          onChange={(e) => onPatchMode(e.target.value as ModulationTargetMode)}
+          title="Math mode for Modulation 2 → Modulation 1 application"
+        >
+          <option value="multiplicative">Multiplicative</option>
+          <option value="additive">Additive</option>
+          <option value="mix">Mix</option>
+        </select>
+      </div>
+      <Mod2TargetRow
+        label="Rate"
+        tooltip="Modulate Modulation 1's Rate (LFO Hz / clock division)."
+        enabled={rate.enabled}
+        amount={rate.amount}
+        onToggle={(v) => onPatchTarget('rate', { enabled: v })}
+        onAmount={(v) => onPatchTarget('rate', { amount: v })}
+      />
+      <Mod2TargetRow
+        label="Depth"
+        tooltip="Modulate Modulation 1's Depth (0..100%)."
+        enabled={depth.enabled}
+        amount={depth.amount}
+        onToggle={(v) => onPatchTarget('depth', { enabled: v })}
+        onAmount={(v) => onPatchTarget('depth', { amount: v })}
+      />
+      <Mod2TargetRow
+        label={shapeLabel}
+        tooltip={shapeTooltip}
+        enabled={shape.enabled}
+        amount={shape.amount}
+        onToggle={(v) => onPatchTarget('shape', { enabled: v })}
+        onAmount={(v) => onPatchTarget('shape', { amount: v })}
+        disabled={!shapeUsable}
+      />
+    </div>
+  )
+}
+
+function Mod2TargetRow({
+  label,
+  tooltip,
+  enabled,
+  amount,
+  onToggle,
+  onAmount,
+  disabled
+}: {
+  label: string
+  tooltip: string
+  enabled: boolean
+  amount: number
+  onToggle: (v: boolean) => void
+  onAmount: (v: number) => void
+  // When `disabled` is true (e.g. Shape row while Mod 1 = Envelope),
+  // the entire row greys out and the checkbox + knob + input
+  // pre-empt the user's clicks. The engine ignores this target's
+  // amount when disabled anyway, but we want the UI to read
+  // unambiguously inert.
+  disabled?: boolean
+}): JSX.Element {
+  return (
+    <div
+      className={`flex items-center gap-2 text-[11px] ${disabled ? 'opacity-50' : ''}`}
+      title={tooltip}
+    >
+      <label className="flex items-center gap-1 cursor-pointer select-none w-32 shrink-0">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => onToggle(e.target.checked)}
+          disabled={disabled}
+        />
+        <span className={enabled && !disabled ? '' : 'text-muted'}>{label}</span>
+      </label>
+      <RoutingMiniKnob
+        value={amount}
+        onChange={(v) => {
+          if (disabled) return
+          onAmount(v)
+        }}
+        title={`${label} amount — drag vertically, dbl-click resets to 0`}
+      />
+      {/* Narrow number entry sized to fit the widest legal value
+          ("100.00") plus a hair for padding. Previous flex-1 stole
+          the rest of the row width, which the user didn't want. */}
+      <BoundedNumberInput
+        className="input w-14 text-center tabular-nums px-1 py-0 text-[11px] leading-tight"
+        value={amount}
+        onChange={(v) => {
+          if (disabled) return
+          onAmount(v)
+        }}
+        min={0}
+        max={100}
+        step={0.01}
+        disabled={disabled}
+        title="Amount (0..100 %) — how strongly Modulation 2 affects this target"
+      />
+      <span className="text-[10px] text-muted">%</span>
+    </div>
+  )
+}
+
+function LfoEditor({
+  cell,
+  u,
+  isMod2
+}: {
+  cell: import('@shared/types').Cell
+  u: CellUpdate
+  // When this editor is rendered inside the Mod 2 section, it's
+  // editing Modulation 2 itself — so the live overlay (which only
+  // makes sense for Modulation 1, the one being modulated) is
+  // suppressed. Default false = Mod 1 path (overlay active).
+  isMod2?: boolean
+}): JSX.Element {
   const m = cell.modulation
   const globalBpm = useStore((s) => s.session.globalBpm)
+  // Live effective-Mod-1 sample for the cell currently being watched
+  // by the Inspector. The hook always runs (rules of hooks); we just
+  // null it out when this editor is for Mod 2 so its controls don't
+  // animate against unrelated data.
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  // Pull the values we'll overlay. `??` falls back to the stored
+  // values when the engine isn't streaming (cell not armed, Mod 2
+  // off, or the streamed sample doesn't have this field populated).
+  const liveRateHz = live?.rateHz
+  const liveDepthPct = live?.depthPct
+  const liveShape = live?.lfoShape
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -2291,9 +3324,17 @@ function LfoEditor({
           longest label ("Random Smoothed") fits without truncation. */}
       <span className="label">Shape</span>
       <select
-        className="input text-[11px] py-0.5 min-w-0"
-        value={m.shape}
+        className={`input text-[11px] py-0.5 min-w-0 ${liveShape !== undefined && liveShape !== m.shape ? 'live-overlay' : ''}`}
+        // Live overlay — when Mod 2 is animating Shape, show the
+        // live shape so the user SEES the morph. Typing / picking
+        // still writes the STORED shape (base value).
+        value={liveShape ?? m.shape}
         onChange={(e) => uMod({ shape: e.target.value as LfoShape })}
+        title={
+          liveShape !== undefined && liveShape !== m.shape
+            ? `Live: ${liveShape} · Base: ${m.shape} (the dropdown shows the live shape; picking a value sets the BASE that Modulation 2 swings around).`
+            : undefined
+        }
       >
         <option value="sine">Sine</option>
         <option value="triangle">Triangle</option>
@@ -2325,17 +3366,33 @@ function LfoEditor({
         min={0}
         max={100}
         step={1}
-        value={m.depthPct}
+        // Live overlay: slider thumb tracks the effective depth so
+        // the user sees Modulation 2 modulating it. onChange still
+        // writes the BASE depth (m.depthPct) — dragging the thumb
+        // sets the base that Modulation 2 swings around.
+        value={liveDepthPct ?? m.depthPct}
         onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+        className={liveDepthPct !== undefined ? 'live-overlay' : ''}
       />
       <div className="flex items-center gap-1 justify-end">
         <BoundedNumberInput
-          className="input w-14 text-right"
-          integer
+          className={`input w-14 text-right ${liveDepthPct !== undefined ? 'live-overlay' : ''}`}
+          integer={liveDepthPct === undefined}
           min={0}
           max={100}
-          value={m.depthPct}
+          // Show 1-decimal live readout when overlaying; integer base
+          // value when not.
+          value={
+            liveDepthPct !== undefined
+              ? Math.round(liveDepthPct * 10) / 10
+              : m.depthPct
+          }
           onChange={(v) => uMod({ depthPct: v })}
+          title={
+            liveDepthPct !== undefined
+              ? `Live: ${liveDepthPct.toFixed(1)} · Base: ${m.depthPct}`
+              : undefined
+          }
         />
         <span className="text-muted text-[11px] w-5 shrink-0">%</span>
       </div>
@@ -2352,10 +3409,11 @@ function LfoEditor({
             max={100}
             step={0.1}
             list="dataflou-rate-ticks"
-            value={rateHzToSlider(m.rateHz)}
+            value={rateHzToSlider(liveRateHz ?? m.rateHz)}
             onChange={(e) =>
               uMod({ rateHz: sliderToRateHz(Number(e.target.value)) })
             }
+            className={liveRateHz !== undefined ? 'live-overlay' : ''}
           />
           <datalist id="dataflou-rate-ticks">
             <option value={0} />
@@ -2366,11 +3424,20 @@ function LfoEditor({
           </datalist>
           <div className="flex items-center gap-1 justify-end">
             <BoundedNumberInput
-              className="input w-14 text-right"
+              className={`input w-14 text-right ${liveRateHz !== undefined ? 'live-overlay' : ''}`}
               min={0.01}
               max={100}
-              value={m.rateHz}
+              value={
+                liveRateHz !== undefined
+                  ? Math.round(liveRateHz * 100) / 100
+                  : m.rateHz
+              }
               onChange={(v) => uMod({ rateHz: v })}
+              title={
+                liveRateHz !== undefined
+                  ? `Live: ${liveRateHz.toFixed(2)} Hz · Base: ${m.rateHz} Hz`
+                  : undefined
+              }
             />
             <span className="text-muted text-[11px] w-5 shrink-0">Hz</span>
           </div>
@@ -2463,13 +3530,22 @@ function LfoEditor({
 
 function ArpEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
   const arp = m.arpeggiator
+  // Live Mod 1 sample — suppressed when this editor is editing Mod 2
+  // itself (Mod 2's own arpMode isn't modulated by anything).
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveArpMode = live?.arpMode
+  const liveRateHz = live?.rateHz
+  const liveDepthPct = live?.depthPct
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -2503,9 +3579,14 @@ function ArpEditor({
 
       <span className="label">Mode</span>
       <select
-        className="input text-[11px] py-0.5 min-w-0"
-        value={arp.arpMode}
+        className={`input text-[11px] py-0.5 min-w-0 ${liveArpMode !== undefined && liveArpMode !== arp.arpMode ? 'live-overlay' : ''}`}
+        value={liveArpMode ?? arp.arpMode}
         onChange={(e) => uArp({ arpMode: e.target.value as ArpMode })}
+        title={
+          liveArpMode !== undefined && liveArpMode !== arp.arpMode
+            ? `Live: ${liveArpMode} · Base: ${arp.arpMode}`
+            : undefined
+        }
       >
         <option value="up">Up</option>
         <option value="down">Down</option>
@@ -2539,17 +3620,27 @@ Div/Mult: Value in the middle; halvings below, doublings above."
         min={0}
         max={100}
         step={1}
-        value={m.depthPct}
+        value={liveDepthPct ?? m.depthPct}
         onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+        className={liveDepthPct !== undefined ? 'live-overlay' : ''}
       />
       <div className="flex items-center gap-1 justify-end">
         <BoundedNumberInput
-          className="input w-14 text-right"
-          integer
+          className={`input w-14 text-right ${liveDepthPct !== undefined ? 'live-overlay' : ''}`}
+          integer={liveDepthPct === undefined}
           min={0}
           max={100}
-          value={m.depthPct}
+          value={
+            liveDepthPct !== undefined
+              ? Math.round(liveDepthPct * 10) / 10
+              : m.depthPct
+          }
           onChange={(v) => uMod({ depthPct: v })}
+          title={
+            liveDepthPct !== undefined
+              ? `Live: ${liveDepthPct.toFixed(1)} · Base: ${m.depthPct}`
+              : undefined
+          }
         />
         <span className="text-muted text-[11px] w-5 shrink-0">%</span>
       </div>
@@ -2562,16 +3653,26 @@ Div/Mult: Value in the middle; halvings below, doublings above."
             min={0}
             max={100}
             step={0.1}
-            value={rateHzToSlider(m.rateHz)}
+            value={rateHzToSlider(liveRateHz ?? m.rateHz)}
             onChange={(e) => uMod({ rateHz: sliderToRateHz(Number(e.target.value)) })}
+            className={liveRateHz !== undefined ? 'live-overlay' : ''}
           />
           <div className="flex items-center gap-1 justify-end">
             <BoundedNumberInput
-              className="input w-14 text-right"
+              className={`input w-14 text-right ${liveRateHz !== undefined ? 'live-overlay' : ''}`}
               min={0.01}
               max={100}
-              value={m.rateHz}
+              value={
+                liveRateHz !== undefined
+                  ? Math.round(liveRateHz * 100) / 100
+                  : m.rateHz
+              }
               onChange={(v) => uMod({ rateHz: v })}
+              title={
+                liveRateHz !== undefined
+                  ? `Live: ${liveRateHz.toFixed(2)} Hz · Base: ${m.rateHz} Hz`
+                  : undefined
+              }
             />
             <span className="text-muted text-[11px] w-5 shrink-0">Hz</span>
           </div>
@@ -2665,11 +3766,20 @@ Div/Mult: Value in the middle; halvings below, doublings above."
 
 function RandomEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
+  // Live overlay (suppressed for Mod 2 self-editing). Random's
+  // continuous param Mod 2 targets is `distribution`.
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveDist = live?.randomDistribution
+  const liveRateHz = live?.rateHz
+  const liveDepthPct = live?.depthPct
   const globalBpm = useStore((s) => s.session.globalBpm)
   const m = cell.modulation
   const rnd = m.random
@@ -2730,6 +3840,41 @@ function RandomEditor({
       />
       <span />
 
+      {/* Distribution skew applied to each random draw. 0 = edge-
+          weighted (cluster at min/max), 0.5 = uniform, 1 = centre-
+          hugging. Inspired by Buchla 266 "Stored Random Voltages". */}
+      <span className="label">Dist.</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={Math.round((liveDist ?? rnd.distribution ?? 0.5) * 100)}
+        onChange={(e) =>
+          uRnd({ distribution: clamp(Number(e.target.value), 0, 100) / 100 })
+        }
+        className={liveDist !== undefined ? 'live-overlay' : ''}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className={`input w-14 text-right ${liveDist !== undefined ? 'live-overlay' : ''}`}
+          integer={liveDist === undefined}
+          min={0}
+          max={100}
+          value={Math.round((liveDist ?? rnd.distribution ?? 0.5) * 100)}
+          onChange={(v) => uRnd({ distribution: v / 100 })}
+          title={
+            liveDist !== undefined
+              ? `Live: ${Math.round(liveDist * 100)}% · Base: ${Math.round((rnd.distribution ?? 0.5) * 100)}%`
+              : undefined
+          }
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+      </div>
+      <div className="col-span-3 text-[10px] text-muted italic">
+        0 % = edges only · 50 % = uniform · 100 % = centre-hugging.
+      </div>
+
       <span className="label">Rate</span>
       {m.sync === 'free' ? (
         <>
@@ -2738,16 +3883,26 @@ function RandomEditor({
             min={0}
             max={100}
             step={0.1}
-            value={rateHzToSlider(m.rateHz)}
+            value={rateHzToSlider(liveRateHz ?? m.rateHz)}
             onChange={(e) => uMod({ rateHz: sliderToRateHz(Number(e.target.value)) })}
+            className={liveRateHz !== undefined ? 'live-overlay' : ''}
           />
           <div className="flex items-center gap-1 justify-end">
             <BoundedNumberInput
-              className="input w-14 text-right"
+              className={`input w-14 text-right ${liveRateHz !== undefined ? 'live-overlay' : ''}`}
               min={0.01}
               max={100}
-              value={m.rateHz}
+              value={
+                liveRateHz !== undefined
+                  ? Math.round(liveRateHz * 100) / 100
+                  : m.rateHz
+              }
               onChange={(v) => uMod({ rateHz: v })}
+              title={
+                liveRateHz !== undefined
+                  ? `Live: ${liveRateHz.toFixed(2)} Hz · Base: ${m.rateHz} Hz`
+                  : undefined
+              }
             />
             <span className="text-muted text-[11px] w-5 shrink-0">Hz</span>
           </div>
@@ -2848,11 +4003,23 @@ function RandomEditor({
 // identical across all clock-driven modulators.
 function CompactRateControls({
   m,
-  uMod
+  uMod,
+  isMod2
 }: {
   m: import('@shared/types').Modulation
   uMod: (patch: Partial<import('@shared/types').Modulation>) => void
+  // Suppresses the live-Mod-1 overlay when this row sits inside the
+  // Mod 2 section (Mod 2's rate is the modulator, it isn't itself
+  // being modulated by anything we surface here).
+  isMod2?: boolean
 }): JSX.Element {
+  // Live effective Mod 1 from the store. Same suppression rule as
+  // the per-modulator editors: if this helper is rendered inside
+  // Modulation 2's section we don't overlay (Mod 2 isn't being
+  // modulated, so the live readout would be misleading).
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveRateHz = live?.rateHz
   return (
     <>
       <span className="label">Rate</span>
@@ -2862,10 +4029,17 @@ function CompactRateControls({
           min={0}
           max={100}
           step={0.1}
-          value={rateHzToSlider(m.rateHz)}
+          value={rateHzToSlider(liveRateHz ?? m.rateHz)}
           onChange={(e) => uMod({ rateHz: sliderToRateHz(Number(e.target.value)) })}
+          className={liveRateHz !== undefined ? 'live-overlay' : ''}
         />
       ) : (
+        // BPM-synced rate doesn't expose a continuous Hz to overlay
+        // (divisionIdx is the stored value, and Modulation 2's Rate
+        // target patches rateHz, not divisionIdx). Slider stays on
+        // the stored division. The Hz readout below still flashes
+        // when free-mode is on; in BPM mode the user reads the
+        // division label.
         <input
           type="range"
           min={0}
@@ -2885,11 +4059,20 @@ function CompactRateControls({
         {m.sync === 'free' ? (
           <>
             <BoundedNumberInput
-              className="input w-14 text-right"
+              className={`input w-14 text-right ${liveRateHz !== undefined ? 'live-overlay' : ''}`}
               min={0.01}
               max={100}
-              value={m.rateHz}
+              value={
+                liveRateHz !== undefined
+                  ? Math.round(liveRateHz * 100) / 100
+                  : m.rateHz
+              }
               onChange={(v) => uMod({ rateHz: v })}
+              title={
+                liveRateHz !== undefined
+                  ? `Live: ${liveRateHz.toFixed(2)} Hz · Base: ${m.rateHz} Hz`
+                  : undefined
+              }
             />
             <span className="text-muted text-[11px] w-5 shrink-0">Hz</span>
           </>
@@ -2945,11 +4128,19 @@ function CompactRateControls({
 // modulators.
 function CompactDepthMode({
   m,
-  uMod
+  uMod,
+  isMod2
 }: {
   m: import('@shared/types').Modulation
   uMod: (patch: Partial<import('@shared/types').Modulation>) => void
+  isMod2?: boolean
 }): JSX.Element {
+  // Same overlay rule as CompactRateControls — Mod 2's depth is the
+  // modulator's own depth, not a value being modulated, so the live
+  // readout is suppressed inside the Mod 2 section.
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveDepthPct = live?.depthPct
   return (
     <>
       <span className="label">Depth</span>
@@ -2958,17 +4149,27 @@ function CompactDepthMode({
         min={0}
         max={100}
         step={1}
-        value={m.depthPct}
+        value={liveDepthPct ?? m.depthPct}
         onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+        className={liveDepthPct !== undefined ? 'live-overlay' : ''}
       />
       <div className="flex items-center gap-1 justify-end">
         <BoundedNumberInput
-          className="input w-14 text-right"
-          integer
+          className={`input w-14 text-right ${liveDepthPct !== undefined ? 'live-overlay' : ''}`}
+          integer={liveDepthPct === undefined}
           min={0}
           max={100}
-          value={m.depthPct}
+          value={
+            liveDepthPct !== undefined
+              ? Math.round(liveDepthPct * 10) / 10
+              : m.depthPct
+          }
           onChange={(v) => uMod({ depthPct: v })}
+          title={
+            liveDepthPct !== undefined
+              ? `Live: ${liveDepthPct.toFixed(1)} · Base: ${m.depthPct}`
+              : undefined
+          }
         />
         <span className="text-muted text-[11px] w-5 shrink-0">%</span>
       </div>
@@ -2996,14 +4197,20 @@ function CompactDepthMode({
 // a probability knob that holds samples across multiple clocks.
 function SampleHoldEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
   const sh = m.sh
   const globalBpm = useStore((s) => s.session.globalBpm)
+  // Live overlay (suppressed when this editor is editing Mod 2 itself).
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveDist = live?.shDistribution
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -3012,8 +4219,8 @@ function SampleHoldEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} />
-      <CompactRateControls m={m} uMod={uMod} />
+      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactRateControls m={m} uMod={uMod} isMod2={isMod2} />
 
       <span className="label">Smooth</span>
       <label className="flex items-center gap-1 col-span-2 text-[11px]">
@@ -3050,6 +4257,37 @@ function SampleHoldEditor({
         Below 100 % the modulator sometimes holds its previous sample
         across clocks — Turing-Machine-style locked-in feel.
       </div>
+
+      {/* Distribution skew on each new S&H sample. 0 = edge-weighted
+          (samples cluster at the rails), 0.5 = uniform, 1 = centre-
+          hugging. Inspired by Buchla 266 "Stored Random Voltages". */}
+      <span className="label">Dist.</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={Math.round((liveDist ?? sh.distribution ?? 0.5) * 100)}
+        onChange={(e) =>
+          uSh({ distribution: clamp(Number(e.target.value), 0, 100) / 100 })
+        }
+        className={liveDist !== undefined ? 'live-overlay' : ''}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className={`input w-14 text-right ${liveDist !== undefined ? 'live-overlay' : ''}`}
+          integer={liveDist === undefined}
+          min={0}
+          max={100}
+          value={Math.round((liveDist ?? sh.distribution ?? 0.5) * 100)}
+          onChange={(v) => uSh({ distribution: v / 100 })}
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+      </div>
+      <div className="col-span-3 text-[10px] text-muted italic">
+        0 % = edges only (samples near min / max) · 50 % = uniform · 100 % = centre-hugging.
+      </div>
+
       <div className="col-span-3">
         <SampleHoldVisual modulation={cell.modulation} globalBpm={globalBpm} />
       </div>
@@ -3060,13 +4298,20 @@ function SampleHoldEditor({
 // Slew editor — random target at the clock rate, exponential glide.
 function SlewEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
   const s = m.slew
+  // Live overlay (suppressed in Mod 2 self-edit).
+  const liveStore = useStore((st) => st.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveRise = live?.slewRiseMs
+  const liveFall = live?.slewFallMs
   const globalBpm = useStore((st) => st.session.globalBpm)
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
@@ -3076,8 +4321,8 @@ function SlewEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} />
-      <CompactRateControls m={m} uMod={uMod} />
+      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactRateControls m={m} uMod={uMod} isMod2={isMod2} />
 
       <span className="label">Rise</span>
       <input
@@ -3085,17 +4330,21 @@ function SlewEditor({
         min={1}
         max={5000}
         step={1}
-        value={s.riseMs}
+        value={Math.round(liveRise ?? s.riseMs)}
         onChange={(e) => uSlew({ riseMs: clamp(Number(e.target.value), 1, 60000) })}
+        className={liveRise !== undefined ? 'live-overlay' : ''}
       />
       <div className="flex items-center gap-1 justify-end">
         <BoundedNumberInput
-          className="input w-14 text-right"
+          className={`input w-14 text-right ${liveRise !== undefined ? 'live-overlay' : ''}`}
           integer
           min={1}
           max={60000}
-          value={s.riseMs}
+          value={Math.round(liveRise ?? s.riseMs)}
           onChange={(v) => uSlew({ riseMs: v })}
+          title={
+            liveRise !== undefined ? `Live: ${Math.round(liveRise)} · Base: ${s.riseMs}` : undefined
+          }
         />
         <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
       </div>
@@ -3106,17 +4355,21 @@ function SlewEditor({
         min={1}
         max={5000}
         step={1}
-        value={s.fallMs}
+        value={Math.round(liveFall ?? s.fallMs)}
         onChange={(e) => uSlew({ fallMs: clamp(Number(e.target.value), 1, 60000) })}
+        className={liveFall !== undefined ? 'live-overlay' : ''}
       />
       <div className="flex items-center gap-1 justify-end">
         <BoundedNumberInput
-          className="input w-14 text-right"
+          className={`input w-14 text-right ${liveFall !== undefined ? 'live-overlay' : ''}`}
           integer
           min={1}
           max={60000}
-          value={s.fallMs}
+          value={Math.round(liveFall ?? s.fallMs)}
           onChange={(v) => uSlew({ fallMs: v })}
+          title={
+            liveFall !== undefined ? `Live: ${Math.round(liveFall)} · Base: ${s.fallMs}` : undefined
+          }
         />
         <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
       </div>
@@ -3148,13 +4401,18 @@ function SlewEditor({
 // cycle (boring). Above 4.0 it escapes (0..1 invariant fails).
 function ChaosEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
   const c = m.chaos
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveR = live?.chaosR
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -3163,8 +4421,8 @@ function ChaosEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} />
-      <CompactRateControls m={m} uMod={uMod} />
+      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactRateControls m={m} uMod={uMod} isMod2={isMod2} />
 
       <span className="label">r</span>
       <input
@@ -3172,17 +4430,21 @@ function ChaosEditor({
         min={3.4}
         max={4.0}
         step={0.001}
-        value={c.r}
+        value={liveR ?? c.r}
         onChange={(e) => uChaos({ r: clamp(Number(e.target.value), 3.4, 4.0) })}
         title="3.5 ~ stable 4-cycle · 3.57 onset of chaos · 3.83 period-3 window · 4.0 fully chaotic"
+        className={liveR !== undefined ? 'live-overlay' : ''}
       />
       <div className="flex items-center gap-1 justify-end">
         <BoundedNumberInput
-          className="input w-14 text-right"
+          className={`input w-14 text-right ${liveR !== undefined ? 'live-overlay' : ''}`}
           min={3.4}
           max={4.0}
-          value={Number(c.r.toFixed(3))}
+          value={Number((liveR ?? c.r).toFixed(3))}
           onChange={(v) => uChaos({ r: v })}
+          title={
+            liveR !== undefined ? `Live: ${liveR.toFixed(3)} · Base: ${c.r.toFixed(3)}` : undefined
+          }
         />
         <span className="text-muted text-[11px] w-5 shrink-0" />
       </div>
@@ -3199,17 +4461,142 @@ function ChaosEditor({
   )
 }
 
+// Strange Attractor editor — pick the ODE system, set its sweep
+// Speed, and the bifurcation Chaos knob. Channel fan-out (slot 0=X,
+// 1=Y, 2=Z, 3=W/speed) is implicit on multi-arg cells.
+function AttractorEditor({
+  cell,
+  u,
+  isMod2
+}: {
+  cell: import('@shared/types').Cell
+  u: CellUpdate
+  isMod2?: boolean
+}): JSX.Element {
+  const m = cell.modulation
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveChaos = live?.attractorChaos
+  const liveSpeed = live?.attractorSpeed
+  // Defensive fallback for sessions saved before the Attractor type
+  // existed (the field is optional on the Modulation union).
+  const ap = m.attractor ?? {
+    type: 'lorenz' as const,
+    speed: 1,
+    chaos: 0.5
+  }
+  function uMod(patch: Partial<typeof m>): void {
+    u({ modulation: { ...m, ...patch } })
+  }
+  function uAp(patch: Partial<typeof ap>): void {
+    u({ modulation: { ...m, attractor: { ...ap, ...patch } } })
+  }
+  return (
+    <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
+      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
+
+      <span className="label">Type</span>
+      <select
+        className="input text-[11px] py-0.5 min-w-0"
+        value={ap.type}
+        onChange={(e) =>
+          uAp({ type: e.target.value as typeof ap.type })
+        }
+        title="3D: Lorenz / Aizawa / Thomas / Rössler. 4D hyperchaotic: Rössler 4D / Lü 4D."
+      >
+        <option value="lorenz">Lorenz (butterfly)</option>
+        <option value="aizawa">Aizawa (toroidal)</option>
+        <option value="thomas">Thomas (cyclic)</option>
+        <option value="rossler">Rössler</option>
+        <option value="rossler4d">Rössler 4D (hyperchaotic)</option>
+        <option value="lu4d">Lü 4D (hyperchaotic)</option>
+      </select>
+      <span />
+
+      <span className="label">Speed</span>
+      <input
+        type="range"
+        min={5}
+        max={1000}
+        step={1}
+        value={Math.round((liveSpeed ?? ap.speed) * 100)}
+        onChange={(e) => uAp({ speed: clamp(Number(e.target.value), 5, 1000) / 100 })}
+        className={liveSpeed !== undefined ? 'live-overlay' : ''}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className={`input w-14 text-right ${liveSpeed !== undefined ? 'live-overlay' : ''}`}
+          min={0.05}
+          max={10}
+          value={Number((liveSpeed ?? ap.speed).toFixed(2))}
+          onChange={(v) => uAp({ speed: v })}
+          title={
+            liveSpeed !== undefined
+              ? `Live: ${liveSpeed.toFixed(2)}× · Base: ${ap.speed.toFixed(2)}×`
+              : undefined
+          }
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">×</span>
+      </div>
+
+      <span className="label">Chaos</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={Math.round((liveChaos ?? ap.chaos) * 100)}
+        onChange={(e) => uAp({ chaos: clamp(Number(e.target.value), 0, 100) / 100 })}
+        title="Drives the attractor's most expressive bifurcation parameter — Lorenz ρ, Rössler c, etc. 50% = canonical chaotic regime."
+        className={liveChaos !== undefined ? 'live-overlay' : ''}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className={`input w-14 text-right ${liveChaos !== undefined ? 'live-overlay' : ''}`}
+          integer={liveChaos === undefined}
+          min={0}
+          max={100}
+          value={Math.round((liveChaos ?? ap.chaos) * 100)}
+          onChange={(v) => uAp({ chaos: v / 100 })}
+          title={
+            liveChaos !== undefined
+              ? `Live: ${Math.round(liveChaos * 100)}% · Base: ${Math.round(ap.chaos * 100)}%`
+              : undefined
+          }
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+      </div>
+
+      <div className="col-span-3 text-[10px] text-muted italic leading-snug">
+        Multi-arg cells fan out: slot&nbsp;0=X, slot&nbsp;1=Y, slot&nbsp;2=Z,
+        slot&nbsp;3={ap.type === 'rossler4d' || ap.type === 'lu4d' ? 'W' : 'speed'}.
+        Single-arg cells read X only.
+      </div>
+      <div className="col-span-3">
+        <AttractorVisual modulation={m} />
+      </div>
+    </div>
+  )
+}
+
 // One-shot ramp modulator editor. Layout mirrors the Envelope editor so
 // the two feel like siblings: sync picker on top, then the time field,
 // curve, depth, and a small live visualizer.
 function RampEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveCurve = live?.rampCurvePct
+  const liveDepthPct = live?.depthPct
+  const liveRampMs = live?.rampMs
   // Defensive fallback — if a session predating the Ramp feature somehow
   // slips past sanitizeMetaController without a `ramp` field, use factory
   // defaults for display so the editor renders instead of blanking the app.
@@ -3350,19 +4737,33 @@ function RampEditor({
               min={0}
               max={1000}
               step={1}
-              value={rampMsToSlider(ramp.rampMs)}
+              value={rampMsToSlider(liveRampMs ?? ramp.rampMs)}
               onChange={(e) =>
                 uRamp({ rampMs: sliderToRampMs(Number(e.target.value)) })
               }
-              title={`${ramp.rampMs.toFixed(1)} ms — slider midpoint = 5000 ms`}
+              title={
+                liveRampMs !== undefined
+                  ? `Live: ${liveRampMs.toFixed(1)} ms · Base: ${ramp.rampMs.toFixed(1)} ms`
+                  : `${ramp.rampMs.toFixed(1)} ms — slider midpoint = 5000 ms`
+              }
+              className={liveRampMs !== undefined ? 'live-overlay' : ''}
             />
             <div className="flex items-center gap-1 justify-end">
               <BoundedNumberInput
-                className="input w-14 text-right"
+                className={`input w-14 text-right ${liveRampMs !== undefined ? 'live-overlay' : ''}`}
                 min={0.1}
                 max={300000}
-                value={ramp.rampMs}
+                value={
+                  liveRampMs !== undefined
+                    ? Math.round(liveRampMs * 10) / 10
+                    : ramp.rampMs
+                }
                 onChange={(v) => uRamp({ rampMs: v })}
+                title={
+                  liveRampMs !== undefined
+                    ? `Live: ${liveRampMs.toFixed(1)} ms · Base: ${ramp.rampMs.toFixed(1)} ms`
+                    : undefined
+                }
               />
               <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
             </div>
@@ -3400,17 +4801,27 @@ function RampEditor({
           min={-100}
           max={100}
           step={1}
-          value={ramp.curvePct}
+          value={Math.round(liveCurve ?? ramp.curvePct)}
           onChange={(e) => uRamp({ curvePct: clamp(Number(e.target.value), -100, 100) })}
           title="-100 = ease-in (slow start) · 0 = linear · +100 = ease-out (fast start)"
+          className={liveCurve !== undefined ? 'live-overlay' : ''}
         />
         <div className="flex items-center gap-1 justify-end">
           <BoundedNumberInput
-            className="input w-14 text-right"
+            className={`input w-14 text-right ${liveCurve !== undefined ? 'live-overlay' : ''}`}
             min={-100}
             max={100}
-            value={ramp.curvePct}
+            value={
+              liveCurve !== undefined
+                ? Math.round(liveCurve * 10) / 10
+                : ramp.curvePct
+            }
             onChange={(v) => uRamp({ curvePct: v })}
+            title={
+              liveCurve !== undefined
+                ? `Live: ${liveCurve.toFixed(1)} · Base: ${ramp.curvePct}`
+                : undefined
+            }
           />
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
@@ -3421,16 +4832,26 @@ function RampEditor({
           min={0}
           max={100}
           step={1}
-          value={m.depthPct}
+          value={liveDepthPct ?? m.depthPct}
           onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+          className={liveDepthPct !== undefined ? 'live-overlay' : ''}
         />
         <div className="flex items-center gap-1 justify-end">
           <BoundedNumberInput
-            className="input w-14 text-right"
+            className={`input w-14 text-right ${liveDepthPct !== undefined ? 'live-overlay' : ''}`}
             min={0}
             max={100}
-            value={m.depthPct}
+            value={
+              liveDepthPct !== undefined
+                ? Math.round(liveDepthPct * 10) / 10
+                : m.depthPct
+            }
             onChange={(v) => uMod({ depthPct: v })}
+            title={
+              liveDepthPct !== undefined
+                ? `Live: ${liveDepthPct.toFixed(1)} · Base: ${m.depthPct}`
+                : undefined
+            }
           />
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
@@ -3524,11 +4945,17 @@ function clamp01(v: number): number {
 
 function EnvelopeEditor({
   cell,
-  u
+  u,
+  isMod2
 }: {
   cell: import('@shared/types').Cell
   u: CellUpdate
+  isMod2?: boolean
 }): JSX.Element {
+  const liveStore = useStore((s) => s.mod1Live)
+  const live = isMod2 ? null : liveStore
+  const liveSus = live?.envelopeSustain
+  const liveDepthPct = live?.depthPct
   const m = cell.modulation
   const env = m.envelope
   function uEnv(patch: Partial<typeof env>): void {
@@ -3651,16 +5078,26 @@ function EnvelopeEditor({
           min={0}
           max={100}
           step={1}
-          value={m.depthPct}
+          value={liveDepthPct ?? m.depthPct}
           onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+          className={liveDepthPct !== undefined ? 'live-overlay' : ''}
         />
         <div className="flex items-center gap-1 justify-end">
           <BoundedNumberInput
-            className="input w-14 text-right"
+            className={`input w-14 text-right ${liveDepthPct !== undefined ? 'live-overlay' : ''}`}
             min={0}
             max={100}
-            value={m.depthPct}
+            value={
+              liveDepthPct !== undefined
+                ? Math.round(liveDepthPct * 10) / 10
+                : m.depthPct
+            }
             onChange={(v) => uMod({ depthPct: v })}
+            title={
+              liveDepthPct !== undefined
+                ? `Live: ${liveDepthPct.toFixed(1)} · Base: ${m.depthPct}`
+                : undefined
+            }
           />
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
@@ -3710,18 +5147,24 @@ function EnvelopeEditor({
           min={0}
           max={100}
           step={1}
-          value={Math.round(env.sustainLevel * 100)}
+          value={Math.round((liveSus ?? env.sustainLevel) * 100)}
           onChange={(e) =>
             uEnv({ sustainLevel: clamp(Number(e.target.value), 0, 100) / 100 })
           }
+          className={liveSus !== undefined ? 'live-overlay' : ''}
         />
         <div className="flex items-center gap-1 justify-end">
           <BoundedNumberInput
-            className="input w-14 text-right"
+            className={`input w-14 text-right ${liveSus !== undefined ? 'live-overlay' : ''}`}
             min={0}
             max={100}
-            value={Math.round(env.sustainLevel * 100)}
+            value={Math.round((liveSus ?? env.sustainLevel) * 100)}
             onChange={(v) => uEnv({ sustainLevel: v / 100 })}
+            title={
+              liveSus !== undefined
+                ? `Live: ${Math.round(liveSus * 100)}% · Base: ${Math.round(env.sustainLevel * 100)}%`
+                : undefined
+            }
           />
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
@@ -3901,12 +5344,19 @@ function CollapsibleViewSection({
 // `headerRight` is an optional slot rendered aligned to the right of the title.
 function CollapsibleSection({
   title,
+  titleTooltip,
   enabled,
   onToggle,
   headerRight,
   children
 }: {
   title: string
+  // Optional hover-only help text — rendered as the `title` attr on
+  // the section heading so the description shows up as a native
+  // tooltip on hover, INSTEAD of taking up vertical space inside the
+  // expanded body. Use this for sections whose description is
+  // explanatory rather than action-driving (e.g. Scaling).
+  titleTooltip?: string
   enabled: boolean
   onToggle: (v: boolean) => void
   headerRight?: React.ReactNode
@@ -3929,7 +5379,9 @@ function CollapsibleSection({
             checked={enabled}
             onChange={(e) => onToggle(e.target.checked)}
           />
-          <span className="label">{title}</span>
+          <span className="label" title={titleTooltip}>
+            {title}
+          </span>
           {!enabled && <span className="text-[10px] text-muted">(click to enable)</span>}
         </label>
         <div className="flex-1" />

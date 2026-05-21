@@ -60,6 +60,8 @@ export default function TrackSidebar(): JSX.Element {
   const addInstrumentRow = useStore((s) => s.addInstrumentRow)
   const addFunctionToInstrumentRow = useStore((s) => s.addFunctionToInstrumentRow)
   const saveAsTemplate = useStore((s) => s.saveAsTemplate)
+  const duplicateFunctionTrack = useStore((s) => s.duplicateFunctionTrack)
+  const duplicateInstrumentTrack = useStore((s) => s.duplicateInstrumentTrack)
   const oscMonitorOpen = useStore((s) => s.oscMonitorOpen)
   const poolHidden = useStore((s) => s.poolHidden)
   const moveTrack = useStore((s) => s.moveTrack)
@@ -596,7 +598,42 @@ export default function TrackSidebar(): JSX.Element {
                     {oscMonitorOpen && !poolHidden ? 'Hide Pool' : 'Show Pool'}
                   </button>
 
-                  {/* 5. Delete (existing). */}
+                  {/* 5. Duplicate — context-aware. Function (Parameter)
+                         rows get "Duplicate Parameter"; Template
+                         (Instrument) rows get "Duplicate Instrument".
+                         Both clone the row + every cell on every
+                         scene; Instrument also clones every child
+                         Parameter row. Only shown for single-row
+                         right-clicks (no multi-select duplicate). */}
+                  {menu.targets.length === 1 && anchor && (
+                    <>
+                      <div className="border-t border-border my-1" />
+                      <button
+                        className="w-full text-left px-3 py-1 hover:bg-panel2"
+                        onClick={() => {
+                          const id = anchor.id
+                          setMenu(null)
+                          if (anchor.kind === 'function') {
+                            duplicateFunctionTrack(id)
+                          } else {
+                            duplicateInstrumentTrack(id)
+                          }
+                        }}
+                        title={
+                          anchor.kind === 'function'
+                            ? 'Create a copy of this Parameter row (+ its cells on every scene) right below the source.'
+                            : 'Create a copy of this Instrument row (+ all its Parameter children + their cells) right below the source.'
+                        }
+                      >
+                        {anchor.kind === 'function'
+                          ? 'Duplicate Parameter'
+                          : 'Duplicate Instrument'}
+                      </button>
+                    </>
+                  )}
+
+                  {/* 6. Delete — context-aware label (Parameter vs
+                         Instrument) based on the anchor's kind. */}
                   {menu.targets.length > 0 && (
                     <>
                       <div className="border-t border-border my-1" />
@@ -608,19 +645,25 @@ export default function TrackSidebar(): JSX.Element {
                           const n = ids.length
                           if (n === 0) return
                           const target = tracks.find((t) => t.id === ids[0])
+                          const isFunction = anchor?.kind === 'function'
+                          const noun = isFunction ? 'Parameter' : 'Instrument'
                           const label =
                             n === 1
-                              ? `Delete "${target?.name ?? ''}"?` +
+                              ? `Delete ${noun} "${target?.name ?? ''}"?` +
                                 (target?.kind === 'template'
                                   ? ' (Will also delete its Parameter children.)'
                                   : '')
-                              : `Delete ${n} instruments?`
+                              : `Delete ${n} ${noun.toLowerCase()}s?`
                           if (confirm(label)) removeTracks(ids)
                         }}
                       >
-                        {menu.targets.length > 1
-                          ? `Delete ${menu.targets.length} instruments`
-                          : 'Delete instrument'}
+                        {(() => {
+                          const isFunction = anchor?.kind === 'function'
+                          const noun = isFunction ? 'Parameter' : 'Instrument'
+                          return menu.targets.length > 1
+                            ? `Delete ${menu.targets.length} ${noun.toLowerCase()}s`
+                            : `Delete ${noun}`
+                        })()}
                       </button>
                     </>
                   )}

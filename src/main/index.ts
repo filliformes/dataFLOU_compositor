@@ -138,6 +138,15 @@ app.whenReady().then(async () => {
     mainWindow?.webContents.send('engine:state', s)
   })
 
+  // Two-stage modulator — push the engine's per-tick effective
+  // Modulation 1 for the cell the Inspector is watching. Throttled
+  // engine-side to ~30 Hz; this just forwards each sample to the
+  // renderer. `null` samples (selection cleared) flow through too so
+  // the Inspector knows to drop stale overlay values.
+  engine.setOnMod1Live((sample) => {
+    mainWindow?.webContents.send('engine:mod1Live', sample)
+  })
+
   // OSC monitor — batch outgoing sends and flush every 50ms to the renderer.
   // Guards against IPC floods (120 Hz × many cells). A hard cap keeps us safe
   // when a burst overflows one flush window; overflow is dropped with a
@@ -257,6 +266,13 @@ app.whenReady().then(async () => {
   })
   safeHandle('engine:sendMetaValue', (_e, knobIdx, v) =>
     engine.sendMetaValue(knobIdx as number, v as number)
+  )
+  // Inspector selection feed for the live Modulation 1 stream. `null`
+  // tells the engine to stop emitting (Inspector closed / cleared).
+  safeHandle('engine:setSelectedCellForLive', (_e, sel) =>
+    engine.setSelectedCellForLive(
+      sel as { sceneId: string; trackId: string } | null
+    )
   )
 
   // ---------- IPC: Session I/O ----------

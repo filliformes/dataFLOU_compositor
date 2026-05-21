@@ -941,10 +941,20 @@ html[data-show-mode='true'] [data-hide-in-show='true'] {
    forwards clicks to the parent (mouseDown listener on the host). */
 .resize-h {
   cursor: row-resize;
-  position: relative;
 }
 .resize-v {
   cursor: col-resize;
+}
+/* Only set `position: relative` when the host hasn't already opted
+   into another positioning scheme via a Tailwind utility class
+   (`absolute`, `fixed`, `sticky`). Otherwise this rule was clobbering
+   the Inspector's `absolute` handle and pulling it out of its
+   anchored position so the user couldn't grab it. The :not() chain
+   keeps the pseudo-anchoring behaviour for the common case (no
+   positioning class) without breaking the explicitly-positioned
+   handles. */
+.resize-h:not(.absolute):not(.fixed):not(.sticky),
+.resize-v:not(.absolute):not(.fixed):not(.sticky) {
   position: relative;
 }
 .resize-h::before {
@@ -970,6 +980,93 @@ html[data-show-mode='true'] [data-hide-in-show='true'] {
 .resize-h:hover,
 .resize-v:hover {
   background: rgb(var(--c-accent) / 0.35);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Routing matrix — Pure Data `vradio`-style square toggles.
+   Two button styles sharing the same square footprint so a column
+   of them reads as a tight vertical strip:
+     .routing-tick      — the per-slot Mod / Seq toggle. Hollow
+                          square when "routed off"; accent-filled
+                          when routed on. Borderless to avoid the
+                          double-border look that two stacked .btn
+                          gave us.
+     .routing-bulk      — the header-row ⇆ buttons. Same footprint
+                          but rendered with a glyph instead of a
+                          fill state so the user can tell apart
+                          "toggle one slot" vs "toggle all slots".
+   Both read CSS variables so themes (Nature, Cream, etc.) pick
+   their own colour palette automatically.
+   ──────────────────────────────────────────────────────────────── */
+.routing-tick,
+.routing-bulk {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 3px;
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-panel2));
+  color: rgb(var(--c-text));
+  cursor: pointer;
+  transition: background 80ms ease, border-color 80ms ease;
+  /* Centre the square inside its grid track so the Mod / Seq pair
+     reads as a tight vertical strip even when the track is only a
+     hair wider than the square. While painting (mouse-down + drag)
+     keep crosshair-style cursor so the user knows it's active. */
+  justify-self: center;
+  user-select: none;
+}
+.routing-tick:hover,
+.routing-bulk:hover {
+  border-color: rgb(var(--c-accent) / 0.6);
+  background: rgb(var(--c-panel3));
+}
+.routing-tick.routing-tick-on {
+  /* Filled square = "routed on" — same accent colour the rest of
+     the app uses for active states. The inset shadow gives a tiny
+     bevel that reads as "lit lamp" on darker themes. */
+  background: rgb(var(--c-accent));
+  border-color: rgb(var(--c-accent));
+  box-shadow: inset 0 0 0 2px rgb(var(--c-panel) / 0.25);
+}
+.routing-tick.routing-tick-on:hover {
+  background: rgb(var(--c-accent) / 0.85);
+  border-color: rgb(var(--c-accent));
+}
+.routing-bulk {
+  font-size: 11px;
+  line-height: 1;
+  /* The glyph itself — use the accent colour so it pops without
+     competing with the routing-tick fills. */
+  color: rgb(var(--c-accent));
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Live modulation overlay — applied to Modulation 1 controls
+   (sliders, number inputs, dropdowns) when Modulation 2 is actively
+   driving their value. The control's displayed value tracks the
+   live engine-effective number while the user's typed / dragged
+   input still writes the BASE (stored) value. Visual treatment:
+   subtle accent-tint outline + accent text colour so the user sees
+   "this is being modulated right now" without losing legibility.
+   ──────────────────────────────────────────────────────────────── */
+.live-overlay {
+  /* Tint the input chrome so the user can tell at a glance the
+     value is animating. Soft accent ring + accent text colour. */
+  outline: 1px solid rgb(var(--c-accent) / 0.6);
+  outline-offset: -1px;
+  color: rgb(var(--c-accent));
+}
+/* Range sliders need a different cue — Chromium / Electron's range
+   thumb ignores `outline`, so we tint the thumb + track via accent. */
+input[type='range'].live-overlay {
+  accent-color: rgb(var(--c-accent));
+  outline: none;
+  box-shadow: 0 0 0 1px rgb(var(--c-accent) / 0.4);
+  border-radius: 4px;
 }
 
 /* ─────────────────────────────────────────────────────────────────

@@ -143,6 +143,24 @@ const ICONS: Record<SeqMode, IconRender> = {
       />
       <circle cx={13} cy={9} r={1.2} fill="currentColor" />
     </svg>
+  ),
+  // Adresse — an arrow pointing INTO a row of steps (CV addresses
+  // the row instead of a clock walking it). Buchla 245 vibe.
+  adresse: () => (
+    <svg width={16} height={16} viewBox="0 0 16 16" fill="none">
+      <rect x={2} y={10} width={2} height={4} fill="currentColor" opacity={0.5} />
+      <rect x={5} y={7} width={2} height={7} fill="currentColor" opacity={0.5} />
+      <rect x={8} y={9} width={2} height={5} fill="currentColor" />
+      <rect x={11} y={6} width={2} height={8} fill="currentColor" opacity={0.5} />
+      <path
+        d="M 9 2 L 9 6 M 7 4 L 9 6 L 11 4"
+        stroke="currentColor"
+        strokeWidth={1.2}
+        fill="none"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   )
 }
 
@@ -155,7 +173,8 @@ const MODE_LABELS: Record<SeqMode, string> = {
   drift: 'Drift',
   ratchet: 'Ratchet',
   bounce: 'Bounce',
-  draw: 'Draw'
+  draw: 'Draw',
+  adresse: 'Address'
 }
 
 const MODE_ORDER: SeqMode[] = [

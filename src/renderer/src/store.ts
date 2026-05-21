@@ -58,7 +58,8 @@ import {
   makeScene,
   makeTemplateSpec,
   makeTemplateTrack,
-  makeTrack
+  makeTrack,
+  parseValueTokens
 } from '@shared/factory'
 import { checkSessionIntegrity } from './hooks/sessionIntegrity'
 
@@ -387,7 +388,7 @@ export function isRichTheme(t: ThemeName): boolean {
 // field to the matching top-level store key (the live source of
 // truth at runtime).
 export function buildSessionForSave(
-  state: { session: Session } & Partial<{
+  state: { session: Session; engine?: EngineState } & Partial<{
     uiScale: number
     rowHeight: number
     sceneColumnWidth: number
@@ -399,6 +400,16 @@ export function buildSessionForSave(
     scenesCollapsed: boolean
   }>
 ): Session {
+  // Snapshot the live Hardware Mode catch state into the saved
+  // session so reopening a show resumes with the same caught arg
+  // slots highlighted red. Override VALUES are intentionally
+  // omitted — they self-heal on the next OSC packet from the bound
+  // device (usually within milliseconds).
+  const caughtByTrack = state.engine?.hardwareCaughtByTrack
+  const hardwareState =
+    caughtByTrack && Object.keys(caughtByTrack).length > 0
+      ? { caughtByTrack }
+      : undefined
   return {
     ...state.session,
     ui: {
@@ -411,7 +422,8 @@ export function buildSessionForSave(
       oscMonitorHeight: state.oscMonitorHeight,
       tracksCollapsed: state.tracksCollapsed,
       scenesCollapsed: state.scenesCollapsed
-    }
+    },
+    ...(hardwareState ? { hardwareState } : {})
   }
 }
 
@@ -562,6 +574,41 @@ interface Actions {
   // Tracks
   addTrack: () => void
   removeTrack: (id: string) => void
+  // Clone an existing Function (Parameter) sidebar row, inserting the
+  // duplicate immediately after the source. Cells from every scene
+  // are copied onto the new row so the duplicate plays the same
+  // values as the source instead of being empty. Both rows still
+  // point at the same Pool blueprint (sourceTemplateId +
+  // sourceFunctionId) — duplicating doesn't fork the blueprint.
+  duplicateFunctionTrack: (id: string) => string | null
+  // Same as above for a Template (Instrument) row — clones the row
+  // AND all of its Function children + all their cells on every
+  // scene. Pool blueprint stays the same (multi-instance of the
+  // template), so changes to the underlying Template apply to both.
+  duplicateInstrumentTrack: (id: string) => string | null
+  // Internal Ctrl+C / Ctrl+V clipboard. Lives in the store (not the
+  // OS clipboard) so it can't conflict with text-field paste in other
+  // apps and can carry rich Track/Cell payloads. Three payload kinds:
+  //  - 'cell' → a single clip; paste target = selectedCell
+  //  - 'function-track' → a Parameter row + cells on every scene
+  //  - 'instrument-track' → Template row + child rows + cells
+  clipboard:
+    | { kind: 'cell'; cell: Cell }
+    | {
+        kind: 'function-track'
+        track: Track
+        cellsByScene: Record<string, Cell>
+      }
+    | {
+        kind: 'instrument-track'
+        track: Track
+        children: Track[]
+        // cellsByScene[sceneId][childTrackId] = Cell
+        cellsByScene: Record<string, Record<string, Cell>>
+      }
+    | null
+  copyToClipboard: () => void
+  pasteFromClipboard: () => void
   renameTrack: (id: string, name: string) => void
   setTrackMidi: (id: string, binding: Track['midiTrigger']) => void
   setTrackDefaults: (
@@ -601,6 +648,11 @@ interface Actions {
     persistent: boolean,
     capturedValue?: string
   ) => void
+  // Edit the captured value for an already-pinned slot, without
+  // touching the pin state. Used by the Parameter Inspector's
+  // inline pinned-value editor. No-op if the slot isn't currently
+  // pinned (avoids accidentally pinning a slot via a typo).
+  setTrackPersistentValue: (id: string, slotIdx: number, value: string) => void
   // Per-CELL pin toggle. Overrides the track-level pin for that slot
   // on this specific scene's clip only. `persistent: true` → pin
   // (capture current value); `false` → explicit unpin; pass
@@ -709,6 +761,14 @@ interface Actions {
   setTrackColumnWidth: (w: number) => void
   setInspectorWidth: (w: number) => void
   setSequencePaused: (paused: boolean) => void
+  // Two-stage modulator — live snapshot of the effective Modulation 1
+  // for whichever cell the Inspector is currently watching. Updated
+  // at ~30 Hz from main via the `engine:mod1Live` IPC channel; null
+  // when the engine isn't streaming (cell deselected / Mod 2 off /
+  // cell not armed). Inspector controls overlay these values on top
+  // of the stored ones so the user can see Mod 2's effect animate.
+  mod1Live: import('@shared/types').Mod1LiveSample | null
+  setMod1Live: (sample: import('@shared/types').Mod1LiveSample | null) => void
   setMidiLearnMode: (on: boolean) => void
   setMidiLearnTarget: (
     t:
@@ -868,6 +928,14 @@ interface Actions {
   // duration / nextMode / multiplicator / morphInMs). Library is
   // replaced by-id on disk; the renderer's local mirror updates
   // both immediately + again via the push-on-change channel.
+  // Rebuild a SavedScene's full payload (tracks + templates + cells)
+  // from a linked LIVE scene in the grid. Used by the Pool's
+  // Scenes-tab right-click menu's "Update and save" action so the
+  // user can iterate on a scene in the grid and push the latest
+  // version back over the existing SavedScene WITHOUT creating a
+  // duplicate library entry. Re-uses the SavedScene's existing id;
+  // the linkedSavedSceneId on the grid scene picks the candidate.
+  updateSavedSceneFromGrid: (savedSceneId: string) => Promise<boolean>
   updateSavedScene: (
     id: string,
     patch: Partial<import('@shared/types').SavedScene['sceneMeta']> & {
@@ -923,6 +991,7 @@ export const useStore = create<State>((set, get) => ({
   selectedSceneIds: [],
   currentFilePath: null,
   engine: emptyEngineState,
+  clipboard: null,
   // Scene notes height in the editor. 0 = hidden (default). The Notes
   // toggle in the TrackSidebar "buttons box" flips this between 0 and
   // NOTES_ONE_LINE_HEIGHT so the user sees exactly one line of text when
@@ -948,6 +1017,10 @@ export const useStore = create<State>((set, get) => ({
   trackColumnWidth: 240,
   inspectorWidth: 340,
   sequencePaused: false,
+  // Live Mod 1 preview — populated by App.tsx's onMod1Live subscriber,
+  // consumed by the Inspector's modulator sub-editors. Null at boot
+  // and whenever the engine isn't streaming.
+  mod1Live: null,
   midiLearnMode: false,
   midiLearnTarget: null,
   theme: 'studio-dark',
@@ -1894,6 +1967,236 @@ export const useStore = create<State>((set, get) => ({
       const track = makeTrack(st.session.tracks.length)
       return { session: { ...st.session, tracks: [...st.session.tracks, track] } }
     }),
+  duplicateFunctionTrack: (id) => {
+    const st0 = get()
+    const src = st0.session.tracks.find((t) => t.id === id)
+    if (!src || src.kind !== 'function') return null
+    if (st0.session.tracks.length >= 128) return null
+    const newId = `t_${Math.random().toString(36).slice(2, 9)}`
+    const existingNames = st0.session.tracks.map((t) => t.name)
+    const cloned: Track = {
+      ...src,
+      id: newId,
+      name: uniqueCopyName(src.name, existingNames)
+    }
+    const idx = st0.session.tracks.findIndex((t) => t.id === id)
+    const newTracks = [...st0.session.tracks]
+    newTracks.splice(idx + 1, 0, cloned)
+    // Clone the source's cell from every scene onto the new track id so
+    // the duplicate row plays the same values as the source instead of
+    // being empty across the grid. Cells stored per-track on the scene.
+    const newScenes = st0.session.scenes.map((sc) => {
+      const srcCell = sc.cells[id]
+      if (!srcCell) return sc
+      return { ...sc, cells: { ...sc.cells, [newId]: { ...srcCell } } }
+    })
+    set((st) => ({
+      session: {
+        ...st.session,
+        tracks: newTracks,
+        scenes: newScenes
+      }
+    }))
+    return newId
+  },
+  duplicateInstrumentTrack: (id) => {
+    const st0 = get()
+    const src = st0.session.tracks.find((t) => t.id === id)
+    if (!src || src.kind !== 'template') return null
+    if (st0.session.tracks.length >= 128) return null
+    // Collect the contiguous block: Template row + its children.
+    const idx = st0.session.tracks.findIndex((t) => t.id === id)
+    const children = st0.session.tracks.filter((t) => t.parentTrackId === id)
+    if (st0.session.tracks.length + 1 + children.length > 128) return null
+    const newTplId = `t_${Math.random().toString(36).slice(2, 9)}`
+    const existingNames = st0.session.tracks.map((t) => t.name)
+    const newTpl: Track = {
+      ...src,
+      id: newTplId,
+      name: uniqueCopyName(src.name, existingNames)
+    }
+    // Map oldChildId → newChildId so cells can be remapped scene-by-scene.
+    const childIdMap = new Map<string, string>()
+    const newChildren: Track[] = children.map((child) => {
+      const newChildId = `t_${Math.random().toString(36).slice(2, 9)}`
+      childIdMap.set(child.id, newChildId)
+      return {
+        ...child,
+        id: newChildId,
+        parentTrackId: newTplId
+      }
+    })
+    // Insert the new block immediately after the source block (so the
+    // sidebar reads source → duplicate left-to-right top-to-bottom).
+    const srcBlockEnd = idx + 1 + children.length // exclusive
+    const newTracks = [
+      ...st0.session.tracks.slice(0, srcBlockEnd),
+      newTpl,
+      ...newChildren,
+      ...st0.session.tracks.slice(srcBlockEnd)
+    ]
+    // Clone every cell on every scene from the source's children onto
+    // the new children's ids. Template-row cells aren't a thing
+    // (templates only carry group triggers), so just children.
+    const newScenes = st0.session.scenes.map((sc) => {
+      const nextCells = { ...sc.cells }
+      childIdMap.forEach((newCId, oldCId) => {
+        const cell = sc.cells[oldCId]
+        if (cell) nextCells[newCId] = { ...cell }
+      })
+      return { ...sc, cells: nextCells }
+    })
+    set((st) => ({
+      session: {
+        ...st.session,
+        tracks: newTracks,
+        scenes: newScenes
+      }
+    }))
+    return newTplId
+  },
+  copyToClipboard: () => {
+    const st = get()
+    // Cell takes priority — if the user has a cell selected, that's
+    // almost always what they want to copy. Falls through to track-
+    // level copy only when no cell is currently selected.
+    if (st.selectedCell) {
+      const { sceneId, trackId } = st.selectedCell
+      const scene = st.session.scenes.find((s) => s.id === sceneId)
+      const cell = scene?.cells[trackId]
+      if (cell) {
+        set({ clipboard: { kind: 'cell', cell: structuredClone(cell) } })
+        return
+      }
+    }
+    if (st.selectedTrack) {
+      const src = st.session.tracks.find((t) => t.id === st.selectedTrack)
+      if (!src) return
+      if (src.kind === 'function') {
+        const cellsByScene: Record<string, Cell> = {}
+        for (const sc of st.session.scenes) {
+          const c = sc.cells[src.id]
+          if (c) cellsByScene[sc.id] = structuredClone(c)
+        }
+        set({
+          clipboard: {
+            kind: 'function-track',
+            track: structuredClone(src),
+            cellsByScene
+          }
+        })
+      } else {
+        const children = st.session.tracks.filter((t) => t.parentTrackId === src.id)
+        const cellsByScene: Record<string, Record<string, Cell>> = {}
+        for (const sc of st.session.scenes) {
+          const row: Record<string, Cell> = {}
+          for (const ch of children) {
+            const c = sc.cells[ch.id]
+            if (c) row[ch.id] = structuredClone(c)
+          }
+          if (Object.keys(row).length > 0) cellsByScene[sc.id] = row
+        }
+        set({
+          clipboard: {
+            kind: 'instrument-track',
+            track: structuredClone(src),
+            children: children.map((c) => structuredClone(c)),
+            cellsByScene
+          }
+        })
+      }
+    }
+  },
+  pasteFromClipboard: () => {
+    const st = get()
+    const clip = st.clipboard
+    if (!clip) return
+    // Cell paste — drop the clipped cell into the currently focused
+    // (sceneId, trackId). Overwrites any existing cell on that
+    // position. User can undo if it wasn't what they wanted.
+    if (clip.kind === 'cell') {
+      if (!st.selectedCell) return
+      const { sceneId, trackId } = st.selectedCell
+      set((s) => ({
+        session: {
+          ...s.session,
+          scenes: s.session.scenes.map((sc) =>
+            sc.id === sceneId
+              ? { ...sc, cells: { ...sc.cells, [trackId]: structuredClone(clip.cell) } }
+              : sc
+          )
+        }
+      }))
+      return
+    }
+    // Track pastes use the Duplicate code paths conceptually — clone
+    // the clipboard payload, generate fresh ids, insert right after
+    // the currently-selected track (or at the end if no selection).
+    if (st.session.tracks.length >= 128) return
+    const targetIdx = st.selectedTrack
+      ? st.session.tracks.findIndex((t) => t.id === st.selectedTrack)
+      : st.session.tracks.length - 1
+    const insertAfter = targetIdx < 0 ? st.session.tracks.length - 1 : targetIdx
+    if (clip.kind === 'function-track') {
+      const newId = `t_${Math.random().toString(36).slice(2, 9)}`
+      const existingNames = st.session.tracks.map((t) => t.name)
+      const cloned: Track = {
+        ...structuredClone(clip.track),
+        id: newId,
+        name: uniqueCopyName(clip.track.name, existingNames)
+      }
+      const newTracks = [...st.session.tracks]
+      newTracks.splice(insertAfter + 1, 0, cloned)
+      const newScenes = st.session.scenes.map((sc) => {
+        const cell = clip.cellsByScene[sc.id]
+        if (!cell) return sc
+        return { ...sc, cells: { ...sc.cells, [newId]: structuredClone(cell) } }
+      })
+      set((s) => ({
+        session: { ...s.session, tracks: newTracks, scenes: newScenes }
+      }))
+      return
+    }
+    if (clip.kind === 'instrument-track') {
+      if (st.session.tracks.length + 1 + clip.children.length > 128) return
+      const newTplId = `t_${Math.random().toString(36).slice(2, 9)}`
+      const existingNames = st.session.tracks.map((t) => t.name)
+      const newTpl: Track = {
+        ...structuredClone(clip.track),
+        id: newTplId,
+        name: uniqueCopyName(clip.track.name, existingNames)
+      }
+      const childIdMap = new Map<string, string>()
+      const newChildren: Track[] = clip.children.map((child) => {
+        const newChildId = `t_${Math.random().toString(36).slice(2, 9)}`
+        childIdMap.set(child.id, newChildId)
+        return {
+          ...structuredClone(child),
+          id: newChildId,
+          parentTrackId: newTplId
+        }
+      })
+      const newTracks = [
+        ...st.session.tracks.slice(0, insertAfter + 1),
+        newTpl,
+        ...newChildren,
+        ...st.session.tracks.slice(insertAfter + 1)
+      ]
+      const newScenes = st.session.scenes.map((sc) => {
+        const row = clip.cellsByScene[sc.id]
+        if (!row) return sc
+        const nextCells = { ...sc.cells }
+        childIdMap.forEach((newCId, oldCId) => {
+          const c = row[oldCId]
+          if (c) nextCells[newCId] = structuredClone(c)
+        })
+        return { ...sc, cells: nextCells }
+      })
+      set((s) => ({
+        session: { ...s.session, tracks: newTracks, scenes: newScenes }
+      }))
+    }
+  },
   moveTrack: (dragId, targetId) =>
     set((st) => {
       const tracks = st.session.tracks
@@ -2073,6 +2376,24 @@ export const useStore = create<State>((set, get) => ({
         })
       }
     })),
+  setTrackPersistentValue: (id, slotIdx, value) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        tracks: st.session.tracks.map((t) => {
+          if (t.id !== id) return t
+          // Only edit slots that are CURRENTLY pinned — a typo
+          // shouldn't silently pin a fresh slot. Inspector UI only
+          // exposes the editor when the slot's "pin" checkbox is
+          // checked, so this guard is mostly belt-and-braces.
+          if (!t.persistentSlots?.[slotIdx]) return t
+          const values = t.persistentValues ? t.persistentValues.slice() : []
+          while (values.length <= slotIdx) values.push('')
+          values[slotIdx] = value
+          return { ...t, persistentValues: values }
+        })
+      }
+    })),
   setCellPersistentSlot: (sceneId, trackId, slotIdx, persistent, capturedValue) =>
     set((st) => ({
       session: {
@@ -2171,6 +2492,44 @@ export const useStore = create<State>((set, get) => ({
       const effIp = ip && ip !== '' ? ip : st.session.defaultDestIp
       const effPort = port && port > 0 ? port : st.session.defaultDestPort
       const effAddr = addr && addr !== '' ? addr : st.session.defaultOscAddress
+      // Pinned-value broadcast — when the user edits track.persistentValues
+      // in the Inspector and clicks Send to clips, the captured values
+      // should appear in every clip's value string so the grid display
+      // matches what the engine emits. We rebuild each cell's tokens
+      // from argSpec, overwriting pinned positions with the captured
+      // value. Cells with a per-cell pin override of EXPLICITLY false
+      // ignore the broadcast (the user has deliberately unpinned that
+      // slot on this clip — respect it).
+      const argSpec = track.argSpec
+      const pinSlots = track.persistentSlots
+      const pinVals = track.persistentValues
+      const hasPins = !!(
+        argSpec &&
+        argSpec.length > 0 &&
+        pinSlots &&
+        pinSlots.some((b) => b === true)
+      )
+      function applyPinsToCellValue(cell: Cell): string {
+        if (!hasPins || !argSpec) return cell.value
+        // Start from current cell tokens; pad to argSpec.length using
+        // the argSpec's init defaults so freshly-created or short value
+        // strings still receive a full token row after the broadcast.
+        const cur = parseValueTokens(cell.value)
+        const initStr = buildInitialValueFromArgSpec(argSpec).split(/\s+/)
+        const out: string[] = new Array(argSpec.length)
+        for (let i = 0; i < argSpec.length; i++) {
+          out[i] = cur[i] ?? initStr[i] ?? '0'
+        }
+        for (let i = 0; i < argSpec.length; i++) {
+          if (pinSlots?.[i] !== true) continue
+          // Per-cell unpin overrides the track-level pin — leave that
+          // slot's token alone.
+          if (cell.persistentSlots?.[i] === false) continue
+          const v = pinVals?.[i]
+          if (v !== undefined && v !== '') out[i] = v
+        }
+        return out.join(' ')
+      }
       return {
         session: {
           ...st.session,
@@ -2190,6 +2549,10 @@ export const useStore = create<State>((set, get) => ({
               if (addr) created.addressLinkedToDefault = false
               // Inherit the Parameter's MIDI defaults on auto-create.
               if (midiOut) created.midiOut = { ...midiOut }
+              // Pinned-value broadcast — stamp the captured pinned
+              // tokens into the brand-new cell's value so the grid
+              // shows what the engine is emitting.
+              if (hasPins) created.value = applyPinsToCellValue(created)
               return { ...s, cells: { ...s.cells, [id]: created } }
             }
             const next: Cell = { ...existing }
@@ -2212,6 +2575,9 @@ export const useStore = create<State>((set, get) => ({
             // the OSC fields. That's what the button promises.
             if (midiOut) {
               next.midiOut = { ...midiOut }
+            }
+            if (hasPins) {
+              next.value = applyPinsToCellValue(next)
             }
             return { ...s, cells: { ...s.cells, [id]: next } }
           })
@@ -2749,6 +3115,7 @@ export const useStore = create<State>((set, get) => ({
     // mode stays on (Ableton-style: keep mapping the next control).
     set(on ? { midiLearnMode: true } : { midiLearnMode: false, midiLearnTarget: null }),
   setMidiLearnTarget: (t) => set({ midiLearnTarget: t }),
+  setMod1Live: (sample) => set({ mod1Live: sample }),
   setTheme: (t) => set({ theme: t }),
   // By default each toggle is independent (scenes only OR messages only).
   // The "linked compact mode" (both at once) is surfaced via a right-click
@@ -3343,9 +3710,26 @@ export const useStore = create<State>((set, get) => ({
     for (const tid of cellTrackIds) {
       if (scene.cells[tid]) savedSceneCells[tid] = scene.cells[tid]
     }
+    // Uniqueness: if the proposed name is already taken by another
+    // saved scene in the library, append " _1" / " _2" / … so the
+    // user doesn't accidentally end up with two indistinguishable
+    // Saved Scenes. Doesn't suppress the save — the new entry just
+    // gets a unique label. Numbered scenes that already exist
+    // increment past their highest current suffix.
+    const proposedName = (name.trim() || scene.name || 'Saved Scene').trim()
+    const existingNames = new Set(st.sceneLibrary.map((s) => s.name))
+    let finalName = proposedName
+    if (existingNames.has(finalName)) {
+      let n = 1
+      // Strip an existing " _N" suffix so duplicating "X _2" yields
+      // "X _3", not "X _2 _1".
+      const base = finalName.replace(/ _\d+$/, '')
+      while (existingNames.has(`${base} _${n}`)) n += 1
+      finalName = `${base} _${n}`
+    }
     const saved: import('@shared/types').SavedScene = {
       id: `scn_lib_${Math.random().toString(36).slice(2, 9)}`,
-      name: name.trim() || scene.name || 'Saved Scene',
+      name: finalName,
       color: scene.color,
       createdAt: Date.now(),
       origin: 'manual',
@@ -3386,6 +3770,72 @@ export const useStore = create<State>((set, get) => ({
     return saved.id
   },
 
+  updateSavedSceneFromGrid: async (savedSceneId) => {
+    const st = get()
+    const cur = st.sceneLibrary.find((s) => s.id === savedSceneId)
+    if (!cur) return false
+    // Find the live Scene that's linked to this SavedScene. There can
+    // only be one (the link is set on save / instantiate, and Pool
+    // mirroring keeps them aligned).
+    const scene = st.session.scenes.find((s) => s.linkedSavedSceneId === savedSceneId)
+    if (!scene) return false
+    // Rebuild the SavedScene exactly the way saveSceneToLibrary does,
+    // but REUSING the existing id so the library entry is overwritten
+    // rather than duplicated.
+    const cellTrackIds = Object.keys(scene.cells).filter((tid) =>
+      st.session.tracks.some((t) => t.id === tid)
+    )
+    const neededIds = new Set<string>(cellTrackIds)
+    const usedTemplateIds = new Set<string>()
+    for (const tid of cellTrackIds) {
+      const tr = st.session.tracks.find((t) => t.id === tid)
+      if (!tr) continue
+      if (tr.parentTrackId) neededIds.add(tr.parentTrackId)
+      if (tr.sourceTemplateId) usedTemplateIds.add(tr.sourceTemplateId)
+    }
+    for (const id of neededIds) {
+      const tr = st.session.tracks.find((t) => t.id === id)
+      if (tr?.sourceTemplateId) usedTemplateIds.add(tr.sourceTemplateId)
+    }
+    const usedTracks: Track[] = st.session.tracks.filter((t) => neededIds.has(t.id))
+    const usedTemplates: InstrumentTemplate[] = []
+    usedTemplateIds.forEach((tplId) => {
+      const tpl = st.session.pool.templates.find((t) => t.id === tplId)
+      if (tpl) usedTemplates.push(tpl)
+    })
+    const savedSceneCells: Record<string, Cell> = {}
+    for (const tid of cellTrackIds) {
+      if (scene.cells[tid]) savedSceneCells[tid] = scene.cells[tid]
+    }
+    const next: import('@shared/types').SavedScene = {
+      ...cur,
+      // Header travels with the live scene so the Pool entry stays
+      // in sync with whatever the user renamed / re-coloured in the
+      // grid since the original save.
+      name: scene.name || cur.name,
+      color: scene.color,
+      templates: usedTemplates,
+      tracks: usedTracks,
+      cells: savedSceneCells,
+      sceneMeta: {
+        name: scene.name,
+        color: scene.color,
+        notes: scene.notes,
+        durationSec: scene.durationSec,
+        nextMode: scene.nextMode,
+        multiplicator: scene.multiplicator,
+        morphInMs: scene.morphInMs
+      }
+    }
+    set({ sceneLibrary: st.sceneLibrary.map((s) => (s.id === savedSceneId ? next : s)) })
+    try {
+      await window.api?.sceneLibrarySave?.(next)
+      return true
+    } catch (e) {
+      console.error('[updateSavedSceneFromGrid] failed:', (e as Error).message)
+      return false
+    }
+  },
   updateSavedScene: async (id, patch) => {
     const st = get()
     const cur = st.sceneLibrary.find((s) => s.id === id)

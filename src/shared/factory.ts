@@ -138,6 +138,12 @@ export const DEFAULT_CHAOS: ChaosParams = {
   r: 3.8
 }
 
+export const DEFAULT_ATTRACTOR: import('./types').AttractorParams = {
+  type: 'lorenz',
+  speed: 1,
+  chaos: 0.5
+}
+
 export const DEFAULT_MODULATION: Modulation = {
   enabled: false,
   type: 'lfo',
@@ -155,7 +161,39 @@ export const DEFAULT_MODULATION: Modulation = {
   random: { ...DEFAULT_RANDOM },
   sh: { ...DEFAULT_SH },
   slew: { ...DEFAULT_SLEW },
-  chaos: { ...DEFAULT_CHAOS }
+  chaos: { ...DEFAULT_CHAOS },
+  attractor: { ...DEFAULT_ATTRACTOR }
+}
+
+// Two-stage modulator default. Same shape as DEFAULT_MODULATION
+// (sine LFO at 1 Hz) PLUS the targeting fields filled in with
+// "moderate impact on rate + depth, no shape modulation yet". Off by
+// default so adding cells doesn't silently introduce a second
+// modulator — the user opts in via the Inspector toggle.
+export const DEFAULT_MODULATION2: Modulation = {
+  ...DEFAULT_MODULATION,
+  // Slightly slower so the rate-on-rate modulation reads as
+  // "shape-shifting" rather than chaotic. Bipolar so the swing is
+  // symmetric around the base Mod 1 values.
+  rateHz: 0.5,
+  mode: 'bipolar',
+  envelope: { ...DEFAULT_ENVELOPE },
+  ramp: { ...DEFAULT_RAMP },
+  arpeggiator: { ...DEFAULT_ARPEGGIATOR },
+  random: { ...DEFAULT_RANDOM },
+  sh: { ...DEFAULT_SH },
+  slew: { ...DEFAULT_SLEW },
+  chaos: { ...DEFAULT_CHAOS },
+  attractor: { ...DEFAULT_ATTRACTOR },
+  // Sensible starter routing: Rate and Depth each receive a 50%
+  // amount, Shape disabled (user opts in once they understand the
+  // context-aware target for their Mod 1 type).
+  targets: {
+    rate: { enabled: true, amount: 50 },
+    depth: { enabled: true, amount: 50 },
+    shape: { enabled: false, amount: 0 }
+  },
+  targetMode: 'multiplicative'
 }
 
 // ---- Arpeggiator helpers ----

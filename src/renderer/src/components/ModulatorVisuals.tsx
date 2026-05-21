@@ -988,3 +988,202 @@ export function ChaosVisual({
     </VisFrame>
   )
 }
+
+// Strange Attractor visual — projects the (X, Y) plane of the
+// chosen attractor's trajectory onto the visual frame. Integrates a
+// few thousand sub-steps off-screen so the user sees the
+// characteristic shape (butterfly, torus, etc.) at-a-glance, not
+// just a noisy noodle. Static (not animated) — the per-tick engine
+// already drives the audio side.
+export function AttractorVisual({ modulation }: { modulation: Modulation }): JSX.Element {
+  const ap = modulation.attractor ?? { type: 'lorenz' as const, speed: 1, chaos: 0.5 }
+  const chaos = Math.max(0, Math.min(1, ap.chaos))
+  // Integrate N steps from a seed and collect the (x, y) projection.
+  // Drop the first `skip` so the visual lands on the attractor
+  // proper (not the transient approach trajectory). 4D hyperchaotic
+  // systems (Lü especially) have aggressive constants that destabilise
+  // at h=0.01; halve the step there to keep the trajectory bounded
+  // within the projection canvas.
+  const is4D = ap.type === 'rossler4d' || ap.type === 'lu4d'
+  const N = is4D ? 2000 : 1200
+  const skip = is4D ? 400 : 200
+  const h = is4D ? 0.003 : 0.01
+  const SAFE_MAX_VIS = 200
+  let x = 1
+  let y = 1
+  let z = 1
+  let w = 0
+  if (ap.type === 'aizawa') {
+    x = 0.1
+    y = 0
+    z = 0.01
+  } else if (ap.type === 'thomas') {
+    x = 0.5
+    y = 0.5
+    z = 0.5
+  } else if (ap.type === 'rossler') {
+    x = 0.1
+    y = 0
+    z = 0
+  } else if (ap.type === 'rossler4d') {
+    x = 0.5
+    y = 0
+    z = 0
+    w = 0
+  } else if (ap.type === 'lu4d') {
+    x = 0.5
+    y = 0.5
+    z = 0.5
+    w = 0
+  }
+  const pts: Array<{ x: number; y: number }> = []
+  for (let i = 0; i < N + skip; i++) {
+    let dx = 0
+    let dy = 0
+    let dz = 0
+    let dw = 0
+    switch (ap.type) {
+      case 'lorenz': {
+        const sigma = 10
+        const beta = 8 / 3
+        const rho = 14 + chaos * 36
+        dx = sigma * (y - x)
+        dy = x * (rho - z) - y
+        dz = x * y - beta * z
+        break
+      }
+      case 'rossler': {
+        const a = 0.2
+        const b = 0.2
+        const c = 4 + chaos * 10
+        dx = -y - z
+        dy = x + a * y
+        dz = b + z * (x - c)
+        break
+      }
+      case 'aizawa': {
+        const a = 0.95
+        const b = 0.7
+        const c = 0.6
+        const d = 3.5
+        const e = 0.25
+        const f = 0.1 + chaos * 0.3
+        dx = (z - b) * x - d * y
+        dy = d * x + (z - b) * y
+        dz = c + a * z - (z * z * z) / 3 - (x * x + y * y) * (1 + e * z) + f * z * (x * x * x)
+        break
+      }
+      case 'thomas': {
+        const b = 0.05 + chaos * 0.3
+        dx = Math.sin(y) - b * x
+        dy = Math.sin(z) - b * y
+        dz = Math.sin(x) - b * z
+        break
+      }
+      case 'rossler4d': {
+        const a = 0.25
+        const b = 3
+        const c = 0.05 + chaos * 0.15
+        const d = 0.5
+        dx = -y - z
+        dy = x + a * y + w
+        dz = b + x * z
+        dw = -c * z + d * w
+        break
+      }
+      case 'lu4d': {
+        const a = 36
+        const b = 3
+        const c = 20
+        const d = 1 + chaos * 2.5
+        dx = a * (y - x) + w
+        dy = c * y - x * z
+        dz = x * y - b * z
+        dw = -x * z + d * w
+        break
+      }
+    }
+    x += h * dx
+    y += h * dy
+    z += h * dz
+    w += h * dw
+    // Defensive clamp identical to the engine's per-sub-step guard.
+    // Without this the 4D systems would diverge mid-loop and emit
+    // either a wildly off-canvas trajectory or a NaN dotted-line.
+    if (!Number.isFinite(x) || Math.abs(x) > SAFE_MAX_VIS)
+      x = Number.isFinite(x) ? Math.sign(x) * SAFE_MAX_VIS : 0.1
+    if (!Number.isFinite(y) || Math.abs(y) > SAFE_MAX_VIS)
+      y = Number.isFinite(y) ? Math.sign(y) * SAFE_MAX_VIS : 0
+    if (!Number.isFinite(z) || Math.abs(z) > SAFE_MAX_VIS)
+      z = Number.isFinite(z) ? Math.sign(z) * SAFE_MAX_VIS : 0
+    if (!Number.isFinite(w) || Math.abs(w) > SAFE_MAX_VIS)
+      w = Number.isFinite(w) ? Math.sign(w) * SAFE_MAX_VIS : 0
+    if (i >= skip && Number.isFinite(x) && Number.isFinite(y)) {
+      pts.push({ x, y })
+    }
+  }
+  // Auto-fit the bounding box of the projected (x, y) into the
+  // visual frame so every attractor reads clearly regardless of its
+  // native units. Empty pts (every integration step diverged →
+  // filtered out) renders a blank frame rather than a NaN-laden
+  // path that would crash the SVG renderer.
+  if (pts.length === 0) {
+    return (
+      <VisFrame>
+        <text
+          x={VW / 2}
+          y={VH / 2}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={9}
+          fill="rgb(var(--c-muted))"
+          opacity={0.7}
+        >
+          attractor diverged — try lower chaos
+        </text>
+      </VisFrame>
+    )
+  }
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x
+    if (p.x > maxX) maxX = p.x
+    if (p.y < minY) minY = p.y
+    if (p.y > maxY) maxY = p.y
+  }
+  const innerW = VW - VPad * 2
+  const innerH = VH - VPad * 2
+  const sx = (innerW * 0.9) / Math.max(1e-6, maxX - minX)
+  const sy = (innerH * 0.9) / Math.max(1e-6, maxY - minY)
+  const cx = (minX + maxX) / 2
+  const cy = (minY + maxY) / 2
+  const project = (px: number, py: number): { x: number; y: number } => ({
+    x: VW / 2 + (px - cx) * sx,
+    y: VH / 2 + (py - cy) * sy
+  })
+  const path = pts
+    .map((p, i) => {
+      const q = project(p.x, p.y)
+      return `${i === 0 ? 'M' : 'L'} ${q.x.toFixed(2)} ${q.y.toFixed(2)}`
+    })
+    .join(' ')
+  return (
+    <VisFrame>
+      <path
+        d={path}
+        fill="none"
+        stroke="url(#rc-mod-stroke)"
+        strokeWidth={0.7}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        opacity={0.85}
+        style={{
+          filter: 'drop-shadow(0 0 2px rgb(var(--c-accent) / 0.4))'
+        }}
+      />
+    </VisFrame>
+  )
+}

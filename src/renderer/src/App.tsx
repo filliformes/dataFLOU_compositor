@@ -101,6 +101,19 @@ export default function App(): JSX.Element {
     return off
   }, [setEngineState])
 
+  // Two-stage modulator live preview — the engine ships ~30 Hz
+  // snapshots of the currently-watched cell's effective Modulation 1
+  // (post-Mod 2 patch). Store them in the renderer slice; the
+  // Inspector reads from there to overlay live values onto sliders /
+  // numbers without clobbering the user's stored authoring values.
+  useEffect(() => {
+    if (!window.api.onMod1Live) return
+    const off = window.api.onMod1Live((sample) => {
+      useStore.getState().setMod1Live(sample)
+    })
+    return off
+  }, [])
+
   // Init MIDI once. The manager will also open the persisted
   // `session.midiInputName` if one is set — but only if init runs
   // AFTER session-load. In practice init runs early on mount with
@@ -291,6 +304,36 @@ export default function App(): JSX.Element {
       if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
         e.preventDefault()
         redo()
+        return
+      }
+
+      // Ctrl/⌘+C / Ctrl/⌘+V — internal clipboard for Instruments,
+      // Parameters, and clips. Suppressed inside text fields so
+      // normal native text copy/paste still works there. Outside
+      // editable targets, copy captures the currently-selected cell
+      // (priority) or selected track; paste drops the payload at
+      // the focused destination. See store.copyToClipboard /
+      // pasteFromClipboard for the routing rules.
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'c'
+      ) {
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        useStore.getState().copyToClipboard()
+        return
+      }
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'v'
+      ) {
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        useStore.getState().pasteFromClipboard()
         return
       }
 

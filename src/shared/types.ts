@@ -55,6 +55,36 @@ export type ModType =
   | 'sh'
   | 'slew'
   | 'chaos'
+  | 'attractor'
+
+// Strange Attractor modulator — smooth correlated chaos via 3D or 4D
+// ODE integration. Unlike 1-D Chaos (logistic map), the attractor's
+// trajectory is bounded but never repeats, and its channels are
+// correlated rather than independently random. For a multi-arg cell:
+//   - 3D types: slot 0=X, 1=Y, 2=Z, 3=speed (|dx,dy,dz|, normalised)
+//   - 4D types: slot 0=W, 1=X, 2=Y, 3=Z
+// Slots ≥ 4 read the last channel (Z or W) — gracefully degrades.
+export type AttractorType =
+  | 'lorenz'
+  | 'aizawa'
+  | 'thomas'
+  | 'rossler'
+  | 'rossler4d'
+  | 'lu4d'
+
+export interface AttractorParams {
+  type: AttractorType
+  // Multiplier on the ODE integration step (1× = canonical speed for
+  // that attractor at the engine's tick rate). Range exposed in
+  // Inspector: 0.05..10. Higher = trajectory sweeps faster.
+  speed: number
+  // Per-attractor "chaos amount" knob. Maps to the attractor's most
+  // expressive bifurcation parameter — Lorenz σ, Rössler c, etc.
+  // 0..1; 0.5 = canonical chaos. Outside the chaotic band the
+  // trajectory can converge to a fixed point or limit cycle, which
+  // is a legitimate (if static) musical state.
+  chaos: number
+}
 export type LfoMode = 'unipolar' | 'bipolar'
 export type LfoSync = 'free' | 'bpm'
 // Envelope / Ramp sync:
@@ -91,6 +121,15 @@ export interface RandomParams {
   valueType: RandomValueType
   min: number // inclusive
   max: number // inclusive (applies per channel for 'colour')
+  // Distribution skew applied to each random draw, in [0, 1].
+  //   0.0  → edge-weighted (values cluster near min and max)
+  //   0.5  → uniform (raw rng, default)
+  //   1.0  → centre-hugging (values cluster near the midpoint)
+  // Implemented as a symmetric power-law warp around 0.5: see
+  // `warpDistribution()` in engine.ts. Per-draw; takes effect mid-
+  // play with no re-trigger. Inspired by the Buchla 266 "Stored
+  // Random Voltages" probability-distribution control.
+  distribution?: number
 }
 
 export interface EnvelopeParams {
@@ -128,6 +167,10 @@ export interface SampleHoldParams {
   // that Music-Thing-Turing-Machine locked-in feel without the full state
   // machine.
   probability: number
+  // Same skew as `RandomParams.distribution` — applied to each new
+  // S&H sample. 0.5 = uniform (default); see warpDistribution() in
+  // engine.ts.
+  distribution?: number
 }
 
 // Slew limiter — generates an internal random target on each clock tick,
@@ -195,7 +238,40 @@ export interface Modulation {
   sh: SampleHoldParams
   slew: SlewParams
   chaos: ChaosParams
+  // Strange Attractor params (used when type='attractor'). Optional
+  // for back-compat with sessions saved before the type existed —
+  // the engine falls back to canonical defaults when reading from
+  // an old session.
+  attractor?: AttractorParams
+  // ── Two-stage modulator: stage-2 targeting ────────────────────────
+  // These fields are READ only when a Modulation is in use as the
+  // SECOND stage (i.e. assigned to Cell.modulation2). For stage-1
+  // they're harmless dead weight. They describe how this modulator's
+  // bipolar [-1,+1] output is applied to the first-stage modulator's
+  // Rate, Depth, and a context-aware third parameter (called "Shape"
+  // in the UI but the underlying field depends on the first-stage
+  // type — LFO shape morph, S&H/Random distribution, Attractor chaos,
+  // etc.). Optional + back-compat: undefined arrays mean "no target
+  // active" so old sessions don't accidentally start modulating.
+  targets?: ModulationTargets
+  // Math mode for applying the stage-2 signal to stage-1's params.
+  //   multiplicative — base * (1 + mod2 * amount/100)
+  //   additive       — base + mod2 * (rangeMax * amount/100)
+  //   mix            — rate/depth multiplicative, shape additive
+  // Default 'multiplicative' (most musical for rate + depth).
+  targetMode?: ModulationTargetMode
 }
+
+// Two-stage routing — how Mod 2's bipolar signal touches each of
+// Mod 1's three controllable params. Per-target enable + amount so
+// you can deeply wiggle the Rate while only nudging the Shape.
+export interface ModulationTargets {
+  rate?: { enabled: boolean; amount: number /* 0..100 */ }
+  depth?: { enabled: boolean; amount: number /* 0..100 */ }
+  shape?: { enabled: boolean; amount: number /* 0..100 */ }
+}
+
+export type ModulationTargetMode = 'multiplicative' | 'additive' | 'mix'
 
 // Sequencer tempo source:
 //   'bpm'   — lock step rate to the session's global BPM
@@ -256,6 +332,19 @@ export type SeqMode =
   | 'ratchet'
   | 'bounce'
   | 'draw'
+  | 'adresse'
+
+// Adresse sub-mode — picks how the modulator and the addressed step
+// value combine. Inspired by the Buchla 245 stage-addressing
+// sequencer (modulation source IS the playhead, not the clock).
+//   hijack    — Mod 1 ONLY addresses; the step's stored value emits
+//               as-is (no further modulation on top). Default.
+//   parallel  — Mod 1 addresses AND modulates the resulting step
+//               value (double-effect, trippy in a good way).
+//   stage2    — Two-stage modulator only: Mod 2 addresses, Mod 1
+//               modulates the step value. Requires `stage2`
+//               (otherwise falls back to `hijack` behaviour).
+export type AdresseMode = 'hijack' | 'parallel' | 'stage2'
 
 export type SeqCombine = 'or' | 'xor' | 'and'
 export type SeqDriftEdge = 'wrap' | 'reflect'
@@ -378,6 +467,12 @@ export interface SequencerParams {
   drawSteps: number    // 4..1024
   drawValueMin: number // value at curve y=0 (canvas floor)
   drawValueMax: number // value at curve y=1 (canvas ceiling)
+
+  // Adresse mode — picks how the per-clip modulator interacts with
+  // the addressed step value. See `AdresseMode` doc above. Optional
+  // for back-compat with sessions saved before the mode existed;
+  // falls back to 'hijack' when undefined.
+  adresseMode?: AdresseMode
 }
 
 // Sequencer rest-behaviour alias.
@@ -399,6 +494,14 @@ export interface Cell {
   delayMs: number // 0..10000
   transitionMs: number // 0..10000
   modulation: Modulation
+  // Optional second-stage modulator. When enabled, Mod 2 evaluates
+  // every tick (same code path as Mod 1) and its bipolar output is
+  // applied to Mod 1's Rate / Depth / context-aware Shape param per
+  // the targeting fields on the Mod 2 Modulation itself. Mod 1's
+  // stored Modulation is NEVER mutated — the engine builds a fresh
+  // "effective Mod 1" each tick. Optional + back-compat: cells with
+  // no modulation2 behave exactly as before.
+  modulation2?: Modulation
   sequencer: SequencerParams
   // If true, each numeric output (post-modulation) is clamped to [0, 1].
   // Applies to each token when `value` contains space-separated values.
@@ -496,6 +599,62 @@ export interface Cell {
   scalingEnabled?: boolean
   scalingMin?: number[]
   scalingMax?: number[]
+  // Per-slot routing matrix — gates which arg slots the Modulator
+  // and Sequencer are allowed to drive. Each boolean array indexes
+  // parallel to argSpec / cell.value tokens. `true` (default) =
+  // routed (modulator / sequencer affects this slot). `false` =
+  // skipped (slot emits its `cell.value` seed instead of the
+  // modulated / step value). When BOTH directions are unrouted on a
+  // slot, the slot is effectively frozen at its seed (similar to
+  // Pin, but using cell.value as the source).
+  //
+  // Engine precedence on a slot:
+  //   argSpec.fixed                  > everything else
+  //   cell.persistentSlots[i] (Pin)  > everything else (after fixed)
+  //   routing.{mod,seq}[i] === false → strip the corresponding
+  //                                     contribution from `out`
+  //   otherwise                       → modulator + sequencer as usual
+  //
+  // Both fields optional + missing entries default to true so legacy
+  // sessions (no `routing` field, or shorter arrays than argSpec)
+  // behave identically to before this feature shipped.
+  routing?: {
+    modulator?: boolean[]
+    // Per-slot Modulation 2 gate. Default true (= Modulation 2 affects
+    // Modulation 1 for this slot, current behaviour). When false, the
+    // slot bypasses Modulation 2's effect on the per-slot modulator
+    // output — the slot reads from the ORIGINAL Modulation 1 params
+    // (Rate is shared globally and can't be "unmodulated" per-slot
+    // because the engine keeps a single phase; Depth and Shape do
+    // revert). Lets multi-arg cells route Modulation 2 to specific
+    // slots only.
+    modulation2?: boolean[]
+    sequencer?: boolean[]
+    // Per-slot Delay (ms) — gates the modulator + sequencer
+    // contribution for this slot until `delay` ms have elapsed
+    // since the cell's trigger. Lets multi-arg cells stagger their
+    // modulation onset (e.g. slot 0 starts immediately, slot 1
+    // joins at +100ms, slot 2 at +200ms — a wave across the
+    // bundle). Default 0 = no delay (legacy behavior).
+    delays?: number[]
+    // Per-slot Variation (0-100%) — random multiplier on the
+    // modulator contribution, sampled ONCE at trigger time so each
+    // slot's modulation feels "similar but a bit different" across
+    // a multi-arg cell. 0 = all slots identical (legacy). 100 =
+    // each slot's modulator amplitude ranges over [0, 2× the
+    // computed value]. Stable for the lifetime of the trigger.
+    variations?: number[]
+  }
+  // Where in the value pipeline the scaling clamp runs:
+  //   'post' (default) → AFTER modulators + sequencer, BEFORE Scale
+  //                       0.0–1.0 and MIDI Scale. Tames extreme
+  //                       outputs from generative sources.
+  //   'pre'            → BEFORE modulators + sequencer pick up the
+  //                       seed value. The whole downstream chain
+  //                       then operates within the clamped band.
+  // Optional + 'post' is the legacy behavior so older sessions still
+  // behave identically.
+  scalingMode?: 'pre' | 'post'
   // ── Pitch snap — quantise to a musical scale ──────────────────
   // When `pitchSnap.enabled` is true, the cell's modulated /
   // sequenced output (after Scaling + scaleToUnit) is mapped into
@@ -1256,6 +1415,16 @@ export interface Session {
   // Optional + every sub-field is also optional, so older sessions
   // without this field fall back to the renderer's runtime defaults.
   ui?: SessionUiState
+  // Persisted Hardware Mode runtime state. Captures which arg slots
+  // were caught by hardware at save time so a reopened session
+  // resumes red-highlighted catches WITHOUT needing the user to
+  // re-wiggle every knob. Override VALUES aren't persisted (they
+  // self-heal on the next incoming OSC packet from the bound
+  // device — usually within milliseconds). Optional + per-track
+  // empty arrays simply mean "no slots caught".
+  hardwareState?: {
+    caughtByTrack: Record<string, number[]>
+  }
 }
 
 // GUI layout snapshot saved with each session. Mirrors the
@@ -1313,6 +1482,41 @@ export interface EngineState {
   // that haven't played yet. Lets the renderer show the jittered
   // velocity in the cell tile so Humanize "moves" visibly.
   lastEmittedVelocityByCell?: Record<string, number>
+}
+
+// Live snapshot of Modulation 1's EFFECTIVE values for the cell
+// currently being watched by the Inspector. Produced by the engine
+// each tick (throttled to ~30 Hz) by running `applyMod2ToMod1` and
+// extracting the user-facing knobs Mod 2 can target. The renderer
+// overlays these onto the Modulator section's controls so the slider
+// thumbs + number readouts animate at the modulation rate.
+//
+// Only the params Mod 2 can actually target appear here — keeps the
+// payload tiny (5 numbers + a couple of strings per tick). Renderer
+// falls back to stored values when a field is undefined.
+export interface Mod1LiveSample {
+  sceneId: string
+  trackId: string
+  rateHz: number
+  depthPct: number
+  // Per-type Rate readout — Attractor's speed and Ramp's time aren't
+  // tracked by rateHz. Populated only when the relevant Mod 1 type is
+  // active so the renderer doesn't overlay stale values on the wrong
+  // editor.
+  attractorSpeed?: number
+  rampMs?: number
+  // Per-type shape param (only the relevant one for the current
+  // Modulation 1 type is populated; the rest are undefined).
+  lfoShape?: LfoShape
+  shDistribution?: number
+  randomDistribution?: number
+  attractorChaos?: number
+  chaosR?: number
+  slewRiseMs?: number
+  slewFallMs?: number
+  envelopeSustain?: number
+  rampCurvePct?: number
+  arpMode?: ArpMode
 }
 
 // One outgoing OSC message as surfaced to the renderer (OSC monitor panel).
@@ -1476,6 +1680,12 @@ export interface ExposedApi {
   // min/max/curve (fetched from the last pushed session) and blasts OSC to
   // every enabled destination.
   sendMetaValue: (knobIndex: number, normalizedValue: number) => Promise<void>
+  // Two-stage modulator — tells the engine which cell the Inspector
+  // is currently watching so it can publish that cell's effective
+  // Mod 1 values at ~30 Hz. `null` deselects (engine stops emitting).
+  setSelectedCellForLive: (
+    sel: { sceneId: string; trackId: string } | null
+  ) => Promise<void>
   // Session I/O
   sessionSaveAs: (session: Session) => Promise<string | null> // returns filepath
   sessionSave: (session: Session, path: string) => Promise<boolean>
@@ -1500,6 +1710,14 @@ export interface ExposedApi {
   onMidiEvents: (cb: (batch: MidiSendEvent[]) => void) => () => void
   // Batched MIDI send / port-open errors.
   onMidiErrors: (cb: (batch: MidiErrorEvent[]) => void) => () => void
+  // Two-stage modulator — live effective-Mod-1 values for the cell
+  // the Inspector is currently watching (see setSelectedCellForLive).
+  // Emits at ~30 Hz while Modulation 2 is enabled and any target is
+  // active. Null sample = "no live data" (engine cleared the selection
+  // or the cell isn't armed). Renderer overlays these values onto the
+  // sliders / number inputs in the Modulator section so the user sees
+  // Mod 2's modulation animating.
+  onMod1Live: (cb: (sample: Mod1LiveSample | null) => void) => () => void
 
   // ── MIDI output ──────────────────────────────────────────────────
   // Returns the list of MIDI output ports currently visible to the
