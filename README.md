@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--057)
+- [Release notes](#release-notes--058)
+  - [0.5.8](#release-notes--058)
   - [0.5.7](#release-notes--057)
   - [0.5.6](#release-notes--056)
   - [0.5.5](#release-notes--055)
@@ -66,7 +67,9 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
-- **Two-stage modulator — Modulation 2 (v0.5.7)** — every clip now carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode). Same Type picker as Mod 1 (LFO / S&H / Slew / Chaos / Strange Attractor / Envelope). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value — Mod 2's modulation breathes around whatever you author. Mod 2 also gets its own Routing-matrix column for per-slot gating.
+- **Gesture modulator (v0.5.8)** — record an X/Y stream by dragging on a square surface in the Inspector and use it as a modulator. The polyline + a crayon-style cursor render LIVE while you draw (canvas pinned-centered so it doesn't shift). On playback the engine loops the captured curve at the modulator's standard Rate (Hz or BPM-synced), and a coloured **playhead dot** animates on the canvas at ~30 Hz so you SEE the curve being traced. Three **Play modes** (Forward / Backward / Ping-Pong), a **Wiggle** knob (0–100 %, sinusoidal back-and-forth jitter on the playhead — modulatable by Modulation 2 as the third "Shape" target), and an **Output** picker: `XY` (X → slot 0, Y → slot 1) or `Merged` (radial distance √(x² + y²)/√2 broadcast to every slot). Two-channel fan-out via `gestureChannelFor`.
+- **Two-stage modulator — Modulation 2 (v0.5.7, expanded v0.5.8)** — every clip carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode, Gesture Wiggle). **Every modulator type** is now usable as Modulation 2 (v0.5.8): LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random, Ramp, Arpeggiator (Gesture-as-Mod-2 reserved for a future revision). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value — Mod 2's modulation breathes around whatever you author. The orange "live" overlay tint is gated on Modulation 2 being enabled, so it doesn't fire when nothing is actually modulating. Mod 2 also gets its own Routing-matrix column for per-slot gating.
+- **Address sequencer Stage-2 sub-mode (v0.5.8)** — Address mode's third sub-mode is now wired: Modulation 2 drives the playhead address while Modulation 1 modulates the addressed step's value. Falls back to Modulation 1 driving the playhead if Modulation 2 is disabled on the cell.
 - **Hardware Mode (v0.5.5)** — drive any compositor cell's args from a physical OSC controller (Trill bars, MIDI-to-OSC bridges, anything streaming UDP). Per-Instrument-template config: bind to a discovered device, pick **Reset** or **Persist** catch-mode, set catch tolerance + movement threshold, optionally narrow to specific Track instances and specific arg slots. Soft-takeover: the hardware value only takes over once it matches the currently-emitted scene value (or persists across scene changes if you want it to). Movement detection skips static/idle packets. Caught arg values render **red** in the live cell of the currently-playing scene, with a pulsing red dot in the Track sidebar + "HW Mode On" badge under the Instrument. Toggle the same Hardware Mode block from either the Pool inspector OR the grid Instrument inspector — both write the same `template.hardwareMode` blob. **Session persistence (v0.5.7)**: the caught-slot map (per-track arg indices currently overridden by hardware) is saved with the session and restored on load, so a power-cycle no longer wipes which slots are bound.
 - **Strange Attractor modulator (v0.5.7)** — new modulator type drawing from 6 well-known chaotic ODEs: **Lorenz, Aizawa, Thomas, Rössler, Rössler-4D, Lü-4D**. Per-tick Euler integration with adaptive sub-steps + per-step `±200` clamps + NaN guards so high-Speed × high-Chaos never blows up. Three knobs: **Type, Speed, Chaos**. Each tick produces a bounded, correlated 3-channel (or 4-channel for 4D types) trajectory; multi-arg cells fan out as slot 0 = X, slot 1 = Y, slot 2 = Z, slot 3 = W (= speed for 3D types, native W for 4D). Live SVG visual previews the 2-D projection of the orbit. Mod 2's Rate target patches `attractor.speed`, not `rateHz`.
 - **Routing matrix (v0.5.7)** — new collapsible section at the bottom of the Cell Inspector. Per-slot 3-column toggle grid (Mod / Mod 2 / Seq) plus **Delay (ms)** and **Variation (%)** columns. Untick a tick to gate the driver out for that slot (slot reads its cell.value seed instead of the modulated value). Click+drag across ticks to paint several at once. Bulk ⇆ buttons toggle a whole column. Delay staggers a slot's modulator/sequencer onset after each trigger. Variation introduces a per-trigger random ±scaling so multi-arg cells stay "similar but a bit different" across slots (with a small SVG knob next to the % input). Modulation 2 column greys out when Mod 2 is disabled on the cell.
@@ -91,7 +94,7 @@ You build a grid of **Instruments** (rows — each Instrument is a typed group o
 - **Per‑arg post‑modulation Scaling (v0.5)** — new collapsible section in the Cell Inspector between Values and Timing. Clamps each arg's output to a user‑chosen `[min, max]` band AFTER modulators / sequencer but BEFORE Scale 0.0–1.0 and MIDI Scale. Lets you tame extreme values from a Random / Chaos / Generative source without rewriting the whole sequencer. Per‑cell, per‑arg.
 - **3‑deep undo / redo (v0.5)** — Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Snapshot ring buffer (3 past + 3 future), 500 ms coalesce so typing bursts count as one undoable edit. Buttons live in the prefs sub‑toolbar with depth indicators. History resets on session load.
 - **Smart Scale 0.0 – 1.0** — auto‑ranges each parameter's actual min/max into `[0, 1]` instead of blunt‑clamping. Works for sequencer cycles, modulator outputs, even multi‑arg colour channels.
-- **Nine modulation types with live visualisations** — **LFO**, **Ramp** (Normal / Inverted / Loop), **Envelope (ADSR)**, **Arpeggiator** (with mode‑aware playback patterns), **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map), and **Strange Attractor** (v0.5.7 — Lorenz / Aizawa / Thomas / Rössler / Rössler-4D / Lü-4D, 3-/4-channel fan-out). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet); per‑modulator preview SVG redraws as you tweak. Each cell can stack a SECOND modulator (Modulation 2) that modulates Modulation 1's Rate / Depth / context-aware Shape — see top of the feature list.
+- **Ten modulation types with live visualisations** — **LFO**, **Ramp** (Normal / Inverted / Loop), **Envelope (ADSR)**, **Arpeggiator** (with mode‑aware playback patterns), **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map), **Strange Attractor** (v0.5.7 — Lorenz / Aizawa / Thomas / Rössler / Rössler-4D / Lü-4D, 3-/4-channel fan-out), and **Gesture** (v0.5.8 — XY recorder with live crayon preview, Wiggle, Forward / Backward / Ping-Pong playback; 2-channel fan-out or merged radial). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet); per‑modulator preview SVG redraws as you tweak. Each cell can stack a SECOND modulator (Modulation 2) that modulates Modulation 1's Rate / Depth / context-aware Shape — see top of the feature list.
 - **Ten sequencer modes** — **Steps**, **Euclidean**, **Polyrhythm** (two interlocking rings), **Density** (per‑step probability), **Cellular** (1‑D Wolfram automaton with Seed LFO), **Drift** (Brownian playhead), **Ratchet** (sub‑pulse bursts with 7 shaping modes), **Bounce** (geometrically accelerating step duration), **Draw** (free‑form curve up to 1024 steps), and **Address** (v0.5.7 — CV-style playhead driven by the Modulator's output, three sub-modes). Each has its own inspector preview.
 - **Generative mode** — flip a switch on any sequencer and the engine reinterprets the step values through a per‑mode musical rule (Tide, Accent, Voicing, Wave, Crowd, Terrain, Scatter, Bounce). Variation knob controls how far values stray from the user's base.
 - **Hold vs Last** rest behaviour — choose whether a muted step keeps emitting the last value (Hold) or replays the previous step's value (Last). Default Hold.
@@ -517,7 +520,7 @@ By default, sessions saved via the Save‑before‑quit / Save‑before‑new fl
 ```
 src/
 ├── main/
-│   ├── engine.ts            # fixed-tick scene engine, 10 sequencer modes, 9 modulators,
+│   ├── engine.ts            # fixed-tick scene engine, 10 sequencer modes, 10 modulators,
 │   │                          # two-stage modulator (Mod 2 → Mod 1's rate/depth/shape),
 │   │                          # cell pin precedence (cell > track > argSpec fixed),
 │   │                          # per-arg post-modulation Scaling clamp (10–300 Hz)
@@ -560,6 +563,76 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes — 0.5.8
+
+A modulator-focused follow-up to v0.5.7. Headlines: a **Gesture modulator** (10th modulator type — XY recorder with a live crayon while you draw, animated playhead dot during playback, **Wiggle** knob, three **Play modes**); the **Address sequencer's Stage-2 sub-mode** is now wired (Modulation 2 drives the playhead while Modulation 1 modulates the step value); every modulator type is now usable as Modulation 2 (**Random / Ramp / Arpeggiator** added alongside the v0.5.7 set); engine + Inspector audit pass with five real bug fixes and four notable perf wins (binary-searched gesture sampling, cached merged-mode sqrt, ref-backed pointermove array kills the O(N²) drawing cost, Mod-2-gated `useStore` selectors stop the editors re-rendering at 30 Hz when Mod 2 is off).
+
+### Gesture modulator
+
+A new modulator type that records an X/Y stream from a square surface in the Inspector and loops it as a continuous modulation source. Capture model: every pointermove during a drag becomes a `GesturePoint` with a relative ms timestamp and (x, y) in [0, 1]². The recorder shows the **in-progress polyline live as you draw**, plus a **crayon-style dot** at the current pointer position (filled accent circle with a subtle pulse ring) — same "ink flowing onto the canvas" feel as the Draw sequencer.
+
+Once recorded, playback:
+
+- **Rate** sweeps the playhead through the captured curve at the modulator's standard `rateHz` / sync controls — same dropdown as every other modulator (Free Hz or BPM-synced with dotted / triplet).
+- **Wiggle** (0..100 %) overlays a sinusoidal back-and-forth jitter on the playhead, scaling up to a roughly half-loop swing at 100 %. This is the **third "Shape" target Modulation 2 can sweep** when Mod 1 = Gesture (label flips to "Gesture · Wiggle" in the Mod 2 Targets row).
+- **Play mode** picks the playhead direction: **Forward** (default — 0 → 1 each loop), **Backward** (1 → 0), or **Ping-Pong** (0 → 1 → 0 each loop, triangle wave). Ping-Pong covers twice as much ground at the same Rate, so halve the Rate if you want forward-and-back to feel as slow as a single forward pass.
+- **Output** picks the slot fan-out: **XY** (slot 0 ← X, slot 1 ← Y; slots ≥ 2 read X for musical coherence rather than going silent) or **Merged** (√(x² + y²) / √2 broadcast to every slot — the unit square maps cleanly to [0, 1]).
+
+Animated playhead dot — the engine streams the gesture's current (x, y) at ~30 Hz via the existing `engine:mod1Live` IPC channel. The Inspector's GestureRecorder canvas overlays an accent-coloured dot at that position so you can watch the curve being traced in real time (independent of whether Modulation 2 is on — the dot animates whenever the cell is armed).
+
+Engine side:
+
+- `Modulation.gesture: GestureParams = { points, mode, wiggle, playMode }` on the cell.
+- `TrackState.gestureX/Y` updated per tick.
+- `sampleGesture(points, playhead01)` — binary search through the time-ordered points, linear interpolation between adjacent samples; returns `(0.5, 0.5)` for empty / single-point recordings.
+- `gestureChannelFor(ts, slotIdx, mode, gestureMode)` — multi-arg fan-out, with a per-tick cache on the merged-mode sqrt so multi-arg cells don't recompute the radial value per slot.
+- Phase-driven loop (reuses `ts.phase`) so Modulation 2 → Rate works out of the box.
+
+### Stage-2 Address sub-mode
+
+Address mode's third sub-mode is now functional: **Modulation 2 drives the playhead address** while Modulation 1 modulates the resulting step's value. Replaces the v0.5.7 placeholder ("requires Two-stage Mod, v0.5.8") in the dropdown. Falls back gracefully to Modulation 1 driving the playhead when Modulation 2 is disabled on the cell — so the dropdown is never a silent no-op.
+
+Engine side: hoisted `mod2NormBipolar` out of the Mod 2 enabled block in the per-tick loop so the Address branch can read it later in the same iteration; new `useMod2ForAddress` flag picks the source.
+
+### Random / Ramp / Arpeggiator now usable as Modulation 2
+
+The v0.5.7 release shipped Mod 2 with only the continuous-signal types (LFO / S&H / Slew / Chaos / Strange Attractor / Envelope) — the other three were marked `(n/a)` in the dropdown. They're now all wired:
+
+- **Random** — clock-driven fresh sample at the modulator's effective rate. New `Mod2State.randCurrent` + `randLastAdvanceAt`. Honours the user's distribution warp. Mod 2 collapses Random's multi-channel output to a single bipolar value per advance.
+- **Ramp** — one-shot evolve-then-hold: `2 * computeRampGain - 1` swings the playhead from -1 → +1 (or +1 → -1 inverted) over the configured length, then settles at the endpoint. Loop mode gives Mod 2 a slow saw-tooth.
+- **Arpeggiator** — clock-driven step advance via the reused `advanceArpStep` helper (signature loosened from `TrackState` to structural `{ arpStepIdx, arpPatternIdx }`). Emits the current step's normalised position as bipolar `(k / (N-1)) * 2 - 1`, so an "up" pattern sweeps -1 → +1 across the ladder, "down" sweeps the reverse, "upDown" makes a triangle. New `Mod2State.arpStepIdx / arpPatternIdx / arpLastAdvanceAt`.
+
+`arpStartStep` accepts an optional seeded RNG so Mod 2's reproducibility holds for `random`-mode arp reseeds (uses `m2.rng` instead of `Math.random`).
+
+### Live overlay gated on Modulation 2 enabled
+
+When the live-emit stream became always-on (so the Gesture playhead can animate without Modulation 2), every Mod 1 control started showing the orange `.live-overlay` tint constantly — `live?.X !== undefined` was always true once a stream existed. Now each editor's `useStore((s) => isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live)` returns a stable `null` whenever the overlay should be off, which has two effects:
+
+1. The orange tint only appears when Modulation 2 is actually driving (the old, clearer visual feedback).
+2. Zustand's default reference-equality skips re-rendering those editors at the engine's 30 Hz live-emit cadence — the Inspector drops from ~30 Hz wasteful re-renders to 0 Hz when Mod 2 is off.
+
+GestureEditor is the exception: it keeps a second always-on subscription (gated only on `isMod2`) feeding the playhead dot, with the Mod-2 gate applied locally to the Wiggle overlay only.
+
+### Engine + Inspector audit pass
+
+Five real bugs found and fixed in a dedicated audit pass:
+
+- **Wiggle multiplicative no-op at base=0** — Gesture's factory default is `wiggle: 0`, so `0 * (1 + mod2 * amt)` = 0 silently in multiplicative mode. Now falls through to additive when `baseWiggle === 0` so Mod 2 → Shape on a fresh cell has a visible effect.
+- **`endRecord` stale closure** — `drawing` was read from React state, which might not have flushed the last pointermove. Switched to a `drawingRef` ref-backed array — `endRecord` always sees the freshest data.
+- **Live emit firing while cell stopping / Mod 1 disabled** — guard added (`!ts.stopping && cell.modulation.enabled`). Playhead dot stops freezing mid-fade-out. The renderer's `mod1Live` slot is also cleared on selection change so a previous cell's stale snapshot doesn't bleed into the new cell's Inspector for ~33 ms.
+- **`arpStartStep('random')` used `Math.random`** — broke Mod 2's reproducibility promise (same cell value should produce the same trajectory). Now accepts an optional `rng` param; Mod 2 trigger reseed passes `rngM2`.
+- **`applyMod2ToMod1` Gesture branch missing `playMode`** in the fallback object literal — fixed to track `DEFAULT_GESTURE`.
+
+Perf wins:
+
+- **GestureRecorder pointermove O(N²) allocation** — `setDrawing(prev => [...prev, p])` allocated a fresh N-element array per move. A 20s recording at 60 Hz = ~720K element copies. Replaced with `drawingRef.current.push(p)` (in-place, O(1)) + a counter state for renders. Long recordings stay flat now.
+- **`sampleGesture` linear scan → binary search** — was O(N) per tick. At 120 Hz × 500-point recordings, drops from ~60K cmp/sec to ~240. Comment notes the array's monotonic ordering invariant.
+- **`gestureChannelFor` merged-mode sqrt cache** — was per-slot per-tick. Now cached on `ts.gestureMergedCache` with a tick-stamp invalidation, so an 8-slot merged-mode cell does one sqrt per tick instead of eight.
+- **Inspector `livePlayhead` allocation** — wrapped with `useMemo` so the `<GestureRecorder>` child sees a stable object reference across renders.
+- **`mod1Live` subscriber gating** — pushed the Mod-2-enabled gate into each editor's `useStore` selector (see above). 30 Hz → 0 Hz re-renders when Mod 2 is off.
 
 ---
 

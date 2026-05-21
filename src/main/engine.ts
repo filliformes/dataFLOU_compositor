@@ -128,6 +128,19 @@ interface Mod2State {
   attractorRawW: number
   attractorLastUpdateMs: number
   attractorSpeed: number
+  // Random modulator state (used when Mod 2's type is 'random'). The
+  // engine's Mod 1 Random emits a value array (one per slot); for
+  // Mod 2 we only need ONE bipolar sample per advance, so we store a
+  // single number here. Clock-driven via standard rateHz + sync.
+  randCurrent: number
+  randLastAdvanceAt: number
+  // Arpeggiator state (used when Mod 2's type is 'arpeggiator').
+  // Walks through a 0..N-1 step ladder per Mod 2's rate; the bipolar
+  // output is the step's normalised position. Mirrors the Mod 1 arp
+  // state fields exactly.
+  arpStepIdx: number
+  arpPatternIdx: number
+  arpLastAdvanceAt: number
   // Stage 2's own PRNG so consuming the random stream doesn't shift
   // Mod 1's behaviour — toggling Mod 2 on/off must not change what
   // Mod 1 produces given the same cell value seed.
@@ -159,6 +172,11 @@ function makeMod2State(): Mod2State {
     attractorRawW: 0,
     attractorLastUpdateMs: 0,
     attractorSpeed: 0,
+    randCurrent: 0,
+    randLastAdvanceAt: 0,
+    arpStepIdx: 0,
+    arpPatternIdx: 0,
+    arpLastAdvanceAt: 0,
     rng: null
   }
 }
@@ -285,6 +303,23 @@ interface TrackState {
   // modulator amplitude has a consistent character (vs jittery
   // tick-to-tick noise). Array length matches the cell's arg count.
   routingVariationFactors: number[]
+  // ── Gesture modulator playback ──────────────────────────────────
+  // Sampled X / Y of the recorded gesture at the current playhead
+  // position. Updated once per tick in the Gesture modulator advance
+  // block (when `cell.modulation.type === 'gesture'`); read by
+  // `gestureChannelFor` in the per-slot emit loop. Default 0.5 =
+  // centre of the unit square so an unrecorded gesture emits a
+  // quiet centre value rather than (0, 0).
+  gestureX: number
+  gestureY: number
+  // Per-tick cache for the merged-mode radial distance, so multi-arg
+  // cells in merged mode don't re-compute sqrt() per slot. The cache
+  // is valid when gestureMergedCacheTickIdx === gestureCacheTickStamp;
+  // the stamp is bumped at the top of every tick (just below the
+  // gesture-advance block).
+  gestureMergedCache: number
+  gestureMergedCacheTickIdx: number
+  gestureCacheTickStamp: number
   // Active cell ref (source of params)
   activeSceneId: string | null
   stopping: boolean
@@ -391,6 +426,11 @@ function makeTrackState(): TrackState {
     attractorLastUpdateMs: 0,
     attractorSpeed: 0,
     routingVariationFactors: [],
+    gestureX: 0.5,
+    gestureY: 0.5,
+    gestureMergedCache: 0.5,
+    gestureMergedCacheTickIdx: -1,
+    gestureCacheTickStamp: 0,
     activeSceneId: null,
     stopping: false,
     armed: false,
@@ -424,6 +464,44 @@ function effectiveSteps(cell: Cell): number {
  *  Pulled out so the same logic feeds the per-tick render path,
  *  scene-morph computation, trigger-time morph target, AND the cycle-
  *  range precompute below. */
+// Sample a recorded gesture at a normalised playhead position in
+// [0, 1]. Linear interpolation between adjacent stored points.
+// Returns (0.5, 0.5) for an empty / single-point recording (centre
+// value — keeps Gesture mode quiet until the user records).
+export function sampleGesture(
+  points: import('@shared/types').GesturePoint[],
+  playhead01: number
+): { x: number; y: number } {
+  if (!points || points.length === 0) return { x: 0.5, y: 0.5 }
+  if (points.length === 1) return { x: points[0].x, y: points[0].y }
+  const lastT = points[points.length - 1].t
+  if (lastT <= 0) return { x: points[0].x, y: points[0].y }
+  const clamped01 = Math.max(0, Math.min(1, playhead01))
+  const targetT = clamped01 * lastT
+  // Binary search — `points` is time-ordered by construction (the
+  // recorder pushes monotonically-increasing timestamps). Drops
+  // the per-tick sample cost from O(N) → O(log N), which matters
+  // at 120 Hz engine ticks × multi-second recordings (500+ points).
+  let lo = 0
+  let hi = points.length - 1
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1
+    if (points[mid].t <= targetT) lo = mid
+    else hi = mid
+  }
+  // Postconditions: points[lo].t <= targetT <= points[hi].t,
+  // where hi === lo + 1 (or both === 0 if the array is tiny —
+  // caught by the early returns above).
+  const pLo = points[lo]
+  const pHi = points[hi]
+  const span = pHi.t - pLo.t
+  const k = span > 0 ? (targetT - pLo.t) / span : 0
+  return {
+    x: pLo.x + (pHi.x - pLo.x) * k,
+    y: pLo.y + (pHi.y - pLo.y) * k
+  }
+}
+
 function resolveStepBaseRaw(
   cell: Cell,
   ts: TrackState,
@@ -1630,6 +1708,29 @@ export class SceneEngine {
         m2.slewLastAdvanceAt = now()
         m2.chaosX = 0.1 + rngM2() * 0.8
         m2.chaosLastAdvanceAt = now()
+        // Random — fire a fresh sample at trigger so the first emit
+        // has a real value rather than 0. Honour distribution warp
+        // if set.
+        {
+          const randDist2 = m2Cfg?.random.distribution
+          const rDraw = rngM2()
+          const rU =
+            randDist2 !== undefined && randDist2 !== 0.5
+              ? warpDistribution(rDraw, randDist2)
+              : rDraw
+          m2.randCurrent = rU * 2 - 1
+          m2.randLastAdvanceAt = now()
+        }
+        // Arpeggiator — start at the mode-appropriate first step
+        // (Up at 0, Down at N-1, etc.) so the first advance fires
+        // from a musical position rather than a stale leftover.
+        // Pass Mod 2's seeded RNG so the 'random' arp mode reseed
+        // is reproducible across re-triggers of the same cell.
+        if (m2Cfg) {
+          m2.arpPatternIdx = 0
+          m2.arpStepIdx = arpStartStep(m2Cfg.arpeggiator, rngM2)
+          m2.arpLastAdvanceAt = now()
+        }
         // Strange Attractor — reseed near the chaotic band for Mod
         // 2's chosen attractor type. Same per-type seeds as Mod 1.
         const ap2 = m2Cfg?.attractor
@@ -2252,6 +2353,10 @@ export class SceneEngine {
       // it when a slot has Modulation 2 routed off in the Routing
       // matrix (see routing.modulation2[idx] checks below).
       let mod1OriginalForSlots: Modulation = cell.modulation
+      // Hoisted so the Address sequencer mode's `stage2` sub-mode can
+      // read it later in this iteration — Mod 2 drives the playhead
+      // instead of Mod 1 in that sub-mode. Stays 0 when Mod 2 is off.
+      let mod2NormBipolar = 0
       if (cell.modulation2?.enabled) {
         mod1OriginalForSlots = cell.modulation
         advanceMod2State(
@@ -2267,7 +2372,7 @@ export class SceneEngine {
         // duration is mainly used by Envelope which is a rare Mod 2
         // pick anyway).
         const sceneDurSec = 1
-        const mod2NormBipolar = evalMod2Bipolar(
+        mod2NormBipolar = evalMod2Bipolar(
           cell.modulation2,
           ts.m2,
           ts.triggerTime,
@@ -2286,69 +2391,13 @@ export class SceneEngine {
         // effective version. The original cell in the session stays
         // untouched.
         cell = { ...cell, modulation: effMod1 }
-        // ── Live preview emit ─────────────────────────────────────
-        // If the Inspector is watching this exact (scene, track), send
-        // the effective Mod 1 to it at ~30 Hz. Throttled so we don't
-        // bury the renderer in IPC chatter at high tick rates. Only
-        // emits the params Mod 2 can target — see Mod1LiveSample.
-        const sel = this.selectedCellForLive
-        if (
-          this.onMod1Live &&
-          sel &&
-          sel.trackId === trackId &&
-          ts.activeSceneId === sel.sceneId &&
-          t - this.lastMod1LiveEmitAt >= 33
-        ) {
-          this.lastMod1LiveEmitAt = t
-          const sample: import('@shared/types').Mod1LiveSample = {
-            sceneId: sel.sceneId,
-            trackId: sel.trackId,
-            rateHz: effMod1.rateHz,
-            depthPct: effMod1.depthPct
-          }
-          // Populate the type-specific Shape readout so the Inspector
-          // can overlay the live value on the relevant control.
-          switch (effMod1.type) {
-            case 'lfo':
-              sample.lfoShape = effMod1.shape
-              break
-            case 'sh':
-              sample.shDistribution = effMod1.sh.distribution
-              break
-            case 'random':
-              sample.randomDistribution = effMod1.random.distribution
-              break
-            case 'attractor':
-              sample.attractorChaos = effMod1.attractor?.chaos
-              // Also surface the effective speed so the AttractorEditor
-              // can animate its Speed slider when Modulation 2 →
-              // Rate target is on.
-              sample.attractorSpeed = effMod1.attractor?.speed
-              break
-            case 'chaos':
-              sample.chaosR = effMod1.chaos.r
-              break
-            case 'slew':
-              sample.slewRiseMs = effMod1.slew.riseMs
-              sample.slewFallMs = effMod1.slew.fallMs
-              break
-            case 'envelope':
-              sample.envelopeSustain = effMod1.envelope.sustainLevel
-              break
-            case 'ramp':
-              sample.rampCurvePct = effMod1.ramp.curvePct
-              // Effective ramp length (ms) — Modulation 2's Rate
-              // target inverts time, so this can feel completely
-              // different from the stored rampMs.
-              sample.rampMs = effMod1.ramp.rampMs
-              break
-            case 'arpeggiator':
-              sample.arpMode = effMod1.arpeggiator.arpMode
-              break
-          }
-          this.onMod1Live(sample)
-        }
       }
+      // NOTE: live-preview emit moved out of the Mod 2 gate — it now
+      // fires unconditionally for the watched cell so the Inspector
+      // can animate things that don't depend on Mod 2 either (e.g.
+      // the Gesture playhead dot, which traces the recorded curve
+      // any time the cell is armed). See block below the per-tick
+      // modulator advances.
 
       // Advance LFO phase (only for LFO modulation; envelope uses real time).
       if (cell.modulation.enabled && cell.modulation.type === 'lfo') {
@@ -2471,6 +2520,75 @@ export class SceneEngine {
       // big step (which would diverge most of these systems). All raw
       // state lives in `attractorRaw*`; the renderable `attractor*`
       // mirror is the same trajectory normalised into [0, 1] per axis.
+      //
+      // ── Gesture modulator advance ────────────────────────────────
+      // Reads the cell's recorded XY polyline + the standard
+      // Modulation rate controls (effectiveLfoHz handles Free / BPM
+      // sync). Advances a [0, 1) playhead through `loopMs = 1000/effHz`
+      // each tick, applies an optional sinusoidal Wiggle that jitters
+      // the playhead back and forth between adjacent recorded points,
+      // and samples (x, y) on the curve. Result is stashed in
+      // ts.gestureX/Y for the slot loop + computeModNorm + Mod 1 live
+      // emit to read.
+      if (
+        cell.modulation.enabled &&
+        cell.modulation.type === 'gesture' &&
+        !ts.stopping
+      ) {
+        const gp = cell.modulation.gesture
+        const pts = gp?.points ?? []
+        if (pts.length === 0) {
+          // No recording — emit a quiet centre value (0.5, 0.5).
+          // Don't advance phase so the modulator stays steady.
+          ts.gestureX = 0.5
+          ts.gestureY = 0.5
+        } else {
+          const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
+          // Advance the shared phase counter at effHz. Phase wraps in
+          // [0, 1) so we can use it directly as the playhead position.
+          ts.phase += effHz * dt
+          const phaseFrac = ts.phase - Math.floor(ts.phase)
+          // Play-mode mapping: forward = phase as-is, backward = 1 -
+          // phase (reverse sweep), pingpong = triangle wave (0 → 1 →
+          // 0 per loop). Wiggle is overlaid on whatever this mapping
+          // produces, so jitter feels coherent in any direction.
+          const playMode = gp?.playMode ?? 'forward'
+          let basePlayhead: number
+          if (playMode === 'backward') {
+            basePlayhead = 1 - phaseFrac
+          } else if (playMode === 'pingpong') {
+            basePlayhead = 1 - Math.abs(2 * phaseFrac - 1)
+          } else {
+            basePlayhead = phaseFrac
+          }
+          // Wiggle — sinusoidal jitter overlaid on the basePlayhead.
+          // At 100 % the swing covers roughly one inter-point gap.
+          // Direction reverses 5× per loop so the user hears a clear
+          // "back-and-forth" against the smooth flow.
+          const wigglePct = Math.max(0, Math.min(100, gp?.wiggle ?? 0)) / 100
+          let playhead01 = basePlayhead
+          if (wigglePct > 0) {
+            // span = 0..0.5 of the full loop at 100% wiggle. 0.5 of
+            // the loop is enough to noticeably ping-pong around any
+            // point without skipping past the whole curve.
+            const span = wigglePct * 0.5
+            const wiggleHz = Math.max(0.05, effHz) * 5
+            const offset =
+              Math.sin(((t - ts.triggerTime) / 1000) * wiggleHz * Math.PI * 2) *
+              span
+            playhead01 = basePlayhead + offset
+            // Wrap into [0, 1).
+            playhead01 = ((playhead01 % 1) + 1) % 1
+          }
+          const sample = sampleGesture(pts, playhead01)
+          ts.gestureX = sample.x
+          ts.gestureY = sample.y
+        }
+        // Invalidate the merged-mode sqrt cache so the per-slot loop
+        // re-computes it once with the new X/Y, then reuses the
+        // result across the remaining slots this tick.
+        ts.gestureCacheTickStamp++
+      }
       if (
         cell.modulation.enabled &&
         cell.modulation.type === 'attractor' &&
@@ -2849,6 +2967,87 @@ export class SceneEngine {
         }
       }
 
+      // ── Live preview emit (~30 Hz) ─────────────────────────────────
+      // Inspector subscribes via `engine:setSelectedCellForLive`; the
+      // engine streams the EFFECTIVE Modulation 1 values (post-Mod 2
+      // patch) so the Inspector's modulator sub-editor can overlay
+      // live values on sliders, dropdowns, and (for Gesture) on the
+      // playhead dot in the XY canvas. Runs unconditionally for the
+      // watched cell — gesture playback wants to animate even when
+      // Mod 2 is off, so we can't gate this on Mod 2 enabled.
+      //
+      // Placed AFTER all per-tick modulator advances so ts.gestureX/Y
+      // and the other modulator state slots are fresh this tick.
+      {
+        const sel = this.selectedCellForLive
+        if (
+          this.onMod1Live &&
+          sel &&
+          sel.trackId === trackId &&
+          ts.activeSceneId === sel.sceneId &&
+          // Don't emit while the cell is stopping (fading out) or
+          // while Mod 1 is disabled — the watched values are stale
+          // or meaningless, and the Inspector's playhead dot
+          // shouldn't keep ticking. The IPC channel still exists;
+          // we just skip the per-tick send.
+          !ts.stopping &&
+          cell.modulation.enabled &&
+          t - this.lastMod1LiveEmitAt >= 33
+        ) {
+          this.lastMod1LiveEmitAt = t
+          // cell.modulation is either the stored Modulation (Mod 2 off)
+          // or the patched effMod1 (Mod 2 on) — we swapped above.
+          const m = cell.modulation
+          const sample: import('@shared/types').Mod1LiveSample = {
+            sceneId: sel.sceneId,
+            trackId: sel.trackId,
+            rateHz: m.rateHz,
+            depthPct: m.depthPct
+          }
+          switch (m.type) {
+            case 'lfo':
+              sample.lfoShape = m.shape
+              break
+            case 'sh':
+              sample.shDistribution = m.sh.distribution
+              break
+            case 'random':
+              sample.randomDistribution = m.random.distribution
+              break
+            case 'attractor':
+              sample.attractorChaos = m.attractor?.chaos
+              sample.attractorSpeed = m.attractor?.speed
+              break
+            case 'chaos':
+              sample.chaosR = m.chaos.r
+              break
+            case 'slew':
+              sample.slewRiseMs = m.slew.riseMs
+              sample.slewFallMs = m.slew.fallMs
+              break
+            case 'envelope':
+              sample.envelopeSustain = m.envelope.sustainLevel
+              break
+            case 'ramp':
+              sample.rampCurvePct = m.ramp.curvePct
+              sample.rampMs = m.ramp.rampMs
+              break
+            case 'arpeggiator':
+              sample.arpMode = m.arpeggiator.arpMode
+              break
+            case 'gesture':
+              sample.gestureWiggle = m.gesture?.wiggle
+              // Live playhead position — GestureEditor draws a dot at
+              // (gesturePlayheadX, gesturePlayheadY) on the XY canvas
+              // so the user sees the curve being traced in real time.
+              sample.gesturePlayheadX = ts.gestureX
+              sample.gesturePlayheadY = ts.gestureY
+              break
+          }
+          this.onMod1Live(sample)
+        }
+      }
+
       // Advance sequencer step. The advance logic is mode-aware: most
       // modes just count seqStepIdx upward (mod steps) like classic
       // step / euclidean; Drift replaces the counter with a Brownian
@@ -2861,16 +3060,37 @@ export class SceneEngine {
       // Note On edge for cells with MIDI Note kind.
       let stepChanged = false
       if (cell.sequencer.enabled && !ts.stopping && cell.sequencer.mode === 'adresse') {
-        // Adresse mode — clock is bypassed entirely; the playhead is
-        // READ from the modulator's normalised output. floor(mod * N)
+        // Address mode — clock is bypassed entirely; the playhead is
+        // READ from a modulator's normalised output. floor(mod * N)
         // picks the active step, so a smooth modulator (LFO, Strange
         // Attractor) scrubs through the step values like a quantised
         // wavetable scanner; a stepped modulator (S&H, Random)
         // teleports between steps. Inspired by the Buchla 245
         // sequential voltage source.
+        //
+        // Sub-mode picks WHICH modulator drives the playhead:
+        //   'hijack'  (default) — Modulation 1 is consumed entirely as
+        //                         the playhead; addressed step emits
+        //                         as-is (no extra modulation on top).
+        //   'parallel'          — Modulation 1 drives the playhead AND
+        //                         continues modulating the addressed
+        //                         step's value (set in the slot loop).
+        //   'stage2'            — Modulation 2 drives the playhead
+        //                         while Modulation 1 modulates the
+        //                         addressed step's value as normal.
+        //                         Falls back to Mod 1 if Mod 2 is off
+        //                         so the dropdown is never a silent
+        //                         no-op.
         const stepsA = effectiveSteps(cell)
+        const subMode = cell.sequencer.adresseMode ?? 'hijack'
+        const useMod2ForAddress =
+          subMode === 'stage2' && cell.modulation2?.enabled === true
         let modAddrUnit = 0.5
-        if (cell.modulation.enabled) {
+        if (useMod2ForAddress) {
+          // mod2NormBipolar was computed above (hoisted). Map [-1,+1]
+          // → [0,1].
+          modAddrUnit = (mod2NormBipolar + 1) / 2
+        } else if (cell.modulation.enabled) {
           const norm = computeModNorm(
             cell.modulation,
             ts,
@@ -3554,7 +3774,14 @@ export class SceneEngine {
             const slotModNorm =
               cell.modulation.type === 'attractor'
                 ? attractorChannelFor(ts, idx, cell.modulation.mode)
-                : modNormForSlot
+                : cell.modulation.type === 'gesture'
+                  ? gestureChannelFor(
+                      ts,
+                      idx,
+                      cell.modulation.mode,
+                      cell.modulation.gesture?.mode ?? 'xy'
+                    )
+                  : modNormForSlot
             // Adresse mode `hijack` (default) — the modulator is
             // CONSUMED entirely as the playhead position; the step
             // value emits as-is, NO additional modulation. `parallel`
@@ -4269,12 +4496,20 @@ function sampleRandom(
 
 // ---- Arpeggiator advance / init ----
 
-function arpStartStep(arp: {
-  steps: number
-  arpMode: import('@shared/types').ArpMode
-}): number {
+function arpStartStep(
+  arp: {
+    steps: number
+    arpMode: import('@shared/types').ArpMode
+  },
+  // Optional seeded RNG so callers in reproducibility-sensitive
+  // contexts (Mod 2 trigger reseed, deterministic cells with the
+  // same Value seed) get the same starting step. Falls back to
+  // Math.random for legacy callers that don't care.
+  rng?: () => number
+): number {
   const N = Math.max(1, Math.min(8, arp.steps))
-  if (arp.arpMode === 'random') return Math.floor(Math.random() * N)
+  const draw = rng ?? Math.random
+  if (arp.arpMode === 'random') return Math.floor(draw() * N)
   if (arp.arpMode === 'walk' || arp.arpMode === 'drunk') return 0
   // Deterministic: start at pattern[0].
   const pat = buildArpPattern(arp.arpMode, N)
@@ -4282,7 +4517,9 @@ function arpStartStep(arp: {
 }
 
 function advanceArpStep(
-  ts: TrackState,
+  // Structural: only reads / writes arpStepIdx + arpPatternIdx, so
+  // both TrackState (Mod 1) and Mod2State (Mod 2) can be passed.
+  ts: { arpStepIdx: number; arpPatternIdx: number },
   arp: { steps: number; arpMode: import('@shared/types').ArpMode }
 ): void {
   const N = Math.max(1, Math.min(8, arp.steps))
@@ -4378,6 +4615,14 @@ function computeModNorm(
     // loop; single-arg / single-channel readers use this fallback.
     return attractorChannelFor(ts, 1, m.mode)
   }
+  if (m.type === 'gesture') {
+    // Default channel = X (slot 0 in xy mode). Multi-arg cells get
+    // per-slot channels via `gestureChannelFor(ts, slotIdx, mode,
+    // gestureMode)` in the per-slot emit loop; single-arg / single-
+    // channel readers use this fallback.
+    const gMode = m.gesture?.mode ?? 'xy'
+    return gestureChannelFor(ts, 0, m.mode, gMode)
+  }
   // LFO (default fallthrough)
   const raw = lfo(m.shape, ts.phase, ts, tickIdx) // -1..1
   if (m.mode === 'bipolar') return raw
@@ -4427,6 +4672,54 @@ function attractorChannelFor(
   }
   if (mode === 'unipolar') return v01
   return v01 * 2 - 1 // bipolar
+}
+
+// Resolve which channel of the recorded gesture feeds a given slot.
+//   GestureMode 'xy':
+//     slot 0 → X, slot 1 → Y, slot ≥ 2 → X (so trailing slots aren't
+//     dead — they read the X channel which keeps the cell musically
+//     coherent rather than silent).
+//   GestureMode 'merged':
+//     every slot reads the same radial distance √(x² + y²) / √2.
+// `mode` is the standard LFO Unipolar / Bipolar — the gesture sample
+// is naturally unipolar [0, 1]; bipolar remaps to [-1, +1].
+function gestureChannelFor(
+  ts: TrackState,
+  slotIdx: number,
+  mode: 'unipolar' | 'bipolar',
+  gestureMode: import('@shared/types').GestureMode
+): number {
+  let v01: number
+  if (gestureMode === 'merged') {
+    // sqrt(2) divisor so the unit square's max distance (1, 1) maps
+    // to 1. Same formula as the old sequencer-mode merged value.
+    // Cached on the track state per tick so multi-arg cells in
+    // merged mode don't re-compute sqrt() per slot (8 slots × 120 Hz
+    // × 10 cells × sqrt() adds up). gestureMergedCacheTickIdx tracks
+    // whether the cache is fresh for the current tick.
+    if (ts.gestureMergedCacheTickIdx !== ts.gestureCacheTickStamp) {
+      ts.gestureMergedCache =
+        Math.sqrt(ts.gestureX * ts.gestureX + ts.gestureY * ts.gestureY) /
+        Math.SQRT2
+      ts.gestureMergedCacheTickIdx = ts.gestureCacheTickStamp
+    }
+    v01 = ts.gestureMergedCache
+  } else {
+    switch (slotIdx) {
+      case 0:
+        v01 = ts.gestureX
+        break
+      case 1:
+        v01 = ts.gestureY
+        break
+      default:
+        v01 = ts.gestureX
+        break
+    }
+  }
+  v01 = Math.max(0, Math.min(1, v01))
+  if (mode === 'unipolar') return v01
+  return v01 * 2 - 1
 }
 
 // ADSR with A, D, S (hold), R. Times in seconds (converted from ms or scene %).
@@ -4784,7 +5077,44 @@ function advanceMod2State(
     }
     return
   }
-  // Envelope / Ramp / Arpeggiator / Random → handled by evalMod2Bipolar
+  // Arpeggiator — clock-driven step advance. Uses the loosened
+  // advanceArpStep helper (structural typing) so Mod 2's
+  // arpStepIdx/arpPatternIdx update in place.
+  if (m.type === 'arpeggiator') {
+    const effHz = effectiveLfoHz(m, bpm)
+    if (effHz > 0) {
+      const period = 1000 / effHz
+      while (t - m2.arpLastAdvanceAt >= period) {
+        m2.arpLastAdvanceAt += period
+        advanceArpStep(m2, m.arpeggiator)
+      }
+    }
+    return
+  }
+  // Random — clock-driven fresh sample at the modulator's effective
+  // rate, with distribution warp honoured. Mod 2 emits ONE bipolar
+  // value (not the multi-channel array Mod 1's Random does), so we
+  // collapse to a single number per advance.
+  if (m.type === 'random') {
+    if (!m2.rng) return
+    const effHz = effectiveLfoHz(m, bpm)
+    if (effHz > 0) {
+      const period = 1000 / effHz
+      const dist = m.random.distribution
+      const rng = m2.rng
+      while (t - m2.randLastAdvanceAt >= period) {
+        m2.randLastAdvanceAt += period
+        const draw = rng()
+        const u =
+          dist !== undefined && dist !== 0.5
+            ? warpDistribution(draw, dist)
+            : draw
+        m2.randCurrent = u * 2 - 1
+      }
+    }
+    return
+  }
+  // Envelope / Ramp / Arpeggiator → handled by evalMod2Bipolar
   // directly (no per-tick state advance needed beyond what Mod 1
   // already does on the shared triggerTime).
 }
@@ -4836,12 +5166,31 @@ function evalMod2Bipolar(
       const raw = lfo(m.shape, m2.phase, m2, tickIdx)
       return raw
     }
-    case 'ramp':
-    case 'arpeggiator':
     case 'random':
-      // Not supported as Mod 2 — treat as no-op so the user doesn't
-      // get surprising "Mod 2 silently zeroed Mod 1" behaviour.
-      return 0
+      // Random — return the last drawn bipolar sample. advanceMod2State
+      // pulls a fresh sample at the modulator's effective rate.
+      return m2.randCurrent
+    case 'ramp': {
+      // Ramp is one-shot: rampGain rises 0 → 1 (or 1 → 0 inverted)
+      // over the configured time, then HOLDS at the final value
+      // forever. As Mod 2 we map it to bipolar so the held tail
+      // settles Mod 1's params at the swing endpoints rather than
+      // around the base. Loop mode in m.ramp.mode === 'loop' keeps
+      // restarting the ramp, which gives Mod 2 a slow saw-tooth.
+      const g = computeRampGain(m.ramp, elapsedSec, sceneDurSec)
+      return 2 * g - 1
+    }
+    case 'arpeggiator': {
+      // Arpeggiator — emit the current step's NORMALISED position
+      // as a bipolar value. With N steps, step k → 2*(k/(N-1)) - 1;
+      // so an "up" pattern sweeps -1 → +1 across the ladder, a
+      // "down" pattern sweeps +1 → -1, "upDown" makes a triangle.
+      // Single-step ladder (N=1) emits 0.
+      const N = Math.max(1, Math.min(8, m.arpeggiator.steps))
+      if (N <= 1) return 0
+      const k = Math.max(0, Math.min(N - 1, m2.arpStepIdx))
+      return (k / (N - 1)) * 2 - 1
+    }
     default:
       return 0
   }
@@ -5063,6 +5412,43 @@ function applyMod2ToMod1(
         out = {
           ...out,
           slew: { ...(out.slew ?? m1.slew), riseMs: rise, fallMs: fall }
+        }
+        break
+      }
+      case 'gesture': {
+        // Gesture's continuous "personality" knob is Wiggle (0..100).
+        // Multiplicative around the base feels natural — amount 100 %
+        // with mod2 = +1 doubles wiggle, mod2 = -1 zeros it. Additive
+        // does a ±100 × amount swing on top of the base.
+        //
+        // Special case: when baseWiggle === 0 (the factory default!),
+        // multiplicative math is `0 * (1 + anything) = 0` → Mod 2 →
+        // Shape silently does nothing. Fall through to additive so
+        // the user gets a visible effect without having to set
+        // baseWiggle > 0 manually.
+        const baseWiggle = m1.gesture?.wiggle ?? 0
+        let nextWiggle: number
+        if (mode === 'additive' || baseWiggle === 0) {
+          nextWiggle = baseWiggle + mod2NormBipolar * 100 * amt
+        } else {
+          nextWiggle = baseWiggle * (1 + mod2NormBipolar * amt)
+        }
+        nextWiggle = Math.max(0, Math.min(100, nextWiggle))
+        // Spread from out.gesture (which carries any earlier
+        // patches) and use DEFAULT_GESTURE as the final fallback so
+        // we don't drift from the canonical shape if a new field
+        // gets added to GestureParams later.
+        out = {
+          ...out,
+          gesture: {
+            ...(out.gesture ?? m1.gesture ?? {
+              points: [],
+              mode: 'xy',
+              wiggle: 0,
+              playMode: 'forward'
+            }),
+            wiggle: nextWiggle
+          }
         }
         break
       }

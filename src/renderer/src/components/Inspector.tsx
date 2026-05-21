@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, isRichTheme } from '../store'
 import { RcArcSlider, RcFlatBar } from './RcArcSlider'
 import { RcModeIcons } from './RcModeIcons'
@@ -6,6 +6,8 @@ import type {
   ArpMode,
   Cell,
   EnvSync,
+  GestureMode,
+  GesturePlayMode,
   LfoMode,
   LfoShape,
   LfoSync,
@@ -40,6 +42,7 @@ import {
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import { DrawCanvas } from './DrawCanvas'
+import { GestureRecorder } from './GestureRecorder'
 import { HardwareModeSection } from './InstrumentsInspectorPane'
 import {
   ArpVisual,
@@ -1523,10 +1526,13 @@ function CellInspector(): JSX.Element {
   }
 
   // Tell the engine which cell to stream live Modulation 1 updates
-  // for. The IPC runs only when Modulation 2 is enabled on this cell
-  // — when it's off there's nothing live to overlay. Clears on
-  // unmount so the engine stops emitting when the user closes /
-  // navigates away from the Inspector.
+  // for. ALWAYS request the stream while the Inspector is mounted on
+  // a cell — even when Modulation 2 is off, the renderer wants the
+  // live data for things like the Gesture playhead dot (which traces
+  // the recorded curve at the modulator's rate regardless of Mod 2).
+  // Engine throttles to ~30 Hz and the payload is small, so the
+  // always-on stream is cheap. Clears on unmount so the engine stops
+  // emitting when the user closes / navigates away from the Inspector.
   useEffect(() => {
     const api = window.api as typeof window.api & {
       setSelectedCellForLive?: (
@@ -1534,18 +1540,22 @@ function CellInspector(): JSX.Element {
       ) => Promise<void>
     }
     if (!api.setSelectedCellForLive) return
-    if (c.modulation2?.enabled) {
-      api.setSelectedCellForLive({
-        sceneId: sel.sceneId,
-        trackId: sel.trackId
-      })
-    } else {
-      api.setSelectedCellForLive(null)
-    }
+    // Clear any leftover live sample from the PREVIOUS cell so the
+    // current cell's editors don't briefly render the wrong overlay
+    // / playhead. The engine will push a fresh sample on its next
+    // tick (~30 ms later).
+    useStore.getState().setMod1Live(null)
+    api.setSelectedCellForLive({
+      sceneId: sel.sceneId,
+      trackId: sel.trackId
+    })
     return () => {
       api.setSelectedCellForLive?.(null)
+      // Also clear on unmount so the next time the Inspector mounts
+      // on a different cell it starts clean.
+      useStore.getState().setMod1Live(null)
     }
-  }, [sel.sceneId, sel.trackId, c.modulation2?.enabled])
+  }, [sel.sceneId, sel.trackId])
 
   return (
     <div className="p-3 flex flex-col gap-3 text-[12px]">
@@ -1952,6 +1962,7 @@ function CellInspector(): JSX.Element {
               <option value="slew">Slew</option>
               <option value="chaos">Chaos</option>
               <option value="attractor">Strange Attractor</option>
+              <option value="gesture">Gesture</option>
             </select>
           ) : null
         }
@@ -1972,6 +1983,8 @@ function CellInspector(): JSX.Element {
           <SlewEditor cell={c} u={u} />
         ) : cell.modulation.type === 'chaos' ? (
           <ChaosEditor cell={c} u={u} />
+        ) : cell.modulation.type === 'gesture' ? (
+          <GestureEditor cell={c} u={u} />
         ) : (
           <AttractorEditor cell={c} u={u} />
         )}
@@ -2116,12 +2129,13 @@ function CellInspector(): JSX.Element {
             </select>
           )}
 
-          {/* Adresse sub-mode picker — only shown when mode = adresse.
-              Hijack (default) consumes the modulator entirely; Parallel
-              uses Mod 1 for BOTH the address AND extra modulation;
-              Stage 2 (requires two-stage modulator, ships in v0.5.8)
-              keeps Mod 1 modulating the value while Mod 2 picks the
-              address. Falls back to hijack when stage2 isn't wired. */}
+          {/* Address sub-mode picker — only shown when mode = address.
+              Hijack (default) consumes Modulation 1 entirely; Parallel
+              uses Modulation 1 for BOTH the address AND extra modulation;
+              Stage 2 (v0.5.8) keeps Modulation 1 modulating the value
+              while Modulation 2 picks the address. Stage 2 falls back to
+              Modulation 1 when Modulation 2 is disabled on the cell,
+              so the dropdown is never a silent no-op. */}
           {cell.sequencer.mode === 'adresse' && (
             <>
               <span className="label">Sub-mode</span>
@@ -2132,9 +2146,10 @@ function CellInspector(): JSX.Element {
                   uSeq({ adresseMode: e.target.value as 'hijack' | 'parallel' | 'stage2' })
                 }
                 title={
-                  'Hijack: Mod 1 ONLY picks the playhead, step value emits as-is.\n' +
-                  'Parallel: Mod 1 picks the playhead AND modulates the resulting step value.\n' +
-                  'Stage 2: requires Two-stage modulator (v0.5.8+) — Mod 2 picks, Mod 1 modulates.\n\n' +
+                  'Hijack: Modulation 1 ONLY picks the playhead, step value emits as-is.\n' +
+                  'Parallel: Modulation 1 picks the playhead AND modulates the resulting step value.\n' +
+                  'Stage 2: Modulation 2 picks the playhead, Modulation 1 modulates the addressed step value.\n' +
+                  '         Requires Modulation 2 to be enabled on the cell; falls back to Hijack if not.\n\n' +
                   'Pairs best with continuous modulators: LFO, S&H, Envelope, Strange Attractor, Slew, Chaos.\n' +
                   'Ramp is one-shot (sweeps the steps once then holds at the last).\n' +
                   'Arpeggiator outputs are quantised to the ladder pattern (uses only a few steps).'
@@ -2142,12 +2157,17 @@ function CellInspector(): JSX.Element {
               >
                 <option value="hijack">Hijack — Mod 1 picks only</option>
                 <option value="parallel">Parallel — Mod 1 picks + modulates</option>
-                <option value="stage2" disabled>
-                  Stage 2 (requires Two-stage Mod, v0.5.8)
-                </option>
+                <option value="stage2">Stage 2 — Mod 2 picks, Mod 1 modulates</option>
               </select>
               <div className="col-span-3 text-[10px] text-muted italic leading-snug">
                 Best with continuous modulators (LFO, S&amp;H, Envelope, Strange Attractor, Slew, Chaos). Ramp sweeps once then holds; Arp jumps between only a few steps.
+                {(cell.sequencer.adresseMode ?? 'hijack') === 'stage2' &&
+                  cell.modulation2?.enabled !== true && (
+                    <>
+                      <br />
+                      <span className="text-accent">Stage 2 picked but Modulation 2 is off on this cell — engine falls back to Modulation 1 driving the playhead.</span>
+                    </>
+                  )}
               </div>
             </>
           )}
@@ -3040,6 +3060,13 @@ function Mod2Section({
             "Cycle Modulation 1's Arpeggiator Mode (up → down → upDown → downUp → exclusion → walk → drunk → random) as Modulation 2 swings. Mode picks happen at the eval rate — keep amount low if the resulting pattern jitter is too busy.",
           usable: true
         }
+      case 'gesture':
+        return {
+          label: 'Gesture · Wiggle',
+          tooltip:
+            "Sweep Modulation 1's Gesture Wiggle (0..100 %) as Modulation 2 swings. 0 = smooth playhead, 100 = playhead jitters back and forth between adjacent recorded points.",
+          usable: true
+        }
       default:
         return {
           label: 'Shape',
@@ -3078,7 +3105,7 @@ function Mod2Section({
               u({ modulation2: { ...m2, type: nextType } })
             }}
             onClick={(e) => e.stopPropagation()}
-            title="Modulation 2 type. Continuous-signal types (LFO/S&H/Slew/Chaos/Attractor) recommended."
+            title="Modulation 2 type. Continuous types breathe; Ramp gives a one-shot evolve-then-hold; Arpeggiator walks Modulation 1 through quantised steps."
           >
             <option value="lfo">LFO</option>
             <option value="sh">Sample &amp; Hold</option>
@@ -3086,15 +3113,9 @@ function Mod2Section({
             <option value="chaos">Chaos</option>
             <option value="attractor">Strange Attractor</option>
             <option value="envelope">Envelope</option>
-            <option value="ramp" disabled>
-              Ramp (n/a)
-            </option>
-            <option value="arpeggiator" disabled>
-              Arpeggiator (n/a)
-            </option>
-            <option value="random" disabled>
-              Random (n/a)
-            </option>
+            <option value="random">Random</option>
+            <option value="ramp">Ramp</option>
+            <option value="arpeggiator">Arpeggiator</option>
           </select>
         ) : null
       }
@@ -3116,10 +3137,15 @@ function Mod2Section({
         <AttractorEditor cell={m2Cell} u={u2} isMod2 />
       ) : m2.type === 'envelope' ? (
         <EnvelopeEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'random' ? (
+        <RandomEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'ramp' ? (
+        <RampEditor cell={m2Cell} u={u2} isMod2 />
+      ) : m2.type === 'arpeggiator' ? (
+        <ArpEditor cell={m2Cell} u={u2} isMod2 />
       ) : (
         <div className="text-[11px] text-muted italic">
           This modulator type isn&apos;t supported as a second stage.
-          Pick LFO, S&amp;H, Slew, Chaos or Strange Attractor.
         </div>
       )}
 
@@ -3287,6 +3313,175 @@ function Mod2TargetRow({
   )
 }
 
+// ─────────────────────────────────────────────────────────────────
+// GestureEditor — Modulator sub-editor for the Gesture modulator type.
+//
+// Renders the modulator's standard Depth + Mode (uni/bi) + Rate +
+// Sync controls (via CompactDepthMode + CompactRateControls so live
+// overlay from Mod 2 applies), then a CENTERED GestureRecorder
+// canvas + Output dropdown (XY / merged) + a Wiggle slider (0..100).
+//
+// Wiggle is the third "Shape" target Mod 2 can sweep (label flips
+// to "Wiggle" when Mod 1 is Gesture). Rate is the standard modulator
+// rate — Mod 2's Rate target patches rateHz normally, so Gesture
+// inherits Rate-sweeping for free.
+//
+// `isMod2` suppresses the live overlay (same convention as the
+// other modulator editors).
+// ─────────────────────────────────────────────────────────────────
+function GestureEditor({
+  cell,
+  u,
+  isMod2
+}: {
+  cell: Cell
+  u: CellUpdate
+  isMod2?: boolean
+}): JSX.Element {
+  const m = cell.modulation
+  const gp = m.gesture ?? { points: [], mode: 'xy' as GestureMode, wiggle: 0 }
+  function uMod(patch: Partial<typeof m>): void {
+    u({ modulation: { ...m, ...patch } })
+  }
+  function uGesture(patch: Partial<typeof gp>): void {
+    u({ modulation: { ...m, gesture: { ...gp, ...patch } } })
+  }
+  // Live store — used for BOTH the playhead dot (which animates any
+  // time the cell is armed and Mod 1 is gesture, regardless of
+  // Mod 2) AND the Wiggle overlay tint (which should only orange-
+  // out when Mod 2 is actually driving Wiggle).
+  const liveStore = useStore((s) => s.mod1Live)
+  // Playhead reads from the always-flowing live stream — gated only
+  // on isMod2 (Mod 2's own gesture playback isn't surfaced via
+  // mod1Live, so the dot is meaningless there). Independent of
+  // whether Mod 2 is enabled on the cell.
+  const livePlayheadSrc = isMod2 ? null : liveStore
+  const livePlayheadX = livePlayheadSrc?.gesturePlayheadX
+  const livePlayheadY = livePlayheadSrc?.gesturePlayheadY
+  const hasPlayhead =
+    livePlayheadSrc !== null &&
+    gp.points.length > 1 &&
+    livePlayheadX !== undefined &&
+    livePlayheadY !== undefined
+  // Memoised so the child <GestureRecorder> sees a STABLE object
+  // reference unless the numeric coords actually changed — keeps a
+  // future React.memo on the recorder useful, and prevents fresh
+  // allocations on every Inspector render (which fires whenever
+  // ANY of the parent's many useStore subscribers ticks).
+  const livePlayhead = useMemo<{ x: number; y: number } | undefined>(() => {
+    if (!hasPlayhead) return undefined
+    return {
+      x: Math.max(0, Math.min(1, livePlayheadX as number)),
+      y: Math.max(0, Math.min(1, livePlayheadY as number))
+    }
+  }, [hasPlayhead, livePlayheadX, livePlayheadY])
+  // Wiggle overlay — only tints orange when Mod 2 is enabled AND
+  // could actually be modulating wiggle. Same gate the other
+  // editors use.
+  const liveOverlay =
+    isMod2 || cell.modulation2?.enabled !== true ? null : liveStore
+  const liveWiggle = liveOverlay?.gestureWiggle
+  return (
+    <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
+      <CompactDepthMode
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
+      <CompactRateControls
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
+
+      {/* Centred XY canvas spanning all 3 grid columns. */}
+      <div className="col-span-3 flex justify-center pt-1">
+        <GestureRecorder
+          points={gp.points}
+          onChange={(next) => uGesture({ points: next })}
+          livePlayhead={livePlayhead}
+        />
+      </div>
+
+      <span className="label">Output</span>
+      <select
+        className="input text-[11px] py-0.5 min-w-0 col-span-2"
+        value={gp.mode}
+        onChange={(e) => uGesture({ mode: e.target.value as GestureMode })}
+        title={
+          'XY: X → slot 0, Y → slot 1 (slots ≥ 2 read X).\n' +
+          'Merged: combine X + Y into a single radial value √(x² + y²) / √2, broadcast to every slot.'
+        }
+      >
+        <option value="xy">XY — X → slot 0, Y → slot 1</option>
+        <option value="merged">Merged — √(x² + y²) → all slots</option>
+      </select>
+
+      <span className="label">Play</span>
+      <select
+        className="input text-[11px] py-0.5 min-w-0 col-span-2"
+        value={gp.playMode ?? 'forward'}
+        onChange={(e) =>
+          uGesture({ playMode: e.target.value as GesturePlayMode })
+        }
+        title={
+          'Forward: 0 → 1 each loop (recorded direction).\n' +
+          'Backward: 1 → 0 each loop (reverse).\n' +
+          'Ping-Pong: 0 → 1 → 0 each loop (triangle). Covers twice as much ground at the same Rate.'
+        }
+      >
+        <option value="forward">Forward</option>
+        <option value="backward">Backward</option>
+        <option value="pingpong">Ping-Pong</option>
+      </select>
+
+      <span className="label">Wiggle</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={Math.round(liveWiggle ?? gp.wiggle)}
+        onChange={(e) =>
+          uGesture({ wiggle: clamp(Number(e.target.value), 0, 100) })
+        }
+        className={liveWiggle !== undefined ? 'live-overlay' : ''}
+        title="0 % = smooth advance through the curve · 100 % = playhead jitters back and forth between adjacent points (sinusoidal at ~5× the loop rate)."
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className={`input w-14 text-right ${liveWiggle !== undefined ? 'live-overlay' : ''}`}
+          integer={liveWiggle === undefined}
+          min={0}
+          max={100}
+          value={
+            liveWiggle !== undefined
+              ? Math.round(liveWiggle * 10) / 10
+              : gp.wiggle
+          }
+          onChange={(v) => uGesture({ wiggle: v })}
+          title={
+            liveWiggle !== undefined
+              ? `Live: ${liveWiggle.toFixed(1)} · Base: ${gp.wiggle}`
+              : undefined
+          }
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+      </div>
+
+      <div className="col-span-3 text-[10px] text-muted italic leading-snug">
+        {gp.points.length === 0
+          ? 'Empty gesture — modulator emits a quiet 0.5 centre value until you record. Drag inside the square above to capture an X / Y path.'
+          : gp.mode === 'xy'
+            ? `${gp.points.length} points · multi-arg cells: slot 0 ← X, slot 1 ← Y, slots ≥ 2 ← X. Rate sets the loop speed.`
+            : `${gp.points.length} points · √(x² + y²) / √2 broadcast to every slot. Rate sets the loop speed.`}
+      </div>
+    </div>
+  )
+}
+
 function LfoEditor({
   cell,
   u,
@@ -3306,8 +3501,15 @@ function LfoEditor({
   // by the Inspector. The hook always runs (rules of hooks); we just
   // null it out when this editor is for Mod 2 so its controls don't
   // animate against unrelated data.
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   // Pull the values we'll overlay. `??` falls back to the stored
   // values when the engine isn't streaming (cell not armed, Mod 2
   // off, or the streamed sample doesn't have this field populated).
@@ -3543,8 +3745,15 @@ function ArpEditor({
   const arp = m.arpeggiator
   // Live Mod 1 sample — suppressed when this editor is editing Mod 2
   // itself (Mod 2's own arpMode isn't modulated by anything).
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveArpMode = live?.arpMode
   const liveRateHz = live?.rateHz
   const liveDepthPct = live?.depthPct
@@ -3777,8 +3986,15 @@ function RandomEditor({
 }): JSX.Element {
   // Live overlay (suppressed for Mod 2 self-editing). Random's
   // continuous param Mod 2 targets is `distribution`.
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveDist = live?.randomDistribution
   const liveRateHz = live?.rateHz
   const liveDepthPct = live?.depthPct
@@ -4006,7 +4222,8 @@ function RandomEditor({
 function CompactRateControls({
   m,
   uMod,
-  isMod2
+  isMod2,
+  mod2Enabled
 }: {
   m: import('@shared/types').Modulation
   uMod: (patch: Partial<import('@shared/types').Modulation>) => void
@@ -4014,13 +4231,24 @@ function CompactRateControls({
   // Mod 2 section (Mod 2's rate is the modulator, it isn't itself
   // being modulated by anything we surface here).
   isMod2?: boolean
+  // Whether Modulation 2 is enabled on the parent cell — when false,
+  // the live stream is still flowing (it carries other data like
+  // the Gesture playhead) but the orange overlay shouldn't tint
+  // these controls, because nothing is actually modulating them.
+  mod2Enabled?: boolean
 }): JSX.Element {
-  // Live effective Mod 1 from the store. Same suppression rule as
-  // the per-modulator editors: if this helper is rendered inside
-  // Modulation 2's section we don't overlay (Mod 2 isn't being
-  // modulated, so the live readout would be misleading).
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Live effective Mod 1 from the store. Suppressed when this helper
+  // is rendered inside Modulation 2's section (isMod2) OR when Mod 2
+  // is disabled on the cell (mod2Enabled false) — the stored values
+  // and the live values are identical in that case, so any orange
+  // tint would be misleading "modulation off but UI says it's on".
+  // Selector returns stable null when overlay should be off — see
+  // matching comment in the per-modulator editors. Cuts the 30 Hz
+  // re-render of every parent that uses this helper down to 0 Hz
+  // whenever Mod 2 is disabled on the cell.
+  const live = useStore((s) =>
+    isMod2 || !mod2Enabled ? null : s.mod1Live
+  )
   const liveRateHz = live?.rateHz
   return (
     <>
@@ -4131,17 +4359,24 @@ function CompactRateControls({
 function CompactDepthMode({
   m,
   uMod,
-  isMod2
+  isMod2,
+  mod2Enabled
 }: {
   m: import('@shared/types').Modulation
   uMod: (patch: Partial<import('@shared/types').Modulation>) => void
   isMod2?: boolean
+  mod2Enabled?: boolean
 }): JSX.Element {
-  // Same overlay rule as CompactRateControls — Mod 2's depth is the
-  // modulator's own depth, not a value being modulated, so the live
-  // readout is suppressed inside the Mod 2 section.
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Suppress the orange overlay when Mod 2 is off (live values equal
+  // base values, so no actual modulation to highlight) or when this
+  // helper is rendered inside Modulation 2's section.
+  // Selector returns stable null when overlay should be off — see
+  // matching comment in the per-modulator editors. Cuts the 30 Hz
+  // re-render of every parent that uses this helper down to 0 Hz
+  // whenever Mod 2 is disabled on the cell.
+  const live = useStore((s) =>
+    isMod2 || !mod2Enabled ? null : s.mod1Live
+  )
   const liveDepthPct = live?.depthPct
   return (
     <>
@@ -4210,8 +4445,15 @@ function SampleHoldEditor({
   const sh = m.sh
   const globalBpm = useStore((s) => s.session.globalBpm)
   // Live overlay (suppressed when this editor is editing Mod 2 itself).
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveDist = live?.shDistribution
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
@@ -4221,8 +4463,18 @@ function SampleHoldEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
-      <CompactRateControls m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactDepthMode
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
+      <CompactRateControls
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
 
       <span className="label">Smooth</span>
       <label className="flex items-center gap-1 col-span-2 text-[11px]">
@@ -4310,8 +4562,11 @@ function SlewEditor({
   const m = cell.modulation
   const s = m.slew
   // Live overlay (suppressed in Mod 2 self-edit).
-  const liveStore = useStore((st) => st.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns stable null when overlay should be off — see
+  // matching comment in the other editors.
+  const live = useStore((st) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : st.mod1Live
+  )
   const liveRise = live?.slewRiseMs
   const liveFall = live?.slewFallMs
   const globalBpm = useStore((st) => st.session.globalBpm)
@@ -4323,8 +4578,18 @@ function SlewEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
-      <CompactRateControls m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactDepthMode
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
+      <CompactRateControls
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
 
       <span className="label">Rise</span>
       <input
@@ -4412,8 +4677,15 @@ function ChaosEditor({
 }): JSX.Element {
   const m = cell.modulation
   const c = m.chaos
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveR = live?.chaosR
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
@@ -4423,8 +4695,18 @@ function ChaosEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
-      <CompactRateControls m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactDepthMode
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
+      <CompactRateControls
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
 
       <span className="label">r</span>
       <input
@@ -4476,8 +4758,15 @@ function AttractorEditor({
   isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveChaos = live?.attractorChaos
   const liveSpeed = live?.attractorSpeed
   // Defensive fallback for sessions saved before the Attractor type
@@ -4495,7 +4784,12 @@ function AttractorEditor({
   }
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <CompactDepthMode m={m} uMod={uMod} isMod2={isMod2} />
+      <CompactDepthMode
+        m={m}
+        uMod={uMod}
+        isMod2={isMod2}
+        mod2Enabled={cell.modulation2?.enabled}
+      />
 
       <span className="label">Type</span>
       <select
@@ -4594,8 +4888,15 @@ function RampEditor({
   isMod2?: boolean
 }): JSX.Element {
   const m = cell.modulation
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveCurve = live?.rampCurvePct
   const liveDepthPct = live?.depthPct
   const liveRampMs = live?.rampMs
@@ -4954,8 +5255,15 @@ function EnvelopeEditor({
   u: CellUpdate
   isMod2?: boolean
 }): JSX.Element {
-  const liveStore = useStore((s) => s.mod1Live)
-  const live = isMod2 ? null : liveStore
+  // Selector returns a STABLE null when the overlay should be off
+  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
+  // itself) — Zustand's default reference-equality then skips the
+  // re-render at the engine's 30 Hz live-emit cadence. When the
+  // overlay is on, the editor re-renders each live sample as
+  // intended.
+  const live = useStore((s) =>
+    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
+  )
   const liveSus = live?.envelopeSustain
   const liveDepthPct = live?.depthPct
   const m = cell.modulation

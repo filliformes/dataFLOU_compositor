@@ -144,6 +144,17 @@ export const DEFAULT_ATTRACTOR: import('./types').AttractorParams = {
   chaos: 0.5
 }
 
+// Gesture modulator defaults — empty recording (engine emits a quiet
+// centre value of 0.5 until the user records something), XY output
+// routing, no wiggle. Rate is driven by the parent Modulation's
+// rateHz / sync fields, not by Gesture's own params.
+export const DEFAULT_GESTURE: import('./types').GestureParams = {
+  points: [],
+  mode: 'xy',
+  wiggle: 0,
+  playMode: 'forward'
+}
+
 export const DEFAULT_MODULATION: Modulation = {
   enabled: false,
   type: 'lfo',
@@ -162,7 +173,8 @@ export const DEFAULT_MODULATION: Modulation = {
   sh: { ...DEFAULT_SH },
   slew: { ...DEFAULT_SLEW },
   chaos: { ...DEFAULT_CHAOS },
-  attractor: { ...DEFAULT_ATTRACTOR }
+  attractor: { ...DEFAULT_ATTRACTOR },
+  gesture: { ...DEFAULT_GESTURE }
 }
 
 // Two-stage modulator default. Same shape as DEFAULT_MODULATION
@@ -185,6 +197,7 @@ export const DEFAULT_MODULATION2: Modulation = {
   slew: { ...DEFAULT_SLEW },
   chaos: { ...DEFAULT_CHAOS },
   attractor: { ...DEFAULT_ATTRACTOR },
+  gesture: { ...DEFAULT_GESTURE },
   // Sensible starter routing: Rate and Depth each receive a 50%
   // amount, Shape disabled (user opts in once they understand the
   // context-aware target for their Mod 1 type).

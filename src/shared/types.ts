@@ -56,6 +56,7 @@ export type ModType =
   | 'slew'
   | 'chaos'
   | 'attractor'
+  | 'gesture'
 
 // Strange Attractor modulator — smooth correlated chaos via 3D or 4D
 // ODE integration. Unlike 1-D Chaos (logistic map), the attractor's
@@ -84,6 +85,57 @@ export interface AttractorParams {
   // trajectory can converge to a fixed point or limit cycle, which
   // is a legitimate (if static) musical state.
   chaos: number
+}
+
+// Gesture playback direction.
+//   'forward'  — playhead sweeps 0 → 1 each loop (default; matches
+//                the recorded direction).
+//   'backward' — playhead sweeps 1 → 0 each loop (reverse).
+//   'pingpong' — playhead traces 0 → 1 → 0 each loop (triangle wave;
+//                covers twice as much ground at the same Rate, so
+//                halve the Rate if you want forward-and-back to feel
+//                as slow as a single forward pass).
+export type GesturePlayMode = 'forward' | 'backward' | 'pingpong'
+
+// Gesture modulator — XY gesture recorder.
+//
+// The user RECORDS an X/Y stream by dragging across a square surface
+// in the Inspector. Captured points are stored as a polyline in
+// [0, 1]² with relative timestamps. Playback loops the gesture at
+// the modulator's standard Rate (Hz or BPM-synced) and feeds the
+// (x, y) stream to the cell's slots, with optional Wiggle that
+// jitters the playhead back and forth between adjacent points (0 =
+// smooth linear advance; 100 = chaotic dance within the local
+// segment).
+//
+// Output routing — see GestureMode doc below.
+//   'xy'     — slot 0 receives X, slot 1 receives Y; slots ≥ 2 read
+//              the X channel (so they're musically related rather
+//              than dead). Best for multi-arg cells where the two
+//              channels are user-meaningful (XY pad, stereo position).
+//   'merged' — both X + Y collapse to a single value via radial
+//              distance √(x² + y²) / √2 (unit square → [0, 1]) and
+//              broadcast to every slot. Best for single-arg cells
+//              where you just want "how far from origin".
+//
+// Wiggle 0..100:
+//   - 0    smooth linear advance through the recorded curve
+//   - 100  the playhead is overlaid with a fast sinusoidal jitter
+//          spanning roughly one inter-point gap; visually you see
+//          the curve being "scrubbed" with a tremolo
+//
+// Mod 2's Shape target on Gesture sweeps Wiggle. Mod 2's Rate target
+// uses the standard rateHz patch — no special handling.
+export interface GestureParams {
+  points: GesturePoint[]
+  mode: GestureMode
+  // Sinusoidal back-and-forth jitter overlaid on the linear advance.
+  // 0..100; 0 = smooth, 100 = ±~one inter-point gap swing at ~5×
+  // the loop rate.
+  wiggle: number
+  // Playhead direction. Optional + 'forward' default so sessions
+  // saved before this field shipped behave identically.
+  playMode?: GesturePlayMode
 }
 export type LfoMode = 'unipolar' | 'bipolar'
 export type LfoSync = 'free' | 'bpm'
@@ -243,6 +295,10 @@ export interface Modulation {
   // the engine falls back to canonical defaults when reading from
   // an old session.
   attractor?: AttractorParams
+  // Gesture modulator params (used when type='gesture'). Optional
+  // for back-compat — engine treats a missing block as an empty
+  // recording (modulator emits a quiet centre value of 0.5).
+  gesture?: GestureParams
   // ── Two-stage modulator: stage-2 targeting ────────────────────────
   // These fields are READ only when a Modulation is in use as the
   // SECOND stage (i.e. assigned to Cell.modulation2). For stage-1
@@ -333,6 +389,28 @@ export type SeqMode =
   | 'bounce'
   | 'draw'
   | 'adresse'
+
+// Gesture output routing — picks how the recorded (x, y) stream is
+// mapped to the cell's argument slots.
+//   xy     — slot 0 receives X, slot 1 receives Y; slots ≥ 2 fall
+//            back to cell.value tokens. Best for multi-arg cells
+//            where the two channels are user-meaningful (XY pad,
+//            stereo position, etc.).
+//   merged — both X + Y collapse to a single value via radial
+//            distance √(x² + y²) / √2 (so the unit square maps to
+//            [0, 1]). Broadcast to every slot. Best for single-arg
+//            cells where you just want "how far from corner".
+export type GestureMode = 'xy' | 'merged'
+
+// A single sample in a recorded gesture. Time is RELATIVE to the
+// recording's start (ms); x and y are normalised to [0, 1] inside the
+// gesture canvas. Captured at the user's cursor at whatever rate the
+// browser delivers pointermove events (usually 60 Hz).
+export interface GesturePoint {
+  t: number
+  x: number
+  y: number
+}
 
 // Adresse sub-mode — picks how the modulator and the addressed step
 // value combine. Inspired by the Buchla 245 stage-addressing
@@ -1517,6 +1595,14 @@ export interface Mod1LiveSample {
   envelopeSustain?: number
   rampCurvePct?: number
   arpMode?: ArpMode
+  gestureWiggle?: number
+  // Gesture playhead position — the engine's current sample of the
+  // recorded XY curve at the modulator's playback position. The
+  // GestureEditor's canvas overlays a dot at this position so the
+  // user sees the playhead trace the curve in real time. Populated
+  // only when Modulation 1 type === 'gesture'.
+  gesturePlayheadX?: number
+  gesturePlayheadY?: number
 }
 
 // One outgoing OSC message as surfaced to the renderer (OSC monitor panel).
