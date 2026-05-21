@@ -4928,21 +4928,32 @@ function applyMod2ToMod1(
     // higher Rate = SHORTER time, so the user's mental model "Rate
     // up = modulator faster" stays consistent across types.
     if (m1.type === 'ramp') {
-      // Inverted multiplier: mod2 = +1 with amount = 100 % → time × 0
-      // (clamped to safe min); mod2 = -1 → time × 2 (twice as slow).
-      const factor =
-        mode === 'additive'
-          ? 1 - mod2NormBipolar * amt
-          : 1 - mod2NormBipolar * amt
-      const clampedFactor = Math.max(0.01, factor)
-      const nextRampMs = Math.max(
-        0.1,
-        Math.min(300000, m1.ramp.rampMs * clampedFactor)
-      )
-      const nextTotalMs = Math.max(
-        0.1,
-        Math.min(300000, (m1.ramp.totalMs ?? m1.ramp.rampMs) * clampedFactor)
-      )
+      // Two paths so additive and multiplicative actually differ:
+      //  multiplicative — INVERTED multiplier on the stored time so
+      //    "higher Rate signal = shorter ramp" stays consistent across
+      //    types. mod2=+1 @ amount=100% → time × 0 (clamped to a safe
+      //    min); mod2=-1 → time × 2 (twice as slow).
+      //  additive — bipolar swing of ±(2000 ms × amount) ADDED on top
+      //    of the base, clamped to [0.1, 300000]. Lets short ramps
+      //    survive (multiplicative pinches them to near-zero at high
+      //    amounts; additive holds the floor at base − 2000 ms).
+      let nextRampMs: number
+      let nextTotalMs: number
+      if (mode === 'additive') {
+        const delta = -mod2NormBipolar * 2000 * amt
+        nextRampMs = Math.max(0.1, Math.min(300000, m1.ramp.rampMs + delta))
+        nextTotalMs = Math.max(
+          0.1,
+          Math.min(300000, (m1.ramp.totalMs ?? m1.ramp.rampMs) + delta)
+        )
+      } else {
+        const factor = Math.max(0.01, 1 - mod2NormBipolar * amt)
+        nextRampMs = Math.max(0.1, Math.min(300000, m1.ramp.rampMs * factor))
+        nextTotalMs = Math.max(
+          0.1,
+          Math.min(300000, (m1.ramp.totalMs ?? m1.ramp.rampMs) * factor)
+        )
+      }
       out = {
         ...out,
         ramp: { ...m1.ramp, rampMs: nextRampMs, totalMs: nextTotalMs }

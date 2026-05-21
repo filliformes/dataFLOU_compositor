@@ -1078,6 +1078,7 @@ function CellRoutingSection({
     onChange({
       routing: {
         modulator: cell.routing?.modulator,
+        modulation2: cell.routing?.modulation2,
         sequencer: cell.routing?.sequencer,
         delays: arr,
         variations: cell.routing?.variations
@@ -1095,6 +1096,7 @@ function CellRoutingSection({
     onChange({
       routing: {
         modulator: cell.routing?.modulator,
+        modulation2: cell.routing?.modulation2,
         sequencer: cell.routing?.sequencer,
         delays: cell.routing?.delays,
         variations: arr
