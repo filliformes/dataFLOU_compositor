@@ -151,10 +151,21 @@ export default function EditView(): JSX.Element {
     // user alt-tabs to refocus the window. Blurring + nudging focus
     // back to <body> on the next frame breaks the stickiness so the
     // user can immediately edit the dropped scene's clip values.
+    //
+    // IMPORTANT: skip the blur if the user is currently typing in
+    // an editable element (Inspector input, scene name, etc).
+    // Otherwise this defensive blur yanks focus out of fields the
+    // user is actively editing -- the visible symptom is drop-focus
+    // bleed when dragging a Pool scene onto the grid while a BPM /
+    // Depth / Rate input is focused.
     requestAnimationFrame(() => {
-      if (document.activeElement instanceof HTMLElement) {
-        document.activeElement.blur()
-      }
+      const ae = document.activeElement
+      if (!(ae instanceof HTMLElement)) return
+      const tag = ae.tagName
+      const isEditable =
+        tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable
+      if (isEditable) return
+      ae.blur()
       document.body.focus?.()
     })
   }

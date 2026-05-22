@@ -46,6 +46,14 @@ export function BoundedNumberInput({
 }: Props): JSX.Element {
   const [str, setStr] = useState(formatValue(value, integer))
   const focused = useRef(false)
+  // "dirty" = the user has actually typed something since gaining
+  // focus. Without this we can't tell "focused but idle" (where
+  // live-overlay updates should keep flowing into str) from
+  // "focused and editing" (where they must NOT clobber the user's
+  // in-progress text). Set true on every onChange; reset to false
+  // on focus + blur. Read inside the value-sync useEffect to know
+  // whether to bail.
+  const dirty = useRef(false)
   // Latest str — read inside onBlur to avoid stale-closure issues
   // (the previous version closed over the str captured at handler-
   // creation time, which intermittently caused onBlur to "restore"
@@ -80,15 +88,24 @@ export function BoundedNumberInput({
   }, [autoFocusToken])
 
   // Sync external value into local string. Runs on every `value`
-  // change. The rule: if the str the user is typing currently parses
-  // to the external value (after clamping), leave it alone — that
-  // means the typing is up-to-date. Otherwise overwrite str with the
-  // formatted value. This keeps unfocused fields fresh AND lets a
-  // focused field accept external updates that don't conflict (e.g.,
-  // switching the focused scene in the inspector while a stale
-  // Dur=5 was being typed) without clobbering an in-progress edit
-  // that already targets the new value.
+  // change. Hard rule: if the user is currently focused AND has
+  // typed something (dirty), NEVER clobber their in-progress text.
+  // The live-modulation overlay (mod1Live) ticks at ~30 Hz and
+  // pushes fresh float values into `value` every frame; without
+  // this guard the user's caret stays put but the displayed text
+  // is constantly replaced, so every keystroke is overwritten
+  // before the next frame -- visible symptom is identical to a
+  // focus drop.
+  //
+  // When focused but not dirty (just clicked in, no typing yet),
+  // we DO let external updates flow so the displayed value tracks
+  // the live overlay until the user starts editing.
+  //
+  // When NOT focused: keep the previous "leave alone if str
+  // already parses to value" guard so external updates land
+  // cleanly while also tolerating in-flight precision.
   useEffect(() => {
+    if (focused.current && dirty.current) return
     const cur = strRef.current
     const parsed = integer ? parseInt(cur, 10) : parseFloat(cur)
     if (Number.isFinite(parsed)) {
@@ -135,6 +152,12 @@ export function BoundedNumberInput({
       disabled={disabled}
       onFocus={() => {
         focused.current = true
+        // Re-arm the dirty flag on every focus -- the user must
+        // type at least one character before our live-overlay
+        // bail-out kicks in. If they focus and immediately blur
+        // without typing, the on-blur commit sees dirty=false and
+        // skips the commit, leaving the parent value untouched.
+        dirty.current = false
       }}
       onChange={(e) => {
         const v = e.target.value
@@ -142,6 +165,9 @@ export function BoundedNumberInput({
         // we still want the input to clear when the user backspaces
         // everything, so they can retype from scratch.
         if (!re.test(v)) return
+        // User actually typed something -- mark dirty so the
+        // useEffect bails on subsequent external value updates.
+        dirty.current = true
         setStr(v)
         // Live commit only for a fully-parsable value. Empty / sign-
         // only / dot-only intermediaries leave the parent value
@@ -154,6 +180,16 @@ export function BoundedNumberInput({
       }}
       onBlur={() => {
         focused.current = false
+        // If the user never typed anything, do NOT run commit --
+        // doing so could clobber an externally-updated value (live
+        // overlay, modulation, another user action) with the stale
+        // snapshot they had on focus. Reset str to the current
+        // value so the displayed text matches the source of truth.
+        if (!dirty.current) {
+          setStr(formatValue(value, integer))
+          return
+        }
+        dirty.current = false
         commit(strRef.current)
       }}
       onKeyDown={(e) => {

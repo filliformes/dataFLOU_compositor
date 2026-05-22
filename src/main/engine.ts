@@ -2386,11 +2386,36 @@ export class SceneEngine {
           cell.modulation2,
           mod2NormBipolar
         )
-        // Shallow-clone the cell with the patched modulation so any
-        // downstream code reading `cell.modulation` sees the
-        // effective version. The original cell in the session stays
-        // untouched.
-        cell = { ...cell, modulation: effMod1 }
+        // Compute effective Sequencer too -- Mod 2 -> Seq routes
+        // through `targetsSeq` (parallel to `targets` for Mod 1).
+        // Same skip-when-no-target fast path keeps cells that don't
+        // use this feature at zero cost. The cell-level routing gate
+        // (`cell.routing.modulation2Seq`) is honoured too: if EVERY
+        // slot in the array is explicitly false, skip the seq patch
+        // (visual cue: user has turned off Mod 2 -> Seq for every
+        // slot in the routing matrix). Any true entry => apply
+        // cell-wide; the seq state (step idx, timing) is global per
+        // cell so true per-slot gating isn't meaningful here.
+        let effSeq = cell.sequencer
+        if (cell.sequencer?.enabled) {
+          const m2SeqRouting = cell.routing?.modulation2Seq
+          const allSlotsOff =
+            Array.isArray(m2SeqRouting) &&
+            m2SeqRouting.length > 0 &&
+            m2SeqRouting.every((b) => b === false)
+          if (!allSlotsOff) {
+            effSeq = applyMod2ToSeq(
+              cell.sequencer,
+              cell.modulation2,
+              mod2NormBipolar
+            )
+          }
+        }
+        // Shallow-clone the cell with the patched modulation +
+        // sequencer so any downstream code reading `cell.modulation`
+        // / `cell.sequencer` sees the effective version. The
+        // original cell in the session stays untouched.
+        cell = { ...cell, modulation: effMod1, sequencer: effSeq }
       }
       // NOTE: live-preview emit moved out of the Mod 2 gate — it now
       // fires unconditionally for the watched cell so the Inspector
@@ -5531,6 +5556,180 @@ function applyMod2ToMod1(
         // silently. Add a case above when you add a new ModType.
         break
     }
+  }
+  return out
+}
+
+// Build an "effective Sequencer" by applying Mod 2's bipolar signal
+// to the cell's sequencer params, per the m2cfg.targetsSeq routing.
+// Same model as applyMod2ToMod1 (Rate / Shape / Depth) but the actual
+// fields patched depend on the sequencer mode:
+//
+//   Rate  -> bpm (when syncMode='bpm' or 'tempo') OR stepMs (free).
+//            Both are patched so the user can flip syncMode without
+//            losing the Mod 2 effect. Engine clamps to legal ranges.
+//   Shape -> per-mode "musical personality" knob:
+//              euclidean   -> rotation        (0..steps-1)
+//              density     -> seed            (0..255)
+//              cellular    -> rule            (0..255)
+//              polyrhythm  -> ringALength     (1..16)
+//              drift       -> bias            (-100..+100)
+//              ratchet     -> ratchetProb     (0..100)
+//              bounce      -> bounceDecay     (0..100)
+//              steps/draw/adresse -> no-op (no single "personality"
+//                                    knob that's musically dominant)
+//   Depth -> genAmount (the universal Generative wildness slider,
+//            0..100). Drives how far the generative variations stray
+//            from the baseline pattern. Mod 2 -> Depth gives the
+//            user a generative-wildness modulator -- swing genAmount
+//            from 0 to 100 with an LFO for "calm/chaotic" breathing.
+//
+// Returns the same SequencerParams object reference when no target
+// is enabled (cheap no-op when the user hasn't checked any box).
+function applyMod2ToSeq(
+  seq: import('@shared/types').SequencerParams,
+  m2cfg: import('@shared/types').Modulation,
+  mod2NormBipolar: number
+): import('@shared/types').SequencerParams {
+  const targets = m2cfg.targetsSeq
+  if (!targets) return seq
+  if (
+    targets.rate?.enabled !== true &&
+    targets.depth?.enabled !== true &&
+    targets.shape?.enabled !== true
+  ) {
+    return seq
+  }
+  const mode = m2cfg.targetMode ?? 'multiplicative'
+  let out: import('@shared/types').SequencerParams = seq
+  // ── Rate -> bpm + stepMs ────────────────────────────────────────
+  if (targets.rate?.enabled) {
+    const amt = (targets.rate.amount ?? 0) / 100
+    // BPM: 10..500. Multiplicative is musical (LFO ±100% halves /
+    // doubles the tempo). Additive ±240 BPM × amount lets the user
+    // pull base tempo all the way to the edges of the legal range.
+    const baseBpm = seq.bpm
+    let nextBpm: number
+    if (mode === 'additive') {
+      nextBpm = baseBpm + mod2NormBipolar * 240 * amt
+    } else {
+      nextBpm = baseBpm * (1 + mod2NormBipolar * amt)
+    }
+    nextBpm = Math.max(10, Math.min(500, nextBpm))
+    // stepMs: 1..60000. Inverse relationship with rate (higher rate
+    // = shorter step). Mirror BPM's signed-positive direction by
+    // INVERTING the bipolar input on stepMs so "mod up = faster"
+    // stays consistent across syncMode flips.
+    const baseStepMs = seq.stepMs
+    let nextStepMs: number
+    if (mode === 'additive') {
+      nextStepMs = baseStepMs - mod2NormBipolar * 500 * amt
+    } else {
+      nextStepMs = baseStepMs * (1 - mod2NormBipolar * amt)
+    }
+    nextStepMs = Math.max(1, Math.min(60000, nextStepMs))
+    out = { ...out, bpm: nextBpm, stepMs: nextStepMs }
+  }
+  // ── Shape -> per-mode musical personality knob ──────────────────
+  if (targets.shape?.enabled) {
+    const amt = (targets.shape.amount ?? 0) / 100
+    switch (seq.mode) {
+      case 'euclidean': {
+        // rotation in [0, steps-1]. Map mod2 swing across a span of
+        // up to ±steps with the amount slider. Wraps so the rotation
+        // stays in legal range even at extreme swings.
+        const steps = Math.max(1, Math.min(16, seq.steps))
+        const swing = Math.round(mod2NormBipolar * steps * amt)
+        const next = ((seq.rotation % steps) + swing + steps * 4) % steps
+        out = { ...out, rotation: next }
+        break
+      }
+      case 'density': {
+        // seed in [0, 2^32-1]. Add a swing of up to ±10000 × amount.
+        // 10000 is enough to materially change the pseudorandom hits
+        // pattern at full amount but small enough that low amounts
+        // give micro-variations.
+        const baseSeed = seq.seed >>> 0
+        const swing = Math.round(mod2NormBipolar * 10000 * amt)
+        const next = ((baseSeed + swing) >>> 0) % 4294967296
+        out = { ...out, seed: next }
+        break
+      }
+      case 'cellular': {
+        // Wolfram rule in [0, 255]. Swing across ±255 × amount,
+        // wrapped. Each rule produces a totally different evolving
+        // pattern so this is a *strong* shape target -- low amounts
+        // recommended for musical use.
+        const baseRule = seq.rule
+        const swing = Math.round(mod2NormBipolar * 255 * amt)
+        let next = (baseRule + swing) % 256
+        if (next < 0) next += 256
+        out = { ...out, rule: next }
+        break
+      }
+      case 'polyrhythm': {
+        // ringALength in [1, 16]. Swing across ±15 × amount.
+        const base = Math.max(1, Math.min(16, seq.ringALength))
+        const swing = Math.round(mod2NormBipolar * 15 * amt)
+        const next = Math.max(1, Math.min(16, base + swing))
+        out = { ...out, ringALength: next }
+        break
+      }
+      case 'drift': {
+        // bias in [-100, +100]. Additive feels right -- the user
+        // sets a base bias and Mod 2 swings around it.
+        const baseBias = seq.bias
+        const next = Math.max(-100, Math.min(100, baseBias + mod2NormBipolar * 100 * amt))
+        out = { ...out, bias: next }
+        break
+      }
+      case 'ratchet': {
+        // ratchetProb in [0, 100]. Multiplicative would null out at
+        // 0 base; additive ±100 × amount lets bursts breathe in /
+        // out independent of the baseline.
+        const base = seq.ratchetProb
+        let next: number
+        if (mode === 'additive') {
+          next = base + mod2NormBipolar * 100 * amt
+        } else {
+          next = base * (1 + mod2NormBipolar * amt)
+        }
+        next = Math.max(0, Math.min(100, next))
+        out = { ...out, ratchetProb: next }
+        break
+      }
+      case 'bounce': {
+        // bounceDecay in [0, 100]. Same shape as ratchetProb.
+        const base = seq.bounceDecay
+        let next: number
+        if (mode === 'additive') {
+          next = base + mod2NormBipolar * 100 * amt
+        } else {
+          next = base * (1 + mod2NormBipolar * amt)
+        }
+        next = Math.max(0, Math.min(100, next))
+        out = { ...out, bounceDecay: next }
+        break
+      }
+      default:
+        // 'steps', 'draw', 'adresse' -- no single dominant
+        // "personality" knob worth modulating here. Silent no-op so
+        // future modes can be added above without touching this.
+        break
+    }
+  }
+  // ── Depth -> genAmount (universal Generative wildness knob) ─────
+  if (targets.depth?.enabled) {
+    const amt = (targets.depth.amount ?? 0) / 100
+    const base = seq.genAmount
+    let next: number
+    if (mode === 'additive') {
+      next = base + mod2NormBipolar * 100 * amt
+    } else {
+      next = base * (1 + mod2NormBipolar * amt)
+    }
+    next = Math.max(0, Math.min(100, next))
+    out = { ...out, genAmount: next }
   }
   return out
 }

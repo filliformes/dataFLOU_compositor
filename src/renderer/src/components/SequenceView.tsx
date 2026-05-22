@@ -851,11 +851,17 @@ function PaletteGrid({
     // See `EditView.onGridDrop` for the explanation — HTML5 DnD leaves
     // a sticky pseudo-focus on the drag source that swallows the next
     // click on the grid until the user alt-tabs. Blur + body focus on
-    // the next paint unsticks it.
+    // the next paint unsticks it. Skip when an editable element is
+    // focused so the workaround doesn't yank the user's caret out
+    // of an Inspector / name field they're mid-typing in.
     requestAnimationFrame(() => {
-      if (document.activeElement instanceof HTMLElement) {
-        document.activeElement.blur()
-      }
+      const ae = document.activeElement
+      if (!(ae instanceof HTMLElement)) return
+      const tag = ae.tagName
+      const isEditable =
+        tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable
+      if (isEditable) return
+      ae.blur()
       document.body.focus?.()
     })
   }

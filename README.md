@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--058)
+- [Release notes](#release-notes--059)
+  - [0.5.9](#release-notes--059)
   - [0.5.8](#release-notes--058)
   - [0.5.7](#release-notes--057)
   - [0.5.6](#release-notes--056)
@@ -68,7 +69,8 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
 - **Gesture modulator (v0.5.8)**: record an X/Y stream by dragging on a square surface in the Inspector and use it as a modulator. The polyline + a crayon-style cursor render LIVE while you draw (canvas pinned-centered so it doesn't shift). On playback the engine loops the captured curve at the modulator's standard Rate (Hz or BPM-synced), and a coloured **playhead dot** animates on the canvas at ~30 Hz so you SEE the curve being traced. Three **Play modes** (Forward / Backward / Ping-Pong), a **Wiggle** knob (0–100 %, sinusoidal back-and-forth jitter on the playhead - modulatable by Modulation 2 as the third "Shape" target), and an **Output** picker: `XY` (X → slot 0, Y → slot 1) or `Merged` (radial distance √(x² + y²)/√2 broadcast to every slot). Two-channel fan-out via `gestureChannelFor`.
-- **Two-stage modulator - Modulation 2 (v0.5.7, expanded v0.5.8)**: every clip carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode, Gesture Wiggle). **Every modulator type** is now usable as Modulation 2 (v0.5.8): LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random, Ramp, Arpeggiator (Gesture-as-Mod-2 reserved for a future revision). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value - Mod 2's modulation breathes around whatever you author. The orange "live" overlay tint is gated on Modulation 2 being enabled, so it doesn't fire when nothing is actually modulating. Mod 2 also gets its own Routing-matrix column for per-slot gating.
+- **Two-stage modulator - Modulation 2 (v0.5.7, expanded v0.5.8 + v0.5.9)**: every clip carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode, Gesture Wiggle). **Every modulator type** is now usable as Modulation 2 (v0.5.8): LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random, Ramp, Arpeggiator (Gesture-as-Mod-2 reserved for a future revision). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value - Mod 2's modulation breathes around whatever you author. The orange "live" overlay tint is gated on Modulation 2 being enabled, so it doesn't fire when nothing is actually modulating. Mod 2 also gets its own Routing-matrix column for per-slot gating.
+- **Modulation 2 → Sequencer (v0.5.9)**: Modulation 2 now also has a parallel route into the cell's Sequencer (in addition to its existing route into Modulation 1). Inspector's Mod 2 section renders TWO Targets blocks: "Mod 1 Targets" and "Seq Targets". The Seq block's Shape label is mode-aware - Rotation for Euclidean, Seed for Density, Rule for Cellular, Ring A Length for Polyrhythm, Bias for Drift, Probability for Ratchet, Decay for Bounce. **Rate** targets bpm + stepMs; **Depth** universally targets the **Generative wildness slider** (`genAmount`) - making Modulation 2 → Sequencer a "calm ↔ chaotic" breathing source for generative sequencer modes. Routing matrix grows a new M2>S column next to M2>1.
 - **Address sequencer Stage-2 sub-mode (v0.5.8)**: Address mode's third sub-mode is now wired: Modulation 2 drives the playhead address while Modulation 1 modulates the addressed step's value. Falls back to Modulation 1 driving the playhead if Modulation 2 is disabled on the cell.
 - **Hardware Mode (v0.5.5)**: drive any compositor cell's args from a physical OSC controller (Trill bars, MIDI-to-OSC bridges, anything streaming UDP). Per-Instrument-template config: bind to a discovered device, pick **Reset** or **Persist** catch-mode, set catch tolerance + movement threshold, optionally narrow to specific Track instances and specific arg slots. Soft-takeover: the hardware value only takes over once it matches the currently-emitted scene value (or persists across scene changes if you want it to). Movement detection skips static/idle packets. Caught arg values render **red** in the live cell of the currently-playing scene, with a pulsing red dot in the Track sidebar + "HW Mode On" badge under the Instrument. Toggle the same Hardware Mode block from either the Pool inspector OR the grid Instrument inspector - both write the same `template.hardwareMode` blob. **Session persistence (v0.5.7)**: the caught-slot map (per-track arg indices currently overridden by hardware) is saved with the session and restored on load, so a power-cycle no longer wipes which slots are bound.
 - **Strange Attractor modulator (v0.5.7)**: new modulator type drawing from 6 well-known chaotic ODEs: **Lorenz, Aizawa, Thomas, Rössler, Rössler-4D, Lü-4D**. Per-tick Euler integration with adaptive sub-steps + per-step `±200` clamps + NaN guards so high-Speed × high-Chaos never blows up. Three knobs: **Type, Speed, Chaos**. Each tick produces a bounded, correlated 3-channel (or 4-channel for 4D types) trajectory; multi-arg cells fan out as slot 0 = X, slot 1 = Y, slot 2 = Z, slot 3 = W (= speed for 3D types, native W for 4D). Live SVG visual previews the 2-D projection of the orbit. Mod 2's Rate target patches `attractor.speed`, not `rateHz`.
@@ -563,6 +565,68 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.5.9
+
+A small follow-up to v0.5.8: one new musical feature (Modulation 2 can now modulate the Sequencer as well as Modulation 1), one persistence bug fix (Hardware Mode config), the Modulation 1 relabel, and two long-standing drop-focus regressions in the Inspector squashed.
+
+### Modulation 2 → Sequencer
+
+The second-stage modulator now has a parallel route into the Sequencer. The Mod 2 section in the Inspector renders two Targets blocks: the original "Mod 1 Targets" (Rate / Depth / Shape applied to Modulation 1) plus a new "Seq Targets" (Rate / Depth / Shape applied to the cell's Sequencer). Same math-mode dropdown drives both — Multiplicative / Additive / Mix is shared so the two blocks compose predictably.
+
+Per-mode Shape mapping (the third target is mode-aware, just like the Mod 1 side):
+
+- **Euclidean** → Rotation (0..steps-1) - which step the pattern starts on
+- **Density** → Seed - tiny offsets give micro-variations, big offsets give wholly different hit patterns
+- **Cellular** → Rule (0..255) - **strong** target, each rule is a totally different evolving pattern, keep amount low for musical use
+- **Polyrhythm** → Ring A Length - cross-rhythm density breathes in and out
+- **Drift** → Bias (-100..+100) - pull the random walker toward one end of the step range
+- **Ratchet** → Probability (0..100 %) - bursts breathe in and out
+- **Bounce** → Decay - long bounces taper to short bounces and back
+- **Steps / Draw / Address** → no-op (no single dominant "personality" knob, the row greys out)
+
+**Depth** universally targets the **Generative wildness slider** (`genAmount`, 0..100). This is the highest-impact musical knob in the v0.5.9 batch: swing genAmount from 0 to 100 with an LFO and the sequencer breathes between metronomic and chaotic. Pairs especially well with Cellular or Density modes, where genAmount governs how far the variations stray from the baseline pattern.
+
+**Rate** targets `bpm` (when syncMode is `bpm` or `tempo`) AND `stepMs` (when syncMode is `free`) so the user can flip syncMode mid-session without losing the modulation. Engine clamps to legal ranges (10..500 BPM, 1..60000 ms).
+
+Routing matrix gets a new column: the existing per-slot "Mod 2" tick is now labelled **M2>1** (Modulation 2 → Modulation 1) and a sibling **M2>S** (Modulation 2 → Sequencer) column sits next to it with a spacer between, so the two features read as distinct. Bulk ⇆ toggle, click-and-drag paint, per-slot ticks - all work the same. Cell-level semantics: if every slot's M2>S flag is explicitly false, Mod 2 → Seq is skipped cell-wide; any ticked slot enables the routing (the sequencer's state is shared per cell, so true per-slot gating isn't musically meaningful here).
+
+Engine side: new `applyMod2ToSeq(seq, m2cfg, mod2NormBipolar)` helper after `applyMod2ToMod1`. Same skip-when-no-target fast path - cells that don't use this feature pay zero cost. Call site shallow-clones the cell with both `modulation: effMod1` and `sequencer: effSeq` so downstream code reads the modulated values uniformly.
+
+Factory: `DEFAULT_MODULATION2.targetsSeq` ships with all three rows disabled (amounts pre-loaded at 50 % so flipping a checkbox gives an immediate audible effect).
+
+### "Modulation" → "Modulation 1" relabel
+
+The Cell Inspector's first modulator section was titled "Modulation" since v0.1, which read as the only modulator. With v0.5.7's introduction of Modulation 2 (and now v0.5.9's Mod 2 → Sequencer extension), the asymmetric label confused users into thinking Modulation 2 was a sub-feature. Now the section title is **"Modulation 1"** - parity with "Modulation 2" makes the two-stage chain visible at a glance.
+
+### Hardware Mode session persistence
+
+Reported during the v0.5.9 batch by a session that had `OCTOCOSME` bound to Hardware Mode but kept losing the binding on every reload. Root cause: the session-load sanitizer (`sanitizePool` + `sanitizeTemplate` in the store) had two layers that each dropped the `hardwareMode` blob:
+
+1. `sanitizeTemplate` was building a fresh template object from each saved entry but never copied `hardwareMode` over. Result: saved entries arrived at the pool merge with `hardwareMode === undefined`.
+2. `sanitizePool` then merged saved entries against the fresh builtin pool. When a saved id collided with a builtin (the common case - the user binds Hardware Mode to a builtin template they instantiated), the merge SKIPPED the saved entry entirely. Result: even if step 1 had carried `hardwareMode` through, step 2 would have discarded it.
+
+Both layers patched. `sanitizeTemplate` now does a shape-validated copy of every `HardwareModeConfig` field (enabled, deviceIp, devicePort, mode, catchTolerance, movementThreshold, movementWindowMs, args, appliesToTrackIds). `sanitizePool` now grafts the saved `hardwareMode` onto fresh builtin entries when ids collide - the builtin still wins for everything else (color, functions, etc.), but the user's per-session HW Mode config rides through.
+
+The catch-state map (per-track arg indices currently overridden by hardware) was already persisting since v0.5.7; what was missing was the binding config that says WHICH device, WHICH catch mode, etc. The combined fix means a v0.5.9 session round-trips cleanly: bind, save, close, reopen, the red instrument badge + "HW Mode On" pill come back exactly where you left them.
+
+### Drop-focus fixes (Inspector inputs)
+
+Two separate causes, both squashed in the same batch.
+
+**Cause 1: live-overlay clobber in `BoundedNumberInput`.** When Modulation 2 is enabled, the engine pushes `mod1Live` over IPC at ~30 Hz so the Inspector's Rate / Depth / Shape fields can animate to show the *effective* (post-Mod 2) values. Those fields' `value` prop binds to the live float. The component's value-sync `useEffect` runs on every external `value` change, and the existing "if str already parses to value, leave alone" guard never triggered because the live value is a continuously-drifting float - every tick of the engine overwrote whatever the user was typing. Visible symptom: caret stays put but every keystroke is wiped before the next frame.
+
+Fix: added a `dirty` ref that flips true on the first onChange after focus. The value-sync useEffect now bails when `focused && dirty` - the user's in-progress text is sacred. onFocus resets dirty=false so the live overlay continues tracking until they actually start typing; onBlur skips the commit if `!dirty` so focusing and leaving without typing doesn't accidentally clobber an externally-updated value.
+
+**Cause 2: drop-handler blur theft in EditView / SequenceView / TrackSidebar.** The three drag-and-drop handlers explicitly call `document.activeElement.blur()` on every drop, deferred to `requestAnimationFrame`. This was added as a defensive workaround for an Electron / Chromium "sticky drag pseudo-focus" bug where the drag source (a Pool pill or button) would keep keyboard interest after the drop and swallow subsequent click → input-focus chains. The workaround did its job for the sticky-button case but fired unconditionally - so when the user was typing in an Inspector input and dropped a saved scene onto the grid, the defensive blur yanked focus out of the Inspector field.
+
+Fix: all three call sites now bail out when `document.activeElement` is an `INPUT`, `TEXTAREA`, or `contentEditable` element. The original Chromium workaround still fires for buttons / pills / divs that hold focus (the case it was designed for), but the user's typing is no longer collateral damage.
+
+### New button save-before-discard modal
+
+The TopBar's New button has been wired through App.tsx's `newSessionConfirmOpen` flag since v0.5.0, with a 3-button modal (Yes saves + opens fresh, No discards + opens fresh, Cancel keeps current). Confirmed in this batch that the wiring is intact - reported as missing during v0.5.8 testing, but the code at HEAD was correct; the user was likely running a stale binary. No change shipped here; documented for confidence.
 
 ---
 

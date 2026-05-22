@@ -311,11 +311,24 @@ export interface Modulation {
   // active" so old sessions don't accidentally start modulating.
   targets?: ModulationTargets
   // Math mode for applying the stage-2 signal to stage-1's params.
-  //   multiplicative — base * (1 + mod2 * amount/100)
-  //   additive       — base + mod2 * (rangeMax * amount/100)
-  //   mix            — rate/depth multiplicative, shape additive
+  //   multiplicative - base * (1 + mod2 * amount/100)
+  //   additive       - base + mod2 * (rangeMax * amount/100)
+  //   mix            - rate/depth multiplicative, shape additive
   // Default 'multiplicative' (most musical for rate + depth).
   targetMode?: ModulationTargetMode
+  // ── Stage-2 → Sequencer routing (parallel to `targets`) ───────────
+  // When this Modulation acts as stage-2 (i.e. assigned to
+  // Cell.modulation2), `targetsSeq` lets it also modulate the cell's
+  // Sequencer params. Same shape as `targets` so the UI is mirrored.
+  //   rate  → cell.sequencer.bpm (or stepMs if syncMode='free')
+  //   shape → mode-dependent generative parameter (rotation for
+  //           euclidean, seed for density, rule for cellular,
+  //           ringALength for polyrhythm, bias for drift,
+  //           ratchetProb for ratchet, bounceDecay for bounce)
+  //   depth → cell.sequencer.genAmount (the Generative wildness knob)
+  // Optional + back-compat: undefined / missing entries mean "no
+  // sequencer target active" so v0.5.8 sessions load unchanged.
+  targetsSeq?: ModulationTargets
 }
 
 // Two-stage routing — how Mod 2's bipolar signal touches each of
@@ -707,6 +720,14 @@ export interface Cell {
     // revert). Lets multi-arg cells route Modulation 2 to specific
     // slots only.
     modulation2?: boolean[]
+    // Per-slot Modulation 2 → Sequencer gate. Default true. When false,
+    // the slot's sequencer params (bpm, per-mode shape key, genAmount)
+    // are not modulated by Mod 2 — the cell still uses the sequencer's
+    // un-modulated values for that slot. Mirrors `modulation2` but
+    // governs the Stage-2 → Sequencer routing instead of the Mod 1
+    // routing. Lets a multi-arg bundle have, say, slot 0 = full
+    // Mod 2 → Seq wildness while slot 1 stays metronomic.
+    modulation2Seq?: boolean[]
     sequencer?: boolean[]
     // Per-slot Delay (ms) — gates the modulator + sequencer
     // contribution for this slot until `delay` ms have elapsed

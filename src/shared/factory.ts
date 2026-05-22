@@ -206,6 +206,16 @@ export const DEFAULT_MODULATION2: Modulation = {
     depth: { enabled: true, amount: 50 },
     shape: { enabled: false, amount: 0 }
   },
+  // Sequencer routing — all off by default. Once the user enables
+  // any of these, Mod 2 starts modulating the cell's sequencer
+  // params in parallel with Mod 1 (Rate → bpm/stepMs, Shape →
+  // per-mode key, Depth → genAmount). Default amounts pre-loaded so
+  // the user can flip a checkbox without having to scrub a knob.
+  targetsSeq: {
+    rate: { enabled: false, amount: 50 },
+    depth: { enabled: false, amount: 50 },
+    shape: { enabled: false, amount: 50 }
+  },
   targetMode: 'multiplicative'
 }
 

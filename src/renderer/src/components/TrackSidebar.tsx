@@ -209,10 +209,17 @@ export default function TrackSidebar(): JSX.Element {
     // a freshly-instantiated track's name input doesn't accept
     // keystrokes until the user alt-tabs away and back. Defer one
     // microtask after dragend, then explicitly release the active
-    // element — kicks the controller out of its sticky state.
+    // element — kicks the controller out of its sticky state. Skip
+    // when an editable element is focused so the workaround doesn't
+    // yank the user's caret out of an input they're typing in.
     requestAnimationFrame(() => {
       const el = document.activeElement as HTMLElement | null
-      el?.blur()
+      if (!el) return
+      const tag = el.tagName
+      const isEditable =
+        tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable
+      if (isEditable) return
+      el.blur()
     })
   }
 

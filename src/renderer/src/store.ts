@@ -4834,6 +4834,45 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
   const fns = (Array.isArray(r.functions) ? r.functions : [])
     .map((f, i) => sanitizeFunction(f, i))
     .filter((f): f is InstrumentFunction => f !== null)
+  // Carry over hardwareMode if the saved entry has one — without
+  // this, sanitizePool sees a stripped saved entry whose hardwareMode
+  // is undefined and the user's saved Hardware Mode config gets lost
+  // every load. Light shape check + light field-by-field copy so
+  // hand-edited / malformed files can't inject a broken blob.
+  const hwRaw = r.hardwareMode as Record<string, unknown> | undefined
+  let hardwareMode: InstrumentTemplate['hardwareMode']
+  if (hwRaw && typeof hwRaw === 'object') {
+    hardwareMode = {
+      enabled: hwRaw.enabled === true,
+      deviceIp: typeof hwRaw.deviceIp === 'string' ? hwRaw.deviceIp : '',
+      devicePort:
+        typeof hwRaw.devicePort === 'number' ? hwRaw.devicePort : 0,
+      mode: hwRaw.mode === 'persist' ? 'persist' : 'reset',
+      catchTolerance:
+        typeof hwRaw.catchTolerance === 'number'
+          ? hwRaw.catchTolerance
+          : 0.02,
+      movementThreshold:
+        typeof hwRaw.movementThreshold === 'number'
+          ? hwRaw.movementThreshold
+          : 0.005,
+      movementWindowMs:
+        typeof hwRaw.movementWindowMs === 'number'
+          ? hwRaw.movementWindowMs
+          : 300,
+      // Optional fields - copy through as-is if present.
+      ...(Array.isArray(hwRaw.appliesToTrackIds)
+        ? {
+            appliesToTrackIds: (hwRaw.appliesToTrackIds as unknown[]).filter(
+              (x): x is string => typeof x === 'string'
+            )
+          }
+        : {}),
+      ...(typeof hwRaw.args === 'object' && hwRaw.args
+        ? { args: hwRaw.args as Record<string, number[]> }
+        : {})
+    }
+  }
   return {
     id: r.id,
     name: r.name,
@@ -4846,7 +4885,8 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
       typeof r.voices === 'number' && r.voices >= 1 ? Math.floor(r.voices) : 1,
     builtin: r.builtin === true,
     draft: r.draft === true,
-    functions: fns
+    functions: fns,
+    ...(hardwareMode ? { hardwareMode } : {})
   }
 }
 
@@ -4857,11 +4897,29 @@ function sanitizePool(raw: unknown): Pool {
         .map((t) => sanitizeTemplate(t))
         .filter((t): t is InstrumentTemplate => t !== null)
     : []
-  // Merge: dedupe by id, builtin always wins so its definition can't be
-  // accidentally drifted by an old session file. User-authored entries
-  // (no id collision with builtins) are appended in order.
+  // Index saved entries by id so we can graft USER-OVERRIDABLE fields
+  // onto the fresh builtin when ids collide (currently just
+  // `hardwareMode`: which OSC controller is bound, catch mode,
+  // tolerance, etc. — that's per-session user state, not part of the
+  // builtin's definition). Without this graft, the merge below
+  // silently drops any saved hardwareMode on a builtin (Hardware Mode
+  // configured on OCTOCOSME disappears every reload).
+  const savedById = new Map<string, InstrumentTemplate>()
+  for (const t of userTemplates) savedById.set(t.id, t)
+  // Merge: dedupe by id, builtin always wins its CORE DEFINITION so
+  // argSpec / oscPath / channelCount etc. can't be accidentally
+  // drifted by an old session file. The grafted user-overridable
+  // fields ride along on top.
   const seen = new Set<string>(builtin.templates.map((t) => t.id))
-  const merged: InstrumentTemplate[] = [...builtin.templates]
+  const merged: InstrumentTemplate[] = builtin.templates.map((b) => {
+    const saved = savedById.get(b.id)
+    if (saved && saved.hardwareMode) {
+      return { ...b, hardwareMode: saved.hardwareMode }
+    }
+    return b
+  })
+  // User-authored entries with NEW ids (no collision with a builtin)
+  // are appended verbatim.
   for (const t of userTemplates) {
     if (seen.has(t.id)) continue
     seen.add(t.id)

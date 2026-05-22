@@ -14,6 +14,7 @@ import type {
   MidiOut,
   Modulation,
   ModulationTargetMode,
+  ModulationTargets,
   ModType,
   MultMode,
   ParamArgSpec,
@@ -1016,6 +1017,8 @@ function CellRoutingSection({
   const modOn = (i: number): boolean => cell.routing?.modulator?.[i] !== false
   const mod2On = (i: number): boolean =>
     cell.routing?.modulation2?.[i] !== false
+  const mod2SeqOn = (i: number): boolean =>
+    cell.routing?.modulation2Seq?.[i] !== false
   const seqOn = (i: number): boolean => cell.routing?.sequencer?.[i] !== false
   // Whether the Modulation 2 column is active — gates the new column
   // visually + functionally. When Modulation 2 is disabled on the
@@ -1023,17 +1026,19 @@ function CellRoutingSection({
   // engine ignores them anyway, but we want the UI to read as
   // "irrelevant right now" rather than "go ahead and change me").
   const mod2Enabled = cell.modulation2?.enabled === true
+  // Type alias for the per-slot routing direction we mutate. New
+  // 'modulation2Seq' branch covers the Mod 2 -> Sequencer column.
+  type RoutingDir = 'modulator' | 'modulation2' | 'modulation2Seq' | 'sequencer'
   // Set a tick to an explicit value (used by both click and the
   // click+drag paint mode). Lazily initialises the arrays so old
   // sessions don't carry empty arrays around.
-  function setTick(
-    direction: 'modulator' | 'modulation2' | 'sequencer',
-    slotIdx: number,
-    value: boolean
-  ): void {
+  function setTick(direction: RoutingDir, slotIdx: number, value: boolean): void {
     const curMod = cell.routing?.modulator ? cell.routing.modulator.slice() : []
     const curMod2 = cell.routing?.modulation2
       ? cell.routing.modulation2.slice()
+      : []
+    const curMod2Seq = cell.routing?.modulation2Seq
+      ? cell.routing.modulation2Seq.slice()
       : []
     const curSeq = cell.routing?.sequencer ? cell.routing.sequencer.slice() : []
     const arr =
@@ -1041,13 +1046,19 @@ function CellRoutingSection({
         ? curMod
         : direction === 'modulation2'
           ? curMod2
-          : curSeq
+          : direction === 'modulation2Seq'
+            ? curMod2Seq
+            : curSeq
     arr[slotIdx] = value
     onChange({
       routing: {
         modulator: direction === 'modulator' ? curMod : cell.routing?.modulator,
         modulation2:
           direction === 'modulation2' ? curMod2 : cell.routing?.modulation2,
+        modulation2Seq:
+          direction === 'modulation2Seq'
+            ? curMod2Seq
+            : cell.routing?.modulation2Seq,
         sequencer: direction === 'sequencer' ? curSeq : cell.routing?.sequencer,
         delays: cell.routing?.delays,
         variations: cell.routing?.variations
@@ -1056,10 +1067,7 @@ function CellRoutingSection({
   }
   // Bulk "all on / all off" per row — quick way to disable an entire
   // driver without unticking each slot.
-  function setAll(
-    direction: 'modulator' | 'modulation2' | 'sequencer',
-    value: boolean
-  ): void {
+  function setAll(direction: RoutingDir, value: boolean): void {
     const arr: boolean[] = new Array(slots.length)
     for (const s of slots) arr[s.idx] = value
     onChange({
@@ -1067,6 +1075,10 @@ function CellRoutingSection({
         modulator: direction === 'modulator' ? arr : cell.routing?.modulator,
         modulation2:
           direction === 'modulation2' ? arr : cell.routing?.modulation2,
+        modulation2Seq:
+          direction === 'modulation2Seq'
+            ? arr
+            : cell.routing?.modulation2Seq,
         sequencer: direction === 'sequencer' ? arr : cell.routing?.sequencer,
         delays: cell.routing?.delays,
         variations: cell.routing?.variations
@@ -1082,6 +1094,7 @@ function CellRoutingSection({
       routing: {
         modulator: cell.routing?.modulator,
         modulation2: cell.routing?.modulation2,
+        modulation2Seq: cell.routing?.modulation2Seq,
         sequencer: cell.routing?.sequencer,
         delays: arr,
         variations: cell.routing?.variations
@@ -1100,6 +1113,7 @@ function CellRoutingSection({
       routing: {
         modulator: cell.routing?.modulator,
         modulation2: cell.routing?.modulation2,
+        modulation2Seq: cell.routing?.modulation2Seq,
         sequencer: cell.routing?.sequencer,
         delays: cell.routing?.delays,
         variations: arr
@@ -1115,7 +1129,7 @@ function CellRoutingSection({
   // direction sets it to that captured value too. Releases anywhere
   // on the window clear the state.
   const [dragMode, setDragMode] = useState<{
-    direction: 'modulator' | 'modulation2' | 'sequencer'
+    direction: RoutingDir
     setTo: boolean
   } | null>(null)
   useEffect(() => {
@@ -1130,12 +1144,15 @@ function CellRoutingSection({
   // row surfaces it.
   const sectionTitleTooltip =
     'Per-slot routing matrix. Columns:\n' +
-    '  Mod    — Modulation 1 → this slot (untick → slot uses cell.value seed)\n' +
-    '  Mod 2  — Modulation 2 → Modulation 1 ON THIS SLOT (untick → slot reads\n' +
-    '            the ORIGINAL Modulation 1 params, bypassing Modulation 2)\n' +
-    '  Seq    — Sequencer → this slot\n' +
-    '  Delay  — ms before Mod / Seq engage after each trigger\n' +
-    '  Var    — random 0..100 % scaling of the modulator amplitude per trigger\n\n' +
+    '  Mod         - Modulation 1 -> this slot (untick -> slot uses cell.value seed)\n' +
+    '  Mod 2 -> 1  - Modulation 2 modulates Modulation 1 on this slot (untick ->\n' +
+    '                slot reads the ORIGINAL Modulation 1 params, bypassing Mod 2)\n' +
+    '  Mod 2 -> S  - Modulation 2 modulates the Sequencer (bpm / shape / genAmount).\n' +
+    '                If EVERY slot is unticked, the Mod 2 -> Seq routing is\n' +
+    '                disabled cell-wide. Any ticked slot enables the routing.\n' +
+    '  Seq         - Sequencer -> this slot\n' +
+    '  Delay       - ms before Mod / Seq engage after each trigger\n' +
+    '  Var         - random 0..100 % scaling of the modulator amplitude per trigger\n\n' +
     'Default (all ticked, Delay 0, Variation 0) = previous behaviour.\n\n' +
     'Beaten by:\n' +
     '  - argSpec.fixed (protocol prefixes always emit their declared value)\n' +
@@ -1162,11 +1179,13 @@ function CellRoutingSection({
       <div
         className="grid gap-x-1.5 gap-y-0.5 items-center text-[10px] mx-auto"
         style={{
-          // Columns: [slot name | Mod | Modulation 2 | Seq | Delay | Var].
-          // Modulation 2 sits BETWEEN Mod and Seq per the user's
-          // request so the "what modulates what" reading order is
-          // Mod 1 → Mod 2 → Sequencer, left-to-right.
-          gridTemplateColumns: 'auto 22px 22px 22px 56px 76px'
+          // Columns: [slot name | Mod | Mod 2 -> Mod 1 | spacer | Mod 2 -> Seq | Seq | Delay | Var].
+          // The two "Mod 2" columns are kept close but separated by
+          // a slim spacer column so the user reads them as TWO
+          // distinct features (Mod 2 -> Mod 1 vs Mod 2 -> Sequencer).
+          // Left-to-right reading order is Mod 1 -> Mod 2 chain ->
+          // Sequencer chain -> per-slot timing controls.
+          gridTemplateColumns: 'auto 22px 22px 12px 22px 22px 56px 76px'
         }}
         onMouseLeave={() => {
           // If the user leaves the matrix while still painting we
@@ -1174,7 +1193,7 @@ function CellRoutingSection({
           // back. No-op here on purpose.
         }}
       >
-        {/* Header row — column labels + bulk-toggle */}
+        {/* Header row 1 — bulk-toggle row */}
         <span className="text-muted text-[9px] uppercase tracking-wide text-right pr-1">
           All
         </span>
@@ -1196,8 +1215,27 @@ function CellRoutingSection({
           }}
           title={
             mod2Enabled
-              ? 'Toggle every Modulation 2 slot on / off'
-              : 'Modulation 2 is disabled on this cell — enable it in the Modulation 2 section above'
+              ? 'Toggle every Modulation 2 -> Mod 1 slot on / off'
+              : 'Modulation 2 is disabled on this cell - enable it in the Modulation 2 section above'
+          }
+          disabled={!mod2Enabled}
+          style={mod2Enabled ? undefined : { opacity: 0.4, cursor: 'default' }}
+        >
+          ⇆
+        </button>
+        {/* Spacer between the two Mod 2 columns — visual separation
+            so the user reads the columns as distinct features. */}
+        <span />
+        <button
+          className="routing-bulk"
+          onClick={() => {
+            const allOn = slots.every((s) => mod2SeqOn(s.idx))
+            setAll('modulation2Seq', !allOn)
+          }}
+          title={
+            mod2Enabled
+              ? 'Toggle every Modulation 2 -> Sequencer slot on / off'
+              : 'Modulation 2 is disabled on this cell - column is inert until you enable it'
           }
           disabled={!mod2Enabled}
           style={mod2Enabled ? undefined : { opacity: 0.4, cursor: 'default' }}
@@ -1220,6 +1258,7 @@ function CellRoutingSection({
         <span className="text-muted text-[9px] uppercase tracking-wide text-center">
           Var
         </span>
+        {/* Header row 2 — column labels */}
         <span />
         <span className="text-muted text-[9px] uppercase tracking-wide text-center">
           Mod
@@ -1228,11 +1267,23 @@ function CellRoutingSection({
           className={`text-[9px] uppercase tracking-wide text-center ${mod2Enabled ? 'text-muted' : 'text-muted/40'}`}
           title={
             mod2Enabled
-              ? 'Modulation 2 routing per slot'
-              : 'Modulation 2 disabled on this cell — column is inert until you enable it.'
+              ? 'Modulation 2 -> Modulation 1 per slot'
+              : 'Modulation 2 disabled on this cell - column is inert until you enable it.'
           }
         >
-          Mod 2
+          M2&gt;1
+        </span>
+        {/* Spacer between Mod2>1 and Mod2>Seq column labels */}
+        <span />
+        <span
+          className={`text-[9px] uppercase tracking-wide text-center ${mod2Enabled ? 'text-muted' : 'text-muted/40'}`}
+          title={
+            mod2Enabled
+              ? 'Modulation 2 -> Sequencer per slot. If EVERY slot is unticked, the Mod 2 -> Seq routing is disabled cell-wide.'
+              : 'Modulation 2 disabled on this cell - column is inert until you enable it.'
+          }
+        >
+          M2&gt;S
         </span>
         <span className="text-muted text-[9px] uppercase tracking-wide text-center">
           Seq
@@ -1269,9 +1320,9 @@ function CellRoutingSection({
               title={`Modulation 1 → ${s.name}${modOn(s.idx) ? ' (routed)' : ' (gated off)'} · drag to paint`}
               aria-pressed={modOn(s.idx)}
             />
-            {/* Modulation 2 per-slot gate. Inert when Modulation 2 is
-                disabled on the cell (still renders so the column
-                layout doesn't jump when the user toggles it). */}
+            {/* Modulation 2 -> Modulation 1 per-slot gate. Inert
+                when Modulation 2 is disabled on the cell (still
+                renders so the column layout doesn't jump). */}
             <button
               className={`routing-tick ${mod2On(s.idx) ? 'routing-tick-on' : ''}`}
               onMouseDown={(e) => {
@@ -1295,10 +1346,44 @@ function CellRoutingSection({
               style={mod2Enabled ? undefined : { opacity: 0.35, cursor: 'default' }}
               title={
                 mod2Enabled
-                  ? `Modulation 2 → ${s.name}${mod2On(s.idx) ? ' (active)' : ' (bypassed — slot reads original Modulation 1)'} · drag to paint`
-                  : 'Modulation 2 is disabled on this cell — enable it in the Modulation 2 section above first'
+                  ? `Modulation 2 -> Mod 1 on ${s.name}${mod2On(s.idx) ? ' (active)' : ' (bypassed - slot reads original Modulation 1)'} - drag to paint`
+                  : 'Modulation 2 is disabled on this cell - enable it in the Modulation 2 section above first'
               }
               aria-pressed={mod2On(s.idx)}
+            />
+            {/* Visual spacer column between the two Mod 2 sub-columns. */}
+            <span />
+            {/* Modulation 2 -> Sequencer per-slot gate. Cell-level
+                semantics: if EVERY slot's flag is false, Mod 2 ->
+                Seq is bypassed cell-wide (the engine skips
+                applyMod2ToSeq). Any ticked slot enables routing. */}
+            <button
+              className={`routing-tick ${mod2SeqOn(s.idx) ? 'routing-tick-on' : ''}`}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                if (!mod2Enabled) return
+                const next = !mod2SeqOn(s.idx)
+                setTick('modulation2Seq', s.idx, next)
+                setDragMode({ direction: 'modulation2Seq', setTo: next })
+              }}
+              onMouseEnter={() => {
+                if (!mod2Enabled) return
+                if (
+                  dragMode &&
+                  dragMode.direction === 'modulation2Seq' &&
+                  mod2SeqOn(s.idx) !== dragMode.setTo
+                ) {
+                  setTick('modulation2Seq', s.idx, dragMode.setTo)
+                }
+              }}
+              disabled={!mod2Enabled}
+              style={mod2Enabled ? undefined : { opacity: 0.35, cursor: 'default' }}
+              title={
+                mod2Enabled
+                  ? `Modulation 2 -> Sequencer on ${s.name}${mod2SeqOn(s.idx) ? ' (active)' : ' (untick all slots to disable Mod 2 -> Seq cell-wide)'} - drag to paint`
+                  : 'Modulation 2 is disabled on this cell - enable it in the Modulation 2 section above first'
+              }
+              aria-pressed={mod2SeqOn(s.idx)}
             />
             <button
               className={`routing-tick ${seqOn(s.idx) ? 'routing-tick-on' : ''}`}
@@ -1923,7 +2008,7 @@ function CellInspector(): JSX.Element {
       />
 
       <CollapsibleSection
-        title="Modulation"
+        title="Modulation 1"
         enabled={cell.modulation.enabled}
         onToggle={(v) => u({ modulation: { ...cell.modulation, enabled: v } })}
         headerRight={
@@ -2985,6 +3070,24 @@ function Mod2Section({
       }
     })
   }
+  // Companion of `patchTargets` for the Mod 2 -> Sequencer routing.
+  // Writes into `modulation2.targetsSeq` (parallel to `targets`).
+  function patchTargetsSeq(
+    branch: 'rate' | 'depth' | 'shape',
+    next: { enabled?: boolean; amount?: number }
+  ): void {
+    const cur = m2.targetsSeq ?? {}
+    const prev = cur[branch] ?? { enabled: false, amount: 0 }
+    u({
+      modulation2: {
+        ...m2,
+        targetsSeq: {
+          ...cur,
+          [branch]: { ...prev, ...next }
+        }
+      }
+    })
+  }
   function patchTargetMode(mode: ModulationTargetMode): void {
     u({ modulation2: { ...m2, targetMode: mode } })
   }
@@ -3071,12 +3174,81 @@ function Mod2Section({
         return {
           label: 'Shape',
           tooltip:
-            'No continuous shape parameter on this Modulation 1 type — Shape target is a no-op.',
+            'No continuous shape parameter on this Modulation 1 type - Shape target is a no-op.',
+          usable: false
+        }
+    }
+  }
+  // Sequencer-side Shape label is mode-aware. Each seq mode has a
+  // single parameter that most strongly defines its musical
+  // personality (rotation for euclidean, seed for density, rule for
+  // cellular, ringALength for polyrhythm, etc). Modes without a
+  // dominant single knob ('steps', 'draw', 'adresse') grey out the
+  // row so the user sees the option exists but can't enable a
+  // no-op.
+  function shapeLabelForSeq(): { label: string; tooltip: string; usable: boolean } {
+    const seqMode = cell.sequencer?.mode ?? 'steps'
+    switch (seqMode) {
+      case 'euclidean':
+        return {
+          label: 'Euclidean - Rotation',
+          tooltip:
+            "Sweep the sequencer's Euclidean rotation (which step the pattern starts on) as Modulation 2 swings. Up to +/- the full step count at 100 % amount.",
+          usable: true
+        }
+      case 'density':
+        return {
+          label: 'Density - Seed',
+          tooltip:
+            "Sweep the sequencer's density seed as Modulation 2 swings. Tiny offsets give micro-variations; big offsets give wholly different hit patterns.",
+          usable: true
+        }
+      case 'cellular':
+        return {
+          label: 'Cellular - Rule',
+          tooltip:
+            "Sweep the Wolfram rule (0..255) as Modulation 2 swings. Each rule produces a totally different evolving pattern - this is a STRONG target, keep amount low for musical use.",
+          usable: true
+        }
+      case 'polyrhythm':
+        return {
+          label: 'Polyrhythm - Ring A Length',
+          tooltip:
+            "Sweep the polyrhythm's first ring length as Modulation 2 swings. Cross-rhythm density breathes in and out.",
+          usable: true
+        }
+      case 'drift':
+        return {
+          label: 'Drift - Bias',
+          tooltip:
+            "Sweep the random walker's directional bias (-100..+100) as Modulation 2 swings. Pull the walk toward one end of the step range.",
+          usable: true
+        }
+      case 'ratchet':
+        return {
+          label: 'Ratchet - Probability',
+          tooltip:
+            "Sweep the per-step ratchet probability (0..100 %) as Modulation 2 swings. Bursts breathe in and out.",
+          usable: true
+        }
+      case 'bounce':
+        return {
+          label: 'Bounce - Decay',
+          tooltip:
+            "Sweep the bounce decay (0..100) as Modulation 2 swings. Long bounces taper to short bounces and back.",
+          usable: true
+        }
+      default:
+        return {
+          label: 'Shape',
+          tooltip:
+            'No dominant generative knob on this sequencer mode (steps / draw / address) - Shape target is a no-op.',
           usable: false
         }
     }
   }
   const shapeMeta = shapeLabelForMod1()
+  const shapeMetaSeq = shapeLabelForSeq()
   return (
     <CollapsibleSection
       title="Modulation 2"
@@ -3149,87 +3321,137 @@ function Mod2Section({
         </div>
       )}
 
-      {/* ── Targets sub-block ─────────────────────────────────────── */}
+      {/* ── Targets sub-block (Mod 2 -> Mod 1) ────────────────────── */}
       <Mod2TargetsBlock
-        m2={m2}
+        title="Mod 1 Targets"
+        titleTooltip={
+          "How Modulation 2 modulates Modulation 1's targets:\n\n" +
+          'Multiplicative - base x (1 + mod2 x amount). Smooth, musical, works for everything.\n' +
+          'Additive       - base + mod2 x range x amount. Fixed-range swing, easier to predict.\n' +
+          'Mix            - rate + depth multiplicative; shape additive.'
+        }
+        targets={m2.targets}
         onPatchTarget={patchTargets}
-        onPatchMode={patchTargetMode}
+        rateLabel="Rate"
+        rateTooltip="Modulate Modulation 1's Rate (LFO Hz / clock division)."
+        depthLabel="Depth"
+        depthTooltip="Modulate Modulation 1's Depth (0..100 %)."
         shapeLabel={shapeMeta.label}
         shapeTooltip={shapeMeta.tooltip}
         shapeUsable={shapeMeta.usable}
+        modeSelector={
+          <select
+            // Auto-width so the select shrinks to its widest entry
+            // ("Multiplicative") plus the native dropdown arrow.
+            className="input text-[10px] py-0.5 w-auto"
+            style={{ width: 'fit-content' }}
+            value={m2.targetMode ?? 'multiplicative'}
+            onChange={(e) =>
+              patchTargetMode(e.target.value as ModulationTargetMode)
+            }
+            title="Math mode for Modulation 2 -> Modulation 1 application (also applies to Sequencer targets below)"
+          >
+            <option value="multiplicative">Multiplicative</option>
+            <option value="additive">Additive</option>
+            <option value="mix">Mix</option>
+          </select>
+        }
+      />
+      {/* ── Sequencer Targets sub-block (Mod 2 -> Sequencer) ──────── */}
+      {/* Parallel branch -- modulates the cell's sequencer params
+          (bpm, per-mode shape key, genAmount). Same math mode as
+          the Mod 1 block above (single source of truth). Shape
+          label is reactive to cell.sequencer.mode so the user
+          sees, e.g., "Cellular - Rule" or "Euclidean - Rotation"
+          depending on the current sequencer mode. */}
+      <Mod2TargetsBlock
+        title="Seq Targets"
+        titleTooltip={
+          'How Modulation 2 modulates the cell\'s Sequencer params:\n\n' +
+          'Rate  -> bpm (or stepMs when syncMode = free).\n' +
+          'Shape -> per-mode "personality" knob (Rotation for Euclidean, Seed for Density, Rule for Cellular, etc).\n' +
+          "Depth -> genAmount (the Generative wildness slider). Modulate this for breathing 'calm <-> chaotic' generative variations.\n\n" +
+          "Math mode is shared with the Mod 1 block above. Targets off by default -- the user opts in per branch."
+        }
+        targets={m2.targetsSeq}
+        onPatchTarget={patchTargetsSeq}
+        rateLabel="Rate"
+        rateTooltip="Modulate the sequencer's tempo (bpm or stepMs)."
+        depthLabel="Depth"
+        depthTooltip="Modulate the sequencer's Generative wildness (genAmount, 0..100 %)."
+        shapeLabel={shapeMetaSeq.label}
+        shapeTooltip={shapeMetaSeq.tooltip}
+        shapeUsable={shapeMetaSeq.usable}
+        modeSelector={null}
       />
     </CollapsibleSection>
   )
 }
 
+// Generic 3-row Rate / Depth / Shape target block. Used twice in
+// the Mod 2 section: once for "Mod 2 -> Mod 1" (header "Targets")
+// and once for "Mod 2 -> Sequencer" (header "Seq Targets"). The
+// math-mode dropdown is rendered ONLY in the Mod 1 block since both
+// blocks share the same `targetMode` on the Modulation object.
 function Mod2TargetsBlock({
-  m2,
+  title,
+  titleTooltip,
+  targets,
   onPatchTarget,
-  onPatchMode,
+  rateLabel,
+  rateTooltip,
+  depthLabel,
+  depthTooltip,
   shapeLabel,
   shapeTooltip,
-  shapeUsable
+  shapeUsable,
+  modeSelector
 }: {
-  m2: Modulation
+  title: string
+  titleTooltip: string
+  targets: ModulationTargets | undefined
   onPatchTarget: (
     branch: 'rate' | 'depth' | 'shape',
     next: { enabled?: boolean; amount?: number }
   ) => void
-  onPatchMode: (mode: ModulationTargetMode) => void
+  rateLabel: string
+  rateTooltip: string
+  depthLabel: string
+  depthTooltip: string
   shapeLabel: string
   shapeTooltip: string
-  // When Modulation 1's current type has no continuous shape
-  // parameter (Envelope / Ramp / Arpeggiator), the third target row
-  // greys out and ignores the user's clicks — the engine is a no-op
-  // for those types anyway. Default true keeps backwards
-  // compatibility with any future caller that omits it.
+  // When the target's underlying parameter doesn't exist on the
+  // current Mod 1 type / Sequencer mode, the third target row greys
+  // out and the engine is a no-op. The UI signals "this branch is
+  // dead for now" without hiding the row entirely.
   shapeUsable: boolean
+  // Optional math-mode dropdown rendered inline with the header.
+  // The Mod 1 block owns the dropdown (it controls both blocks'
+  // math); the Seq block passes null so its header is just text.
+  modeSelector?: JSX.Element | null
 }): JSX.Element {
-  const mode = m2.targetMode ?? 'multiplicative'
-  const rate = m2.targets?.rate ?? { enabled: false, amount: 0 }
-  const depth = m2.targets?.depth ?? { enabled: false, amount: 0 }
-  const shape = m2.targets?.shape ?? { enabled: false, amount: 0 }
+  const rate = targets?.rate ?? { enabled: false, amount: 0 }
+  const depth = targets?.depth ?? { enabled: false, amount: 0 }
+  const shape = targets?.shape ?? { enabled: false, amount: 0 }
   return (
     <div className="flex flex-col gap-2 pt-2 border-t border-border mt-1">
       <div className="flex items-center gap-2">
-        <span
-          className="label"
-          title={
-            'How Modulation 2 modulates Modulation 1\'s targets:\n\n' +
-            'Multiplicative — base × (1 + mod2 × amount). Smooth, musical, works for everything.\n' +
-            'Additive       — base + mod2 × range × amount. Fixed-range swing, easier to predict.\n' +
-            'Mix            — rate + depth multiplicative; shape additive.'
-          }
-        >
-          Targets
+        <span className="label" title={titleTooltip}>
+          {title}
         </span>
-        <select
-          // Auto-width via inline style + w-auto so the select shrinks
-          // to its widest entry ("Multiplicative") plus the native
-          // dropdown arrow chrome. Previous fixed 110 px clipped
-          // "Multiplicative" on macOS' wider system font.
-          className="input text-[10px] py-0.5 w-auto"
-          style={{ width: 'fit-content' }}
-          value={mode}
-          onChange={(e) => onPatchMode(e.target.value as ModulationTargetMode)}
-          title="Math mode for Modulation 2 → Modulation 1 application"
-        >
-          <option value="multiplicative">Multiplicative</option>
-          <option value="additive">Additive</option>
-          <option value="mix">Mix</option>
-        </select>
+        {modeSelector}
       </div>
       <Mod2TargetRow
-        label="Rate"
-        tooltip="Modulate Modulation 1's Rate (LFO Hz / clock division)."
+        label={rateLabel}
+        tooltip={rateTooltip}
         enabled={rate.enabled}
         amount={rate.amount}
         onToggle={(v) => onPatchTarget('rate', { enabled: v })}
         onAmount={(v) => onPatchTarget('rate', { amount: v })}
       />
       <Mod2TargetRow
-        label="Depth"
-        tooltip="Modulate Modulation 1's Depth (0..100%)."
+        label={depthLabel}
+        tooltip={depthTooltip}
         enabled={depth.enabled}
         amount={depth.amount}
         onToggle={(v) => onPatchTarget('depth', { enabled: v })}
