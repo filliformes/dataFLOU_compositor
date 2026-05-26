@@ -560,6 +560,25 @@ export default function App(): JSX.Element {
         st.setMidiLearnMode(!st.midiLearnMode)
         return
       }
+      // G → toggle the Generative Settings popover (v0.5.10). Lets
+      // the performer flip the window in / out without finding the
+      // chevron next to the GENERATIVE button. Popover is draggable
+      // and remembers its position across opens, so G + drag once =
+      // permanent "Generative HUD" wherever the user parked it.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === 'g'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setGenerativePopoverOpen(!st.generativePopoverOpen)
+        return
+      }
       // P → toggle Pool visibility inside the OSC Monitor. If the
       // drawer is currently closed, opens it AND shows the Pool — one
       // keystroke gets the user from "I want to drag a Template" to a

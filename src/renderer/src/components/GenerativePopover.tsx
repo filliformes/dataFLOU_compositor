@@ -82,24 +82,75 @@ function useArmLearn(
   }
 }
 
+// Persisted popover position (localStorage). Saved on drag-end so a
+// reload restores the window where the user last parked it. null /
+// missing = "anchor below the button row" (default first-open
+// behaviour). Stored as JSON {x, y}.
+const POPOVER_POS_KEY = 'dataflou.generativePopoverPos'
+function loadPopoverPos(): { x: number; y: number } | null {
+  try {
+    const raw = localStorage.getItem(POPOVER_POS_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as unknown
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as { x: unknown }).x === 'number' &&
+      typeof (parsed as { y: unknown }).y === 'number'
+    ) {
+      return parsed as { x: number; y: number }
+    }
+  } catch {
+    /* ignore malformed JSON or no localStorage */
+  }
+  return null
+}
+function savePopoverPos(p: { x: number; y: number }): void {
+  try {
+    localStorage.setItem(POPOVER_POS_KEY, JSON.stringify(p))
+  } catch {
+    /* ignore localStorage failures */
+  }
+}
+
 // Standalone GENERATIVE pill button + adjacent chevron. The pill
 // toggles the master flag; the chevron opens the popover. Pill has
 // a live dot indicator (off / on / active-playing) and is itself
 // MIDI-learnable via right-click.
+//
+// Popover open state lives in the store (UI-only, not persisted with
+// the session) so the global G hotkey in App.tsx can toggle it from
+// anywhere. Popover position is persisted in localStorage so the
+// user's chosen drag spot survives a reload.
 export function GenerativeButton(): JSX.Element {
   const gen = useStore(
     (s) => s.session.generative ?? DEFAULT_GENERATIVE_CONFIG
   )
   const setEnabled = useStore((s) => s.setGenerativeEnabled)
-  const [open, setOpen] = useState(false)
+  const open = useStore((s) => s.generativePopoverOpen)
+  const setOpen = useStore((s) => s.setGenerativePopoverOpen)
   const buttonRowRef = useRef<HTMLDivElement | null>(null)
   const popoverRef = useRef<HTMLDivElement | null>(null)
+  // Position state. null = "use the button-row anchor" (first open
+  // after fresh app load with no saved pos, OR after the user
+  // explicitly resets via the Reset button in the title bar). Set to
+  // a {x, y} via drag or by restoring from localStorage on first
+  // mount.
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(
+    () => loadPopoverPos()
+  )
   const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null)
+  // Drag state. While dragging, every mousemove updates `position`.
+  // Captures the offset between the cursor and the popover's
+  // top-left so the popover follows the cursor naturally instead of
+  // jumping to position the corner at the cursor.
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null)
 
-  // Re-anchor on open + on window resize so the popover sticks
-  // beneath the button row.
+  // Compute the button-anchor on open + on window resize -- used
+  // ONLY when `position` is null (first-time or after Reset).
   useEffect(() => {
     if (!open || !buttonRowRef.current) return
+    if (position !== null) return // user has dragged -- skip auto-anchor
     const update = (): void => {
       const rect = buttonRowRef.current!.getBoundingClientRect()
       setAnchor({ x: rect.left, y: rect.bottom + 4 })
@@ -107,8 +158,11 @@ export function GenerativeButton(): JSX.Element {
     update()
     window.addEventListener('resize', update)
     return () => window.removeEventListener('resize', update)
-  }, [open])
-  // Click-outside + Escape to close.
+  }, [open, position])
+
+  // Click-outside + Escape to close. The G hotkey also toggles via
+  // setOpen; we intentionally don't intercept it here so the
+  // App-level handler stays the single source of truth.
   useEffect(() => {
     if (!open) return
     function onDown(e: MouseEvent): void {
@@ -127,12 +181,54 @@ export function GenerativeButton(): JSX.Element {
       window.removeEventListener('mousedown', onDown)
       window.removeEventListener('keydown', onKey)
     }
-  }, [open])
+  }, [open, setOpen])
+
+  // Drag handlers. Installed only while dragging so we don't pay for
+  // a global mousemove listener when the popover is idle.
+  useEffect(() => {
+    if (!dragRef.current) return
+    function onMove(e: MouseEvent): void {
+      if (!dragRef.current) return
+      // Clamp to keep the popover at least partially on-screen
+      // (16px margin) so it can't be dragged completely off the
+      // edge into oblivion.
+      const w = popoverRef.current?.offsetWidth ?? 340
+      const h = popoverRef.current?.offsetHeight ?? 200
+      const maxX = window.innerWidth - 32
+      const maxY = window.innerHeight - 32
+      const x = Math.max(-(w - 32), Math.min(maxX, e.clientX - dragRef.current.dx))
+      const y = Math.max(8, Math.min(maxY, e.clientY - dragRef.current.dy))
+      setPosition({ x, y })
+    }
+    function onUp(): void {
+      // Persist final position so a reload puts the window back
+      // where the user dropped it.
+      if (popoverRef.current) {
+        const rect = popoverRef.current.getBoundingClientRect()
+        savePopoverPos({ x: rect.left, y: rect.top })
+      }
+      dragRef.current = null
+      // Force a re-render so the effect cleanup fires and removes
+      // the listeners until the next drag.
+      setPosition((p) => (p ? { ...p } : null))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    // Re-run when position changes only to capture the post-drag
+    // listener cleanup; dragRef.current presence gates the effect.
+  }, [position])
 
   const toggleLearn = useArmLearn('generativeToggle')
   const dotColor = gen.enabled
     ? 'rgb(var(--c-accent))'
     : 'rgb(var(--c-muted) / 0.4)'
+  // Final on-screen position: persisted/dragged position wins;
+  // anchor is the fallback for first-open with no saved pos.
+  const effectivePos = position ?? anchor
   return (
     <div
       ref={buttonRowRef}
@@ -166,26 +262,86 @@ export function GenerativeButton(): JSX.Element {
         className={`btn text-[10px] py-0.5 px-1.5 shrink-0 ${
           open ? 'bg-panel3' : ''
         }`}
-        onClick={() => setOpen((v) => !v)}
-        title="Generative settings: pool, mode, affinity, duration, weights"
+        onClick={() => setOpen(!open)}
+        title="Generative settings (G to toggle): pool, mode, affinity, duration, weights"
       >
         ▾
       </button>
       {open &&
-        anchor &&
+        effectivePos &&
         createPortal(
           <div
             ref={popoverRef}
-            className="fixed z-50 bg-panel border border-border rounded shadow-lg text-[11px] p-3 flex flex-col gap-2.5"
+            className="fixed z-50 bg-panel border border-border rounded shadow-lg text-[11px] flex flex-col"
             style={{
-              left: Math.max(8, anchor.x),
-              top: anchor.y,
+              left: Math.max(8, effectivePos.x),
+              top: effectivePos.y,
               width: 340,
-              maxHeight: 'calc(100vh - 80px)',
-              overflowY: 'auto'
+              maxHeight: 'calc(100vh - 80px)'
             }}
           >
-            <GenerativePopoverBody onClose={() => setOpen(false)} />
+            {/* Drag handle / title bar. Pressing here starts a drag;
+                the close + reset buttons stop the mousedown from
+                bubbling so they don't accidentally start a drag. */}
+            <div
+              className="flex items-center justify-between px-3 py-1.5 border-b border-border bg-panel2 rounded-t cursor-move select-none"
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                const rect = popoverRef.current?.getBoundingClientRect()
+                if (!rect) return
+                dragRef.current = {
+                  dx: e.clientX - rect.left,
+                  dy: e.clientY - rect.top
+                }
+                // Seed position so the drag handler has a valid
+                // starting point (avoid undefined offset math when
+                // position was null and the popover was rendered
+                // via the auto-anchor).
+                setPosition({ x: rect.left, y: rect.top })
+              }}
+              title="Drag to move. Right-click the X to reset to the default position next to the button."
+            >
+              <span className="font-semibold text-[12px]">
+                Generative Settings
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  className="text-muted hover:text-text text-[10px] px-1"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    // Right-click on X would also fire onClick on
+                    // some browsers; the second binding (oncontext)
+                    // handles the reset explicitly.
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    setPosition(null)
+                    try {
+                      localStorage.removeItem(POPOVER_POS_KEY)
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                  title="Right-click to reset position to default (next to the GENERATIVE button)"
+                >
+                  ⟲
+                </button>
+                <button
+                  className="text-muted hover:text-text text-[12px] px-1"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={() => setOpen(false)}
+                  title="Close (Esc or G)"
+                  aria-label="Close"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div className="p-3 flex flex-col gap-2.5 overflow-y-auto">
+              <GenerativePopoverBody onClose={() => setOpen(false)} />
+            </div>
           </div>,
           document.body
         )}
@@ -223,19 +379,13 @@ function GenerativePopoverBody({
   const useMorphLearn = useArmLearn('generativeUseMorph')
   const randomWeightsLearn = useArmLearn('generativeRandomWeights')
 
+  // Reference to keep the `onClose` prop satisfied even though the
+  // new draggable title bar owns the close button. Calling onClose
+  // when the user picks a value from the keyboard would be wrong --
+  // we only close on the explicit X click or Escape.
+  void onClose
   return (
     <>
-      <div className="flex items-center justify-between">
-        <span className="font-semibold text-[12px]">Generative Settings</span>
-        <button
-          className="text-muted hover:text-text text-[12px]"
-          onClick={onClose}
-          aria-label="Close"
-        >
-          ✕
-        </button>
-      </div>
-
       {/* ── Pool Source ───────────────────────────────────────────── */}
       <div className="flex items-center gap-2">
         <span className="label flex-1">Pool source</span>

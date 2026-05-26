@@ -623,6 +623,10 @@ In the grid-side Parameter Inspector (click a track header), a new **Default Tra
 
 Hover the **Transition** label in the Cell Inspector's Timing section for a short explanation of what Transition does, how it relates to Scene Morph, and the `timingEnabled` bypass. Long-awaited docs for a long-existing feature.
 
+### Draggable Generative popover + G hotkey
+
+The Generative Settings popover has a title bar you can grab to drag the window anywhere on the screen. Position persists in localStorage so a reload restores it where you parked it. **⟲** in the title bar resets to the default anchor (next to the GENERATIVE button); **✕** or **Esc** closes; **G** toggles visibility from anywhere in the app. Drag once, then treat the popover as a permanent "Generative HUD" you can summon with G.
+
 ---
 
 ## Release notes - 0.5.9

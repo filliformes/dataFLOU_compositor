@@ -235,6 +235,12 @@ interface UiState {
   // messages (address, ip:port, args) for debugging. Off by default; when
   // closed the monitor component unmounts so no state accumulates.
   oscMonitorOpen: boolean
+  // Generative Settings popover open flag (v0.5.10). UI-only -- not
+  // persisted with the session. Lifted to the store so the G hotkey
+  // can toggle visibility from anywhere in the app, not just from
+  // the chevron next to the GENERATIVE button. Default false so a
+  // fresh app load doesn't pop the popover unprompted.
+  generativePopoverOpen: boolean
   // Drawer height (px). User-resizable via the handle on top edge,
   // 120..600 (clamped). Persisted as part of the in-session UI prefs so
   // the height survives a drawer toggle.
@@ -834,6 +840,7 @@ interface Actions {
   setTracksCollapsed: (v: boolean) => void
   setShowMode: (v: boolean) => void
   setOscMonitorOpen: (v: boolean) => void
+  setGenerativePopoverOpen: (v: boolean) => void
   setOscMonitorHeight: (h: number) => void
   setPoolHidden: (v: boolean) => void
   setEditInspectorVisible: (v: boolean) => void
@@ -1134,6 +1141,7 @@ export const useStore = create<State>((set, get) => ({
   // Exit: hold Escape for ~1 second while in show mode.
   showMode: false,
   oscMonitorOpen: false,
+  generativePopoverOpen: false,
   oscMonitorHeight: 220,
   poolHidden: false,
   editInspectorVisible: true,
@@ -3271,6 +3279,7 @@ export const useStore = create<State>((set, get) => ({
     ),
   setTracksCollapsed: (v) => set({ tracksCollapsed: v }),
   setOscMonitorOpen: (v) => set({ oscMonitorOpen: v }),
+  setGenerativePopoverOpen: (v) => set({ generativePopoverOpen: v }),
   setOscMonitorHeight: (h) => set({ oscMonitorHeight: clampInt(h, 120, 600) }),
   setPoolHidden: (v) => set({ poolHidden: v }),
   setEditInspectorVisible: (v) => set({ editInspectorVisible: v }),
