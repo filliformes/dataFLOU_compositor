@@ -505,6 +505,77 @@ function TrackInspector(): JSX.Element {
         Only fields with a value get sent. Leave a field blank to skip it.
         Pinned values, when present, are also broadcast to every clip on this row.
       </div>
+
+      {/* v0.5.10 -- Default Transition broadcast. Independent of the
+          OSC/MIDI defaults above so the user can push a transition
+          value without touching everything else. Local component
+          state for the input, store action for the broadcast. */}
+      <TrackTransitionBroadcast trackId={trackId} scenesCount={scenesCount} />
+    </div>
+  )
+}
+
+// Standalone Transition-broadcast block. Lives in the TrackInspector
+// (grid-side Parameter Inspector). Lets the user push a fresh
+// transitionMs to every cell on this row in one click without
+// dragging the OSC/MIDI defaults along for the ride.
+function TrackTransitionBroadcast({
+  trackId,
+  scenesCount
+}: {
+  trackId: string
+  scenesCount: number
+}): JSX.Element {
+  const broadcast = useStore((s) => s.broadcastTransitionMs)
+  // Seed from the FIRST cell on this row that has a non-zero
+  // transitionMs (or 0 when every cell is zero) so the user sees
+  // their current default-ish value instead of always starting at 0.
+  const seed = useStore((s) => {
+    for (const sc of s.session.scenes) {
+      const c = sc.cells[trackId]
+      if (c && typeof c.transitionMs === 'number') return c.transitionMs
+    }
+    return 0
+  })
+  const [value, setValue] = useState<number>(seed)
+  // Reset the input when the focused track changes (the seed prop
+  // changes as the user clicks different tracks). Avoids carrying a
+  // stale typed-but-not-broadcast value across track switches.
+  useEffect(() => {
+    setValue(seed)
+  }, [trackId, seed])
+  return (
+    <div className="flex flex-col gap-1 pt-2 border-t border-border">
+      <div className="flex items-center gap-2">
+        <span
+          className="label"
+          title={
+            'Default Clip Transition (v0.5.10): the per-cell glide time to push to every clip on this row. Click "Send to all clips" to broadcast.\n\nClips with Timing disabled (the checkbox in the Cell Inspector\'s Timing section) keep their disabled state -- they just remember the new value for when re-enabled. Scene Morph (TransportBar) overrides per-cell Transition when enabled.'
+          }
+        >
+          Transition
+        </span>
+        <BoundedNumberInput
+          className="input w-20"
+          value={value}
+          onChange={(v) => setValue(v)}
+          min={0}
+          max={10000}
+          integer
+        />
+        <span className="text-muted text-[11px]">ms</span>
+        <button
+          className="btn text-[11px] flex-1"
+          onClick={() => {
+            if (scenesCount === 0) return
+            broadcast(trackId, value)
+          }}
+          disabled={scenesCount === 0}
+          title="Push this Transition value to every clip's transitionMs on this row"
+        >
+          Send to all clips
+        </button>
+      </div>
     </div>
   )
 }
@@ -1963,7 +2034,18 @@ function CellInspector(): JSX.Element {
             integer
           />
           <span className="text-muted text-[11px]">ms</span>
-          <span className="label">Transition</span>
+          <span
+            className="label"
+            title={
+              'Transition: per-cell glide time. When this cell triggers, the track\'s value glides linearly from its current value to this cell\'s value over `transitionMs` ms. Stopped cells glide back to 0 over the same duration.\n\n' +
+              'Relationship to Scene Morph (TransportBar):\n' +
+              '  - When Scene Morph is OFF (or its ms is 0), each cell uses its own Transition.\n' +
+              '  - When Scene Morph is ON, the morph time OVERRIDES every cell\'s Transition for that scene change.\n\n' +
+              'Set to 0 to snap instantly. The Timing section checkbox bypasses Delay + Transition entirely (treated as 0). Pinned slots ignore Transition -- they emit their captured value directly.'
+            }
+          >
+            Transition
+          </span>
           <BoundedNumberInput
             className="input"
             value={cell.transitionMs}

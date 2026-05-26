@@ -9,6 +9,9 @@ import type {
   FunctionParamNature,
   FunctionParamType,
   FunctionStreamMode,
+  GenerativeConfig,
+  GenerativeMode,
+  GenerativePoolSource,
   InstrumentFunction,
   InstrumentTemplate,
   MetaController,
@@ -30,11 +33,22 @@ import type {
   Track,
   TrackKind
 } from '@shared/types'
-import { META_KNOB_COUNT, META_MAX_DESTS } from '@shared/types'
+import {
+  GENERATIVE_AFFINITY_MAX,
+  GENERATIVE_AFFINITY_MIN,
+  GENERATIVE_DURATION_MAX_MS,
+  GENERATIVE_DURATION_MIN_MS,
+  META_KNOB_COUNT,
+  META_MAX_DESTS,
+  SCENE_WEIGHT_DEFAULT,
+  SCENE_WEIGHT_MAX,
+  SCENE_WEIGHT_MIN
+} from '@shared/types'
 import {
   DEFAULT_ARPEGGIATOR,
   DEFAULT_CHAOS,
   DEFAULT_ENVELOPE,
+  DEFAULT_GENERATIVE_CONFIG,
   DEFAULT_MODULATION,
   DEFAULT_RAMP,
   DEFAULT_RANDOM,
@@ -200,6 +214,17 @@ interface UiState {
     // itself (goMidi, morphTimeMidi) so they travel with the project file.
     | { kind: 'go' }
     | { kind: 'morphTime' }
+    // Generative Scene Sequencer (v0.5.10) learn targets. Bindings
+    // live on session.generative.{toggleMidi, noRepeatMidi,
+    // affinityMidi, minDurationMidi, maxDurationMidi, useMorphMidi,
+    // randomWeightsMidi}.
+    | { kind: 'generativeToggle' }
+    | { kind: 'generativeNoRepeat' }
+    | { kind: 'generativeAffinity' }
+    | { kind: 'generativeMinDuration' }
+    | { kind: 'generativeMaxDuration' }
+    | { kind: 'generativeUseMorph' }
+    | { kind: 'generativeRandomWeights' }
     | null
   // Theme is a UI preference, not saved in the session file.
   theme: ThemeName
@@ -634,6 +659,12 @@ interface Actions {
     patch: Partial<import('@shared/types').MidiOut> | null
   ) => void
   sendTrackDefaultsToClips: (id: string) => void
+  // Broadcast a single transitionMs value to every existing cell on
+  // the given track. v0.5.10 -- driven from the Parameter Inspector's
+  // new Default Transition box. Doesn't touch `cell.timingEnabled` so
+  // cells with Timing turned off keep their flag (they just remember
+  // the new value for when re-enabled).
+  broadcastTransitionMs: (trackId: string, transitionMs: number) => void
   // Toggle a track's "enabled" flag (default: enabled). When false,
   // the engine skips this track on any trigger path.
   setTrackEnabled: (id: string, enabled: boolean) => void
@@ -778,6 +809,13 @@ interface Actions {
       | { kind: 'instrument'; sceneId: string; templateRowId: string }
       | { kind: 'go' }
       | { kind: 'morphTime' }
+      | { kind: 'generativeToggle' }
+      | { kind: 'generativeNoRepeat' }
+      | { kind: 'generativeAffinity' }
+      | { kind: 'generativeMinDuration' }
+      | { kind: 'generativeMaxDuration' }
+      | { kind: 'generativeUseMorph' }
+      | { kind: 'generativeRandomWeights' }
       | null
   ) => void
   // Bind / clear an Instrument-group MIDI trigger on a specific
@@ -827,6 +865,37 @@ interface Actions {
   setAutoAdvanceArm: (v: boolean) => void
   setMorphEnabled: (v: boolean) => void
   setMorphMs: (ms: number) => void
+  // ── Generative Scene Sequencer (v0.5.10) ──────────────────────────
+  // Single-cell setters on session.generative. Each one clones the
+  // existing config (or seeds from DEFAULT_GENERATIVE_CONFIG when
+  // session.generative is missing — back-compat for v0.5.9 sessions
+  // loaded into v0.5.10) and writes the patched field. Preset writes
+  // also clear `mode` to 'custom' when the user tweaks something
+  // unrelated to the current preset's defaults (handled by
+  // `applyGenerativeMode`).
+  setGenerativeEnabled: (v: boolean) => void
+  setGenerativePoolSource: (src: GenerativePoolSource) => void
+  setSceneInPool: (sceneId: string, inPool: boolean) => void
+  selectAllScenesForPool: (inPool: boolean) => void
+  setGenerativeMode: (mode: GenerativeMode) => void
+  setGenerativeAffinity: (affinity: number) => void
+  setGenerativeNoRepeat: (v: boolean) => void
+  setGenerativeShuffleCycle: (v: boolean) => void
+  setGenerativeMinDurationMs: (ms: number) => void
+  setGenerativeMaxDurationMs: (ms: number) => void
+  setGenerativeUseMorph: (v: boolean) => void
+  setSceneWeight: (sceneId: string, weight: number) => void
+  rollRandomWeights: () => void
+  // MIDI binding setters (one per learnable control). Mirror the
+  // existing setGoMidi / setMorphTimeMidi pattern: pass undefined to
+  // clear, otherwise persist into session.generative.
+  setGenerativeToggleMidi: (b: MidiBinding | undefined) => void
+  setGenerativeNoRepeatMidi: (b: MidiBinding | undefined) => void
+  setGenerativeAffinityMidi: (b: MidiBinding | undefined) => void
+  setGenerativeMinDurationMidi: (b: MidiBinding | undefined) => void
+  setGenerativeMaxDurationMidi: (b: MidiBinding | undefined) => void
+  setGenerativeUseMorphMidi: (b: MidiBinding | undefined) => void
+  setRandomWeightsMidi: (b: MidiBinding | undefined) => void
   // Resolve the morph-ms that should apply when triggering `sceneId` right
   // now: per-scene override > transport > undefined. Exposed so call sites
   // (fireArmed, keyboard triggers, click triggers) all follow the same
@@ -969,6 +1038,39 @@ interface Actions {
 }
 
 type State = { session: Session } & UiState & Actions
+
+// Generative mode preset detector. The setGenerativeMode action
+// WRITES the underlying knobs (affinity, noRepeat, shuffleCycle) to
+// known values when the user picks Random / Drift / Surprise /
+// Shuffle. The individual knob setters call this to detect whether
+// the user's tweak keeps the existing preset's knob set intact (mode
+// label sticks) or drifts away from it (mode label flips to
+// 'custom'). Returns true if the candidate field=value combination
+// is consistent with the current mode's defaults.
+function matchesPresetMode(
+  cur: GenerativeConfig,
+  field: 'affinity' | 'noRepeat' | 'shuffleCycle',
+  value: number | boolean
+): boolean {
+  if (cur.mode === 'custom') return false
+  const presets: Record<
+    Exclude<GenerativeMode, 'custom'>,
+    { affinity: number; noRepeat: boolean; shuffleCycle: boolean }
+  > = {
+    random: { affinity: 0, noRepeat: true, shuffleCycle: false },
+    drift: { affinity: 80, noRepeat: true, shuffleCycle: false },
+    surprise: { affinity: -80, noRepeat: true, shuffleCycle: false },
+    shuffle: { affinity: 0, noRepeat: true, shuffleCycle: true }
+  }
+  const expected = presets[cur.mode]
+  // Build a hypothetical config with this field swapped in; compare.
+  const hyp = { ...cur, [field]: value }
+  return (
+    hyp.affinity === expected.affinity &&
+    hyp.noRepeat === expected.noRepeat &&
+    hyp.shuffleCycle === expected.shuffleCycle
+  )
+}
 
 const emptyEngineState: EngineState = {
   activeBySceneAndTrack: {},
@@ -2584,6 +2686,33 @@ export const useStore = create<State>((set, get) => ({
         }
       }
     }),
+  broadcastTransitionMs: (trackId, transitionMs) =>
+    set((st) => {
+      // Clamp to the legal range (0..10000 ms) so a hand-edited value
+      // can't push the engine outside its expected glide window. The
+      // round preserves the integer shape used elsewhere in the engine
+      // for transitionMs.
+      const clamped = Math.max(0, Math.min(10000, Math.round(transitionMs)))
+      return {
+        session: {
+          ...st.session,
+          scenes: st.session.scenes.map((sc) => {
+            const cell = sc.cells[trackId]
+            if (!cell) return sc
+            // Same value -- skip the clone to keep React's reference
+            // identity stable.
+            if (cell.transitionMs === clamped) return sc
+            return {
+              ...sc,
+              cells: {
+                ...sc.cells,
+                [trackId]: { ...cell, transitionMs: clamped }
+              }
+            }
+          })
+        }
+      }
+    }),
 
   addScene: () =>
     set((st) => {
@@ -3204,6 +3333,250 @@ export const useStore = create<State>((set, get) => ({
     if (!Number.isFinite(ms)) return
     set({ morphMs: Math.max(0, Math.min(300000, ms)) })
   },
+  // ── Generative Scene Sequencer actions ────────────────────────────
+  // All writers go through `patchGenerative` (defined inline) which
+  // seeds DEFAULT_GENERATIVE_CONFIG when session.generative is missing
+  // (back-compat with v0.5.9 sessions). After patching, the engine
+  // sync is automatic via the existing `session` -> `window.api`
+  // pipeline on the next update tick.
+  setGenerativeEnabled: (v) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, enabled: v }
+      }
+    })),
+  setGenerativePoolSource: (src) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, poolSource: src }
+      }
+    })),
+  setSceneInPool: (sceneId, inPool) =>
+    set((st) => {
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const nextExcluded = { ...cur.excluded }
+      // Sparse storage: only excluded scenes get an entry. Default
+      // (not excluded == in pool) is the absence of the key.
+      if (inPool) delete nextExcluded[sceneId]
+      else nextExcluded[sceneId] = true
+      return {
+        session: { ...st.session, generative: { ...cur, excluded: nextExcluded } }
+      }
+    }),
+  selectAllScenesForPool: (inPool) =>
+    set((st) => {
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const nextExcluded: Record<string, boolean> = {}
+      if (!inPool) {
+        for (const s of st.session.scenes) nextExcluded[s.id] = true
+      }
+      return {
+        session: { ...st.session, generative: { ...cur, excluded: nextExcluded } }
+      }
+    }),
+  setGenerativeMode: (mode) =>
+    set((st) => {
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      // Mode picker WRITES the underlying knobs to known values --
+      // it's a preset, not a separate code path. 'custom' is the only
+      // mode that leaves the knobs untouched (used as a label when
+      // the user has tweaked something away from a preset).
+      let patch: Partial<GenerativeConfig> = { mode }
+      if (mode === 'random')
+        patch = { mode, affinity: 0, noRepeat: true, shuffleCycle: false }
+      else if (mode === 'drift')
+        patch = { mode, affinity: 80, noRepeat: true, shuffleCycle: false }
+      else if (mode === 'surprise')
+        patch = { mode, affinity: -80, noRepeat: true, shuffleCycle: false }
+      else if (mode === 'shuffle')
+        patch = { mode, affinity: 0, noRepeat: true, shuffleCycle: true }
+      // 'custom' falls through with just { mode } so the user's
+      // already-tweaked knobs are preserved.
+      return {
+        session: { ...st.session, generative: { ...cur, ...patch } }
+      }
+    }),
+  setGenerativeAffinity: (affinity) =>
+    set((st) => {
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const clamped = Math.max(
+        GENERATIVE_AFFINITY_MIN,
+        Math.min(GENERATIVE_AFFINITY_MAX, affinity)
+      )
+      // Tweaking affinity away from a preset's value auto-switches
+      // mode label to 'custom' so the dropdown reflects reality.
+      const nextMode: GenerativeMode = matchesPresetMode(
+        cur,
+        'affinity',
+        clamped
+      )
+        ? cur.mode
+        : 'custom'
+      return {
+        session: {
+          ...st.session,
+          generative: { ...cur, affinity: clamped, mode: nextMode }
+        }
+      }
+    }),
+  setGenerativeNoRepeat: (v) =>
+    set((st) => {
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const nextMode: GenerativeMode = matchesPresetMode(cur, 'noRepeat', v)
+        ? cur.mode
+        : 'custom'
+      return {
+        session: {
+          ...st.session,
+          generative: { ...cur, noRepeat: v, mode: nextMode }
+        }
+      }
+    }),
+  setGenerativeShuffleCycle: (v) =>
+    set((st) => {
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const nextMode: GenerativeMode = matchesPresetMode(
+        cur,
+        'shuffleCycle',
+        v
+      )
+        ? cur.mode
+        : 'custom'
+      return {
+        session: {
+          ...st.session,
+          generative: { ...cur, shuffleCycle: v, mode: nextMode }
+        }
+      }
+    }),
+  setGenerativeMinDurationMs: (ms) =>
+    set((st) => {
+      if (!Number.isFinite(ms)) return st
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const clamped = Math.max(
+        GENERATIVE_DURATION_MIN_MS,
+        Math.min(GENERATIVE_DURATION_MAX_MS, Math.round(ms))
+      )
+      // Keep max >= min by bumping max up if the user pushes min past it.
+      const nextMax = Math.max(clamped, cur.maxDurationMs)
+      return {
+        session: {
+          ...st.session,
+          generative: { ...cur, minDurationMs: clamped, maxDurationMs: nextMax }
+        }
+      }
+    }),
+  setGenerativeMaxDurationMs: (ms) =>
+    set((st) => {
+      if (!Number.isFinite(ms)) return st
+      const cur = { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative }
+      const clamped = Math.max(
+        GENERATIVE_DURATION_MIN_MS,
+        Math.min(GENERATIVE_DURATION_MAX_MS, Math.round(ms))
+      )
+      // Keep min <= max by pulling min down if the user drags max
+      // below it.
+      const nextMin = Math.min(clamped, cur.minDurationMs)
+      return {
+        session: {
+          ...st.session,
+          generative: { ...cur, maxDurationMs: clamped, minDurationMs: nextMin }
+        }
+      }
+    }),
+  setGenerativeUseMorph: (v) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, useMorph: v }
+      }
+    })),
+  setSceneWeight: (sceneId, weight) =>
+    set((st) => {
+      if (!Number.isFinite(weight)) return st
+      const clamped = Math.max(
+        SCENE_WEIGHT_MIN,
+        Math.min(SCENE_WEIGHT_MAX, weight)
+      )
+      return {
+        session: {
+          ...st.session,
+          scenes: st.session.scenes.map((s) =>
+            s.id === sceneId ? { ...s, weight: clamped } : s
+          )
+        }
+      }
+    }),
+  rollRandomWeights: () =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        scenes: st.session.scenes.map((s) => ({
+          ...s,
+          // Uniform random in [SCENE_WEIGHT_MIN, SCENE_WEIGHT_MAX].
+          // Round to 1 decimal so the displayed value is readable
+          // and the user can tweak from there without micro-noise.
+          weight:
+            Math.round(
+              (SCENE_WEIGHT_MIN +
+                Math.random() * (SCENE_WEIGHT_MAX - SCENE_WEIGHT_MIN)) *
+                10
+            ) / 10
+        }))
+      }
+    })),
+  // MIDI bindings -- one shape, seven slots.
+  setGenerativeToggleMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, toggleMidi: b }
+      }
+    })),
+  setGenerativeNoRepeatMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, noRepeatMidi: b }
+      }
+    })),
+  setGenerativeAffinityMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, affinityMidi: b }
+      }
+    })),
+  setGenerativeMinDurationMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, minDurationMidi: b }
+      }
+    })),
+  setGenerativeMaxDurationMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, maxDurationMidi: b }
+      }
+    })),
+  setGenerativeUseMorphMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, useMorphMidi: b }
+      }
+    })),
+  setRandomWeightsMidi: (b) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        generative: { ...DEFAULT_GENERATIVE_CONFIG, ...st.session.generative, randomWeightsMidi: b }
+      }
+    })),
   resolveMorphMs: (sceneId) => {
     const st = get()
     const scene = st.session.scenes.find((s) => s.id === sceneId)
@@ -4314,6 +4687,12 @@ function propagateDefaults(s: Session): Session {
         typeof sc.morphInMs === 'number' && Number.isFinite(sc.morphInMs)
           ? Math.max(0, Math.min(300000, Math.floor(sc.morphInMs)))
           : undefined,
+      // Generative weight — clamp & default for v0.5.10. v0.5.9 sessions
+      // arrive with weight === undefined; treat that as the default.
+      weight:
+        typeof sc.weight === 'number' && Number.isFinite(sc.weight)
+          ? Math.max(SCENE_WEIGHT_MIN, Math.min(SCENE_WEIGHT_MAX, sc.weight))
+          : SCENE_WEIGHT_DEFAULT,
       midiTrigger: sanitizeMidiBinding(sc.midiTrigger),
       cells: Object.fromEntries(
         Object.entries(sc.cells).map(([tid, c]) => {
@@ -4496,7 +4875,88 @@ function propagateDefaults(s: Session): Session {
     // OSC forward targets — new in v0.5, defaults to empty list. Sanitize
     // each entry so a hand-edited session file with garbage values doesn't
     // crash the main-process listener.
-    forwardTargets: sanitizeForwardTargets(s.forwardTargets)
+    forwardTargets: sanitizeForwardTargets(s.forwardTargets),
+    // Generative Scene Sequencer (v0.5.10). Sanitize every field
+    // independently so a hand-edited or partially-malformed session
+    // can't introduce NaN ranges, out-of-bounds affinity, or
+    // unrecognized mode strings into the engine. Missing entirely =>
+    // seed from DEFAULT_GENERATIVE_CONFIG so older sessions load
+    // with the feature disabled (no behaviour change).
+    generative: sanitizeGenerativeConfig(s.generative)
+  }
+}
+
+// Sanitize the Generative Scene Sequencer config (v0.5.10). Pure
+// function. Accepts unknown JSON shape and produces a fully-typed
+// GenerativeConfig with every field clamped to its legal range.
+// Unknown / missing fields fall back to DEFAULT_GENERATIVE_CONFIG.
+// MIDI bindings go through sanitizeMidiBinding so a malformed
+// channel / number can't crash midi.ts at session load.
+function sanitizeGenerativeConfig(raw: unknown): GenerativeConfig {
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_GENERATIVE_CONFIG }
+  const r = raw as Partial<GenerativeConfig>
+  const validModes: GenerativeMode[] = [
+    'random',
+    'drift',
+    'surprise',
+    'shuffle',
+    'custom'
+  ]
+  const validSources: GenerativePoolSource[] = ['all', 'timeline']
+  const clampDuration = (n: unknown): number => {
+    if (typeof n !== 'number' || !Number.isFinite(n))
+      return DEFAULT_GENERATIVE_CONFIG.minDurationMs
+    return Math.max(
+      GENERATIVE_DURATION_MIN_MS,
+      Math.min(GENERATIVE_DURATION_MAX_MS, Math.round(n))
+    )
+  }
+  // Excluded map — keep only string keys with true values. Anything
+  // else gets dropped (sparse-by-design).
+  const rawExcluded = (r.excluded ?? {}) as Record<string, unknown>
+  const excluded: Record<string, boolean> = {}
+  for (const k of Object.keys(rawExcluded)) {
+    if (rawExcluded[k] === true) excluded[k] = true
+  }
+  const minMs = clampDuration(r.minDurationMs)
+  let maxMs = clampDuration(r.maxDurationMs ?? DEFAULT_GENERATIVE_CONFIG.maxDurationMs)
+  if (maxMs < minMs) maxMs = minMs
+  return {
+    enabled: r.enabled === true,
+    poolSource:
+      typeof r.poolSource === 'string' && validSources.includes(r.poolSource)
+        ? r.poolSource
+        : DEFAULT_GENERATIVE_CONFIG.poolSource,
+    excluded,
+    mode:
+      typeof r.mode === 'string' && validModes.includes(r.mode)
+        ? r.mode
+        : DEFAULT_GENERATIVE_CONFIG.mode,
+    affinity:
+      typeof r.affinity === 'number' && Number.isFinite(r.affinity)
+        ? Math.max(GENERATIVE_AFFINITY_MIN, Math.min(GENERATIVE_AFFINITY_MAX, r.affinity))
+        : DEFAULT_GENERATIVE_CONFIG.affinity,
+    noRepeat:
+      typeof r.noRepeat === 'boolean'
+        ? r.noRepeat
+        : DEFAULT_GENERATIVE_CONFIG.noRepeat,
+    shuffleCycle:
+      typeof r.shuffleCycle === 'boolean'
+        ? r.shuffleCycle
+        : DEFAULT_GENERATIVE_CONFIG.shuffleCycle,
+    minDurationMs: minMs,
+    maxDurationMs: maxMs,
+    useMorph:
+      typeof r.useMorph === 'boolean'
+        ? r.useMorph
+        : DEFAULT_GENERATIVE_CONFIG.useMorph,
+    toggleMidi: sanitizeMidiBinding(r.toggleMidi),
+    noRepeatMidi: sanitizeMidiBinding(r.noRepeatMidi),
+    affinityMidi: sanitizeMidiBinding(r.affinityMidi),
+    minDurationMidi: sanitizeMidiBinding(r.minDurationMidi),
+    maxDurationMidi: sanitizeMidiBinding(r.maxDurationMidi),
+    useMorphMidi: sanitizeMidiBinding(r.useMorphMidi),
+    randomWeightsMidi: sanitizeMidiBinding(r.randomWeightsMidi)
   }
 }
 

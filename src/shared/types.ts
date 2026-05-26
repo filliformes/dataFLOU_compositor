@@ -1354,6 +1354,14 @@ export interface Scene {
   // morph time if one is set at trigger time. Omitted = no per-scene
   // preference.
   morphInMs?: number
+  // Generative selection weight (v0.5.10). Used ONLY when the session's
+  // generative mode is on -- otherwise inert. Range SCENE_WEIGHT_MIN..
+  // SCENE_WEIGHT_MAX, default SCENE_WEIGHT_DEFAULT. A scene with
+  // weight 10 is 10x more likely to be picked than a scene with
+  // weight 1 (modified by Affinity bias + repetition penalty). The
+  // "Random Weights" button in the Generative popover rolls fresh
+  // weights into every scene at once.
+  weight?: number
   // Sparse: key is trackId. Missing = empty cell.
   cells: Record<string, Cell>
   // MIDI binding for triggering the whole scene.
@@ -1453,6 +1461,104 @@ export const META_BANK_COUNT = 4
 export const META_KNOBS_PER_BANK = 8
 export const META_MAX_DESTS = 8
 
+// ---- Generative Scene Sequencer (v0.5.10) ------------------------------
+// A session-level "shuffle button" for the scene timeline. When
+// `enabled === true`, the engine's auto-advance path bypasses each
+// scene's authored `nextMode` and instead picks a random next scene
+// from an eligible pool, with the picker shaped by Affinity, Weights,
+// and a few constraints. Manual triggers (Cue/GO, scene clicks, MIDI
+// scene triggers, keyboard 1-0 + Space) still use the scene's own
+// duration + nextMode -- only natural advances are diverted, so the
+// user can preempt the generative flow at any time.
+
+// Pool source: which scenes are eligible before the per-scene
+// `excluded` flags narrow it further.
+//   'all'      -- every scene in session.scenes (Spotify-shuffle the
+//                 whole library)
+//   'timeline' -- only scenes currently placed in session.sequence
+//                 (shuffle the songs you queued)
+export type GenerativePoolSource = 'all' | 'timeline'
+
+// Selection mode preset. The engine's selector reads the underlying
+// knobs (affinity, noRepeat, shuffleCycle) directly -- modes are UI
+// shortcuts that write those knobs to a known feel. 'custom' is the
+// auto-applied label when the user tweaks any knob away from the
+// preset's defaults.
+//   'random'   -- affinity=0, noRepeat=true, shuffleCycle=false
+//   'drift'    -- affinity=+80, noRepeat=true, shuffleCycle=false
+//                 (strong pull toward similar scenes)
+//   'surprise' -- affinity=-80, noRepeat=true, shuffleCycle=false
+//                 (strong pull toward dissimilar scenes)
+//   'shuffle'  -- affinity=0, noRepeat=true, shuffleCycle=true
+//                 (every scene once before any repeats)
+//   'custom'   -- knobs don't match any preset's exact values
+export type GenerativeMode =
+  | 'random'
+  | 'drift'
+  | 'surprise'
+  | 'shuffle'
+  | 'custom'
+
+export interface GenerativeConfig {
+  // Master toggle. Flipping this true diverts the engine's
+  // auto-advance into the generative selector.
+  enabled: boolean
+  poolSource: GenerativePoolSource
+  // Per-scene exclude flags. Default false (= in pool) for any scene
+  // not listed. Sparse storage keyed by sceneId, only entries that are
+  // true get persisted. The Generative popover's checklist writes
+  // here.
+  excluded: Record<string, boolean>
+  mode: GenerativeMode
+  // Bipolar similarity bias.
+  //   -100 = always pick most dissimilar (Contrast)
+  //      0 = ignore similarity (pure weighted random)
+  //   +100 = always pick most similar (Coherence)
+  // Engine maps |affinity|/100 to an exponent in [0, 4] applied to
+  // each candidate's similarity^exp, then negates the sign of the
+  // exponent for negative affinity (so Contrast picks the inverse).
+  affinity: number
+  // No immediate repeat hard constraint. Even with affinity = 0 this
+  // prevents back-to-back duplicates of the same scene (when the
+  // pool has more than one eligible scene).
+  noRepeat: boolean
+  // Shuffle Cycle: every scene plays once before any can repeat. The
+  // engine keeps a per-cycle "already played" set; resets when
+  // exhausted. Weights still bias which scene plays NEXT within the
+  // cycle, but every scene is guaranteed at least one play per cycle.
+  shuffleCycle: boolean
+  // Auto-advance duration range. Stored in milliseconds (matches the
+  // rest of the engine's time math). Engine rolls a fresh duration in
+  // [min, max] each time it auto-advances under generative mode.
+  minDurationMs: number // default 5000 (5 s)
+  maxDurationMs: number // default 600000 (10 min)
+  // When true, generative auto-advances pass the TransportBar's
+  // current morphMs through to triggerScene so transitions glide.
+  // When false, generative picks pass morphMs=0 (snap behavior)
+  // regardless of TransportBar.
+  useMorph: boolean
+  // MIDI Learn bindings. All seven are independently learnable via
+  // the existing L-hotkey + Learned-panel flow.
+  toggleMidi?: MidiBinding
+  noRepeatMidi?: MidiBinding
+  affinityMidi?: MidiBinding
+  minDurationMidi?: MidiBinding
+  maxDurationMidi?: MidiBinding
+  useMorphMidi?: MidiBinding
+  randomWeightsMidi?: MidiBinding
+}
+
+// Generative mode legal ranges -- imported by the engine + UI for
+// clamping. Exposed as constants so a future migration can widen them
+// without touching both ends of the codebase.
+export const GENERATIVE_DURATION_MIN_MS = 100
+export const GENERATIVE_DURATION_MAX_MS = 600000
+export const GENERATIVE_AFFINITY_MIN = -100
+export const GENERATIVE_AFFINITY_MAX = 100
+export const SCENE_WEIGHT_MIN = 1
+export const SCENE_WEIGHT_MAX = 10
+export const SCENE_WEIGHT_DEFAULT = 1
+
 export interface Session {
   version: 1
   name: string
@@ -1524,6 +1630,14 @@ export interface Session {
   hardwareState?: {
     caughtByTrack: Record<string, number[]>
   }
+  // Generative Scene Sequencer config (v0.5.10). When enabled, the
+  // engine's auto-advance path picks the next scene from a weighted
+  // pool instead of following each scene's authored nextMode. Manual
+  // triggers (Cue/GO, scene clicks, MIDI scene triggers, Space, 1-0)
+  // still play the scene at its authored duration -- only natural
+  // advances are diverted. Optional + back-compat: older sessions
+  // without this field default to disabled.
+  generative?: GenerativeConfig
 }
 
 // GUI layout snapshot saved with each session. Mirrors the

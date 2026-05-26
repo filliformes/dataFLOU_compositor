@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--059)
+- [Release notes](#release-notes--0510)
+  - [0.5.10](#release-notes--0510)
   - [0.5.9](#release-notes--059)
   - [0.5.8](#release-notes--058)
   - [0.5.7](#release-notes--057)
@@ -71,6 +72,7 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **Gesture modulator (v0.5.8)**: record an X/Y stream by dragging on a square surface in the Inspector and use it as a modulator. The polyline + a crayon-style cursor render LIVE while you draw (canvas pinned-centered so it doesn't shift). On playback the engine loops the captured curve at the modulator's standard Rate (Hz or BPM-synced), and a coloured **playhead dot** animates on the canvas at ~30 Hz so you SEE the curve being traced. Three **Play modes** (Forward / Backward / Ping-Pong), a **Wiggle** knob (0–100 %, sinusoidal back-and-forth jitter on the playhead - modulatable by Modulation 2 as the third "Shape" target), and an **Output** picker: `XY` (X → slot 0, Y → slot 1) or `Merged` (radial distance √(x² + y²)/√2 broadcast to every slot). Two-channel fan-out via `gestureChannelFor`.
 - **Two-stage modulator - Modulation 2 (v0.5.7, expanded v0.5.8 + v0.5.9)**: every clip carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode, Gesture Wiggle). **Every modulator type** is now usable as Modulation 2 (v0.5.8): LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random, Ramp, Arpeggiator (Gesture-as-Mod-2 reserved for a future revision). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value - Mod 2's modulation breathes around whatever you author. The orange "live" overlay tint is gated on Modulation 2 being enabled, so it doesn't fire when nothing is actually modulating. Mod 2 also gets its own Routing-matrix column for per-slot gating.
 - **Modulation 2 → Sequencer (v0.5.9)**: Modulation 2 now also has a parallel route into the cell's Sequencer (in addition to its existing route into Modulation 1). Inspector's Mod 2 section renders TWO Targets blocks: "Mod 1 Targets" and "Seq Targets". The Seq block's Shape label is mode-aware - Rotation for Euclidean, Seed for Density, Rule for Cellular, Ring A Length for Polyrhythm, Bias for Drift, Probability for Ratchet, Decay for Bounce. **Rate** targets bpm + stepMs; **Depth** universally targets the **Generative wildness slider** (`genAmount`) - making Modulation 2 → Sequencer a "calm ↔ chaotic" breathing source for generative sequencer modes. Routing matrix grows a new M2>S column next to M2>1.
+- **Generative Scene Sequencer (v0.5.10)**: a one-button shuffle for the scene timeline. Click GENERATIVE at the top of the Sequence view and the engine starts picking the next scene from a weighted pool with min/max duration windows, four selection-mode presets (**Random / Drift / Surprise / Shuffle**), a bipolar **Affinity** slider (-100 Contrast .. +100 Coherence) that biases toward similar or dissimilar scenes via an auto-computed multi-arg-aware scene similarity matrix, per-scene **Weight** (1-10) + a **Random Weights** button, a **Use Morph** toggle, and seven MIDI-learnable controls for hands-on stage use. Manual triggers (Cue/GO, scene clicks, Space, 1-0, MIDI scene triggers) still play the scene at its authored duration - only natural advances are diverted, so you keep precise manual control. Made for installations + live shows with generative input.
 - **Address sequencer Stage-2 sub-mode (v0.5.8)**: Address mode's third sub-mode is now wired: Modulation 2 drives the playhead address while Modulation 1 modulates the addressed step's value. Falls back to Modulation 1 driving the playhead if Modulation 2 is disabled on the cell.
 - **Hardware Mode (v0.5.5)**: drive any compositor cell's args from a physical OSC controller (Trill bars, MIDI-to-OSC bridges, anything streaming UDP). Per-Instrument-template config: bind to a discovered device, pick **Reset** or **Persist** catch-mode, set catch tolerance + movement threshold, optionally narrow to specific Track instances and specific arg slots. Soft-takeover: the hardware value only takes over once it matches the currently-emitted scene value (or persists across scene changes if you want it to). Movement detection skips static/idle packets. Caught arg values render **red** in the live cell of the currently-playing scene, with a pulsing red dot in the Track sidebar + "HW Mode On" badge under the Instrument. Toggle the same Hardware Mode block from either the Pool inspector OR the grid Instrument inspector - both write the same `template.hardwareMode` blob. **Session persistence (v0.5.7)**: the caught-slot map (per-track arg indices currently overridden by hardware) is saved with the session and restored on load, so a power-cycle no longer wipes which slots are bound.
 - **Strange Attractor modulator (v0.5.7)**: new modulator type drawing from 6 well-known chaotic ODEs: **Lorenz, Aizawa, Thomas, Rössler, Rössler-4D, Lü-4D**. Per-tick Euler integration with adaptive sub-steps + per-step `±200` clamps + NaN guards so high-Speed × high-Chaos never blows up. Three knobs: **Type, Speed, Chaos**. Each tick produces a bounded, correlated 3-channel (or 4-channel for 4D types) trajectory; multi-arg cells fan out as slot 0 = X, slot 1 = Y, slot 2 = Z, slot 3 = W (= speed for 3D types, native W for 4D). Live SVG visual previews the 2-D projection of the orbit. Mod 2's Rate target patches `attractor.speed`, not `rateHz`.
@@ -565,6 +567,61 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.5.10
+
+The big one for **Juin Generatif** (June 14 talk): a **Generative Scene Sequencer**. One button at the top of the Sequence view turns the entire scene timeline into a shuffle source - the engine picks each next scene from a weighted, similarity-aware pool with min/max duration windows, four selection-mode presets, and seven MIDI-learnable controls so you can drive the whole thing from a hardware controller during a live set or installation.
+
+### Generative Scene Sequencer
+
+Click **GENERATIVE** at the top of the Sequence view's Scenes column. The engine stops following each scene's authored Follow Action and starts picking the next scene randomly from a configurable pool. Manual triggers (Cue/GO, scene clicks, MIDI scene triggers, Space + 1-0 keys) still play the scene at its own duration - only natural advances are diverted - so you keep precise manual control whenever you want it.
+
+**Pool Source** dropdown:
+- **All scenes** (default) - every scene in the session is eligible (like Spotify shuffling your whole library).
+- **Timeline only** - only scenes currently placed in the timeline are eligible (shuffles just the songs you queued).
+
+A per-scene **checklist** in the popover narrows the pool further. Excluded scenes stay completely silent under generative mode but remain playable manually.
+
+**Selection Mode** presets (the dropdown writes a known combination of the underlying knobs - tweaking afterward auto-switches the label to **Custom** so the user can see what's been changed):
+- **Random** *(default)* - weight-biased random with No-Repeat. Affinity = 0.
+- **Drift** - Affinity = +80, strong pull toward similar scenes. Smooth gradual exploration.
+- **Surprise** - Affinity = -80, strong pull toward dissimilar scenes. Forces variety.
+- **Shuffle** - every scene plays once before any can repeat. Affinity = 0, cycle resets automatically.
+- **Custom** - the underlying knobs (Affinity, No-Repeat, Shuffle Cycle) have been tweaked away from any preset's defaults.
+
+**Affinity** slider (bipolar, -100..+100, default 0):
+- `-100 = Contrast` - always pick the most-dissimilar candidate scene.
+- `0 = Random` - similarity is ignored, pure weight-based pick.
+- `+100 = Coherence` - always pick the most-similar candidate scene.
+- Continuous in between: `|Affinity|/100` maps to an exponent in `[0, 4]` applied to each candidate's similarity (or `1 - similarity` when negative).
+
+**Scene similarity** is computed automatically. Each pair of scenes gets a 0..1 similarity score derived from cell-by-cell, token-by-token comparison: matched silence = 1.0; one cell active and the other not = 0.0; both active = element-wise normalized numeric distance across every numeric token in the cell's value string. **Multi-arg cells are handled element-wise** - a 4-arg OCTOCOSME cell is compared token-by-token to other 4-arg cells on the same track. Non-numeric tokens (like the `compositor` protocol prefix) are skipped. The matrix is sub-millisecond to compute for typical sessions and only rebuilds on session changes.
+
+**No immediate repeat** toggle (default ON, MIDI-learnable) - prevents back-to-back duplicates of the same scene.
+
+**Shuffle Cycle** toggle - every scene in the pool must play once before any can repeat. Automatically resets each cycle.
+
+**Min / Max scene duration** sliders + editable float boxes (default 5s and 600s, both MIDI CC learnable). Each time the engine auto-advances under generative mode, it rolls a fresh duration uniformly distributed in `[min, max]` and uses that instead of the scene's authored `durationSec`.
+
+**Use Morph** toggle (default ON) - when ON, generative auto-advances apply the current TransportBar morph time so transitions glide smoothly. When OFF, scenes snap.
+
+**Per-scene Weight** slider (1-10, default 1) lives in the Scene Inspector's Generative section. A scene with weight 10 is 10× more likely to be picked than a weight-1 scene. The **Random Weights** button in the Generative popover rolls fresh weights into every scene in one click (also MIDI-learnable - tap a pad mid-set for a one-shot reshuffle of the probability landscape).
+
+**Repetition penalty** - recent plays get their effective weight shrunk so the engine doesn't keep returning to scenes you've just heard. The history ring buffer holds the last 24 plays.
+
+**Reproducibility** - the selector is purely `Math.random()`-driven in v0.5.10. A future revision may add seeded RNG so a rehearsal can be replayed identically.
+
+**MIDI Learn** - all seven generative controls (Toggle / No-Repeat / Affinity / Min duration / Max duration / Use Morph / Random Weights) are independently learnable via the same `L`-hotkey + Learned-panel flow as scene triggers and Meta knobs. Affinity / Min / Max accept CC only (continuous). The four toggles + Random Weights accept either note or CC.
+
+### Per-track Default Transition broadcast
+
+In the grid-side Parameter Inspector (click a track header), a new **Default Transition** field with a **Send to all clips** button. Type a ms value, click the button, every cell on that row's `transitionMs` is updated at once. Doesn't touch each cell's `timingEnabled` flag, so cells with Timing turned off keep their state - they just remember the new value for when re-enabled.
+
+### Cell Inspector Transition tooltip
+
+Hover the **Transition** label in the Cell Inspector's Timing section for a short explanation of what Transition does, how it relates to Scene Morph, and the `timingEnabled` bypass. Long-awaited docs for a long-existing feature.
 
 ---
 

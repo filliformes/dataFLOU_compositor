@@ -177,6 +177,29 @@ class MidiManager {
         // notes so the user can keep trying with a knob/slider.
         if (binding.kind !== 'cc') return
         st.setMorphTimeMidi(binding)
+      } else if (target.kind === 'generativeToggle') {
+        // Toggle target accepts notes (pad) or CCs (button). Engine
+        // reads value > 0 in the fire path so it acts on press, not
+        // release.
+        st.setGenerativeToggleMidi(binding)
+      } else if (target.kind === 'generativeNoRepeat') {
+        st.setGenerativeNoRepeatMidi(binding)
+      } else if (target.kind === 'generativeUseMorph') {
+        st.setGenerativeUseMorphMidi(binding)
+      } else if (target.kind === 'generativeRandomWeights') {
+        // Random Weights is a momentary fire (any press rolls fresh
+        // weights). Accept either kind so a pad or button works.
+        st.setRandomWeightsMidi(binding)
+      } else if (target.kind === 'generativeAffinity') {
+        // Continuous slider -- only CCs make sense.
+        if (binding.kind !== 'cc') return
+        st.setGenerativeAffinityMidi(binding)
+      } else if (target.kind === 'generativeMinDuration') {
+        if (binding.kind !== 'cc') return
+        st.setGenerativeMinDurationMidi(binding)
+      } else if (target.kind === 'generativeMaxDuration') {
+        if (binding.kind !== 'cc') return
+        st.setGenerativeMaxDurationMidi(binding)
       }
       st.setMidiLearnTarget(null)
       return
@@ -220,6 +243,37 @@ class MidiManager {
         if (!st.morphEnabled) st.setMorphEnabled(true)
         return
       }
+      // ── Generative continuous-control CCs (v0.5.10) ──────────
+      // Affinity: 0..127 mapped linearly to -100..+100, with the
+      // midpoint snapping exactly to 0 (so a centred-knob controller
+      // gives "pure random" instead of slightly biased).
+      const gen = session.generative
+      if (gen?.affinityMidi && matches(gen.affinityMidi, binding)) {
+        // 0..127 -> -100..+100 with 64 snapping to 0.
+        let affinity: number
+        if (value === 64) affinity = 0
+        else affinity = Math.round(((value - 64) / 63) * 100)
+        st.setGenerativeAffinity(
+          Math.max(-100, Math.min(100, affinity))
+        )
+        return
+      }
+      if (gen?.minDurationMidi && matches(gen.minDurationMidi, binding)) {
+        // 0..127 -> [GENERATIVE_DURATION_MIN_MS, GENERATIVE_DURATION_MAX_MS].
+        // Use a quadratic curve so the bottom of the range has more
+        // resolution (5s precision in the first half, 5min..10min in
+        // the top half).
+        const t = value / 127
+        const ms = 100 + Math.round(t * t * (600000 - 100))
+        st.setGenerativeMinDurationMs(ms)
+        return
+      }
+      if (gen?.maxDurationMidi && matches(gen.maxDurationMidi, binding)) {
+        const t = value / 127
+        const ms = 100 + Math.round(t * t * (600000 - 100))
+        st.setGenerativeMaxDurationMs(ms)
+        return
+      }
     }
 
     // Triggers (scenes/cells) only fire on value > 0 so a CC's release edge
@@ -232,6 +286,29 @@ class MidiManager {
     if (session.goMidi && matches(session.goMidi, binding)) {
       if (st.armedSceneId) st.fireArmed()
       return
+    }
+
+    // ── Generative discrete-control bindings (v0.5.10) ─────────────
+    // Note/CC bindings on the toggles + Random Weights. Each fires
+    // on press (value > 0 is already gated above).
+    {
+      const gen = session.generative
+      if (gen?.toggleMidi && matches(gen.toggleMidi, binding)) {
+        st.setGenerativeEnabled(!(gen.enabled === true))
+        return
+      }
+      if (gen?.noRepeatMidi && matches(gen.noRepeatMidi, binding)) {
+        st.setGenerativeNoRepeat(!(gen.noRepeat === true))
+        return
+      }
+      if (gen?.useMorphMidi && matches(gen.useMorphMidi, binding)) {
+        st.setGenerativeUseMorph(!(gen.useMorph === true))
+        return
+      }
+      if (gen?.randomWeightsMidi && matches(gen.randomWeightsMidi, binding)) {
+        st.rollRandomWeights()
+        return
+      }
     }
 
     // Cell triggers first (per-clip binding).

@@ -4,6 +4,7 @@ import type {
   Cell,
   ChaosParams,
   EnvelopeParams,
+  GenerativeConfig,
   InstrumentFunction,
   InstrumentTemplate,
   MetaController,
@@ -23,7 +24,7 @@ import type {
   Session,
   Track
 } from './types'
-import { META_KNOB_COUNT } from './types'
+import { META_KNOB_COUNT, SCENE_WEIGHT_DEFAULT } from './types'
 
 export function uid(prefix = ''): string {
   return prefix + Math.random().toString(36).slice(2, 10)
@@ -1090,8 +1091,28 @@ export function makeScene(index: number): Scene {
     durationSec: 5,
     nextMode: 'stop',
     multiplicator: 1,
+    weight: SCENE_WEIGHT_DEFAULT,
     cells: {}
   }
+}
+
+// Default Generative Scene Sequencer config (v0.5.10). Off by default
+// so freshly-created or back-compat-loaded sessions keep the
+// pre-v0.5.10 follow-action behaviour. Pre-loaded with sensible
+// midstream settings -- 'random' preset, all scenes in pool, 5s..10min
+// duration window, morph ON -- so flipping the toggle "just works"
+// with no further config.
+export const DEFAULT_GENERATIVE_CONFIG: GenerativeConfig = {
+  enabled: false,
+  poolSource: 'all',
+  excluded: {},
+  mode: 'random',
+  affinity: 0,
+  noRepeat: true,
+  shuffleCycle: false,
+  minDurationMs: 5000,
+  maxDurationMs: 600000,
+  useMorph: true
 }
 
 // Plain orphan-Function track — what the old "Add Message" produced.
@@ -1879,7 +1900,8 @@ export function makeEmptySession(): Session {
     // global toggle is on.
     midiEnabled: true,
     metaController: makeMetaController(),
-    pool: { ...builtinPool, templates: [...builtinPool.templates, draftTpl] }
+    pool: { ...builtinPool, templates: [...builtinPool.templates, draftTpl] },
+    generative: { ...DEFAULT_GENERATIVE_CONFIG }
   }
   // Pre-populate a clip on the default scene for the child Parameter
   // row so the user has something to trigger immediately. The

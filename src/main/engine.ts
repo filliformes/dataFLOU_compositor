@@ -13,8 +13,30 @@
 //    triggers do NOT start the scene duration timer). After durationSec, nextMode
 //    picks the next scene (or off).
 
-import type { Cell, EngineState, LfoShape, Modulation, Scene, SequencerParams, Session } from '@shared/types'
-import { META_KNOB_COUNT, SCALE_INTERVALS } from '@shared/types'
+import type {
+  Cell,
+  EngineState,
+  GenerativeConfig,
+  LfoShape,
+  Modulation,
+  Scene,
+  SequencerParams,
+  Session,
+  Track
+} from '@shared/types'
+import {
+  META_KNOB_COUNT,
+  SCALE_INTERVALS,
+  SCENE_WEIGHT_DEFAULT,
+  SCENE_WEIGHT_MAX,
+  SCENE_WEIGHT_MIN
+} from '@shared/types'
+
+// Generative history ring buffer length. Caps the no-repeat memory
+// and the shuffle-cycle "already played" set. ~24 entries covers a
+// typical session's worth of scene plays without growing unbounded
+// during long installations.
+const GENERATIVE_HISTORY_LEN = 24
 import {
   advanceDrift,
   autoDetectOscArg,
@@ -969,6 +991,24 @@ export class SceneEngine {
   // packet. Recomputed on every `updateSession`.
   private hasAnyHardwareModeEnabled = false
 
+  // ── Generative Scene Sequencer state (v0.5.10) ───────────────────
+  // Ring of recently-played scene IDs (newest at end). Drives the
+  // repetition penalty + no-repeat constraint + shuffleCycle's
+  // "every scene once before any repeats" guarantee. Capped at
+  // GENERATIVE_HISTORY_LEN entries.
+  private generativeHistory: string[] = []
+  // Cached scene-similarity matrix. Sparse: only contains rows for
+  // scenes that have been queried since the last invalidation. Both
+  // axes index by sceneId. Lazily filled by selectGenerativeScene()
+  // when it needs `sim[currentSceneId]`. Invalidated wholesale on
+  // updateSession() when scenes / cells / tracks change (we don't
+  // attempt diff-based invalidation -- a session typically holds
+  // <100 scenes so a full rebuild is sub-millisecond).
+  private generativeSimilarity: Map<string, Map<string, number>> = new Map()
+  // True when the similarity matrix needs rebuilding. Set on
+  // updateSession when the session changes; cleared on first read.
+  private generativeSimDirty = true
+
   async start(): Promise<void> {
     await this.sender.start()
     this.startTicker()
@@ -1352,6 +1392,21 @@ export class SceneEngine {
     // emit lazy-open ports as needed.
     if (prevMidiEnabled !== next.midiEnabled) {
       this.midiSender.setEnabled(!!next.midiEnabled)
+    }
+    // Invalidate the generative similarity matrix on every session
+    // update. The matrix is sparse + lazily filled, so re-marking
+    // dirty is cheap; the rebuild happens at most once per natural
+    // advance (and only when generative mode is on). Avoids tracking
+    // per-cell change diffs.
+    this.generativeSimDirty = true
+    // Drop history entries for scenes that no longer exist so the
+    // no-repeat / shuffle-cycle constraints don't lock on phantom
+    // scene ids forever.
+    if (this.generativeHistory.length > 0) {
+      const sceneIdSet = new Set(next.scenes.map((s) => s.id))
+      this.generativeHistory = this.generativeHistory.filter((id) =>
+        sceneIdSet.has(id)
+      )
     }
     // Ensure per-track state exists for each track; drop stale.
     const keep = new Set(next.tracks.map((t) => t.id))
@@ -1903,7 +1958,17 @@ export class SceneEngine {
   // the scene is placed multiple times.
   triggerScene(
     sceneId: string,
-    opts?: { morphMs?: number; sourceSlotIdx?: number | null }
+    opts?: {
+      morphMs?: number
+      sourceSlotIdx?: number | null
+      // v0.5.10 -- when the generative selector picks this scene, it
+      // overrides the scene's authored durationSec for this play so
+      // the auto-advance timer respects the min/max duration window.
+      // Manual triggers (Cue/GO, scene clicks, MIDI, kbd, palette)
+      // never pass this -- they keep the scene's own duration so the
+      // user-precise trigger feels precise.
+      generativeDurationSec?: number
+    }
   ): void {
     if (!this.session) return
     const scene = this.session.scenes.find((s) => s.id === sceneId)
@@ -1962,11 +2027,21 @@ export class SceneEngine {
     // (palette / column / MIDI / cue triggers aren't tied to a slot).
     this.activeSequenceSlotIdx =
       typeof opts?.sourceSlotIdx === 'number' ? opts.sourceSlotIdx : null
-    this.armSceneAdvance(scene)
+    // Push to the Generative history ring buffer when generative mode
+    // is enabled. Tracks BOTH manual triggers AND auto-advances so
+    // the no-repeat / shuffle-cycle constraints respect every play,
+    // not just the selector's picks. Capped at GENERATIVE_HISTORY_LEN.
+    if (this.session.generative?.enabled === true) {
+      this.generativeHistory.push(sceneId)
+      while (this.generativeHistory.length > GENERATIVE_HISTORY_LEN) {
+        this.generativeHistory.shift()
+      }
+    }
+    this.armSceneAdvance(scene, opts?.generativeDurationSec)
     this.emitState()
   }
 
-  private armSceneAdvance(scene: Scene): void {
+  private armSceneAdvance(scene: Scene, generativeDurationSec?: number): void {
     this.clearSceneAdvance()
     // Capture the scene's id, NOT the scene object itself, so that edits
     // made while the duration timer is ticking (user changes nextMode,
@@ -1985,11 +2060,20 @@ export class SceneEngine {
       slotIdx !== null
         ? this.session?.sequenceSlotOverrides?.[slotIdx]
         : undefined
+    // Precedence (highest wins):
+    //   1. generativeDurationSec  (this play was picked by the
+    //      Generative selector -- rolled fresh from [min, max])
+    //   2. slot override          (per-slot duration set by the user
+    //      on the Sequence view)
+    //   3. scene's own durationSec
     const effectiveDuration =
-      slotOverride?.durationSec !== undefined &&
-      Number.isFinite(slotOverride.durationSec)
-        ? slotOverride.durationSec
-        : scene.durationSec
+      typeof generativeDurationSec === 'number' &&
+      Number.isFinite(generativeDurationSec)
+        ? generativeDurationSec
+        : slotOverride?.durationSec !== undefined &&
+            Number.isFinite(slotOverride.durationSec)
+          ? slotOverride.durationSec
+          : scene.durationSec
     this.sceneAdvanceTimer = setTimeout(() => {
       // Re-fetch the current version of this scene off the live session.
       const cur =
@@ -2053,8 +2137,279 @@ export class SceneEngine {
     }
   }
 
+  // ── Generative Scene Sequencer: similarity matrix lazy build ──────
+  // Walks every track × scene pair ONCE and fills the matrix. Cost is
+  // O(scenes^2 × tracks × avg-tokens-per-cell) -- typically <1 ms for
+  // a 30-scene × 30-track session. Only runs when the matrix is dirty
+  // AND the current advance actually needs a row (selector requests
+  // sim[currentSceneId]). Avoids rebuilding on every cell edit.
+  private ensureGenerativeSimilarity(): void {
+    if (!this.generativeSimDirty) return
+    if (!this.session) return
+    const scenes = this.session.scenes
+    const tracks = this.session.tracks
+    this.generativeSimilarity = new Map<string, Map<string, number>>()
+    // Pre-parse every (sceneId, trackId) -> token-vector so the
+    // pairwise loop reads from a cache instead of re-tokenizing the
+    // same cell string for every comparison.
+    const cellTokens = new Map<string, number[] | null>()
+    const cellActive = new Map<string, boolean>()
+    for (const sc of scenes) {
+      for (const tr of tracks) {
+        const key = `${sc.id}|${tr.id}`
+        const cell = sc.cells[tr.id]
+        if (!cell) {
+          cellActive.set(key, false)
+          cellTokens.set(key, null)
+          continue
+        }
+        const trimmed = cell.value.trim()
+        cellActive.set(key, trimmed.length > 0)
+        if (trimmed.length === 0) {
+          cellTokens.set(key, null)
+          continue
+        }
+        // Parse each whitespace-separated token. Non-numeric tokens
+        // (e.g. OCTOCOSME's `compositor` protocol prefix, or string
+        // labels) get filtered out via Number.isFinite -- they don't
+        // contribute to similarity arithmetic. The resulting vector
+        // may be empty if every token is non-numeric; that case is
+        // handled in cellSimilarityFromTokens.
+        const numeric: number[] = []
+        for (const tok of trimmed.split(/\s+/)) {
+          const n = parseFloat(tok)
+          if (Number.isFinite(n)) numeric.push(n)
+        }
+        cellTokens.set(key, numeric.length > 0 ? numeric : null)
+      }
+    }
+    // Fill the full symmetric matrix. sim[A][B] === sim[B][A] so we
+    // could halve the work, but the constant factor isn't worth the
+    // bookkeeping for sessions this small. Diagonal entry (A === B)
+    // is always 1.0.
+    for (const a of scenes) {
+      const row = new Map<string, number>()
+      for (const b of scenes) {
+        if (a.id === b.id) {
+          row.set(b.id, 1)
+          continue
+        }
+        let trackScoreSum = 0
+        let trackScoreCount = 0
+        for (const tr of tracks) {
+          const aActive = cellActive.get(`${a.id}|${tr.id}`) === true
+          const bActive = cellActive.get(`${b.id}|${tr.id}`) === true
+          if (!aActive && !bActive) {
+            trackScoreSum += 1 // matched silence
+            trackScoreCount += 1
+            continue
+          }
+          if (aActive !== bActive) {
+            trackScoreSum += 0 // one active, one not
+            trackScoreCount += 1
+            continue
+          }
+          // Both active -- compare token vectors element-wise.
+          const aTok = cellTokens.get(`${a.id}|${tr.id}`) ?? null
+          const bTok = cellTokens.get(`${b.id}|${tr.id}`) ?? null
+          trackScoreSum += cellSimilarityFromTokens(aTok, bTok)
+          trackScoreCount += 1
+        }
+        row.set(b.id, trackScoreCount > 0 ? trackScoreSum / trackScoreCount : 1)
+      }
+      this.generativeSimilarity.set(a.id, row)
+    }
+    this.generativeSimDirty = false
+  }
+
+  // ── Generative Scene Sequencer: pick the next scene ───────────────
+  // Returns the next scene id under generative mode, or null when the
+  // pool is empty (no eligible scenes). Reads:
+  //   - session.generative (config: pool source, mode/affinity knobs,
+  //     no-repeat, shuffleCycle, weights via scene.weight)
+  //   - generativeHistory (recent plays)
+  //   - generativeSimilarity (lazy-built when Affinity != 0)
+  private pickGenerativeScene(currentSceneId: string): string | null {
+    if (!this.session) return null
+    const cfg = this.session.generative
+    if (!cfg || !cfg.enabled) return null
+    // Build eligible pool: scenes that exist, not explicitly excluded,
+    // and (when poolSource === 'timeline') currently present in the
+    // sequence array. We materialize an array so we can iterate
+    // multiple times without rebuilding the filter.
+    let pool: Scene[] = this.session.scenes.filter(
+      (s) => cfg.excluded[s.id] !== true
+    )
+    if (cfg.poolSource === 'timeline') {
+      const inTimeline = new Set(
+        (this.session.sequence ?? []).filter(
+          (id): id is string => typeof id === 'string'
+        )
+      )
+      pool = pool.filter((s) => inTimeline.has(s.id))
+    }
+    if (pool.length === 0) return null
+    if (pool.length === 1) return pool[0].id
+    // No-immediate-repeat: drop the current scene from the pool when
+    // the toggle is on AND removing it still leaves at least one
+    // candidate. Lone-scene pools fall through (the user clearly
+    // wants the same scene every time).
+    let candidates = pool
+    if (cfg.noRepeat) {
+      const filtered = pool.filter((s) => s.id !== currentSceneId)
+      if (filtered.length > 0) candidates = filtered
+    }
+    // Shuffle Cycle: every scene in the eligible pool must play once
+    // before any repeat. Track the "already played this cycle" set
+    // by scanning generativeHistory back until we hit an entry NOT
+    // in the eligible pool (that's the marker of a previous cycle's
+    // end) OR we've covered the whole pool. Reset is automatic:
+    // when all eligible scenes are in the recent history, drop them
+    // all and start fresh.
+    if (cfg.shuffleCycle) {
+      const eligibleSet = new Set(candidates.map((s) => s.id))
+      const playedThisCycle = new Set<string>()
+      for (let i = this.generativeHistory.length - 1; i >= 0; i--) {
+        const id = this.generativeHistory[i]
+        if (!eligibleSet.has(id)) break
+        playedThisCycle.add(id)
+        // Stop once we've covered every eligible scene -- earlier
+        // history is from prior cycles and shouldn't constrain
+        // current picks.
+        if (playedThisCycle.size >= eligibleSet.size) break
+      }
+      if (playedThisCycle.size >= eligibleSet.size) {
+        // Cycle complete -- reset (allow every scene again).
+      } else {
+        const remaining = candidates.filter((s) => !playedThisCycle.has(s.id))
+        if (remaining.length > 0) candidates = remaining
+      }
+    }
+    if (candidates.length === 0) return null
+    if (candidates.length === 1) return candidates[0].id
+    // Compute affinity-biased weights. |affinity|/100 maps to an
+    // exponent in [0, 4] applied to similarity^exp. Positive
+    // affinity = bias toward similar (high sim values amplified);
+    // negative affinity = bias toward DISSIMILAR (we invert the
+    // similarity via 1 - sim). Affinity = 0 reduces to pure weight-
+    // based pick.
+    const affinity = cfg.affinity ?? 0
+    const exp = (Math.abs(affinity) / 100) * 4
+    let simRow: Map<string, number> | undefined
+    if (exp > 0) {
+      this.ensureGenerativeSimilarity()
+      simRow = this.generativeSimilarity.get(currentSceneId)
+    }
+    // Repetition penalty: each scene in the recent history (excluding
+    // the absolute newest, which the noRepeat clause already handled)
+    // gets a weight shrink proportional to its recency. The freshest
+    // history entries cut weight by 50%; older entries by less.
+    const recencyPenalty = new Map<string, number>()
+    const histLen = this.generativeHistory.length
+    for (let i = 0; i < histLen; i++) {
+      const id = this.generativeHistory[i]
+      // Newest entry (last in array) gets the strongest penalty.
+      const recency = (i + 1) / histLen // 0..1, newer = higher
+      const penalty = 0.5 * recency // newest: 0.5, oldest: ~0
+      const prev = recencyPenalty.get(id) ?? 0
+      // Stack penalty for repeat appearances: a scene that played
+      // twice in the history window gets BOTH penalties combined
+      // (capped at 0.95 so its weight never collapses entirely).
+      recencyPenalty.set(id, Math.min(0.95, prev + penalty))
+    }
+    const weights: number[] = new Array(candidates.length)
+    let totalWeight = 0
+    for (let i = 0; i < candidates.length; i++) {
+      const s = candidates[i]
+      // Base weight (1..10), clamped + defaulted for back-compat.
+      let w =
+        typeof s.weight === 'number' && Number.isFinite(s.weight)
+          ? Math.max(SCENE_WEIGHT_MIN, Math.min(SCENE_WEIGHT_MAX, s.weight))
+          : SCENE_WEIGHT_DEFAULT
+      // Affinity bias.
+      if (exp > 0 && simRow) {
+        const sim = simRow.get(s.id) ?? 0
+        const biased = affinity > 0 ? sim : 1 - sim
+        // Add a tiny floor (0.01) so an exactly-zero biased value
+        // doesn't permanently zero out the candidate -- the user
+        // still has a sliver of variety even at max affinity.
+        w *= Math.pow(biased + 0.01, exp)
+      }
+      // Repetition penalty.
+      const pen = recencyPenalty.get(s.id) ?? 0
+      w *= 1 - pen
+      // Floor to avoid totalWeight===0 in extreme cases.
+      if (!Number.isFinite(w) || w < 0) w = 0
+      weights[i] = w
+      totalWeight += w
+    }
+    if (totalWeight <= 0) {
+      // Every candidate ended up at weight 0 (extreme penalty +
+      // bias). Fall back to uniform random over candidates so we
+      // never return null when there ARE eligible scenes.
+      return candidates[Math.floor(Math.random() * candidates.length)].id
+    }
+    // Weighted random pick.
+    const target = Math.random() * totalWeight
+    let acc = 0
+    for (let i = 0; i < candidates.length; i++) {
+      acc += weights[i]
+      if (acc >= target) return candidates[i].id
+    }
+    // Floating-point fallthrough (shouldn't happen but be safe).
+    return candidates[candidates.length - 1].id
+  }
+
   private advanceScene(current: Scene, modeOverride?: Scene['nextMode']): void {
     if (!this.session) return
+    // ── Generative Scene Sequencer early-out (v0.5.10) ────────────
+    // When generative mode is on, bypass the linear follow-action
+    // switch entirely and let the selector pick the next scene from
+    // a weighted pool. Manual triggers (Cue/GO, scene clicks, MIDI
+    // scene triggers, keyboard 1-0/Space) STILL use the scene's own
+    // duration + nextMode -- those funnel through triggerScene() and
+    // never visit this method, so manual preempt works as before.
+    // EXCEPTION: a 'loop' modeOverride (per-slot Loop override on a
+    // sequence slot) still wins, so the user can pin a single slot
+    // to loop even under generative mode.
+    if (this.session.generative?.enabled === true && modeOverride !== 'loop') {
+      const pickedId = this.pickGenerativeScene(current.id)
+      if (pickedId) {
+        // Roll a fresh duration in [minSec, maxSec] for this play.
+        const cfg = this.session.generative
+        const minMs = Math.min(cfg.minDurationMs, cfg.maxDurationMs)
+        const maxMs = Math.max(cfg.minDurationMs, cfg.maxDurationMs)
+        const durMs = minMs + Math.random() * (maxMs - minMs)
+        // Honour Use Morph -- pass through transport morphMs when on,
+        // 0 (snap) when off. The renderer's "Use Morph" toggle is the
+        // single source of truth; the engine just opts in or out.
+        const opts: {
+          morphMs?: number
+          sourceSlotIdx?: number | null
+          generativeDurationSec?: number
+        } = { generativeDurationSec: durMs / 1000 }
+        if (cfg.useMorph) {
+          // Read morphMs from the session-level transport-morph
+          // binding only when set. The renderer doesn't currently
+          // mirror its UI-only morphMs into the session, so for v1
+          // we rely on a per-scene morphInMs OR fall back to a
+          // sensible default (1500 ms) when useMorph is on. Future
+          // work: surface a transport.morphMs field on Session so
+          // the engine can read it directly.
+          const morphIn =
+            this.session.scenes.find((s) => s.id === pickedId)?.morphInMs
+          opts.morphMs = typeof morphIn === 'number' ? morphIn : 1500
+        } else {
+          opts.morphMs = 0
+        }
+        this.triggerScene(pickedId, opts)
+        return
+      }
+      // Selector returned null (empty pool, paused, etc.) -- fall
+      // through to Stop so the engine doesn't drone indefinitely.
+      this.stopScene(current.id)
+      return
+    }
     // Use the slot's override nextMode if armSceneAdvance passed one;
     // otherwise fall back to the scene's own nextMode. Lets per-slot
     // overrides redirect playback differently for each placement of
@@ -5584,6 +5939,39 @@ function applyMod2ToMod1(
 //            user a generative-wildness modulator -- swing genAmount
 //            from 0 to 100 with an LFO for "calm/chaotic" breathing.
 //
+// Compare two numeric-token vectors and return a similarity score
+// in [0, 1]. Used by the Generative Scene Sequencer's scene-pair
+// similarity computation. Both inputs are pre-parsed numeric arrays
+// (non-numeric tokens like 'compositor' have already been stripped
+// upstream). Either side can be null when the cell had no numeric
+// content; in that case we treat them as "matched non-numerics" and
+// return 1.0 (vacuous match).
+//
+// The metric is symmetric element-wise normalized absolute
+// difference: per token, 1 - |va - vb| / max(1, |va| + |vb|) -- a
+// scale-aware difference that's robust to whether the values are
+// 0..1, 0..127, or 60..127. Padding: when vectors differ in length,
+// the shorter one is treated as zeros for the missing tail. That
+// makes a 1-arg cell more similar to a 1-arg cell than to a 4-arg
+// cell, which is the musical intuition we want.
+function cellSimilarityFromTokens(
+  a: number[] | null,
+  b: number[] | null
+): number {
+  if (a === null && b === null) return 1
+  if (a === null || b === null) return 0
+  const n = Math.max(a.length, b.length)
+  if (n === 0) return 1
+  let sum = 0
+  for (let i = 0; i < n; i++) {
+    const va = a[i] ?? 0
+    const vb = b[i] ?? 0
+    const norm = Math.max(1, Math.abs(va) + Math.abs(vb))
+    sum += 1 - Math.abs(va - vb) / norm
+  }
+  return sum / n
+}
+
 // Returns the same SequencerParams object reference when no target
 // is enabled (cheap no-op when the user hasn't checked any box).
 function applyMod2ToSeq(

@@ -290,6 +290,13 @@ type LearnedBinding = {
     | { kind: 'instrument'; sceneId: string; templateRowId: string }
     | { kind: 'go' }
     | { kind: 'morphTime' }
+    | { kind: 'generativeToggle' }
+    | { kind: 'generativeNoRepeat' }
+    | { kind: 'generativeAffinity' }
+    | { kind: 'generativeMinDuration' }
+    | { kind: 'generativeMaxDuration' }
+    | { kind: 'generativeUseMorph' }
+    | { kind: 'generativeRandomWeights' }
     | null
   onDelete: () => void
   // Apply a manually-edited binding (note/CC number and channel can
@@ -324,6 +331,14 @@ function collectLearnedBindings(
     setGoMidi: (b: MidiBinding | undefined) => void
     setMorphTimeMidi: (b: MidiBinding | undefined) => void
     setMetaKnobMidi: (knobIdx: number, binding: MidiBinding | null) => void
+    // Generative Scene Sequencer setters (v0.5.10).
+    setGenerativeToggleMidi: (b: MidiBinding | undefined) => void
+    setGenerativeNoRepeatMidi: (b: MidiBinding | undefined) => void
+    setGenerativeAffinityMidi: (b: MidiBinding | undefined) => void
+    setGenerativeMinDurationMidi: (b: MidiBinding | undefined) => void
+    setGenerativeMaxDurationMidi: (b: MidiBinding | undefined) => void
+    setGenerativeUseMorphMidi: (b: MidiBinding | undefined) => void
+    setRandomWeightsMidi: (b: MidiBinding | undefined) => void
   }
 ): LearnedBinding[] {
   const out: LearnedBinding[] = []
@@ -348,6 +363,86 @@ function collectLearnedBindings(
       editTarget: { kind: 'morphTime' },
       onDelete: () => store.setMorphTimeMidi(undefined),
       onUpdate: (next) => store.setMorphTimeMidi(next)
+    })
+  }
+  // Generative Scene Sequencer bindings (v0.5.10). All seven slots
+  // live on session.generative; emit a row for each one that's set.
+  const gen = session.generative
+  if (gen?.toggleMidi) {
+    out.push({
+      id: 'gen-toggle',
+      label: 'Generative on/off',
+      source: 'Generative',
+      binding: gen.toggleMidi,
+      editTarget: { kind: 'generativeToggle' },
+      onDelete: () => store.setGenerativeToggleMidi(undefined),
+      onUpdate: (next) => store.setGenerativeToggleMidi(next)
+    })
+  }
+  if (gen?.noRepeatMidi) {
+    out.push({
+      id: 'gen-no-repeat',
+      label: 'No-repeat',
+      source: 'Generative',
+      binding: gen.noRepeatMidi,
+      editTarget: { kind: 'generativeNoRepeat' },
+      onDelete: () => store.setGenerativeNoRepeatMidi(undefined),
+      onUpdate: (next) => store.setGenerativeNoRepeatMidi(next)
+    })
+  }
+  if (gen?.affinityMidi) {
+    out.push({
+      id: 'gen-affinity',
+      label: 'Affinity',
+      source: 'Generative',
+      binding: gen.affinityMidi,
+      editTarget: { kind: 'generativeAffinity' },
+      onDelete: () => store.setGenerativeAffinityMidi(undefined),
+      onUpdate: (next) => store.setGenerativeAffinityMidi(next)
+    })
+  }
+  if (gen?.minDurationMidi) {
+    out.push({
+      id: 'gen-min-dur',
+      label: 'Min duration',
+      source: 'Generative',
+      binding: gen.minDurationMidi,
+      editTarget: { kind: 'generativeMinDuration' },
+      onDelete: () => store.setGenerativeMinDurationMidi(undefined),
+      onUpdate: (next) => store.setGenerativeMinDurationMidi(next)
+    })
+  }
+  if (gen?.maxDurationMidi) {
+    out.push({
+      id: 'gen-max-dur',
+      label: 'Max duration',
+      source: 'Generative',
+      binding: gen.maxDurationMidi,
+      editTarget: { kind: 'generativeMaxDuration' },
+      onDelete: () => store.setGenerativeMaxDurationMidi(undefined),
+      onUpdate: (next) => store.setGenerativeMaxDurationMidi(next)
+    })
+  }
+  if (gen?.useMorphMidi) {
+    out.push({
+      id: 'gen-use-morph',
+      label: 'Use Morph',
+      source: 'Generative',
+      binding: gen.useMorphMidi,
+      editTarget: { kind: 'generativeUseMorph' },
+      onDelete: () => store.setGenerativeUseMorphMidi(undefined),
+      onUpdate: (next) => store.setGenerativeUseMorphMidi(next)
+    })
+  }
+  if (gen?.randomWeightsMidi) {
+    out.push({
+      id: 'gen-random-weights',
+      label: 'Random Weights',
+      source: 'Generative',
+      binding: gen.randomWeightsMidi,
+      editTarget: { kind: 'generativeRandomWeights' },
+      onDelete: () => store.setRandomWeightsMidi(undefined),
+      onUpdate: (next) => store.setRandomWeightsMidi(next)
     })
   }
   // Meta knobs.
@@ -650,6 +745,18 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   const setGoMidi = useStore((s) => s.setGoMidi)
   const setMorphTimeMidi = useStore((s) => s.setMorphTimeMidi)
   const setMetaKnobMidi = useStore((s) => s.setMetaKnobMidi)
+  // Generative Scene Sequencer MIDI setters (v0.5.10).
+  const setGenerativeToggleMidi = useStore((s) => s.setGenerativeToggleMidi)
+  const setGenerativeNoRepeatMidi = useStore((s) => s.setGenerativeNoRepeatMidi)
+  const setGenerativeAffinityMidi = useStore((s) => s.setGenerativeAffinityMidi)
+  const setGenerativeMinDurationMidi = useStore(
+    (s) => s.setGenerativeMinDurationMidi
+  )
+  const setGenerativeMaxDurationMidi = useStore(
+    (s) => s.setGenerativeMaxDurationMidi
+  )
+  const setGenerativeUseMorphMidi = useStore((s) => s.setGenerativeUseMorphMidi)
+  const setRandomWeightsMidi = useStore((s) => s.setRandomWeightsMidi)
   const [learnedColPx, setLearnedColPxState] = useState<number>(() =>
     loadLearnedColPx()
   )
@@ -688,7 +795,14 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
         updateCellStore(sceneId, trackId, patch),
       setGoMidi: (b) => setGoMidi(b),
       setMorphTimeMidi: (b) => setMorphTimeMidi(b),
-      setMetaKnobMidi: (knobIdx, b) => setMetaKnobMidi(knobIdx, b)
+      setMetaKnobMidi: (knobIdx, b) => setMetaKnobMidi(knobIdx, b),
+      setGenerativeToggleMidi: (b) => setGenerativeToggleMidi(b),
+      setGenerativeNoRepeatMidi: (b) => setGenerativeNoRepeatMidi(b),
+      setGenerativeAffinityMidi: (b) => setGenerativeAffinityMidi(b),
+      setGenerativeMinDurationMidi: (b) => setGenerativeMinDurationMidi(b),
+      setGenerativeMaxDurationMidi: (b) => setGenerativeMaxDurationMidi(b),
+      setGenerativeUseMorphMidi: (b) => setGenerativeUseMorphMidi(b),
+      setRandomWeightsMidi: (b) => setRandomWeightsMidi(b)
     })
   }, [
     session,
@@ -697,7 +811,14 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
     updateCellStore,
     setGoMidi,
     setMorphTimeMidi,
-    setMetaKnobMidi
+    setMetaKnobMidi,
+    setGenerativeToggleMidi,
+    setGenerativeNoRepeatMidi,
+    setGenerativeAffinityMidi,
+    setGenerativeMinDurationMidi,
+    setGenerativeMaxDurationMidi,
+    setGenerativeUseMorphMidi,
+    setRandomWeightsMidi
   ])
   // Buffers live at module scope (top of this file) so closing +
   // reopening the drawer keeps the captured history visible. We just

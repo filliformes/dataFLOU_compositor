@@ -24,6 +24,7 @@ import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import type { NextMode, Scene } from '@shared/types'
 import { ResizeHandle } from './ResizeHandle'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { GenerativeButton } from './GenerativePopover'
 import {
   POOL_SAVED_SCENE_DRAG_MIME,
   type PoolSavedSceneDragPayload
@@ -308,6 +309,10 @@ export default function SequenceView(): JSX.Element {
             className="shrink-0 bg-panel border-r border-border flex flex-col relative"
             style={{ width: paletteWidth }}
           >
+            {/* Generative Scene Sequencer toggle + settings popover
+                (v0.5.10). Sits ABOVE the Scenes toolbar so it reads as
+                a session-level mode switch, not a "Scenes" action. */}
+            <GenerativeButton />
             <div className="px-2 py-2 border-b border-border shrink-0 flex items-center gap-2">
               <span className="label flex-1 truncate">Scenes ({scenes.length})</span>
               {/* + Silence: a regular scene with no cells (no OSC fires)
@@ -1342,10 +1347,67 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
         </span>
       </div>
 
+      {/* Generative section (v0.5.10) — per-scene Weight slider used
+          by the Generative Scene Sequencer. Inert when Generative
+          mode is off; documented in the tooltip. The Random Weights
+          button in the Generative popover rolls fresh weights into
+          every scene at once. */}
+      <SceneGenerativeSection scene={scene} />
+
       <div className="flex items-center gap-2 text-[11px] text-muted">
         <span>Tip: switch to the Edit view (Tab) to edit this scene's clips.</span>
       </div>
     </fieldset>
+  )
+}
+
+// Per-scene Generative settings. Reads scene.weight, writes via
+// store.setSceneWeight. Slider + editable number box pattern matches
+// the Min/Max in the Generative popover.
+function SceneGenerativeSection({ scene }: { scene: Scene }): JSX.Element {
+  const setSceneWeight = useStore((s) => s.setSceneWeight)
+  const generativeEnabled = useStore(
+    (s) => s.session.generative?.enabled === true
+  )
+  const weight = typeof scene.weight === 'number' ? scene.weight : 1
+  return (
+    <div className="flex flex-col gap-1 border-t border-border pt-2">
+      <div className="flex items-center justify-between">
+        <span
+          className="label"
+          title={
+            'Generative Weight (v0.5.10): how often the Generative Scene Sequencer picks this scene relative to others.\n' +
+            '  1  = baseline (default)\n' +
+            ' 10 = ten times more likely than a weight-1 scene\n\n' +
+            'Inert when Generative mode is off. Use the Random Weights button in the Generative popover to roll fresh weights into every scene at once.'
+          }
+        >
+          Generative Weight
+        </span>
+        {!generativeEnabled && (
+          <span className="text-muted text-[9px] italic">(Generative off)</span>
+        )}
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="range"
+          min={1}
+          max={10}
+          step={0.1}
+          value={weight}
+          onChange={(e) => setSceneWeight(scene.id, parseFloat(e.target.value))}
+          className="flex-1"
+        />
+        <BoundedNumberInput
+          className="input w-14 text-[11px] py-0 text-center tabular-nums"
+          value={weight}
+          onChange={(v) => setSceneWeight(scene.id, v)}
+          min={1}
+          max={10}
+          step={0.1}
+        />
+      </div>
+    </div>
   )
 }
 
