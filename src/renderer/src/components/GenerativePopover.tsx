@@ -82,46 +82,28 @@ function useArmLearn(
   }
 }
 
-// Persisted popover position (localStorage). Saved on drag-end so a
-// reload restores the window where the user last parked it. null /
-// missing = "anchor below the button row" (default first-open
-// behaviour). Stored as JSON {x, y}.
-const POPOVER_POS_KEY = 'dataflou.generativePopoverPos'
-function loadPopoverPos(): { x: number; y: number } | null {
-  try {
-    const raw = localStorage.getItem(POPOVER_POS_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as unknown
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as { x: unknown }).x === 'number' &&
-      typeof (parsed as { y: unknown }).y === 'number'
-    ) {
-      return parsed as { x: number; y: number }
-    }
-  } catch {
-    /* ignore malformed JSON or no localStorage */
-  }
-  return null
-}
-function savePopoverPos(p: { x: number; y: number }): void {
-  try {
-    localStorage.setItem(POPOVER_POS_KEY, JSON.stringify(p))
-  } catch {
-    /* ignore localStorage failures */
-  }
+// One-time cleanup: nuke any persisted popover position from
+// earlier v0.5.10 builds (we used to save drag-end positions to
+// localStorage; the new behaviour re-centers on every open, so
+// any stale saved position would just override the centering).
+// Safe to drop entirely after a few releases.
+try {
+  localStorage.removeItem('dataflou.generativePopoverPos')
+} catch {
+  /* ignore (no localStorage / quota / privacy mode) */
 }
 
-// Standalone GENERATIVE pill button + adjacent chevron. The pill
-// toggles the master flag; the chevron opens the popover. Pill has
-// a live dot indicator (off / on / active-playing) and is itself
-// MIDI-learnable via right-click.
-//
-// Popover open state lives in the store (UI-only, not persisted with
-// the session) so the global G hotkey in App.tsx can toggle it from
-// anywhere. Popover position is persisted in localStorage so the
-// user's chosen drag spot survives a reload.
+// Fixed width for the popover. Height is content-driven (the body
+// is overflow:auto with a maxHeight cap), so we can't predict it
+// up-front -- which is why the centered default uses CSS-based
+// transform centering instead of pixel math.
+const POPOVER_WIDTH = 340
+
+// Standalone GENERATIVE pill button + adjacent chevron. Lives at the
+// top of the Sequence view's Scene column. The pill toggles the
+// master flag; the chevron opens the popover (which is now hosted
+// at App level by GenerativePopoverHost, so it works in Grid view
+// too). Pill is itself MIDI-learnable via right-click.
 export function GenerativeButton(): JSX.Element {
   const gen = useStore(
     (s) => s.session.generative ?? DEFAULT_GENERATIVE_CONFIG
@@ -129,111 +111,12 @@ export function GenerativeButton(): JSX.Element {
   const setEnabled = useStore((s) => s.setGenerativeEnabled)
   const open = useStore((s) => s.generativePopoverOpen)
   const setOpen = useStore((s) => s.setGenerativePopoverOpen)
-  const buttonRowRef = useRef<HTMLDivElement | null>(null)
-  const popoverRef = useRef<HTMLDivElement | null>(null)
-  // Position state. null = "use the button-row anchor" (first open
-  // after fresh app load with no saved pos, OR after the user
-  // explicitly resets via the Reset button in the title bar). Set to
-  // a {x, y} via drag or by restoring from localStorage on first
-  // mount.
-  const [position, setPosition] = useState<{ x: number; y: number } | null>(
-    () => loadPopoverPos()
-  )
-  const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null)
-  // Drag state. While dragging, every mousemove updates `position`.
-  // Captures the offset between the cursor and the popover's
-  // top-left so the popover follows the cursor naturally instead of
-  // jumping to position the corner at the cursor.
-  const dragRef = useRef<{ dx: number; dy: number } | null>(null)
-
-  // Compute the button-anchor on open + on window resize -- used
-  // ONLY when `position` is null (first-time or after Reset).
-  useEffect(() => {
-    if (!open || !buttonRowRef.current) return
-    if (position !== null) return // user has dragged -- skip auto-anchor
-    const update = (): void => {
-      const rect = buttonRowRef.current!.getBoundingClientRect()
-      setAnchor({ x: rect.left, y: rect.bottom + 4 })
-    }
-    update()
-    window.addEventListener('resize', update)
-    return () => window.removeEventListener('resize', update)
-  }, [open, position])
-
-  // Click-outside + Escape to close. The G hotkey also toggles via
-  // setOpen; we intentionally don't intercept it here so the
-  // App-level handler stays the single source of truth.
-  useEffect(() => {
-    if (!open) return
-    function onDown(e: MouseEvent): void {
-      const t = e.target as Node | null
-      if (!t) return
-      if (buttonRowRef.current?.contains(t)) return
-      if (popoverRef.current?.contains(t)) return
-      setOpen(false)
-    }
-    function onKey(e: KeyboardEvent): void {
-      if (e.key === 'Escape') setOpen(false)
-    }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [open, setOpen])
-
-  // Drag handlers. Installed only while dragging so we don't pay for
-  // a global mousemove listener when the popover is idle.
-  useEffect(() => {
-    if (!dragRef.current) return
-    function onMove(e: MouseEvent): void {
-      if (!dragRef.current) return
-      // Clamp to keep the popover at least partially on-screen
-      // (16px margin) so it can't be dragged completely off the
-      // edge into oblivion.
-      const w = popoverRef.current?.offsetWidth ?? 340
-      const h = popoverRef.current?.offsetHeight ?? 200
-      const maxX = window.innerWidth - 32
-      const maxY = window.innerHeight - 32
-      const x = Math.max(-(w - 32), Math.min(maxX, e.clientX - dragRef.current.dx))
-      const y = Math.max(8, Math.min(maxY, e.clientY - dragRef.current.dy))
-      setPosition({ x, y })
-    }
-    function onUp(): void {
-      // Persist final position so a reload puts the window back
-      // where the user dropped it.
-      if (popoverRef.current) {
-        const rect = popoverRef.current.getBoundingClientRect()
-        savePopoverPos({ x: rect.left, y: rect.top })
-      }
-      dragRef.current = null
-      // Force a re-render so the effect cleanup fires and removes
-      // the listeners until the next drag.
-      setPosition((p) => (p ? { ...p } : null))
-    }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
-    return () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
-    }
-    // Re-run when position changes only to capture the post-drag
-    // listener cleanup; dragRef.current presence gates the effect.
-  }, [position])
-
   const toggleLearn = useArmLearn('generativeToggle')
   const dotColor = gen.enabled
-    ? 'rgb(var(--c-accent))'
+    ? '#ffffff'
     : 'rgb(var(--c-muted) / 0.4)'
-  // Final on-screen position: persisted/dragged position wins;
-  // anchor is the fallback for first-open with no saved pos.
-  const effectivePos = position ?? anchor
   return (
-    <div
-      ref={buttonRowRef}
-      className="px-2 py-1.5 border-b border-border shrink-0 flex items-center gap-1"
-    >
+    <div className="px-2 py-1.5 border-b border-border shrink-0 flex items-center gap-1">
       <button
         className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded border text-[11px] font-semibold tracking-wider uppercase transition-colors ${
           gen.enabled
@@ -267,85 +150,189 @@ export function GenerativeButton(): JSX.Element {
       >
         ▾
       </button>
-      {open &&
-        effectivePos &&
-        createPortal(
-          <div
-            ref={popoverRef}
-            className="fixed z-50 bg-panel border border-border rounded shadow-lg text-[11px] flex flex-col"
-            style={{
-              left: Math.max(8, effectivePos.x),
-              top: effectivePos.y,
-              width: 340,
-              maxHeight: 'calc(100vh - 80px)'
-            }}
-          >
-            {/* Drag handle / title bar. Pressing here starts a drag;
-                the close + reset buttons stop the mousedown from
-                bubbling so they don't accidentally start a drag. */}
-            <div
-              className="flex items-center justify-between px-3 py-1.5 border-b border-border bg-panel2 rounded-t cursor-move select-none"
-              onMouseDown={(e) => {
-                if (e.button !== 0) return
-                const rect = popoverRef.current?.getBoundingClientRect()
-                if (!rect) return
-                dragRef.current = {
-                  dx: e.clientX - rect.left,
-                  dy: e.clientY - rect.top
-                }
-                // Seed position so the drag handler has a valid
-                // starting point (avoid undefined offset math when
-                // position was null and the popover was rendered
-                // via the auto-anchor).
-                setPosition({ x: rect.left, y: rect.top })
-              }}
-              title="Drag to move. Right-click the X to reset to the default position next to the button."
-            >
-              <span className="font-semibold text-[12px]">
-                Generative Settings
-              </span>
-              <div className="flex items-center gap-1">
-                <button
-                  className="text-muted hover:text-text text-[10px] px-1"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    // Right-click on X would also fire onClick on
-                    // some browsers; the second binding (oncontext)
-                    // handles the reset explicitly.
-                  }}
-                  onContextMenu={(e) => {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    setPosition(null)
-                    try {
-                      localStorage.removeItem(POPOVER_POS_KEY)
-                    } catch {
-                      /* ignore */
-                    }
-                  }}
-                  title="Right-click to reset position to default (next to the GENERATIVE button)"
-                >
-                  ⟲
-                </button>
-                <button
-                  className="text-muted hover:text-text text-[12px] px-1"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={() => setOpen(false)}
-                  title="Close (Esc or G)"
-                  aria-label="Close"
-                >
-                  ✕
-                </button>
-              </div>
-            </div>
-            <div className="p-3 flex flex-col gap-2.5 overflow-y-auto">
-              <GenerativePopoverBody onClose={() => setOpen(false)} />
-            </div>
-          </div>,
-          document.body
-        )}
     </div>
+  )
+}
+
+// Popover host. Mounted once at App level so the popover is
+// available in BOTH Grid and Sequence views (the G hotkey toggles
+// session.generative.enabled from anywhere). Renders nothing when
+// the store flag is off -- zero cost at idle.
+export function GenerativePopoverHost(): JSX.Element | null {
+  const open = useStore((s) => s.generativePopoverOpen)
+  const setOpen = useStore((s) => s.setGenerativePopoverOpen)
+  const popoverRef = useRef<HTMLDivElement | null>(null)
+  // Position state. null = "render centered on screen" (the default
+  // every time the user toggles the popover visible). Drag updates
+  // this within the current open; the next open re-centers because
+  // we reset to null on each false->true transition below.
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(
+    null
+  )
+  // Pin state (v0.5.10). When pinned, clicks outside the popover
+  // don't close it -- the user can edit other surfaces (clip
+  // values, modulators, the grid) without the popover slamming
+  // shut. Persists across hide/show cycles since this component
+  // is mounted once at App level. Escape + ✕ + G hotkey still
+  // close so the user always has a way out.
+  const [pinned, setPinned] = useState(false)
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null)
+  // Re-center the popover EVERY time it toggles visible. Without
+  // this, a previous drag would persist across hide/show cycles
+  // and the user would never see the centred default again. Drag
+  // within the current visible cycle still works (setPosition
+  // overrides the centered render); next open resets to centered.
+  useEffect(() => {
+    if (open) setPosition(null)
+  }, [open])
+
+  // Click-outside + Escape to close. The G hotkey is handled at
+  // App level and toggles via the store. When pinned, click-outside
+  // is disabled -- the user explicitly wants the window to stay
+  // up; only Escape, ✕, or G close it.
+  useEffect(() => {
+    if (!open) return
+    function onDown(e: MouseEvent): void {
+      if (pinned) return
+      const t = e.target as Node | null
+      if (!t) return
+      if (popoverRef.current?.contains(t)) return
+      // Don't close on clicks targeting the GenerativeButton's
+      // chevron either -- detect by checking the title attribute.
+      const target = t as HTMLElement
+      const closestBtn = target.closest?.('button')
+      if (
+        closestBtn &&
+        closestBtn.getAttribute('title')?.includes('Generative settings')
+      ) {
+        return
+      }
+      setOpen(false)
+    }
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open, setOpen, pinned])
+
+  // Drag handlers. Installed only while dragging so we don't pay
+  // for a global mousemove listener when the popover is idle.
+  useEffect(() => {
+    if (!dragRef.current) return
+    function onMove(e: MouseEvent): void {
+      if (!dragRef.current) return
+      const w = popoverRef.current?.offsetWidth ?? POPOVER_WIDTH
+      const maxX = window.innerWidth - 32
+      const maxY = window.innerHeight - 32
+      const x = Math.max(-(w - 32), Math.min(maxX, e.clientX - dragRef.current.dx))
+      const y = Math.max(8, Math.min(maxY, e.clientY - dragRef.current.dy))
+      setPosition({ x, y })
+    }
+    function onUp(): void {
+      // No localStorage persistence -- the popover re-centers on
+      // every open, so saving the drag-end position would just
+      // get overwritten on the next toggle. Drag affects the
+      // current open only.
+      dragRef.current = null
+      setPosition((p) => (p ? { ...p } : null))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+  }, [position])
+
+  if (!open) return null
+  // Centered when no drag-position is set (the default on every
+  // open). Uses CSS transform-based centering -- left/top at 50%
+  // with translate(-50%, -50%) -- so the popover stays centered
+  // regardless of its actual rendered height, which varies with
+  // content + the scene checklist's length. Drag flips to
+  // explicit pixel left/top.
+  const isCentered = position === null
+  return createPortal(
+    <div
+      ref={popoverRef}
+      className="fixed z-50 bg-panel border border-border rounded shadow-lg text-[11px] flex flex-col"
+      style={
+        isCentered
+          ? {
+              left: '50%',
+              top: '50%',
+              transform: 'translate(-50%, -50%)',
+              width: POPOVER_WIDTH,
+              maxHeight: 'calc(100vh - 80px)'
+            }
+          : {
+              left: Math.max(8, position.x),
+              top: position.y,
+              width: POPOVER_WIDTH,
+              maxHeight: 'calc(100vh - 80px)'
+            }
+      }
+    >
+      {/* Drag handle / title bar. Pressing here starts a drag. */}
+      <div
+        className="flex items-center justify-between px-3 py-1.5 border-b border-border bg-panel2 rounded-t cursor-move select-none"
+        onMouseDown={(e) => {
+          if (e.button !== 0) return
+          const rect = popoverRef.current?.getBoundingClientRect()
+          if (!rect) return
+          dragRef.current = {
+            dx: e.clientX - rect.left,
+            dy: e.clientY - rect.top
+          }
+          setPosition({ x: rect.left, y: rect.top })
+        }}
+        title="Drag to move within this open. The popover re-centers on every G toggle (unless pinned)."
+      >
+        <span className="font-semibold text-[12px]">Generative Settings</span>
+        <div className="flex items-center gap-1">
+          {/* Pin toggle (v0.5.10). When ON, clicks outside the
+              popover no longer close it -- the user can edit other
+              surfaces without losing the Generative window. Escape /
+              ✕ / G hotkey still close it explicitly. */}
+          <button
+            className={`text-[12px] px-1.5 py-0 rounded transition-colors ${
+              pinned
+                ? 'bg-accent text-black'
+                : 'text-muted hover:text-text'
+            }`}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => setPinned((p) => !p)}
+            title={
+              pinned
+                ? 'Pinned - the window stays visible when clicking elsewhere. Click to unpin.'
+                : 'Pin the window so it stays visible when clicking elsewhere.'
+            }
+            aria-pressed={pinned}
+            aria-label={pinned ? 'Unpin window' : 'Pin window'}
+          >
+            📌
+          </button>
+          <button
+            className="text-muted hover:text-text text-[12px] px-1"
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => setOpen(false)}
+            title="Close (Esc or G)"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+      <div className="p-3 flex flex-col gap-2.5 overflow-y-auto">
+        <GenerativePopoverBody onClose={() => setOpen(false)} />
+      </div>
+    </div>,
+    document.body
   )
 }
 

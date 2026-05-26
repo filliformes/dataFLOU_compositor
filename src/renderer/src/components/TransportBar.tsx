@@ -38,6 +38,7 @@ export default function TransportBar(): JSX.Element {
       return
     }
     const st = useStore.getState()
+    const generativeOn = st.session.generative?.enabled === true
     // In the Sequence view, Play is a SEQUENCE TRANSPORT button, not
     // a scene trigger. The selected sequence slot (set by clicking a
     // slot or Timeline segment) becomes the start point; otherwise
@@ -63,15 +64,37 @@ export default function TransportBar(): JSX.Element {
           setPaused(false)
           transportPlay()
         }
+        return
+      }
+      // v0.5.10: empty-timeline + generative-on fallback. Without
+      // this, hitting Play with generative ON and no slots placed
+      // silently did nothing -- Play needs SOMETHING in the
+      // sequence to bootstrap. Now we pick a starter from the
+      // generative pool; the engine's selector takes over for
+      // every subsequent advance.
+      if (generativeOn) {
+        const starterId = st.pickGenerativeStarterId()
+        if (starterId) {
+          st.triggerSceneWithMorph(starterId, null)
+          setPaused(false)
+          transportPlay()
+        }
       }
       return
     }
     // Edit view — keep the legacy "play focused scene" behavior so
     // the user can audition a single scene without leaving Edit.
+    // v0.5.10: under generative mode, the starter comes from the
+    // generative pool when nothing's focused / placed. So flipping
+    // GENERATIVE on + hitting Play in Edit view starts the auto-
+    // advance from a random pool scene.
     let startId = focusedSceneId
     if (!startId) {
       const first = session.sequence.find((id) => !!id) ?? null
       startId = first
+    }
+    if (!startId && generativeOn) {
+      startId = st.pickGenerativeStarterId()
     }
     if (startId) {
       st.triggerSceneWithMorph(startId)
@@ -171,6 +194,15 @@ export default function TransportBar(): JSX.Element {
           configured duration. Per-scene morphInMs (set in the Sequence
           view's SceneInfoPanel) takes precedence. */}
       <MorphSection />
+
+      <div className="h-6 w-px bg-border" />
+
+      {/* Generative ON/OFF toggle (v0.5.10) -- mirrors the GENERATIVE
+          button at the top of the Scene Inspector in the Sequence
+          view. Same store action, so flipping one updates the other.
+          Lives in the transport bar so the performer can flip it
+          from anywhere, including Edit / Grid view. */}
+      <TransportGenerativeToggle />
 
       <div className="h-6 w-px bg-border" />
 
@@ -564,6 +596,40 @@ function MorphProgressBar(): JSX.Element | null {
       }}
       aria-hidden
     />
+  )
+}
+
+// Generative ON/OFF toggle for the transport bar (v0.5.10). Reads
+// the same session.generative.enabled flag as the GENERATIVE button
+// in the Scene Inspector; flipping one updates the other instantly.
+// Compact pill style to match the other transport-bar widgets
+// (MorphSection, CueGoSection), with the same red-on-accent visual
+// language the rest of the generative UI uses.
+function TransportGenerativeToggle(): JSX.Element {
+  const enabled = useStore((s) => s.session.generative?.enabled === true)
+  const setEnabled = useStore((s) => s.setGenerativeEnabled)
+  return (
+    <button
+      className={`flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] font-semibold uppercase tracking-wide transition-colors ${
+        enabled
+          ? 'bg-accent border-accent text-black'
+          : 'bg-panel2 border-border text-muted hover:text-text'
+      }`}
+      onClick={() => setEnabled(!enabled)}
+      title={
+        enabled
+          ? 'Generative ON - engine picks the next scene from the pool. Click to turn off.'
+          : 'Generative OFF - engine follows each scene\'s Follow Action. Click to flip to generative.'
+      }
+    >
+      <span
+        className="inline-block w-2 h-2 rounded-full"
+        style={{
+          background: enabled ? 'rgba(0,0,0,0.7)' : 'rgb(var(--c-muted) / 0.4)'
+        }}
+      />
+      Generative
+    </button>
   )
 }
 

@@ -340,9 +340,9 @@ export default function SequenceView(): JSX.Element {
                 column 1 is scene 1, bottom of column 4 is scene 48. */}
             <PaletteGrid scenes={scenes} focusedSceneId={focusedSceneId} />
             {focusedScene && sceneInspectorVisible && (
-              <div className="shrink-0 border-t border-border overflow-y-auto max-h-[60%]">
+              <SceneInfoPanelWrapper>
                 <SceneInfoPanel scene={focusedScene} />
-              </div>
+              </SceneInfoPanelWrapper>
             )}
             {/* Drag the right edge to resize. Matches the pattern used for
                 scene column width + Inspector width elsewhere. */}
@@ -1184,6 +1184,40 @@ function PaletteItem({
  * Delete key with the view focused on a scene (handled in App.tsx globally)
  * also deletes the scene.
  */
+// User-resizable wrapper around the SceneInfoPanel (v0.5.10). The
+// panel sits at the bottom of the Scenes column; drag its TOP edge
+// upward to grow it (eats into the palette grid's vertical space).
+// Height is persisted in the UI store via setSceneInfoPanelHeight.
+function SceneInfoPanelWrapper({
+  children
+}: {
+  children: React.ReactNode
+}): JSX.Element {
+  const height = useStore((s) => s.sceneInfoPanelHeight)
+  const setHeight = useStore((s) => s.setSceneInfoPanelHeight)
+  return (
+    <div
+      className="shrink-0 border-t border-border overflow-y-auto relative"
+      style={{ height }}
+    >
+      {/* Top-edge drag handle. `inverse` flips the delta so dragging
+          UPWARD increases height (the panel grows upward, eating
+          into the palette grid above it). */}
+      <ResizeHandle
+        direction="row"
+        value={height}
+        onChange={setHeight}
+        inverse
+        min={80}
+        max={1600}
+        className="absolute top-0 left-0 right-0 h-[4px] z-10"
+        title="Drag upward to expand the Scene Inspector"
+      />
+      {children}
+    </div>
+  )
+}
+
 function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
   const updateScene = useStore((s) => s.updateScene)
   const removeScene = useStore((s) => s.removeScene)

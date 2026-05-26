@@ -20,6 +20,7 @@ import CapturePopup from './components/CapturePopup'
 import { Modal } from './components/Modal'
 import { initUndo, undo, redo } from './undo'
 import TransportBar from './components/TransportBar'
+import { GenerativePopoverHost } from './components/GenerativePopover'
 
 export default function App(): JSX.Element {
   const session = useStore((s) => s.session)
@@ -1042,6 +1043,12 @@ export default function App(): JSX.Element {
           other panel including the Pool drawer. Null when closed
           (no subscription / no cost). */}
       <CapturePopup />
+      {/* Generative Settings popover (v0.5.10). Mounted here at App
+          level (not inside GenerativeButton) so the popover is
+          available in BOTH Grid and Sequence views, and the G
+          hotkey can toggle it from anywhere. Renders null when
+          closed. */}
+      <GenerativePopoverHost />
       {closeConfirmOpen && (
         <Modal title="Save before quitting?" onClose={handleQuitCancel}>
           <div className="flex flex-col gap-3 text-[12px]">

@@ -1158,6 +1158,36 @@ export class SceneEngine {
   }
 
   /**
+   * Returns true when the given source ip:port matches any Pool
+   * InstrumentTemplate's `hardwareMode` config with `enabled: true`.
+   *
+   * Used by `oscNetwork.setOnShouldSuppressForward()` to suppress the
+   * raw-bytes forward path for sources Hardware Mode is actively
+   * absorbing — preventing double-emission to scene-output targets
+   * (e.g. the Teensy controller broadcasting to dataFLOU's listener
+   * would otherwise both be HW-Mode-consumed AND independently
+   * byte-forwarded to Max/PD, causing two competing values per OSC
+   * address per packet).
+   *
+   * Cheap by design: fast-paths on `hasAnyHardwareModeEnabled` so it
+   * costs nothing per packet when no HW Mode template is configured.
+   * When at least one is, scans the templates linearly — sessions
+   * typically have <10 templates so a Map index isn't worth the
+   * coherency overhead vs. updateSession.
+   */
+  isHardwareModeSource(ip: string, port: number): boolean {
+    if (!this.hasAnyHardwareModeEnabled) return false
+    if (!this.session) return false
+    for (const tpl of this.session.pool.templates) {
+      const hw = tpl.hardwareMode
+      if (hw && hw.enabled && hw.deviceIp === ip && hw.devicePort === port) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
    * Hardware Mode entry point — called by the OSC network listener
    * for EVERY incoming OSC message. Routes the message through:
    *
@@ -2037,7 +2067,26 @@ export class SceneEngine {
         this.generativeHistory.shift()
       }
     }
-    this.armSceneAdvance(scene, opts?.generativeDurationSec)
+    // Auto-roll a min/max duration under generative mode (v0.5.10).
+    // When the caller doesn't pass an explicit generativeDurationSec
+    // (Play button, scene click, Cue/GO, MIDI scene trigger, kbd
+    // 1-0/Space all skip it), generate one from session.generative.
+    // {min,max}DurationMs so the FIRST scene played after flipping
+    // Generative ON respects the duration window immediately. The
+    // selector's own picks already pass an explicit value; this
+    // bridges the "manual entry into generative flow" case.
+    let effectiveGenerativeDurationSec = opts?.generativeDurationSec
+    if (
+      effectiveGenerativeDurationSec === undefined &&
+      this.session.generative?.enabled === true
+    ) {
+      const cfg = this.session.generative
+      const minMs = Math.min(cfg.minDurationMs, cfg.maxDurationMs)
+      const maxMs = Math.max(cfg.minDurationMs, cfg.maxDurationMs)
+      effectiveGenerativeDurationSec =
+        (minMs + Math.random() * (maxMs - minMs)) / 1000
+    }
+    this.armSceneAdvance(scene, effectiveGenerativeDurationSec)
     this.emitState()
   }
 
@@ -2104,12 +2153,20 @@ export class SceneEngine {
           ? this.session?.sequenceSlotOverrides?.[slotIdx]
           : undefined
       const effectiveNextMode = liveOverride?.nextMode ?? cur.nextMode
-      // Stop now *actually* stops everything. Previously the engine kept
-      // the scene "alive" as long as any cell had modulation or sequencer
-      // enabled — useful in theory, but the user's intent with Stop is
-      // "end the scene here." Morph every active cell back to 0 over its
-      // own transitionMs and clear the active-scene state.
-      if (effectiveNextMode === 'stop') {
+      // Generative override (v0.5.10): when generative is ON, the
+      // scene's authored nextMode is ignored -- the selector picks
+      // the next scene unconditionally. Without this, a scene with
+      // nextMode='stop' (the default!) would stop the engine after
+      // its first play instead of advancing into generative flow.
+      // Loop is still respected when set per-slot (slot override
+      // wins) so the user can pin one slot to loop under generative.
+      const generativeOn = this.session?.generative?.enabled === true
+      if (effectiveNextMode === 'stop' && !generativeOn) {
+        // Stop now *actually* stops everything. Previously the engine kept
+        // the scene "alive" as long as any cell had modulation or sequencer
+        // enabled — useful in theory, but the user's intent with Stop is
+        // "end the scene here." Morph every active cell back to 0 over its
+        // own transitionMs and clear the active-scene state.
         this.stopScene(cur.id)
       } else {
         this.advanceScene(cur, effectiveNextMode)
@@ -2363,16 +2420,17 @@ export class SceneEngine {
   private advanceScene(current: Scene, modeOverride?: Scene['nextMode']): void {
     if (!this.session) return
     // ── Generative Scene Sequencer early-out (v0.5.10) ────────────
-    // When generative mode is on, bypass the linear follow-action
-    // switch entirely and let the selector pick the next scene from
-    // a weighted pool. Manual triggers (Cue/GO, scene clicks, MIDI
-    // scene triggers, keyboard 1-0/Space) STILL use the scene's own
-    // duration + nextMode -- those funnel through triggerScene() and
-    // never visit this method, so manual preempt works as before.
-    // EXCEPTION: a 'loop' modeOverride (per-slot Loop override on a
-    // sequence slot) still wins, so the user can pin a single slot
-    // to loop even under generative mode.
-    if (this.session.generative?.enabled === true && modeOverride !== 'loop') {
+    // When generative mode is on, bypass EVERY follow action --
+    // including Loop -- and let the selector pick the next scene
+    // from the weighted pool. Manual triggers (Cue/GO, scene clicks,
+    // MIDI scene triggers, keyboard 1-0/Space) funnel through
+    // triggerScene() so the user can preempt at any time; the
+    // engine auto-rolls a fresh min/max duration for those too.
+    // If the user wants a specific scene to loop, the answer is to
+    // either turn Generative off OR add only that scene to the
+    // generative pool (the no-repeat clause auto-disables when the
+    // pool is size-1, so the scene plays forever).
+    if (this.session.generative?.enabled === true) {
       const pickedId = this.pickGenerativeScene(current.id)
       if (pickedId) {
         // Roll a fresh duration in [minSec, maxSec] for this play.

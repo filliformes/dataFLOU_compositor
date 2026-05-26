@@ -218,6 +218,19 @@ app.whenReady().then(async () => {
     engine.handleHardwareInput(ip, port, address, numericArgs)
   })
 
+  // Forward-path suppression — when Hardware Mode is consuming a
+  // controller's OSC, the raw byte-forward path MUST skip those
+  // packets. Otherwise downstream consumers (Max, PD) receive both
+  // the engine's clean catch-mode emission AND the raw passthrough
+  // for the same OSC address, producing flicker (two competing
+  // values per packet) and message-queue buildup that crashes the
+  // downstream after ~5 min of sustained dual-emission. The hook
+  // returns false (fast-path) when no template has HW Mode enabled,
+  // so existing forward-only setups are unaffected.
+  networkListener.setOnShouldSuppressForward((ip, port) =>
+    engine.isHardwareModeSource(ip, port)
+  )
+
   // Wrapper that catches thrown errors inside an IPC handler, logs
   // them with the channel name, and returns undefined to the renderer
   // instead of propagating a generic IPC failure. Without this, a

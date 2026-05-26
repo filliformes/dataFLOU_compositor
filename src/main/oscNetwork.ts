@@ -283,11 +283,32 @@ export class OscNetworkListener {
         const rawSock = (port as unknown as { socket?: dgram.Socket })
           .socket
         if (rawSock && typeof rawSock.on === 'function') {
-          rawSock.on('message', (buf: Buffer) => {
+          rawSock.on('message', (buf: Buffer, rinfo: dgram.RemoteInfo) => {
             if (!this.enabled) return
             // Skip if no forward targets — avoids a Buffer copy and
             // the for-loop on every quiet packet.
             if (this.forwardTargets.length === 0) return
+            // Hardware-Mode suppression: when the engine has Hardware
+            // Mode enabled for a template bound to this source's
+            // ip:port, skip the raw byte-forward. The engine consumes
+            // the packet via the onMessageHook path and emits a clean
+            // single-source value per parameter; relaying the raw
+            // packet too would cause downstream consumers (Max, PD)
+            // to receive the same OSC address with two competing
+            // values per packet, producing flicker and message-queue
+            // pressure that crashes Max after ~5 minutes of sustained
+            // dual-emission. The hook itself early-returns when no HW
+            // Mode template is enabled session-wide, so this check is
+            // O(1) in the common case.
+            if (
+              this.onShouldSuppressForwardHook &&
+              rinfo &&
+              typeof rinfo.address === 'string' &&
+              typeof rinfo.port === 'number' &&
+              this.onShouldSuppressForwardHook(rinfo.address, rinfo.port)
+            ) {
+              return
+            }
             this.forwardPacket(buf)
           })
         }
@@ -440,6 +461,27 @@ export class OscNetworkListener {
     fn: (ip: string, port: number, address: string, numericArgs: number[]) => void
   ): void {
     this.onMessageHook = fn
+  }
+
+  // Optional gate for the raw-bytes forward path. When set, the
+  // listener will SKIP byte-forwarding any packet whose source
+  // ip:port returns true from this predicate. Used by the engine to
+  // suppress forwarding of packets coming from Hardware-Mode-bound
+  // controllers — without this, the controller's raw OSC would be
+  // both consumed by Hardware Mode (clean catch-mode emission) AND
+  // independently relayed by the forward path, causing the same
+  // OSC address to arrive at downstream consumers (PD, Max) with
+  // two competing values per packet. The predicate is called inside
+  // the dgram 'message' handler so it must be cheap (a Map lookup
+  // or short linear scan); engines should return true only when
+  // Hardware Mode actually wants to absorb the source.
+  private onShouldSuppressForwardHook:
+    | ((ip: string, port: number) => boolean)
+    | null = null
+  setOnShouldSuppressForward(
+    fn: ((ip: string, port: number) => boolean) | null
+  ): void {
+    this.onShouldSuppressForwardHook = fn
   }
 
   private observe(

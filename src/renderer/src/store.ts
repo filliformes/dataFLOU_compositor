@@ -198,6 +198,11 @@ interface UiState {
   // Width of the Sequence view's left column (scene palette + info panel).
   // 200..480; default 280. Drag the handle on the column's right edge.
   scenePaletteWidth: number
+  // Height of the Scene Info Panel below the scenes palette in the
+  // Sequence view (v0.5.10). User-resizable via a drag handle on
+  // its top edge. Clamped to a sensible band so it can't shrink
+  // away entirely or push the palette grid offscreen.
+  sceneInfoPanelHeight: number
   trackColumnWidth: number // 160..400
   inspectorWidth: number // 280..640
   // Sequence transport pause state (local — just UI; engine has its own flag).
@@ -795,6 +800,7 @@ interface Actions {
   setRowHeight: (h: number) => void
   setSceneColumnWidth: (w: number) => void
   setScenePaletteWidth: (w: number) => void
+  setSceneInfoPanelHeight: (h: number) => void
   setTrackColumnWidth: (w: number) => void
   setInspectorWidth: (w: number) => void
   setSequencePaused: (paused: boolean) => void
@@ -893,6 +899,16 @@ interface Actions {
   setGenerativeUseMorph: (v: boolean) => void
   setSceneWeight: (sceneId: string, weight: number) => void
   rollRandomWeights: () => void
+  // Pick an initial scene id under generative mode for the Play
+  // button's empty-timeline fallback. Walks the eligible pool
+  // (poolSource + excluded[]) and returns a weight-biased random
+  // pick. Returns null when generative is off OR the pool is empty
+  // (so the Play button can fall back to its normal "do nothing"
+  // path with a console hint). The engine takes over after this
+  // initial trigger via advanceScene's generative branch -- this
+  // helper exists just to bootstrap the flow when the user has no
+  // timeline placed and no scene focused.
+  pickGenerativeStarterId: () => string | null
   // MIDI binding setters (one per learnable control). Mirror the
   // existing setGoMidi / setMorphTimeMidi pattern: pass undefined to
   // clear, otherwise persist into session.generative.
@@ -1123,6 +1139,7 @@ export const useStore = create<State>((set, get) => ({
   // to all fit on one row in the Sequence-tab scene inspector. Users can
   // drag the right edge to grow / shrink (clamped 200..480).
   scenePaletteWidth: 360,
+  sceneInfoPanelHeight: 360,
   trackColumnWidth: 240,
   inspectorWidth: 340,
   sequencePaused: false,
@@ -3239,6 +3256,8 @@ export const useStore = create<State>((set, get) => ({
   setRowHeight: (h) => set({ rowHeight: clampInt(h, 45, 220) }),
   setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 180, 480) }),
   setScenePaletteWidth: (w) => set({ scenePaletteWidth: clampInt(w, 200, 1200) }),
+  setSceneInfoPanelHeight: (h) =>
+    set({ sceneInfoPanelHeight: clampInt(h, 80, 1600) }),
   setTrackColumnWidth: (w) => set({ trackColumnWidth: clampInt(w, 160, 400) }),
   setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 320, 640) }),
   setSequencePaused: (paused) => set({ sequencePaused: paused }),
@@ -3536,6 +3555,47 @@ export const useStore = create<State>((set, get) => ({
         }))
       }
     })),
+  pickGenerativeStarterId: () => {
+    const st = get()
+    const cfg = st.session.generative
+    if (!cfg || !cfg.enabled) return null
+    // Build eligible pool: scenes not excluded by the per-scene
+    // checklist, narrowed by Timeline-only when configured. We
+    // intentionally use the SAME pool rules as the engine selector
+    // (see engine.pickGenerativeScene) so the starter looks
+    // continuous with subsequent picks. Affinity is not applied --
+    // there's no "current scene" yet to bias toward.
+    let pool = st.session.scenes.filter((s) => cfg.excluded[s.id] !== true)
+    if (cfg.poolSource === 'timeline') {
+      const inTimeline = new Set(
+        (st.session.sequence ?? []).filter(
+          (id): id is string => typeof id === 'string'
+        )
+      )
+      pool = pool.filter((s) => inTimeline.has(s.id))
+    }
+    if (pool.length === 0) return null
+    if (pool.length === 1) return pool[0].id
+    // Weighted random pick using scene.weight (default 1, clamped
+    // 1..10). No repetition penalty -- this is the FIRST pick, no
+    // history to bias against.
+    const weights: number[] = pool.map((s) => {
+      const w =
+        typeof s.weight === 'number' && Number.isFinite(s.weight)
+          ? Math.max(SCENE_WEIGHT_MIN, Math.min(SCENE_WEIGHT_MAX, s.weight))
+          : SCENE_WEIGHT_DEFAULT
+      return w
+    })
+    const total = weights.reduce((a, b) => a + b, 0)
+    if (total <= 0) return pool[Math.floor(Math.random() * pool.length)].id
+    const target = Math.random() * total
+    let acc = 0
+    for (let i = 0; i < pool.length; i++) {
+      acc += weights[i]
+      if (acc >= target) return pool[i].id
+    }
+    return pool[pool.length - 1].id
+  },
   // MIDI bindings -- one shape, seven slots.
   setGenerativeToggleMidi: (b) =>
     set((st) => ({

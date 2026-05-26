@@ -230,14 +230,23 @@ export default function TopBar(): JSX.Element {
         <MidiLearnButton />
       </div>
 
-      <div className="flex-1" />
+      {/* Generative ON status badge (v0.5.10) -- visible only when
+          session.generative.enabled is true. Sits centered between
+          MIDI Learn and the view toggle so the performer can see at
+          a glance that auto-advance is being driven by the selector
+          instead of follow-actions. Red because that mirrors how
+          performance-critical "this is firing" indicators show up
+          elsewhere in the app (Hardware Mode caught dots). */}
+      <div className="flex-1 flex items-center justify-center">
+        <GenerativeStatusBadge />
+      </div>
 
       <button
         className="btn min-w-[76px]"
         onClick={() => setView(view === 'edit' ? 'sequence' : 'edit')}
-        title={`Go to ${view === 'edit' ? 'Sequence' : 'Edit'} view`}
+        title={`Go to ${view === 'edit' ? 'Sequence' : 'Grid'} view`}
       >
-        {view === 'edit' ? 'Sequence' : 'Edit'}
+        {view === 'edit' ? 'Sequence' : 'Grid'}
       </button>
 
       <button
@@ -800,6 +809,31 @@ function MidiLearnButton(): JSX.Element {
       }
     >
       MIDI Learn
+    </button>
+  )
+}
+
+// Orange "Generative ON" status badge (v0.5.10). Renders only when
+// session.generative.enabled is true. Same accent colour as the
+// GENERATIVE button in the Scene Inspector so the visual identity
+// of the generative system stays consistent across the app. Click
+// toggles generative OFF so the performer can kill the selector
+// from the top toolbar without hunting for the popover. When OFF
+// the badge hides entirely so the toolbar stays clean.
+function GenerativeStatusBadge(): JSX.Element | null {
+  const enabled = useStore((s) => s.session.generative?.enabled === true)
+  const setEnabled = useStore((s) => s.setGenerativeEnabled)
+  if (!enabled) return null
+  return (
+    <button
+      className="flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-semibold tracking-wide uppercase transition-colors bg-accent text-black border border-accent"
+      onClick={() => setEnabled(false)}
+      title="Generative mode is ON - engine picks the next scene from the pool. Click to turn off."
+    >
+      <span
+        className="inline-block w-2 h-2 rounded-full bg-black/70 animate-pulse"
+      />
+      Generative ON
     </button>
   )
 }

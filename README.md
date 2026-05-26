@@ -576,7 +576,13 @@ The big one for **Juin Generatif** (June 14 talk): a **Generative Scene Sequence
 
 ### Generative Scene Sequencer
 
-Click **GENERATIVE** at the top of the Sequence view's Scenes column. The engine stops following each scene's authored Follow Action and starts picking the next scene randomly from a configurable pool. Manual triggers (Cue/GO, scene clicks, MIDI scene triggers, Space + 1-0 keys) still play the scene at its own duration - only natural advances are diverted - so you keep precise manual control whenever you want it.
+Click **GENERATIVE** at the top of the Sequence view's Scenes column **OR** in the Transport bar (mirrors the same store flag) **OR** hit **G** from anywhere in the app. The engine stops following each scene's authored Follow Action and starts picking the next scene randomly from a configurable pool. Manual triggers (Cue/GO, scene clicks, MIDI scene triggers, Space + 1-0 keys) still preempt the flow, but under Generative they auto-roll a fresh duration from the min/max window so the FIRST scene you Play also obeys the generative timing.
+
+When Generative is ON, an orange **● Generative ON** badge appears in the TopBar between MIDI Learn and the Grid/Sequence view toggle. Click the badge to flip Generative off without opening the popover.
+
+The Generative popover (chevron next to the GENERATIVE pill, or G hotkey) is **draggable** by its title bar, **centered** on every open (re-centers when toggled off + on), and gets a **📌 pin** button so it stays visible while you edit other surfaces. Esc / ✕ / G still close it.
+
+Under Generative mode, EVERY follow action is overridden including Stop and Loop -- the selector picks the next scene unconditionally after each min/max-rolled duration. To make a scene actually loop while in Generative, narrow the pool to that single scene (the no-repeat clause auto-disables for a 1-scene pool).
 
 **Pool Source** dropdown:
 - **All scenes** (default) - every scene in the session is eligible (like Spotify shuffling your whole library).
@@ -623,9 +629,15 @@ In the grid-side Parameter Inspector (click a track header), a new **Default Tra
 
 Hover the **Transition** label in the Cell Inspector's Timing section for a short explanation of what Transition does, how it relates to Scene Morph, and the `timingEnabled` bypass. Long-awaited docs for a long-existing feature.
 
-### Draggable Generative popover + G hotkey
+### Sequence view: Edit → Grid relabel + resizable Scene Inspector
 
-The Generative Settings popover has a title bar you can grab to drag the window anywhere on the screen. Position persists in localStorage so a reload restores it where you parked it. **⟲** in the title bar resets to the default anchor (next to the GENERATIVE button); **✕** or **Esc** closes; **G** toggles visibility from anywhere in the app. Drag once, then treat the popover as a permanent "Generative HUD" you can summon with G.
+The "Edit" button in the Sequence view's view-toggle now reads **Grid** (matching how dataFLOU regulars talk about it). The lower Scene Inspector panel below the Scenes palette is now **resizable** -- drag its top edge upward to grow the editor area. Height persists across the session.
+
+### Hardware Mode × OSC Forward dual-emission fix
+
+Reported during late v0.5.10 testing: when Hardware Mode is bound to an OSC controller (e.g. OCTOCOSME on 127.0.0.1:9000) AND the OSC Forward feature is fanning out to downstream consumers (Pure Data, Max, another machine), the same incoming packets were both consumed by Hardware Mode (clean catch-mode emission) AND independently relayed by the raw byte-forward path. Downstream consumers ended up receiving two competing values per packet on the same OSC address, producing visual flicker on Pd patches and a slow Max message-queue saturation that crashed the receiver after ~5 minutes of sustained dual-emission.
+
+Fixed via a new `setOnShouldSuppressForward` gate on the OSC listener (`src/main/oscNetwork.ts`). The engine wires `isHardwareModeSource(ip, port)` to this gate at startup, so the raw forward path now skips ONLY packets whose source matches a Hardware-Mode-bound device. Packets from any other source (other controllers, computers on the LAN) still fan out as before. When no Hardware Mode is enabled session-wide, the gate is a single boolean read -- zero behaviour change for users not using HW Mode.
 
 ---
 
