@@ -1695,6 +1695,15 @@ export interface EngineState {
   // that haven't played yet. Lets the renderer show the jittered
   // velocity in the cell tile so Humanize "moves" visibly.
   lastEmittedVelocityByCell?: Record<string, number>
+  // Per-scene most-recent generative auto-rolled duration (ms).
+  // Each entry = the duration the engine rolled the last time it
+  // triggered that scene under generative mode. The Scene Inspector
+  // overlays this on the focused scene's Dur input so the user can
+  // see "this scene last played for X seconds under the current
+  // min/max window." Scenes that have never played under generative
+  // are absent from the map. Engine prunes entries on session
+  // reload + scene removal. Undefined when the map is empty.
+  generativeRolledBySceneId?: Record<string, number>
 }
 
 // Live snapshot of Modulation 1's EFFECTIVE values for the cell

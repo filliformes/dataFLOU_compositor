@@ -359,54 +359,11 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <BoundedNumberInput
-              className="input w-12 text-[11px] py-0.5"
-              value={scene.durationSec}
-              onChange={(v) => updateScene(sceneId, { durationSec: v })}
-              min={0.5}
-              max={300}
-            />
+            <SceneHeaderDurInput sceneId={sceneId} scene={scene} updateScene={updateScene} />
           </span>
           <span className="text-muted">s</span>
           <span className="label ml-1">Next</span>
-          <select
-            // select-compact swaps the bulky native dropdown arrow (~20 px
-            // on Windows, ~24 px on macOS) for a small 8 px SVG chevron.
-            // Width hugs the widest entry ("Previous") + chevron — about
-            // 78 px — so the dropdown never widens the scene column.
-            // (Previous design used flex-1 which let the dropdown grow
-            // alongside any MIDI chip and push the column wide.) The MIDI
-            // chip itself was removed from the header — the new "Learned"
-            // tab in the MIDI Monitor is the canonical place to view +
-            // edit MIDI bindings.
-            className="input select-compact text-[11px] py-0.5"
-            style={{ width: 78 }}
-            value={scene.nextMode}
-            onClick={(e) => e.stopPropagation()}
-            onMouseDown={(e) => e.stopPropagation()}
-            onChange={(e) =>
-              updateScene(sceneId, {
-                nextMode: e.target.value as
-                  | 'stop'
-                  | 'loop'
-                  | 'next'
-                  | 'prev'
-                  | 'first'
-                  | 'last'
-                  | 'any'
-                  | 'other'
-              })
-            }
-          >
-            <option value="stop">Stop</option>
-            <option value="loop">Loop</option>
-            <option value="next">Next</option>
-            <option value="prev">Previous</option>
-            <option value="first">First</option>
-            <option value="last">Last</option>
-            <option value="any">Any</option>
-            <option value="other">Other</option>
-          </select>
+          <SceneHeaderNextSelect sceneId={sceneId} scene={scene} updateScene={updateScene} />
         </div>
 
         {/* Notes resize handle on the bottom border of the header — identical
@@ -801,6 +758,128 @@ function InstrumentTriggerCell({
           <div className={`midi-learn-overlay ${learnOverlayClass}`} aria-hidden />
         )}
       </button>
+    </div>
+  )
+}
+
+// Scene-header Dur input with orange generative-rolled-duration
+// overlay (v0.5.10). Same pattern as the Scene Inspector's Dur
+// overlay: when Generative mode is on AND the engine has recorded
+// a most-recent rolled duration for this scene, an orange number
+// sits ON TOP of the authored Dur input. Focus the input to edit
+// the underlying authored value -- the overlay hides on focus via
+// group-focus-within. Renders the authored input untouched when
+// Generative is off or this scene has never been played under it.
+// Scene-header Next-action dropdown with a "?" overlay shown when
+// Generative mode is on (v0.5.10). The authored Follow Action stays
+// underneath; the "?" reflects that under Generative, the next scene
+// is decided by the selector, not the dropdown's value. Click into
+// the select to peek/edit the authored value -- the overlay hides
+// while the user interacts and returns when focus leaves.
+function SceneHeaderNextSelect({
+  sceneId,
+  scene,
+  updateScene
+}: {
+  sceneId: string
+  scene: { nextMode: NextMode }
+  updateScene: (id: string, patch: { nextMode?: NextMode }) => void
+}): JSX.Element {
+  const generativeEnabled = useStore(
+    (s) => s.session.generative?.enabled === true
+  )
+  return (
+    <div className="relative group inline-block">
+      <select
+        // select-compact swaps the bulky native dropdown arrow (~20 px
+        // on Windows, ~24 px on macOS) for a small 8 px SVG chevron.
+        // Width hugs the widest entry ("Previous") + chevron — about
+        // 78 px — so the dropdown never widens the scene column.
+        className="input select-compact text-[11px] py-0.5"
+        style={{ width: 78 }}
+        value={scene.nextMode}
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+        onChange={(e) =>
+          updateScene(sceneId, { nextMode: e.target.value as NextMode })
+        }
+      >
+        <option value="stop">Stop</option>
+        <option value="loop">Loop</option>
+        <option value="next">Next</option>
+        <option value="prev">Previous</option>
+        <option value="first">First</option>
+        <option value="last">Last</option>
+        <option value="any">Any</option>
+        <option value="other">Other</option>
+      </select>
+      {generativeEnabled && (
+        <div
+          className="absolute inset-0 flex items-center justify-center pointer-events-none rounded-sm group-hover:hidden group-focus-within:hidden"
+          style={{
+            background: 'rgb(var(--c-panel))',
+            outline: '1px solid rgb(var(--c-accent) / 0.7)',
+            outlineOffset: '-1px'
+          }}
+          title="Generative ON - the engine picks the next scene, not the authored Follow Action. Hover or click to peek/edit the authored value."
+        >
+          <span
+            className="text-[12px] font-bold leading-none"
+            style={{ color: 'rgb(var(--c-accent))' }}
+          >
+            ?
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SceneHeaderDurInput({
+  sceneId,
+  scene,
+  updateScene
+}: {
+  sceneId: string
+  scene: { durationSec: number }
+  updateScene: (id: string, patch: { durationSec?: number }) => void
+}): JSX.Element {
+  const generativeEnabled = useStore(
+    (s) => s.session.generative?.enabled === true
+  )
+  const rolledMs = useStore((s) => {
+    const map = s.engine.generativeRolledBySceneId
+    return map && typeof map[sceneId] === 'number' ? map[sceneId] : null
+  })
+  const showOverlay =
+    generativeEnabled && rolledMs !== null && rolledMs > 0
+  return (
+    <div className="relative group inline-block">
+      <BoundedNumberInput
+        className="input w-12 text-[11px] py-0.5"
+        value={scene.durationSec}
+        onChange={(v) => updateScene(sceneId, { durationSec: v })}
+        min={0.5}
+        max={300}
+      />
+      {showOverlay && rolledMs !== null && (
+        <div
+          className="absolute inset-0 flex items-center justify-center pointer-events-none rounded-sm group-focus-within:hidden"
+          style={{
+            background: 'rgb(var(--c-panel))',
+            outline: '1px solid rgb(var(--c-accent) / 0.7)',
+            outlineOffset: '-1px'
+          }}
+          title={`Generative rolled this scene to ${(rolledMs / 1000).toFixed(1)}s the last time it played. Click to edit the authored Dur underneath.`}
+        >
+          <span
+            className="text-[11px] tabular-nums font-medium"
+            style={{ color: 'rgb(var(--c-accent))' }}
+          >
+            {(rolledMs / 1000).toFixed(1)}
+          </span>
+        </div>
+      )}
     </div>
   )
 }

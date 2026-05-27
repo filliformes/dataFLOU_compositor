@@ -1297,30 +1297,17 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
       <div className="flex items-center gap-3">
         <div className="flex items-center gap-1.5">
           <span className="label">Dur</span>
-          <BoundedNumberInput
-            className="input w-16 text-[12px] py-0.5"
-            value={scene.durationSec}
-            onChange={(v) => updateScene(scene.id, { durationSec: v })}
-            min={0.5}
-            max={300}
-            autoFocusToken={focusDurationToken}
-          />
+          <SceneDurationWithGenerativeOverlay scene={scene} focusDurationToken={focusDurationToken} />
           <span className="text-muted text-[11px]">s</span>
         </div>
 
         <div className="flex items-center gap-1.5">
           <span className="label">Next</span>
-          <select
-            className="input text-[12px] py-0.5 min-w-[96px]"
-            value={scene.nextMode}
-            onChange={(e) => updateScene(scene.id, { nextMode: e.target.value as NextMode })}
-          >
-            {nextModes.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
-          </select>
+          <SceneInspectorNextSelect
+            scene={scene}
+            nextModes={nextModes}
+            onChange={(v) => updateScene(scene.id, { nextMode: v })}
+          />
         </div>
 
         {/* Multiplicator — only exposed here (Sequence-tab inspector) per
@@ -1392,6 +1379,129 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
         <span>Tip: switch to the Edit view (Tab) to edit this scene's clips.</span>
       </div>
     </fieldset>
+  )
+}
+
+// Scene Inspector Next-action dropdown with a "?" overlay shown
+// when Generative mode is on (v0.5.10). Same pattern as the
+// SceneColumn header's SceneHeaderNextSelect, but sized for the
+// Inspector's wider dropdown. Hover or click to reveal the
+// authored Follow Action underneath.
+function SceneInspectorNextSelect({
+  scene,
+  nextModes,
+  onChange
+}: {
+  scene: Scene
+  nextModes: { id: NextMode; label: string }[]
+  onChange: (v: NextMode) => void
+}): JSX.Element {
+  const generativeEnabled = useStore(
+    (s) => s.session.generative?.enabled === true
+  )
+  return (
+    <div className="relative group inline-block">
+      <select
+        className="input text-[12px] py-0.5 min-w-[96px]"
+        value={scene.nextMode}
+        onChange={(e) => onChange(e.target.value as NextMode)}
+      >
+        {nextModes.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label}
+          </option>
+        ))}
+      </select>
+      {generativeEnabled && (
+        <div
+          className="absolute inset-0 flex items-center justify-center pointer-events-none rounded-sm group-hover:hidden group-focus-within:hidden"
+          style={{
+            background: 'rgb(var(--c-panel))',
+            outline: '1px solid rgb(var(--c-accent) / 0.7)',
+            outlineOffset: '-1px'
+          }}
+          title="Generative ON - the engine picks the next scene, not the authored Follow Action. Hover or click to peek/edit the authored value."
+        >
+          <span
+            className="text-[14px] font-bold leading-none"
+            style={{ color: 'rgb(var(--c-accent))' }}
+          >
+            ?
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Wraps the Scene Inspector's Dur input with an orange overlay that
+// shows the **most-recently-rolled** generative duration for the
+// focused scene -- regardless of whether that scene is currently
+// playing. The engine tracks the last roll PER scene id, so any
+// scene the user focuses will show its rolled Dur if it's ever
+// played under generative mode.
+//
+// The overlay sits ON TOP of the authored Dur input with
+// pointer-events-none + group-focus-within:hidden so the user can
+// still click into the input to edit the authored value -- the
+// moment the input takes focus, the overlay disappears so typing
+// isn't visually masked. When focus leaves, the overlay reappears
+// (assuming the conditions still hold).
+//
+// Display: rolled duration in seconds with 1-decimal precision.
+// Same accent colour as the GENERATIVE button + the "Generative
+// ON" badge for visual coherence.
+function SceneDurationWithGenerativeOverlay({
+  scene,
+  focusDurationToken
+}: {
+  scene: Scene
+  focusDurationToken: number
+}): JSX.Element {
+  const updateScene = useStore((s) => s.updateScene)
+  const generativeEnabled = useStore(
+    (s) => s.session.generative?.enabled === true
+  )
+  const rolledMs = useStore((s) => {
+    const map = s.engine.generativeRolledBySceneId
+    return map && typeof map[scene.id] === 'number' ? map[scene.id] : null
+  })
+  const showOverlay =
+    generativeEnabled && rolledMs !== null && rolledMs > 0
+  return (
+    <div className="relative group">
+      <BoundedNumberInput
+        className="input w-16 text-[12px] py-0.5"
+        value={scene.durationSec}
+        onChange={(v) => updateScene(scene.id, { durationSec: v })}
+        min={0.5}
+        max={300}
+        autoFocusToken={focusDurationToken}
+      />
+      {showOverlay && rolledMs !== null && (
+        <div
+          // Cover the input visually. pointer-events-none lets clicks
+          // pass through to the input behind. group-focus-within:hidden
+          // hides the overlay when the input is being edited so the
+          // user's typed digits are visible. background matches the
+          // panel so the overlay reads as opaque, not translucent.
+          className="absolute inset-0 flex items-center justify-center pointer-events-none rounded-sm group-focus-within:hidden"
+          style={{
+            background: 'rgb(var(--c-panel))',
+            outline: '1px solid rgb(var(--c-accent) / 0.7)',
+            outlineOffset: '-1px'
+          }}
+          title={`Generative rolled this scene to ${(rolledMs / 1000).toFixed(1)}s the last time it played. Click to edit the authored Dur underneath.`}
+        >
+          <span
+            className="text-[12px] tabular-nums font-medium"
+            style={{ color: 'rgb(var(--c-accent))' }}
+          >
+            {(rolledMs / 1000).toFixed(1)}
+          </span>
+        </div>
+      )}
+    </div>
   )
 }
 

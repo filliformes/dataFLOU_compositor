@@ -629,6 +629,14 @@ In the grid-side Parameter Inspector (click a track header), a new **Default Tra
 
 Hover the **Transition** label in the Cell Inspector's Timing section for a short explanation of what Transition does, how it relates to Scene Morph, and the `timingEnabled` bypass. Long-awaited docs for a long-existing feature.
 
+### Generative readout on per-scene Dur + Next
+
+Each scene's **Dur** input shows the engine's most-recently-rolled duration as an **orange overlay** when Generative is ON. Visible everywhere a scene's Dur appears — the SceneColumn header in Grid view AND the Scene Inspector in Sequence view. Focus the input to peek/edit the authored value (overlay hides while focused); blur to bring it back.
+
+Each scene's **Next** (Follow Action) dropdown gets an orange **?** overlay when Generative is ON — because under Generative the engine picks the next scene, not the dropdown's authored value. Hover or click to peek/edit the authored Follow Action.
+
+Engine side: tracks the last-rolled duration per scene id in a `Map<sceneId, ms>`, mirrored into `EngineState.generativeRolledBySceneId`. Pruned automatically on session reload + scene removal.
+
 ### Sequence view: Edit → Grid relabel + resizable Scene Inspector
 
 The "Edit" button in the Sequence view's view-toggle now reads **Grid** (matching how dataFLOU regulars talk about it). The lower Scene Inspector panel below the Scenes palette is now **resizable** -- drag its top edge upward to grow the editor area. Height persists across the session.

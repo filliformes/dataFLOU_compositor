@@ -997,6 +997,16 @@ export class SceneEngine {
   // "every scene once before any repeats" guarantee. Capped at
   // GENERATIVE_HISTORY_LEN entries.
   private generativeHistory: string[] = []
+  // Per-scene most-recent generative auto-roll, in ms. Mirrored
+  // into EngineState so the Scene Inspector can overlay the rolled
+  // duration on the Dur input for ANY focused scene that's been
+  // played under generative mode -- not just the currently-active
+  // one. Scenes that have never been played under generative are
+  // absent from this map; the renderer falls back to the authored
+  // Dur for those. Cleared on session reload (updateSession
+  // invalidates the map when the scene list changes) so stale ids
+  // can't accumulate.
+  private generativeRolledBySceneId: Map<string, number> = new Map()
   // Cached scene-similarity matrix. Sparse: only contains rows for
   // scenes that have been queried since the last invalidation. Both
   // axes index by sceneId. Lazily filled by selectGenerativeScene()
@@ -1143,6 +1153,16 @@ export class SceneEngine {
     for (const k of Object.keys(hardwareCaughtByTrack)) {
       hardwareCaughtByTrack[k].sort((a, b) => a - b)
     }
+    // Flatten the per-scene rolled-duration map into a Record only
+    // when non-empty -- keeps the IPC payload tight at boot and
+    // when generative mode has never been used.
+    let generativeRolledBySceneId: Record<string, number> | undefined
+    if (this.generativeRolledBySceneId.size > 0) {
+      generativeRolledBySceneId = {}
+      this.generativeRolledBySceneId.forEach((ms, sid) => {
+        generativeRolledBySceneId![sid] = ms
+      })
+    }
     this.onStateChange({
       activeBySceneAndTrack: active,
       seqStepBySceneAndTrack: seq,
@@ -1153,7 +1173,10 @@ export class SceneEngine {
       pausedAt: this.pauseStartedAt,
       tickRateHz: this.session.tickRateHz,
       hardwareCaughtByTrack,
-      lastEmittedVelocityByCell: lastVel
+      lastEmittedVelocityByCell: lastVel,
+      ...(generativeRolledBySceneId
+        ? { generativeRolledBySceneId }
+        : {})
     })
   }
 
@@ -1431,12 +1454,20 @@ export class SceneEngine {
     this.generativeSimDirty = true
     // Drop history entries for scenes that no longer exist so the
     // no-repeat / shuffle-cycle constraints don't lock on phantom
-    // scene ids forever.
-    if (this.generativeHistory.length > 0) {
+    // scene ids forever. Also prune the rolled-duration map for
+    // the same reason -- removed scenes shouldn't keep their last
+    // rolled value lingering in engine state.
+    if (
+      this.generativeHistory.length > 0 ||
+      this.generativeRolledBySceneId.size > 0
+    ) {
       const sceneIdSet = new Set(next.scenes.map((s) => s.id))
       this.generativeHistory = this.generativeHistory.filter((id) =>
         sceneIdSet.has(id)
       )
+      for (const sid of Array.from(this.generativeRolledBySceneId.keys())) {
+        if (!sceneIdSet.has(sid)) this.generativeRolledBySceneId.delete(sid)
+      }
     }
     // Ensure per-track state exists for each track; drop stale.
     const keep = new Set(next.tracks.map((t) => t.id))
@@ -2085,6 +2116,19 @@ export class SceneEngine {
       const maxMs = Math.max(cfg.minDurationMs, cfg.maxDurationMs)
       effectiveGenerativeDurationSec =
         (minMs + Math.random() * (maxMs - minMs)) / 1000
+    }
+    // Per-scene rolled-duration tracking (v0.5.10). Each time the
+    // engine triggers a scene under generative mode with a rolled
+    // duration, stash it under that sceneId. The Scene Inspector
+    // reads from this map to overlay the rolled value on whichever
+    // scene the user has focused -- so they can switch between
+    // scenes and see each one's last-rolled Dur without needing
+    // the scene to be the currently-active one.
+    if (typeof effectiveGenerativeDurationSec === 'number') {
+      this.generativeRolledBySceneId.set(
+        sceneId,
+        Math.round(effectiveGenerativeDurationSec * 1000)
+      )
     }
     this.armSceneAdvance(scene, effectiveGenerativeDurationSec)
     this.emitState()
