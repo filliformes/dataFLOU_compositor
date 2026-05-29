@@ -17,6 +17,7 @@ import * as dgram from 'dgram'
 import type {
   DiscoveredOscAddress,
   DiscoveredOscDevice,
+  ForwardDiagEntry,
   NetworkListenerStatus,
   OscForwardTarget
 } from '@shared/types'
@@ -62,6 +63,23 @@ export class OscNetworkListener {
   // flood the console at the upstream sender's packet rate (which can
   // be hundreds of msg/sec for control surfaces).
   private forwardErrorThrottle = new Map<string, number>()
+  // v0.5.10 -- per-source diagnostic counters for the HW Mode
+  // Suppress-check panel in the renderer. For each `${ip}:${port}`
+  // we count:
+  //   - received: total UDP packets observed from this source
+  //   - suppressed: those that the suppress hook claimed (= HW Mode
+  //     absorbed them and the byte-forward path was skipped)
+  //   - forwarded: those that ran through forwardPacket() (would
+  //     reach Max/PD/etc if any target is enabled)
+  // The forwarded counter increments WHETHER OR NOT any target is
+  // actually enabled -- we want to surface "this source is unsuppressed"
+  // even when Forward is empty so the user can see the bug before it
+  // bites. Capped at MAX_DEVICES entries (same defensive bound as the
+  // device map) so a broadcast spammer can't OOM us.
+  private forwardDiag = new Map<
+    string,
+    { ip: string; port: number; received: number; suppressed: number; forwarded: number }
+  >()
   // Push callback invoked by external code on each tick of the IPC
   // batching timer (set up in main/index.ts). Same shape as OscSender.
   private onUpdate:
@@ -107,12 +125,46 @@ export class OscNetworkListener {
 
   clear(): void {
     this.devices.clear()
+    // Also wipe the diagnostic counters -- they only make sense
+    // alongside the device list. Clearing one without the other
+    // would surface stale "this source had dual-emission packets"
+    // warnings for a device the user just forgot about.
+    this.forwardDiag.clear()
     this.dirty = true
     // Immediately push the empty snapshot so the UI updates without
     // waiting for the next periodic flush.
     if (this.onUpdate) {
       this.onUpdate({ status: this.getStatus(), devices: [] })
     }
+  }
+
+  // v0.5.10 -- snapshot of the per-source forward diagnostic
+  // counters. The renderer polls this from the HW Mode Suppress
+  // panel in Pool > Network. Returned as a flat array so the UI
+  // can sort it without an extra Object.entries() pass.
+  getForwardDiag(): ForwardDiagEntry[] {
+    const out: ForwardDiagEntry[] = []
+    this.forwardDiag.forEach((e) => {
+      out.push({
+        ip: e.ip,
+        port: e.port,
+        received: e.received,
+        suppressed: e.suppressed,
+        forwarded: e.forwarded
+      })
+    })
+    // Most-active first so the source we care about (typically a
+    // HW controller streaming at high rate) pops to the top.
+    out.sort((a, b) => b.received - a.received)
+    return out
+  }
+
+  // v0.5.10 -- reset the diagnostic counters without clearing the
+  // device map. Used by the "Reset counters" button in the panel
+  // when the user wants to measure a fresh window (e.g. after
+  // flipping a HW Mode toggle).
+  clearForwardDiag(): void {
+    this.forwardDiag.clear()
   }
 
   /**
@@ -285,6 +337,40 @@ export class OscNetworkListener {
         if (rawSock && typeof rawSock.on === 'function') {
           rawSock.on('message', (buf: Buffer, rinfo: dgram.RemoteInfo) => {
             if (!this.enabled) return
+            // v0.5.10 -- update per-source diagnostic counters first,
+            // BEFORE the no-forward-targets fast-out, so the panel
+            // can still show "this source is unsuppressed" even when
+            // no Forward target is enabled. Bounded by MAX_DEVICES.
+            const diagIp =
+              rinfo && typeof rinfo.address === 'string' ? rinfo.address : ''
+            const diagPort =
+              rinfo && typeof rinfo.port === 'number' ? rinfo.port : 0
+            const suppressed =
+              !!this.onShouldSuppressForwardHook &&
+              diagIp.length > 0 &&
+              diagPort > 0 &&
+              this.onShouldSuppressForwardHook(diagIp, diagPort)
+            if (diagIp.length > 0 && diagPort > 0) {
+              const key = `${diagIp}:${diagPort}`
+              let entry = this.forwardDiag.get(key)
+              if (!entry) {
+                if (this.forwardDiag.size < MAX_DEVICES) {
+                  entry = {
+                    ip: diagIp,
+                    port: diagPort,
+                    received: 0,
+                    suppressed: 0,
+                    forwarded: 0
+                  }
+                  this.forwardDiag.set(key, entry)
+                }
+              }
+              if (entry) {
+                entry.received += 1
+                if (suppressed) entry.suppressed += 1
+                else entry.forwarded += 1
+              }
+            }
             // Skip if no forward targets — avoids a Buffer copy and
             // the for-loop on every quiet packet.
             if (this.forwardTargets.length === 0) return
@@ -300,15 +386,7 @@ export class OscNetworkListener {
             // dual-emission. The hook itself early-returns when no HW
             // Mode template is enabled session-wide, so this check is
             // O(1) in the common case.
-            if (
-              this.onShouldSuppressForwardHook &&
-              rinfo &&
-              typeof rinfo.address === 'string' &&
-              typeof rinfo.port === 'number' &&
-              this.onShouldSuppressForwardHook(rinfo.address, rinfo.port)
-            ) {
-              return
-            }
+            if (suppressed) return
             this.forwardPacket(buf)
           })
         }

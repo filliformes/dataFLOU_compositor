@@ -12,11 +12,12 @@
 // drawer can provide). Drafts (auto-created backing Templates behind
 // "Add Instrument" sidebar rows) are hidden until "Save as Template".
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useStore } from '../store'
 import type {
   DiscoveredOscDevice,
+  ForwardDiagEntry,
   InstrumentFunction,
   InstrumentTemplate,
   NetworkListenerStatus,
@@ -838,12 +839,21 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
   const status = useStore((s) => s.networkStatus)
   const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
   const materialise = useStore((s) => s.materialiseNetworkDevice)
-  // Port input is local (mirrored from localStorage on mount and from
-  // the listener's actual port via status pushes). We don't bind it
-  // directly to status.port because the user edits it free-form before
-  // hitting "Apply".
+  // v0.5.10 -- session.listenerPort takes priority over the
+  // localStorage fallback. When set, the TopBar's "Listen on" input
+  // and this NetworkTab input show the same value and write through
+  // the same store action so the two surfaces stay in sync.
+  const sessionListenerPort = useStore((s) => s.session.listenerPort)
+  const setListenerPort = useStore((s) => s.setListenerPort)
+  const rebindAllHardwareModes = useStore(
+    (s) => s.rebindAllHardwareModesToDevice
+  )
+  // Port input is local (mirrored from session.listenerPort if set,
+  // else status.port from main, else the localStorage fallback). We
+  // don't bind it directly to any of those because the user edits
+  // free-form before hitting "Apply".
   const [portInput, setPortInput] = useState<number>(() =>
-    status.port || loadNetworkPort()
+    sessionListenerPort || status.port || loadNetworkPort()
   )
   // Track whether the port input is currently focused so external
   // status pushes don't overwrite the user's in-progress typing. The
@@ -886,6 +896,17 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status.port])
 
+  // v0.5.10 -- also keep in sync with session.listenerPort, which
+  // can be changed from the TopBar's "Listen on" input or by
+  // loading a session file. Same focus-guard rules.
+  useEffect(() => {
+    if (portInputFocused.current) return
+    if (sessionListenerPort && sessionListenerPort !== portInput) {
+      setPortInput(sessionListenerPort)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionListenerPort])
+
   async function applyToggle(): Promise<void> {
     setBusy(true)
     try {
@@ -907,10 +928,19 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
   async function applyPort(): Promise<void> {
     if (!Number.isFinite(portInput) || portInput < 1 || portInput > 65535) return
     saveNetworkPort(portInput)
+    // v0.5.10 -- write through to session.listenerPort so the
+    // binding survives save/load AND the TopBar's "Listen on"
+    // input reflects the same value. setListenerPort also pushes
+    // to the main-process listener via IPC, so we don't need to
+    // call networkSetEnabled separately when the listener is
+    // already enabled.
+    setListenerPort(portInput)
     setBusy(true)
     try {
       // Re-bind on the new port. Pass current enabled state so we
       // stay on if already listening, or stay off if we weren't.
+      // (setListenerPort always passes enabled=true, but if the
+      // user had the listener OFF we want to preserve that here.)
       const next = await window.api?.networkSetEnabled?.(
         status.enabled,
         portInput
@@ -1044,8 +1074,282 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
               // handler to remove the just-materialised template when
               // the drop didn't land on a valid target.
               onCancelMaterialise={(tplId) => useStore.getState().removeTemplate(tplId)}
+              // v0.5.10 -- right-click batch rebind. Sweeps every
+              // Pool template whose hardwareMode is configured
+              // and points it at this device's ip:port. Use case:
+              // the user's controller moved to a new address and
+              // they want every HW-Moded Instrument to follow at
+              // once without editing each template by hand.
+              onRebindAllHardwareModes={() =>
+                rebindAllHardwareModes(d.ip, d.port)
+              }
             />
           ))}
+        </>
+      )}
+      {/* v0.5.10 -- HW Mode Suppress diagnostic panel. Shows whether
+          the byte-forward path is being correctly suppressed for
+          packets coming from HW-Moded controllers. Critical for
+          show-night diagnosis of "is Max getting dual-emission
+          packets that will crash it after 5 minutes". */}
+      <HwModeSuppressPanel />
+    </div>
+  )
+}
+
+// v0.5.10 -- HW Mode Suppress diagnostic panel.
+//
+// THE PROBLEM IT DIAGNOSES:
+//   When a HW Mode controller (e.g. OCTOCOSME) sends OSC to dataFLOU's
+//   listener AND any Forward target is enabled, every packet should
+//   be suppressed from the byte-forward path -- HW Mode emits a clean
+//   single value via the normal cell-emit path, and re-forwarding the
+//   raw packet too would land at downstream consumers (Max, PD) as a
+//   DUPLICATE for the same OSC address, causing message-queue pressure
+//   that crashes Max after ~5 minutes.
+//
+//   The suppress hook gates this. It matches on (sourceIp, sourcePort)
+//   against every configured `template.hardwareMode.{deviceIp,devicePort}`.
+//   If the user's HW controller's actual UDP source port DOESN'T match
+//   the configured port (common when the controller binds an ephemeral
+//   source rather than 8888), the suppress hook silently misses every
+//   packet -- HW Mode itself ALSO misses, but Forward still fires raw.
+//
+// WHAT THIS PANEL SHOWS:
+//   For each HW-Moded template:
+//     - Configured source ip:port
+//     - Live counter of received / suppressed / forwarded packets
+//     - Status badge: ✓ healthy / ⚠ port mismatch / ✕ no packets / 🔥 dual-emission
+//   Plus a "Suspect mismatch?" section listing any source whose IP
+//   matches a HW Mode template's IP but whose PORT does not -- the
+//   smoking gun for the source-port-mismatch class of bugs.
+function HwModeSuppressPanel(): JSX.Element {
+  const templates = useStore((s) => s.session.pool.templates)
+  // Polled diagnostic counters. Re-fetched at ~2 Hz while the panel
+  // is mounted. Cheap (single IPC return of <=64 small objects).
+  const [diag, setDiag] = useState<ForwardDiagEntry[]>([])
+  const [collapsed, setCollapsed] = useState(true)
+  // Only enumerate templates that have an enabled HW Mode block --
+  // the panel is dead weight when nothing is configured.
+  const hwTemplates = useMemo(
+    () => templates.filter((t) => t.hardwareMode && t.hardwareMode.enabled),
+    [templates]
+  )
+  useEffect(() => {
+    if (collapsed) return
+    let cancelled = false
+    async function poll(): Promise<void> {
+      const next = await window.api?.networkGetForwardDiag?.()
+      if (cancelled) return
+      if (Array.isArray(next)) setDiag(next)
+    }
+    void poll()
+    const id = setInterval(() => void poll(), 500)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [collapsed])
+  async function reset(): Promise<void> {
+    await window.api?.networkClearForwardDiag?.()
+    setDiag([])
+  }
+  // Build a quick index of seen sources for cross-reference. Keys:
+  // both `ip:port` (exact match) and `ip` (fuzzy / port-agnostic).
+  const byExact = useMemo(() => {
+    const m = new Map<string, ForwardDiagEntry>()
+    for (const e of diag) m.set(`${e.ip}:${e.port}`, e)
+    return m
+  }, [diag])
+  const byIp = useMemo(() => {
+    const m = new Map<string, ForwardDiagEntry[]>()
+    for (const e of diag) {
+      const arr = m.get(e.ip) ?? []
+      arr.push(e)
+      m.set(e.ip, arr)
+    }
+    return m
+  }, [diag])
+  // Total dual-emission count across all configured templates --
+  // surfaces a "everything's fine" / "danger" headline on the
+  // collapsed pill.
+  const totalDualEmission = useMemo(() => {
+    let n = 0
+    for (const t of hwTemplates) {
+      const hw = t.hardwareMode
+      if (!hw) continue
+      const e = byExact.get(`${hw.deviceIp}:${hw.devicePort}`)
+      if (e) n += e.forwarded
+    }
+    return n
+  }, [hwTemplates, byExact])
+  if (hwTemplates.length === 0) {
+    // No HW Mode templates configured -- panel is informational only.
+    // Render a tiny stub so the surface is discoverable when the
+    // user enables their first HW Mode block.
+    return (
+      <div className="px-2 pt-3 pb-2 border-t border-border/60">
+        <div className="text-[10px] text-muted leading-snug">
+          <span className="font-semibold text-text">HW Mode Suppress:</span>{' '}
+          no Hardware Mode templates configured -- nothing to diagnose
+          here. Enable Hardware Mode on a Pool Instrument to surface
+          per-source suppress counters.
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="px-2 pt-2 pb-2 border-t border-border/60 flex flex-col gap-1">
+      <div className="flex items-center gap-1">
+        <button
+          className="text-muted hover:text-text text-[10px] leading-none w-4 shrink-0"
+          onClick={() => setCollapsed((v) => !v)}
+          title={collapsed ? 'Expand' : 'Collapse'}
+        >
+          {collapsed ? '▸' : '▾'}
+        </button>
+        <span className="text-[10px] uppercase tracking-wide text-muted">
+          HW Mode Suppress
+        </span>
+        <span
+          className="inline-block w-1.5 h-1.5 rounded-full ml-1"
+          style={{
+            background:
+              totalDualEmission > 0
+                ? 'rgb(var(--c-danger))'
+                : 'rgb(var(--c-success))'
+          }}
+          title={
+            totalDualEmission > 0
+              ? `${totalDualEmission} unsuppressed packets from HW-Moded sources -- Max/PD may receive duplicates`
+              : 'No dual-emission detected from configured HW-Moded sources'
+          }
+        />
+        <div className="flex-1" />
+        {!collapsed && (
+          <button
+            className="text-[9px] text-muted hover:text-text px-1 leading-tight"
+            onClick={reset}
+            title="Reset per-source counters without clearing the device list"
+          >
+            Reset
+          </button>
+        )}
+      </div>
+      {!collapsed && (
+        <>
+          <div className="text-[9px] text-muted leading-snug">
+            For each HW Mode template, counts packets from its
+            configured source ip:port. `suppressed` is good (no dual
+            emission). `forwarded` from a HW-Moded source is BAD --
+            Max/PD will see duplicate values per OSC address.
+          </div>
+          {hwTemplates.map((t) => {
+            const hw = t.hardwareMode!
+            const exactKey = `${hw.deviceIp}:${hw.devicePort}`
+            const exact = byExact.get(exactKey)
+            const sameIp = byIp.get(hw.deviceIp) ?? []
+            const mismatches = sameIp.filter(
+              (e) => e.port !== hw.devicePort
+            )
+            // Status badge selection. Priority: dual emission > port
+            // mismatch (no exact match but IP seen on other port) > no
+            // packets > healthy.
+            let badge: { label: string; color: string; tip: string }
+            if (exact && exact.forwarded > 0) {
+              badge = {
+                label: '🔥 DUAL EMISSION',
+                color: 'rgb(var(--c-danger))',
+                tip: `${exact.forwarded} packets reached Forward without being suppressed. Max/PD will see duplicate values per OSC address -- expect crashes after sustained streaming.`
+              }
+            } else if (!exact && mismatches.length > 0) {
+              badge = {
+                label: '⚠ PORT MISMATCH',
+                color: 'rgb(var(--c-warning, 234 179 8))',
+                tip: `No packets at the configured ${hw.deviceIp}:${hw.devicePort}, but packets arrived from ${hw.deviceIp} on a DIFFERENT source port. Suppress hook never fires. Likely the controller's UDP source port is ephemeral -- update the HW Mode device port to match the actually-seen one (below), or pin the source port on the controller firmware.`
+              }
+            } else if (!exact) {
+              badge = {
+                label: '✕ NO PACKETS',
+                color: 'rgb(var(--c-muted))',
+                tip: `No packets observed from ${hw.deviceIp}:${hw.devicePort}. Either the controller is offline, addressed at the wrong listener port, or unreachable on the network.`
+              }
+            } else {
+              badge = {
+                label: '✓ HEALTHY',
+                color: 'rgb(var(--c-success))',
+                tip: `${exact.suppressed} packets suppressed. No dual-emission risk.`
+              }
+            }
+            return (
+              <div
+                key={t.id}
+                className="flex flex-col gap-0.5 px-1.5 py-1 border border-border/40 rounded text-[10px]"
+              >
+                <div className="flex items-center gap-1">
+                  <span className="font-semibold text-text truncate flex-1">
+                    {t.name}
+                  </span>
+                  <span
+                    className="text-[9px] px-1 py-0 rounded-sm font-mono shrink-0"
+                    style={{ color: badge.color, borderColor: badge.color }}
+                    title={badge.tip}
+                  >
+                    {badge.label}
+                  </span>
+                </div>
+                <div className="text-[9px] text-muted leading-tight">
+                  Configured:{' '}
+                  <span className="font-mono text-text">
+                    {hw.deviceIp}:{hw.devicePort}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 text-[9px] tabular-nums font-mono">
+                  <span title="UDP packets observed from the configured source">
+                    recv:{' '}
+                    <span className="text-text">{exact?.received ?? 0}</span>
+                  </span>
+                  <span
+                    title="Packets the suppress hook claimed (= HW Mode absorbed them, no dual-emission risk)"
+                    style={{ color: 'rgb(var(--c-success))' }}
+                  >
+                    supp: {exact?.suppressed ?? 0}
+                  </span>
+                  <span
+                    title="Packets the suppress hook did NOT claim (= would reach Max/PD via Forward, dual-emission risk)"
+                    style={{
+                      color:
+                        (exact?.forwarded ?? 0) > 0
+                          ? 'rgb(var(--c-danger))'
+                          : 'rgb(var(--c-muted))'
+                    }}
+                  >
+                    fwd: {exact?.forwarded ?? 0}
+                  </span>
+                </div>
+                {mismatches.length > 0 && (
+                  <div
+                    className="text-[9px] leading-snug border-t border-border/40 pt-1 mt-0.5"
+                    style={{ color: 'rgb(var(--c-warning, 234 179 8))' }}
+                  >
+                    Suspect: same IP on other source port(s):{' '}
+                    {mismatches.map((m, i) => (
+                      <span key={`${m.ip}:${m.port}`} className="font-mono">
+                        {i > 0 && ', '}
+                        {m.ip}:{m.port}
+                        <span className="text-muted">
+                          {' '}
+                          ({m.received} pkt)
+                        </span>
+                      </span>
+                    ))}
+                    . Update the template's device port to match if
+                    this is the same physical device.
+                  </div>
+                )}
+              </div>
+            )
+          })}
         </>
       )}
     </div>
@@ -1057,7 +1361,8 @@ function NetworkDeviceRow({
   expanded,
   onToggleExpand,
   onMaterialiseForDrag,
-  onCancelMaterialise
+  onCancelMaterialise,
+  onRebindAllHardwareModes
 }: {
   device: DiscoveredOscDevice
   expanded: boolean
@@ -1072,7 +1377,30 @@ function NetworkDeviceRow({
   // leave the just-materialised template stranded in the Pool. We
   // call this on dragend when dataTransfer.dropEffect === 'none'.
   onCancelMaterialise: (tplId: string) => void
+  // v0.5.10 -- right-click action: rebind every Pool template's
+  // HW Mode source to this device's ip:port. The store action
+  // walks templates with `hardwareMode` set and updates them in
+  // place. No-op on templates without a hardwareMode block.
+  onRebindAllHardwareModes: () => void
 }): JSX.Element {
+  // Right-click context menu. We track the mouse coords so the
+  // floating menu lands where the user clicked. State lives here
+  // (per-row) because the menu only affects this device. Closed
+  // by clicking outside, pressing Esc, or invoking an action.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = (): void => setCtxMenu(null)
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setCtxMenu(null)
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [ctxMenu])
   // Track the id committed at drag-start so onDragEnd can roll back
   // if the drop didn't take. Using a ref instead of state keeps the
   // value stable across React renders that happen between dragstart
@@ -1120,9 +1448,17 @@ function NetworkDeviceRow({
         onDragStart={onDragStart}
         onDragEnd={onDragEnd}
         onClick={onToggleExpand}
+        onContextMenu={(e) => {
+          // v0.5.10 -- right-click opens the HW Mode batch-rebind
+          // menu. Keep the action small + obvious so we don't grow
+          // into a kitchen-sink menu.
+          e.preventDefault()
+          e.stopPropagation()
+          setCtxMenu({ x: e.clientX, y: e.clientY })
+        }}
         className="relative flex items-center gap-1 px-1 py-[1px] cursor-grab text-[12px] leading-tight hover:bg-panel2/60"
         style={{ borderLeft: `3px solid rgb(var(--c-accent))` }}
-        title="Drag onto the Edit sidebar to add as an Instrument (one Parameter per address)."
+        title="Drag onto the Edit sidebar to add as an Instrument (one Parameter per address). Right-click for HW Mode actions."
       >
         <button
           className="text-muted hover:text-text text-[15px] font-bold leading-none w-5 shrink-0"
@@ -1180,6 +1516,33 @@ function NetworkDeviceRow({
             ))}
         </div>
       )}
+      {/* v0.5.10 right-click context menu -- portalled to body so
+          it isn't clipped by the Pool drawer's overflow. Single
+          action for now: rebind every HW-Moded Instrument to this
+          device. */}
+      {ctxMenu &&
+        createPortal(
+          <div
+            className="fixed z-[1000] bg-panel border border-border rounded shadow-lg text-[11px] py-1"
+            style={{ left: ctxMenu.x, top: ctxMenu.y, minWidth: 240 }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="px-2 py-1 text-[10px] text-muted border-b border-border/60">
+              <span className="font-mono">{device.id}</span>
+            </div>
+            <button
+              className="block w-full text-left px-3 py-1.5 hover:bg-panel2"
+              onClick={() => {
+                onRebindAllHardwareModes()
+                setCtxMenu(null)
+              }}
+              title="For every Pool template that has Hardware Mode configured, set its source device to this ip:port. Templates without HW Mode are untouched."
+            >
+              Rebind every HW-Moded Instrument to this device
+            </button>
+          </div>,
+          document.body
+        )}
     </div>
   )
 }

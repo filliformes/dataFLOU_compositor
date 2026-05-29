@@ -1638,6 +1638,12 @@ export interface Session {
   // advances are diverted. Optional + back-compat: older sessions
   // without this field default to disabled.
   generative?: GenerativeConfig
+  // Incoming OSC listener port (v0.5.10). Stored on the session so
+  // the binding travels with the file -- when you reopen the
+  // session, dataFLOU re-binds to the same port automatically.
+  // Optional + back-compat: when missing, the renderer falls back
+  // to its localStorage value (`dataflou.networkPort:v1`) or 9000.
+  listenerPort?: number
 }
 
 // GUI layout snapshot saved with each session. Mirrors the
@@ -1648,6 +1654,11 @@ export interface Session {
 // missing pieces.
 export interface SessionUiState {
   uiScale?: number
+  // v0.5.10 -- per-toolbar zoom multiplier (default 1.0). Applied on
+  // top of uiScale so the toolbar's effective rendering is
+  // `uiScale * topBarScale`. Lets users bump up just the toolbar
+  // when uiScale is small (e.g. 0.6) without rescaling the grid.
+  topBarScale?: number
   rowHeight?: number
   sceneColumnWidth?: number
   inspectorWidth?: number
@@ -1862,6 +1873,22 @@ export interface NetworkListenerStatus {
   lastError: string
 }
 
+// v0.5.10 -- per-source diagnostic counter for the HW Mode Suppress
+// panel in Pool > Network. One entry per (ip, port) UDP source the
+// listener has heard from. `suppressed` increments when the engine's
+// HW Mode suppress hook claimed the packet (= no dual-emission risk);
+// `forwarded` increments when the packet passed through the forward
+// path (= would reach Max/PD if any target is enabled). When a HW
+// Mode template is configured for this source but `forwarded > 0`,
+// the panel flags dual-emission danger.
+export interface ForwardDiagEntry {
+  ip: string
+  port: number
+  received: number
+  suppressed: number
+  forwarded: number
+}
+
 // One OSC forward destination. dataFLOU listens on `session.defaultDestPort`
 // and, if any forward target is enabled, byte-copies every received UDP
 // packet onward to that target's ip:port. Lets dataFLOU sit in front of
@@ -2015,6 +2042,20 @@ export interface ExposedApi {
   // Called from the store on any add/remove/enable/edit so main always
   // mirrors the renderer's session state.
   networkSetForwardTargets: (targets: OscForwardTarget[]) => Promise<void>
+  // v0.5.10 -- per-source diagnostic counter snapshot for the HW
+  // Mode Suppress panel. Polled by the renderer at ~2 Hz while the
+  // panel is visible. Returns the full set in one go so the UI
+  // can show every recently-seen source, not just the HW-Moded ones.
+  networkGetForwardDiag: () => Promise<ForwardDiagEntry[]>
+  // v0.5.10 -- reset the diagnostic counters without clearing the
+  // device list. Lets the user measure a fresh window after
+  // flipping a HW Mode toggle to verify the fix took.
+  networkClearForwardDiag: () => Promise<void>
+  // v0.5.10 -- package version string (e.g. "0.5.10"). Resolves
+  // to the value Electron's `app.getVersion()` returns, which is
+  // sourced from package.json at app start. Renderer reads this
+  // once on mount to bake the version into `document.title`.
+  appGetVersion: () => Promise<string>
   // Push channel — fired on a 250ms timer whenever the device map has
   // changed (new sender, new address, or fresh packet count). Status
   // is bundled in so port-rebinds and bind errors round-trip too.

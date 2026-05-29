@@ -79,6 +79,11 @@ function shutdown(): void {
 }
 
 function createWindow(): void {
+  // v0.5.10 -- bake the package version into the window title.
+  // The renderer further appends the loaded session name via
+  // `document.title`, which Electron auto-syncs back to the
+  // window chrome.
+  const appVersion = app.getVersion()
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -87,7 +92,7 @@ function createWindow(): void {
     show: false,
     backgroundColor: '#1d1d1d',
     autoHideMenuBar: true,
-    title: 'dataFLOU_compositor',
+    title: `dataFLOU_compositor v${appVersion}`,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -330,6 +335,17 @@ app.whenReady().then(async () => {
       Array.isArray(targets) ? (targets as OscForwardTarget[]) : []
     )
   })
+  // v0.5.10 -- HW Mode Suppress diagnostic panel. Renderer polls
+  // these at ~2 Hz while the Pool > Network tab's panel is visible.
+  // Cheap: returns a flat array from a Map of at most MAX_DEVICES (64)
+  // entries.
+  safeHandle('network:getForwardDiag', () => networkListener.getForwardDiag())
+  safeHandle('network:clearForwardDiag', () => networkListener.clearForwardDiag())
+  // v0.5.10 -- expose package version to the renderer so it can
+  // include it in `document.title` (which Electron auto-syncs back
+  // to the window chrome). Sync to a Promise return so the renderer
+  // can render before this resolves and update on resolution.
+  safeHandle('app:getVersion', () => app.getVersion())
 
   // ---------- IPC: MIDI ----------
   // Enumerate currently-visible MIDI output ports. Renderer calls

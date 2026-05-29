@@ -84,6 +84,14 @@ const api: ExposedApi = {
   networkClear: () => ipcRenderer.invoke('network:clear'),
   networkSetForwardTargets: (targets) =>
     ipcRenderer.invoke('network:setForwardTargets', targets),
+  // v0.5.10 -- HW Mode Suppress diagnostic panel polling
+  networkGetForwardDiag: () => ipcRenderer.invoke('network:getForwardDiag'),
+  networkClearForwardDiag: () =>
+    ipcRenderer.invoke('network:clearForwardDiag'),
+  // v0.5.10 -- package version (sourced from package.json via
+  // Electron's app.getVersion()). Renderer reads this once on mount
+  // to populate the window title.
+  appGetVersion: () => ipcRenderer.invoke('app:getVersion'),
   onNetworkDevices: (cb) => {
     const h = (
       _e: Electron.IpcRendererEvent,

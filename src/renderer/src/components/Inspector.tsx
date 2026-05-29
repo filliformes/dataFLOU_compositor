@@ -349,6 +349,15 @@ function TrackInspector(): JSX.Element {
         </div>
       </Section>
 
+      {/* v0.5.10 -- Instrument-wide OSC port broadcast. Switches the
+          template's destPort, every instantiated row's defaultDestPort,
+          and every cell's destPort in one click. Use case: two
+          physical OCTOCOSME controllers on different ports (1985 /
+          1986) -- flip between them mid-show without touching cells. */}
+      {isTemplate && templateForRow && (
+        <InstrumentPortBroadcast templateId={templateForRow.id} currentPort={templateForRow.destPort} />
+      )}
+
       {/* Hardware Mode — only for Template (Instrument) rows. Shows
           the same controls as the Pool's TemplateInspector. Both
           surfaces edit the SAME template.hardwareMode blob via
@@ -519,6 +528,56 @@ function TrackInspector(): JSX.Element {
 // (grid-side Parameter Inspector). Lets the user push a fresh
 // transitionMs to every cell on this row in one click without
 // dragging the OSC/MIDI defaults along for the ride.
+// Instrument-wide OSC port switcher (v0.5.10). Lets the user flip
+// an entire Instrument's OSC port -- template default + every
+// instantiated row's defaultDestPort + every cell across every
+// scene -- in one click. Designed for the "two physical
+// controllers on different ports" use case (e.g. two OCTOCOSME
+// units on 1985 + 1986) where the user wants to swap which one is
+// receiving without rebinding every cell.
+function InstrumentPortBroadcast({
+  templateId,
+  currentPort
+}: {
+  templateId: string
+  currentPort: number
+}): JSX.Element {
+  const broadcast = useStore((s) => s.broadcastInstrumentPort)
+  const [port, setPort] = useState<number>(currentPort)
+  // Sync the input to the current template port whenever the user
+  // switches which Instrument row is focused (the seed prop changes
+  // as the user clicks different instruments).
+  useEffect(() => {
+    setPort(currentPort)
+  }, [templateId, currentPort])
+  return (
+    <Section title="OSC Port (Instrument-wide)">
+      <div className="flex items-center gap-2">
+        <BoundedNumberInput
+          className="input w-20 text-[12px] text-center tabular-nums"
+          value={port}
+          onChange={(v) => setPort(v)}
+          min={0}
+          max={65535}
+          integer
+          title="Type the new port. Click Apply to broadcast to every row and clip of this Instrument."
+        />
+        <button
+          className="btn text-[11px] flex-1"
+          onClick={() => broadcast(templateId, port)}
+          title="Apply this port to every Parameter row + every clip of this Instrument."
+        >
+          Apply
+        </button>
+      </div>
+      <div className="text-[10px] text-muted leading-snug mt-1">
+        Broadcasts the chosen port to the template's default + every
+        instantiated row + every clip across every scene.
+      </div>
+    </Section>
+  )
+}
+
 function TrackTransitionBroadcast({
   trackId,
   scenesCount

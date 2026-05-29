@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--0510)
+- [Release notes](#release-notes--0511)
+  - [0.5.11](#release-notes--0511)
   - [0.5.10](#release-notes--0510)
   - [0.5.9](#release-notes--059)
   - [0.5.8](#release-notes--058)
@@ -567,6 +568,44 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.5.11
+
+A live-routing + ergonomics pass ahead of the **Juin Generatif** show. The headline is **session-wide OSC routing**: you can now flip the whole session's outgoing broadcast destination and listener port from the prefs toolbar, and an **Instrument-wide OSC port broadcast** lets you swap which physical controller an entire Instrument talks to in one click. Plus a diagnostic panel for the v0.5.10 Hardware-Mode-vs-Forward crash, a version + session name in the window title, a separate saveable toolbar zoom, and a tighter scene-title row.
+
+### Session-wide OSC routing
+
+The prefs sub-toolbar gets two new compact controls:
+- **OSC Broadcast** (IP + port + Apply) - sets the session's default outgoing OSC destination in one place. Calls `broadcastSessionDest`, which stamps the chosen IP/port across the session's default OSC group so every Instrument that inherits the session default follows it.
+- **Listener Port** (port + Apply) - sets the UDP port the compositor binds for incoming OSC (Hardware Mode + Capture + Forward source). Persisted on the session as `listenerPort`; the Pool · Network tab's port input now reads from and writes to the same session value, so the two surfaces never drift.
+
+### Instrument-wide OSC port broadcast
+
+The grid-side **Instrument Inspector** (click a Template/Instrument row header) gets a new **OSC Port (Instrument-wide)** section: type a port, click **Apply**, and the chosen port is written to the template default **and** every instantiated Parameter row's `defaultDestPort` **and** every clip across every scene. Built for the "two physical OCTOCOSME units on 1985 + 1986" case - swap which unit an Instrument drives mid-show without rebinding cells one by one (`broadcastInstrumentPort`).
+
+### Rebind every HW-Moded Instrument to one device
+
+Pool · Network tab: right-click any discovered device → **Rebind every HW-Moded Instrument to this device**. Repoints every Instrument whose Hardware Mode is enabled at the chosen device's IP/port in one action - handy when a controller comes up on a new address (`rebindAllHardwareModesToDevice`).
+
+### Hardware Mode Forward-suppress diagnostic panel
+
+A new panel at the bottom of the Pool · Network tab surfaces the v0.5.10 dual-emission fix live. While expanded it polls `network:getForwardDiag` (~500 ms) and shows a per-source card with **received / suppressed / forwarded** counters and a status badge: **✓ HEALTHY** (HW-Mode source is being suppressed as intended), **🔥 DUAL EMISSION** (packets are being forwarded that shouldn't be), **⚠ PORT MISMATCH** (source port ≠ the device's configured port, so the suppress hook is missing), or **✕ NO PACKETS**. The collapsed pill shows a red dot if anything is still forwarding. A **Reset** button clears the counters. This is the tool to confirm whether Max is getting clean single-emission OSC.
+
+### Window title with version + session name
+
+The window title now reads `dataFLOU_compositor v0.5.11 : OCTOCOSME` - app name + version (from `package.json` via `app.getVersion()`) + the current session name (session name → loaded filename → "Untitled"). Updates live when you load or rename a session.
+
+### Separate, saveable toolbar zoom + zoom shortcuts
+
+The whole UI's zoom (`uiScale`) already persisted per session; v0.5.11 wires the keyboard shortcuts **Ctrl + =** (zoom in), **Ctrl + -** (zoom out), and **Ctrl + 0** (reset to 100 %). On top of that, the **top toolbar now has its own independent zoom** (`topBarScale`) with a **Toolbar [−] NN% [+]** control in the prefs panel - the percent button resets it to 100 %. Saved inside the session, so a per-show toolbar size travels with the file. Useful on small laptop screens where the global zoom made the toolbar text too tiny.
+
+### Tighter scene-title row + horizontal scroll
+
+- **Scene title row**: the per-scene colour-picker square now sits flush above the **Next** (Follow Action) dropdown's right edge instead of stretching to the full column width, reclaiming horizontal space in every scene column.
+- **Narrower minimum widths**: scene columns can now shrink to **140 px** (was 180) and the right Inspector to **280 px** (was 320).
+- **Horizontal scroll wheel**: trackpad / tilt-wheel horizontal deltas (`deltaX`) now scroll the grid horizontally even when the pointer isn't over a native horizontal scrollbar.
 
 ---
 

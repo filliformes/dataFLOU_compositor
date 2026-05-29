@@ -118,6 +118,41 @@ function saveUiScale(v: number): void {
   }
 }
 
+// v0.5.10 -- per-toolbar zoom multiplier. Applied on top of `uiScale`
+// so a user can scale up the main toolbar independently of the
+// working area (use case: at uiScale 0.6 the toolbar buttons get
+// hard to read; topBarScale lifts JUST the toolbar without
+// rescaling every Scene column). Stored in session.ui so it
+// travels with the file, mirrored to localStorage for fresh-session
+// defaults. Effective toolbar zoom = uiScale * topBarScale.
+const TOPBAR_SCALE_KEY = 'dataflou:topBarScale:v1'
+export const TOPBAR_SCALE_MIN = 0.5
+export const TOPBAR_SCALE_MAX = 2.5
+export const TOPBAR_SCALE_STEP = 0.05
+const TOPBAR_SCALE_DEFAULT = 1.0
+function loadTopBarScale(): number {
+  try {
+    const raw =
+      typeof localStorage !== 'undefined'
+        ? localStorage.getItem(TOPBAR_SCALE_KEY)
+        : null
+    const n = raw == null ? NaN : parseFloat(raw)
+    return Number.isFinite(n) && n >= TOPBAR_SCALE_MIN && n <= TOPBAR_SCALE_MAX
+      ? n
+      : TOPBAR_SCALE_DEFAULT
+  } catch {
+    return TOPBAR_SCALE_DEFAULT
+  }
+}
+function saveTopBarScale(v: number): void {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem(TOPBAR_SCALE_KEY, String(v))
+  } catch {
+    /* ignore */
+  }
+}
+
 function loadTemplates(): ClipTemplate[] {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(TEMPLATES_KEY) : null
@@ -189,6 +224,13 @@ interface UiState {
   // main toolbar via a `zoom` CSS wrapper so the top bar stays at its
   // natural size. Persisted in localStorage.
   uiScale: number
+  // v0.5.10 -- per-toolbar zoom multiplier, applied on top of `uiScale`.
+  // 1 = 100% (toolbar same size as everything else). Use case: at very
+  // small uiScale (e.g. 0.6) the top toolbar gets unreadable; bumping
+  // topBarScale to 1.4 brings JUST the toolbar back to legible size
+  // without rescaling the Scene grid. Persisted in localStorage AND
+  // mirrored into session.ui.topBarScale so it travels with the file.
+  topBarScale: number
   // Shared height of the scene-notes textarea in pixels. Drives header height
   // across all scene columns + the track sidebar so rows stay aligned.
   editorNotesHeight: number
@@ -426,6 +468,7 @@ export function isRichTheme(t: ThemeName): boolean {
 export function buildSessionForSave(
   state: { session: Session; engine?: EngineState } & Partial<{
     uiScale: number
+    topBarScale: number
     rowHeight: number
     sceneColumnWidth: number
     inspectorWidth: number
@@ -450,6 +493,7 @@ export function buildSessionForSave(
     ...state.session,
     ui: {
       uiScale: state.uiScale,
+      topBarScale: state.topBarScale,
       rowHeight: state.rowHeight,
       sceneColumnWidth: state.sceneColumnWidth,
       inspectorWidth: state.inspectorWidth,
@@ -676,6 +720,38 @@ interface Actions {
   // cells with Timing turned off keep their flag (they just remember
   // the new value for when re-enabled).
   broadcastTransitionMs: (trackId: string, transitionMs: number) => void
+  // Switch an entire Instrument (template + every instantiated row +
+  // every cell on those rows + every Function blueprint on the
+  // template) to a new OSC destination port in one click. Use case:
+  // two physical OCTOCOSME controllers on ports 1985 + 1986; flip
+  // between them mid-show without touching individual cells. Lets
+  // the user keep the rest of the Instrument's config (IP, OSC
+  // address, sequencers, mods) intact -- only the port changes.
+  // Clamped 0..65535.
+  broadcastInstrumentPort: (templateId: string, port: number) => void
+  // Session-wide outgoing OSC broadcast (v0.5.10). When the user
+  // switches the downstream consumer's IP/port (e.g. Max moved to
+  // a new laptop), this single action repoints EVERY layer at once:
+  // session defaults, every Pool template, every Function override
+  // (cleared so the template default wins), every Track default,
+  // and every Cell's explicit destIp/destPort. The user can pass
+  // ip-only, port-only, or both -- omitting a field leaves it
+  // unchanged. Linkage flags are NOT touched (cells that were
+  // linked stay linked + auto-follow; cells that were pinned get
+  // their pinned value repointed to the new target).
+  broadcastSessionDest: (next: { ip?: string; port?: number }) => void
+  // Session-wide incoming OSC listener port (v0.5.10). Stored in
+  // Session.listenerPort so the binding travels with the session
+  // file. Setting via this action also pushes the new port to the
+  // main-process OSC listener so it re-binds immediately.
+  setListenerPort: (port: number) => void
+  // Hardware Mode source-IP/port batch update (v0.5.10). For every
+  // Pool template whose hardwareMode is configured (regardless of
+  // its enabled flag), rebind to a single ip:port. Use case: the
+  // user's controller moved to a new IP or port and they want every
+  // HW-Moded Instrument in the Pool to follow at once. Invoked from
+  // the Network discovery panel's right-click menu on a device.
+  rebindAllHardwareModesToDevice: (ip: string, port: number) => void
   // Toggle a track's "enabled" flag (default: enabled). When false,
   // the engine skips this track on any trigger path.
   setTrackEnabled: (id: string, enabled: boolean) => void
@@ -975,6 +1051,10 @@ interface Actions {
   // by metaSmooth.ts on every tween frame.
   setMetaKnobDisplayValues: (values: number[]) => void
   setUiScale: (s: number) => void
+  // v0.5.10 -- per-toolbar zoom multiplier. Same range/step as uiScale.
+  // Applied on top of `uiScale` so the toolbar's effective rendering
+  // is `uiScale * topBarScale`.
+  setTopBarScale: (s: number) => void
 
   // ── Network discovery ───────────────────────────────────────────
   // Replace the device list + status snapshot from a main-process
@@ -1199,10 +1279,24 @@ export const useStore = create<State>((set, get) => ({
   // (see setSession below).
   metaKnobDisplayValues: Array.from({ length: META_KNOB_COUNT }, () => 0),
   uiScale: loadUiScale(),
+  topBarScale: loadTopBarScale(),
   clipTemplates: loadTemplates(),
 
   setSession: (s) => {
     const propagated = backfillTrackArgSpecsFromPool(propagateDefaults(s))
+    // Apply session-level OSC listener port (v0.5.10). When the
+    // session carries a listenerPort, push it to the main-process
+    // listener immediately so reopening a saved session re-binds
+    // to its previously-used port. Sessions saved before v0.5.10
+    // have no listenerPort field and the localStorage fallback in
+    // PoolPane keeps working unchanged.
+    if (typeof propagated.listenerPort === 'number') {
+      // Flat naming -- the preload exposes `networkSetEnabled`, not
+      // a nested `network.setEnabled` object. Always pass true so
+      // the listener auto-rebinds on session load even if it was
+      // off; users can turn it off again via the Network tab.
+      void window.api?.networkSetEnabled?.(true, propagated.listenerPort)
+    }
     // Merge any User entries from the global pool library that the
     // loaded session doesn't already include — same rule as
     // newSession (library entries follow the user across sessions).
@@ -1251,6 +1345,15 @@ export const useStore = create<State>((set, get) => ({
       // Mirror to localStorage so the runtime zoom hook stays in
       // sync with whatever the session restored.
       saveUiScale(uiPatch.uiScale)
+    }
+    // v0.5.10 -- topBarScale (toolbar-only zoom multiplier).
+    // Optional; missing -> defaults to whatever's already in state.
+    if (typeof ui.topBarScale === 'number' && Number.isFinite(ui.topBarScale)) {
+      uiPatch.topBarScale = Math.max(
+        TOPBAR_SCALE_MIN,
+        Math.min(TOPBAR_SCALE_MAX, ui.topBarScale)
+      )
+      saveTopBarScale(uiPatch.topBarScale)
     }
     if (typeof ui.rowHeight === 'number' && Number.isFinite(ui.rowHeight)) {
       uiPatch.rowHeight = clampInt(ui.rowHeight, 45, 220)
@@ -2738,6 +2841,193 @@ export const useStore = create<State>((set, get) => ({
         }
       }
     }),
+  broadcastInstrumentPort: (templateId, port) =>
+    set((st) => {
+      const clamped = Math.max(0, Math.min(65535, Math.round(port)))
+      // 1. Pool template -- update its default destPort AND clear
+      // every child Function's destPortOverride so the new template
+      // default applies uniformly to any future instantiation.
+      const nextPool = {
+        ...st.session.pool,
+        templates: st.session.pool.templates.map((t) => {
+          if (t.id !== templateId) return t
+          return {
+            ...t,
+            destPort: clamped,
+            functions: t.functions.map((f) => ({
+              ...f,
+              // Clear the per-function port override -- under uniform
+              // port broadcast we want every function to follow the
+              // template's new port, not retain a stale override.
+              destPortOverride: undefined
+            }))
+          }
+        })
+      }
+      // 2. Build the set of affected tracks: every Template-row Track
+      // whose sourceTemplateId === templateId, PLUS every child
+      // Parameter Track whose parentTrackId is in that set.
+      const templateRowIds = new Set<string>()
+      for (const t of st.session.tracks) {
+        if (t.kind === 'template' && t.sourceTemplateId === templateId) {
+          templateRowIds.add(t.id)
+        }
+      }
+      const affected = new Set<string>(templateRowIds)
+      for (const t of st.session.tracks) {
+        if (t.parentTrackId && templateRowIds.has(t.parentTrackId)) {
+          affected.add(t.id)
+        }
+      }
+      // 3. Tracks -- set the per-instance defaultDestPort. New cells
+      // created later (via ensureCell) inherit this immediately.
+      const nextTracks = st.session.tracks.map((t) =>
+        affected.has(t.id) ? { ...t, defaultDestPort: clamped } : t
+      )
+      // 4. Cells -- patch destPort on every existing clip across all
+      // scenes for affected tracks. We don't touch destLinkedToDefault
+      // (the engine resolves the effective port via that flag + track
+      // default + session default, so a true linkage just re-reads the
+      // updated track default; an explicit cell port also lands on the
+      // new value -- both paths converge).
+      const nextScenes = st.session.scenes.map((sc) => {
+        let changed = false
+        const nextCells: typeof sc.cells = {}
+        for (const [tid, cell] of Object.entries(sc.cells)) {
+          if (affected.has(tid) && cell.destPort !== clamped) {
+            nextCells[tid] = { ...cell, destPort: clamped }
+            changed = true
+          } else {
+            nextCells[tid] = cell
+          }
+        }
+        return changed ? { ...sc, cells: nextCells } : sc
+      })
+      return {
+        session: {
+          ...st.session,
+          pool: nextPool,
+          tracks: nextTracks,
+          scenes: nextScenes
+        }
+      }
+    }),
+  broadcastSessionDest: (next) =>
+    set((st) => {
+      const ipPatch = typeof next.ip === 'string' ? next.ip.trim() : undefined
+      const portPatch =
+        typeof next.port === 'number' && Number.isFinite(next.port)
+          ? Math.max(0, Math.min(65535, Math.round(next.port)))
+          : undefined
+      if (ipPatch === undefined && portPatch === undefined) return st
+      // 1. Pool -- every template + every function. Clearing the
+      // per-function destIp/destPortOverride ensures the new template
+      // default wins uniformly.
+      const nextPool = {
+        ...st.session.pool,
+        templates: st.session.pool.templates.map((t) => ({
+          ...t,
+          destIp: ipPatch !== undefined ? ipPatch : t.destIp,
+          destPort: portPatch !== undefined ? portPatch : t.destPort,
+          functions: t.functions.map((f) => ({
+            ...f,
+            destIpOverride: ipPatch !== undefined ? undefined : f.destIpOverride,
+            destPortOverride:
+              portPatch !== undefined ? undefined : f.destPortOverride
+          }))
+        }))
+      }
+      // 2. Tracks -- update defaultDestIp / defaultDestPort on every
+      // row that has those fields (header rows + Parameter children).
+      const nextTracks = st.session.tracks.map((t) => {
+        const patch: Partial<Track> = {}
+        if (ipPatch !== undefined) patch.defaultDestIp = ipPatch
+        if (portPatch !== undefined) patch.defaultDestPort = portPatch
+        return { ...t, ...patch }
+      })
+      // 3. Cells -- repoint every clip's destIp / destPort. We don't
+      // touch destLinkedToDefault: linked cells will re-read the new
+      // session default anyway; unlinked cells get their pinned
+      // value moved to the new target (which is the user intent
+      // when they say "the consumer's IP changed -- everything goes
+      // there now").
+      const nextScenes = st.session.scenes.map((sc) => {
+        let changed = false
+        const nextCells: typeof sc.cells = {}
+        for (const [tid, cell] of Object.entries(sc.cells)) {
+          let cellChanged = false
+          let newCell = cell
+          if (ipPatch !== undefined && cell.destIp !== ipPatch) {
+            newCell = { ...newCell, destIp: ipPatch }
+            cellChanged = true
+          }
+          if (portPatch !== undefined && cell.destPort !== portPatch) {
+            newCell = { ...newCell, destPort: portPatch }
+            cellChanged = true
+          }
+          nextCells[tid] = newCell
+          if (cellChanged) changed = true
+        }
+        return changed ? { ...sc, cells: nextCells } : sc
+      })
+      // 4. Session defaults -- the base layer.
+      return {
+        session: {
+          ...st.session,
+          defaultDestIp:
+            ipPatch !== undefined ? ipPatch : st.session.defaultDestIp,
+          defaultDestPort:
+            portPatch !== undefined ? portPatch : st.session.defaultDestPort,
+          pool: nextPool,
+          tracks: nextTracks,
+          scenes: nextScenes
+        }
+      }
+    }),
+  setListenerPort: (port) =>
+    set((st) => {
+      if (!Number.isFinite(port)) return st
+      const clamped = Math.max(0, Math.min(65535, Math.round(port)))
+      // Push to the main-process OSC listener so it re-binds
+      // immediately. We always pass enabled=true since the
+      // listener is generally on in normal use -- users can still
+      // disable it later via the Network tab if they want.
+      void window.api?.networkSetEnabled?.(true, clamped)
+      return {
+        session: { ...st.session, listenerPort: clamped }
+      }
+    }),
+  rebindAllHardwareModesToDevice: (ip, port) =>
+    set((st) => {
+      const ipTrim = typeof ip === 'string' ? ip.trim() : ''
+      if (!ipTrim || !Number.isFinite(port) || port < 0 || port > 65535) {
+        return st
+      }
+      const clamped = Math.max(0, Math.min(65535, Math.round(port)))
+      const nextPool = {
+        ...st.session.pool,
+        templates: st.session.pool.templates.map((t) => {
+          // Skip templates that have no hardwareMode at all -- don't
+          // create one on a template the user never configured.
+          if (!t.hardwareMode) return t
+          if (
+            t.hardwareMode.deviceIp === ipTrim &&
+            t.hardwareMode.devicePort === clamped
+          ) {
+            return t
+          }
+          return {
+            ...t,
+            hardwareMode: {
+              ...t.hardwareMode,
+              deviceIp: ipTrim,
+              devicePort: clamped
+            }
+          }
+        })
+      }
+      return { session: { ...st.session, pool: nextPool } }
+    }),
 
   addScene: () =>
     set((st) => {
@@ -3254,12 +3544,22 @@ export const useStore = create<State>((set, get) => ({
   // can collapse tracks via the sidebar toggle instead, which
   // switches to the 32-px single-line layout.
   setRowHeight: (h) => set({ rowHeight: clampInt(h, 45, 220) }),
-  setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 180, 480) }),
+  // v0.5.10 -- minimum lowered from 180 to 140 so a uiScale 0.6
+  // user can pack more Scene columns onto a 1080p screen. At 140
+  // the Dur row labels squeeze but the Scene name stays readable
+  // and the Next dropdown (fixed 78px) still fits. Below 140 the
+  // header starts wrapping and we lose the at-a-glance scan that
+  // makes the Edit view useful.
+  setSceneColumnWidth: (w) => set({ sceneColumnWidth: clampInt(w, 140, 480) }),
   setScenePaletteWidth: (w) => set({ scenePaletteWidth: clampInt(w, 200, 1200) }),
   setSceneInfoPanelHeight: (h) =>
     set({ sceneInfoPanelHeight: clampInt(h, 80, 1600) }),
   setTrackColumnWidth: (w) => set({ trackColumnWidth: clampInt(w, 160, 400) }),
-  setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 320, 640) }),
+  // v0.5.10 -- minimum lowered from 320 to 280. At 280 the
+  // SettingsBox row of two buttons wraps to two rows (still
+  // readable), all form sections reflow via flex-wrap, and the
+  // user reclaims 40 layout-pixels for more Scene columns.
+  setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 280, 640) }),
   setSequencePaused: (paused) => set({ sequencePaused: paused }),
   setMidiLearnMode: (on) =>
     // Clear midiLearnTarget ONLY when turning OFF (cancelling).
@@ -3950,6 +4250,13 @@ export const useStore = create<State>((set, get) => ({
   setMetaKnobDisplayValues: (values) => set({ metaKnobDisplayValues: values }),
   setUiScale: (s) =>
     set({ uiScale: Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, s)) }),
+  setTopBarScale: (s) =>
+    set({
+      topBarScale: Math.max(
+        TOPBAR_SCALE_MIN,
+        Math.min(TOPBAR_SCALE_MAX, s)
+      )
+    }),
 
   setNetworkSnapshot: (devices, status) =>
     set({ networkDevices: devices, networkStatus: status }),
@@ -4554,6 +4861,7 @@ function hslToHex(h: number, s: number, l: number): string {
 // always replaced when modified, so identity-equality is a reliable signal.
 let lastTemplates: ClipTemplate[] = useStore.getState().clipTemplates
 let lastUiScale: number = useStore.getState().uiScale
+let lastTopBarScale: number = useStore.getState().topBarScale
 useStore.subscribe((state) => {
   if (state.clipTemplates !== lastTemplates) {
     lastTemplates = state.clipTemplates
@@ -4562,6 +4870,10 @@ useStore.subscribe((state) => {
   if (state.uiScale !== lastUiScale) {
     lastUiScale = state.uiScale
     saveUiScale(state.uiScale)
+  }
+  if (state.topBarScale !== lastTopBarScale) {
+    lastTopBarScale = state.topBarScale
+    saveTopBarScale(state.topBarScale)
   }
 })
 
@@ -4951,7 +5263,18 @@ function propagateDefaults(s: Session): Session {
     // unrecognized mode strings into the engine. Missing entirely =>
     // seed from DEFAULT_GENERATIVE_CONFIG so older sessions load
     // with the feature disabled (no behaviour change).
-    generative: sanitizeGenerativeConfig(s.generative)
+    generative: sanitizeGenerativeConfig(s.generative),
+    // Listener port (v0.5.10). Persisted on the session so reopen
+    // re-binds automatically. Sanitize to a legal UDP port range; if
+    // a hand-edited file has an out-of-range value, drop it back to
+    // undefined and the renderer's localStorage fallback kicks in.
+    listenerPort:
+      typeof s.listenerPort === 'number' &&
+      Number.isFinite(s.listenerPort) &&
+      s.listenerPort >= 0 &&
+      s.listenerPort <= 65535
+        ? Math.round(s.listenerPort)
+        : undefined
   }
 }
 

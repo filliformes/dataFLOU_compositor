@@ -313,6 +313,31 @@ export default function TopBar(): JSX.Element {
 
         <span className="h-5 w-px bg-border mx-1" />
 
+        {/* v0.5.10 -- Session-wide outgoing OSC broadcast. One-click
+            switch of every cell + every Track default + every Pool
+            template + the Session default to a new IP and/or port.
+            Use case: the downstream consumer (Max patch, hardware
+            controller, etc.) moved -- repoint the whole session
+            without touching individual clips. */}
+        <SessionOscBroadcast />
+
+        <span className="h-5 w-px bg-border mx-1" />
+
+        {/* v0.5.10 -- Session listener port. Mirror of the
+            Pool > Network tab port input, surfaced here so it
+            travels with the session file. Apply binds the
+            main-process OSC listener to the new port. */}
+        <SessionListenerPort />
+
+        <span className="h-5 w-px bg-border mx-1" />
+
+        {/* v0.5.10 -- per-toolbar zoom slider. Lifts the toolbar's
+            effective size when the working area is shrunk via
+            uiScale (e.g. uiScale=0.6 makes toolbar text tiny). */}
+        <TopBarScaleControl />
+
+        <span className="h-5 w-px bg-border mx-1" />
+
         {/* Show mode — locks the UI into a performance-only view. Exit with
             F11 or by holding Escape for ~800 ms (see App.tsx keyboard router). */}
         <button
@@ -346,6 +371,191 @@ export default function TopBar(): JSX.Element {
       </div>
     )}
     </>
+  )
+}
+
+// v0.5.10 -- per-toolbar zoom slider. Renders three tight buttons
+// in the prefs sub-toolbar: minus, percent readout, plus. The
+// readout doubles as a click-to-reset (back to 100%). Step = 5%.
+// The store action clamps to [TOPBAR_SCALE_MIN, TOPBAR_SCALE_MAX]
+// = [0.5, 2.5]. Value travels with the session via
+// `session.ui.topBarScale`.
+function TopBarScaleControl(): JSX.Element {
+  const topBarScale = useStore((s) => s.topBarScale)
+  const setTopBarScale = useStore((s) => s.setTopBarScale)
+  const STEP = 0.05
+  const MIN = 0.5
+  const MAX = 2.5
+  function step(dir: -1 | 1): void {
+    const next = Math.max(MIN, Math.min(MAX, topBarScale + dir * STEP))
+    if (next !== topBarScale) setTopBarScale(next)
+  }
+  return (
+    <div
+      className="flex items-center gap-0.5"
+      title={`Toolbar zoom (currently ${Math.round(topBarScale * 100)}%). Lifts JUST the toolbar without rescaling the working area below -- useful when uiScale is small. Saved to the session.`}
+    >
+      <span className="label shrink-0">Toolbar</span>
+      <button
+        className="btn px-1.5 py-0 text-[12px] leading-tight"
+        onClick={() => step(-1)}
+        disabled={topBarScale <= MIN + 0.0001}
+        title="Smaller toolbar (-5%)"
+      >
+        −
+      </button>
+      <button
+        className="btn px-1.5 py-0 text-[10px] leading-tight tabular-nums min-w-[42px]"
+        onClick={() => setTopBarScale(1.0)}
+        title="Click to reset toolbar zoom to 100%"
+      >
+        {Math.round(topBarScale * 100)}%
+      </button>
+      <button
+        className="btn px-1.5 py-0 text-[12px] leading-tight"
+        onClick={() => step(1)}
+        disabled={topBarScale >= MAX - 0.0001}
+        title="Larger toolbar (+5%)"
+      >
+        +
+      </button>
+    </div>
+  )
+}
+
+// v0.5.10 - Session-wide outgoing OSC broadcast. Lets the user
+// repoint every cell + every track default + every Pool template
+// + the session default to a new IP and/or port with one Apply
+// click. Lives in the TopBar prefs sub-toolbar between Theme/MIDI
+// and the listener-port input. Either field can be left blank to
+// patch only the other axis. We surface session.defaultDestIp /
+// defaultDestPort as the seed values so the user can see the
+// current downstream target at a glance.
+function SessionOscBroadcast(): JSX.Element {
+  const seedIp = useStore((s) => s.session.defaultDestIp)
+  const seedPort = useStore((s) => s.session.defaultDestPort)
+  const broadcast = useStore((s) => s.broadcastSessionDest)
+  const [ip, setIp] = useState<string>(seedIp || '')
+  const [port, setPort] = useState<number>(seedPort || 0)
+  // Re-seed when the session changes (file load / new session).
+  // We compare against current state so user edits in flight
+  // aren't clobbered by no-op re-renders.
+  useEffect(() => {
+    setIp(seedIp || '')
+  }, [seedIp])
+  useEffect(() => {
+    setPort(seedPort || 0)
+  }, [seedPort])
+  const ipChanged = (ip || '') !== (seedIp || '')
+  const portChanged = port > 0 && port !== seedPort
+  const canApply = ipChanged || portChanged
+  function apply(): void {
+    if (!canApply) return
+    const patch: { ip?: string; port?: number } = {}
+    if (ipChanged) patch.ip = ip.trim()
+    if (portChanged) patch.port = port
+    broadcast(patch)
+  }
+  return (
+    <div
+      className="flex items-center gap-1"
+      title="Repoint the WHOLE session to a new outgoing OSC destination. Type a new IP and/or port, click Apply. Every cell + Track default + Pool template + Session default gets repointed in one click. Leave a field blank to patch only the other axis."
+    >
+      <span className="label shrink-0">Send OSC to</span>
+      <input
+        type="text"
+        className="bg-panel2 border border-border rounded text-[11px] px-1 py-0 w-[100px] leading-tight"
+        placeholder="127.0.0.1"
+        value={ip}
+        onChange={(e) => setIp(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') apply()
+        }}
+        title="Destination IP address (e.g. 127.0.0.1 or 192.168.1.42)."
+      />
+      <span className="text-muted text-[10px]">:</span>
+      <input
+        type="number"
+        min={0}
+        max={65535}
+        className="bg-panel2 border border-border rounded text-[11px] px-1 py-0 w-[58px] leading-tight tabular-nums"
+        value={port > 0 ? port : ''}
+        onChange={(e) => {
+          const n = parseInt(e.target.value, 10)
+          if (Number.isFinite(n) && n >= 0 && n <= 65535) setPort(n)
+          else if (e.target.value === '') setPort(0)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') apply()
+        }}
+        title="Destination UDP port (1..65535)."
+      />
+      <button
+        className="btn text-[10px] py-0 px-1.5 leading-tight"
+        disabled={!canApply}
+        onClick={apply}
+        title="Apply this IP and/or port to every clip, Track default, Pool template, and the Session default. The current IP/port is the seed shown above."
+      >
+        Apply to all
+      </button>
+    </div>
+  )
+}
+
+// v0.5.10 - Session listener port. Mirrors the Pool > Network
+// tab's port input so the user can change the incoming OSC bind
+// from either surface. Writes through Session.listenerPort so the
+// binding travels with the saved session. Setting the port also
+// re-binds the main-process listener immediately (the store
+// action handles the IPC).
+function SessionListenerPort(): JSX.Element {
+  const stored = useStore((s) => s.session.listenerPort)
+  const statusPort = useStore((s) => s.networkStatus.port)
+  const setListenerPort = useStore((s) => s.setListenerPort)
+  // Seed: prefer the live listener port (what main is actually
+  // bound to), fall back to the session-stored value. If neither
+  // is present, show 9000 as a sensible default placeholder.
+  const seed = statusPort || stored || 9000
+  const [port, setPort] = useState<number>(seed)
+  useEffect(() => {
+    setPort(seed)
+  }, [seed])
+  const dirty = port > 0 && port !== seed
+  function apply(): void {
+    if (!Number.isFinite(port) || port < 1 || port > 65535) return
+    setListenerPort(port)
+  }
+  return (
+    <div
+      className="flex items-center gap-1"
+      title="Incoming OSC listener port. dataFLOU binds a UDP socket to this port so the Network tab can discover senders and Hardware Mode can catch their packets. Persisted with the session file so reopening rebinds automatically."
+    >
+      <span className="label shrink-0">Listen on</span>
+      <input
+        type="number"
+        min={1}
+        max={65535}
+        className="bg-panel2 border border-border rounded text-[11px] px-1 py-0 w-[58px] leading-tight tabular-nums"
+        value={port > 0 ? port : ''}
+        onChange={(e) => {
+          const n = parseInt(e.target.value, 10)
+          if (Number.isFinite(n) && n >= 1 && n <= 65535) setPort(n)
+          else if (e.target.value === '') setPort(0)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') apply()
+        }}
+        title="UDP port to bind for incoming OSC (1..65535)."
+      />
+      <button
+        className="btn text-[10px] py-0 px-1.5 leading-tight"
+        disabled={!dirty}
+        onClick={apply}
+        title="Rebind the listener to this port and save it to the session. Same effect as the port input in Pool > Network."
+      >
+        Apply
+      </button>
+    </div>
   )
 }
 

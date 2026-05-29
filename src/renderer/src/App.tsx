@@ -62,6 +62,7 @@ export default function App(): JSX.Element {
   // these inside the session payload, not just per-session-content
   // edits.
   const uiScaleW = useStore((s) => s.uiScale)
+  const topBarScaleW = useStore((s) => s.topBarScale)
   const rowHeightW = useStore((s) => s.rowHeight)
   const sceneColumnWidthW = useStore((s) => s.sceneColumnWidth)
   const inspectorWidthW = useStore((s) => s.inspectorWidth)
@@ -86,6 +87,7 @@ export default function App(): JSX.Element {
   }, [
     session,
     uiScaleW,
+    topBarScaleW,
     rowHeightW,
     sceneColumnWidthW,
     inspectorWidthW,
@@ -95,6 +97,42 @@ export default function App(): JSX.Element {
     tracksCollapsedW,
     scenesCollapsedW
   ])
+
+  // v0.5.10 -- bake the package version + the current session name
+  // into `document.title`. Electron auto-syncs the BrowserWindow
+  // title from document.title, so the OS title bar reflects both
+  // bits in real time as the user opens different sessions.
+  // The version is fetched from main once on mount (sourced from
+  // package.json via `app.getVersion()`); the session name reacts
+  // live to `session.name` + `currentFilePath` changes.
+  const [appVersion, setAppVersion] = useState<string>('')
+  useEffect(() => {
+    let cancelled = false
+    void window.api?.appGetVersion?.().then((v) => {
+      if (!cancelled && typeof v === 'string') setAppVersion(v)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  const sessionNameForTitle = useStore((s) => s.session.name)
+  const currentFilePathForTitle = useStore((s) => s.currentFilePath)
+  useEffect(() => {
+    // Prefer the human-typed session name; fall back to the
+    // filename basename (without `.dflou.json`) when the user
+    // hasn't named it. Empty -> "Untitled".
+    let sessionPart = (sessionNameForTitle || '').trim()
+    if (!sessionPart && currentFilePathForTitle) {
+      const parts = currentFilePathForTitle.split(/[\\/]/)
+      sessionPart = (parts[parts.length - 1] || '').replace(
+        /\.dflou\.json$/i,
+        ''
+      )
+    }
+    if (!sessionPart) sessionPart = 'Untitled'
+    const verPart = appVersion ? ` v${appVersion}` : ''
+    document.title = `dataFLOU_compositor${verPart} : ${sessionPart}`
+  }, [appVersion, sessionNameForTitle, currentFilePathForTitle])
 
   // Subscribe to engine state events.
   useEffect(() => {
@@ -166,11 +204,7 @@ export default function App(): JSX.Element {
       }
       // Shift+wheel = horizontal scroll on the nearest overflow-x
       // container. Lets users without a horizontal scroll wheel
-      // navigate wide views (Edit grid, Sequence timeline). For
-      // users WITH a horizontal scroll wheel (Logitech MX Master
-      // etc.), `deltaX` flows through to the native scroller below
-      // — no preventDefault when ctrl/shift aren't held, so the
-      // browser handles deltaX itself.
+      // navigate wide views (Edit grid, Sequence timeline).
       if (e.shiftKey && e.deltaY !== 0 && e.deltaX === 0) {
         let el = e.target as Element | null
         while (el && el !== document.body) {
@@ -184,11 +218,98 @@ export default function App(): JSX.Element {
           el = el.parentElement
         }
       }
+      // v0.5.10 -- explicit horizontal-wheel handling for users
+      // WITH a horizontal scroll wheel (Logitech MX Master / VX
+      // thumb wheels). Previously we relied on Chromium's native
+      // deltaX → overflow-x propagation, but that only works when
+      // the event target itself is the scrollable element; when
+      // the cursor sits over a child (e.g. a cell tile inside a
+      // scrollable Edit grid), Chromium doesn't bubble the deltaX
+      // up to find a scrollable ancestor. Walk up to the nearest
+      // overflow-x container ourselves and apply scrollLeft there.
+      // Triggers only when (a) no modifier is held (Ctrl+wheel
+      // and Shift+wheel are claimed above) and (b) deltaX is the
+      // dominant axis -- so a primarily-vertical wheel still goes
+      // through Chromium's native vertical scroll, untouched.
+      if (
+        !e.ctrlKey &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        e.deltaX !== 0 &&
+        Math.abs(e.deltaX) >= Math.abs(e.deltaY)
+      ) {
+        let el = e.target as Element | null
+        while (el && el !== document.body) {
+          const style = window.getComputedStyle(el)
+          const ox = style.overflowX
+          if (
+            (ox === 'auto' || ox === 'scroll') &&
+            el.scrollWidth > el.clientWidth
+          ) {
+            ;(el as HTMLElement).scrollLeft += e.deltaX
+            e.preventDefault()
+            return
+          }
+          el = el.parentElement
+        }
+      }
     }
     // `passive: false` required so preventDefault actually stops any
     // browser-side Ctrl+wheel behavior.
     window.addEventListener('wheel', onWheel, { passive: false })
     return () => window.removeEventListener('wheel', onWheel)
+  }, [])
+
+  // v0.5.10 -- intercept Chromium's built-in zoom keyboard shortcuts
+  // (Ctrl+= / Ctrl+- / Ctrl+0) and route them through dataFLOU's
+  // own `uiScale`. Without this, those shortcuts hit webContents
+  // zoom (a separate Chromium-level zoom system) which ISN'T
+  // persisted in the session -- so a user who occasionally hits
+  // Ctrl+= would see two competing zoom values drift apart.
+  // Now there's exactly one zoom (uiScale) and it travels with
+  // the session file via `session.ui.uiScale`.
+  useEffect(() => {
+    function onZoomKey(e: KeyboardEvent): void {
+      // Match Ctrl OR Cmd (Mac users). Shift+Ctrl+= is the same
+      // physical key on US layouts (Ctrl+Plus), so we accept both.
+      if (!(e.ctrlKey || e.metaKey)) return
+      // Skip when the user is typing in an input/textarea/select
+      // so Ctrl+= inside a number field stays usable for browsers
+      // that bind it (rare, but safer to skip).
+      const t = e.target as HTMLElement | null
+      const tag = t?.tagName
+      const isEditable =
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        t?.isContentEditable
+      if (isEditable) return
+      const key = e.key
+      // Plus / equals on US layouts (Ctrl+= without Shift typically
+      // sends "="; Ctrl+Shift+= sends "+"; some layouts send
+      // "Add" on numpad).
+      const isZoomIn = key === '+' || key === '=' || key === 'Add'
+      const isZoomOut = key === '-' || key === '_' || key === 'Subtract'
+      const isZoomReset = key === '0' || key === 'Numpad0'
+      if (!isZoomIn && !isZoomOut && !isZoomReset) return
+      e.preventDefault()
+      const store = useStore.getState()
+      if (isZoomReset) {
+        // Reset to a sensible 1.0 baseline. Matches "Actual size"
+        // in most browsers/apps.
+        store.setUiScale(1.0)
+        return
+      }
+      const cur = store.uiScale
+      const dir = isZoomIn ? 1 : -1
+      const next = Math.max(
+        UI_SCALE_MIN,
+        Math.min(UI_SCALE_MAX, cur + dir * UI_SCALE_STEP)
+      )
+      if (next !== cur) store.setUiScale(next)
+    }
+    window.addEventListener('keydown', onZoomKey)
+    return () => window.removeEventListener('keydown', onZoomKey)
   }, [])
 
   // Global keyboard shortcuts.
@@ -761,6 +882,7 @@ export default function App(): JSX.Element {
   }, [setView, addScene, removeScene])
 
   const uiScale = useStore((s) => s.uiScale)
+  const topBarScale = useStore((s) => s.topBarScale)
 
   // Network discovery: subscribe to main-process device updates at
   // app-level (not inside PoolPane) so the Pool drawer's title-bar
@@ -1002,18 +1124,29 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <div className="flex flex-col h-full">
-      <TopBar />
-      {/* Everything below the main toolbar lives inside a zoom wrapper so
-          Ctrl+wheel rescales the whole working area (Meta Controller bar,
-          Scenes, Messages, Inspector, Sequence grid) while the top toolbar
-          stays at 100%. `zoom` is a Chromium-supported CSS property that
-          reflows layout at the scaled factor, unlike `transform: scale`
-          which would just visually squish content. */}
-      <div
-        className="flex flex-col flex-1 min-h-0"
-        style={{ zoom: uiScale }}
-      >
+    // v0.5.10 -- the zoom wrapper now wraps the ENTIRE app, including
+    // the top toolbar. Previously the toolbar was kept at a fixed
+    // size so its buttons stayed readable when content shrank, and
+    // users who wanted everything to scale relied on Chromium's
+    // Ctrl+= keyboard zoom as an escape hatch. Now that Ctrl+= is
+    // routed through `uiScale` for persistence, the toolbar would
+    // have stayed pinned -- so we move the wrapper up here so a
+    // single `uiScale` value scales every pixel uniformly. CSS
+    // `zoom` keeps layout reflowing at the scaled size.
+    <div
+      className="flex flex-col h-full"
+      style={{ zoom: uiScale }}
+    >
+      {/* v0.5.10 -- TopBar gets an additional `topBarScale` zoom
+          (default 1.0) on top of uiScale, so users running a small
+          uiScale (e.g. 0.6) can bump JUST the toolbar back to a
+          legible size without rescaling the Scene grid. The wrapper
+          uses width: 100% / no negative margin so the toolbar still
+          spans the full window width even when scaled below 1.0. */}
+      <div style={{ zoom: topBarScale }}>
+        <TopBar />
+      </div>
+      <div className="flex flex-col flex-1 min-h-0">
         <MetaControllerBar />
         <div className="flex-1 min-h-0">
           {view === 'edit' ? <EditView /> : <SequenceView />}

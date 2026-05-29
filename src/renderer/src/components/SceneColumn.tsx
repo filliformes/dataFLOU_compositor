@@ -243,7 +243,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         direction="col"
         value={sceneColumnWidth}
         onChange={setSceneColumnWidth}
-        min={180}
+        min={140}
         max={480}
         className={`absolute top-0 right-0 bottom-0 w-[4px] z-10 ${scenesCollapsed ? 'hidden' : ''}`}
         title="Drag to resize all scene columns"
@@ -285,12 +285,22 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         </div>
       ) : (
       <div
-        className="relative border-b border-border px-2 py-2 flex flex-col gap-1.5 shrink-0"
+        className="relative border-b border-border px-2 py-2 shrink-0"
         style={{ height: headerH }}
         onContextMenu={onContextMenu}
       >
         {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none z-0" />}
         {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
+        {/* v0.5.10 -- inline-flex column with `w-fit` so all three
+            rows (title, notes, Dur+Next) share a single content
+            width set by the WIDEST row. The bottom row (Dur input +
+            Next dropdown) is naturally the widest, so it anchors
+            the right edge; the title row's name input flex-grows
+            inside that constrained width, landing the color picker
+            at the same X as the Next dropdown's right edge. Saves
+            horizontal space inside the column without making the
+            border-b stop short of the column edge. */}
+        <div className="inline-flex flex-col gap-1.5 w-fit max-w-full">
         <div className="flex items-center gap-1.5">
           <SceneTriggerButton
             isPlaying={isPlaying}
@@ -303,6 +313,15 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             }}
           />
           <UncontrolledTextInput
+            // size={2} keeps the input's *intrinsic* (max-content) width
+            // tiny so it no longer dominates the w-fit column's width
+            // calc. The bottom Dur+Next row then becomes the widest row
+            // and anchors the column width; flex-1 grows this input to
+            // fill, landing the color picker at the Next dropdown's
+            // right edge. Without the small size, the input's default
+            // ~20-char intrinsic width made the title row the widest,
+            // expanding the whole header to full column width.
+            size={2}
             className="input flex-1 text-[12px] font-semibold min-w-0"
             value={scene.name}
             // Focusing the scene name input re-anchors selection
@@ -364,6 +383,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           <span className="text-muted">s</span>
           <span className="label ml-1">Next</span>
           <SceneHeaderNextSelect sceneId={sceneId} scene={scene} updateScene={updateScene} />
+        </div>
         </div>
 
         {/* Notes resize handle on the bottom border of the header — identical
