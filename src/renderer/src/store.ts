@@ -1135,6 +1135,12 @@ interface Actions {
   // tracks (same trackIds, no new sidebar rows), names the copy
   // "<orig> (copy)". Returns the new scene id.
   duplicateScene: (sceneId: string) => string | null
+  // (v0.5.12) Capture the engine's live emitted values (including
+  // Hardware Mode catches) as a new scene cloned from sceneId. Returns
+  // the new scene id, or null if sceneId doesn't exist. When sceneId
+  // is not the currently-active scene, falls back to behaving like
+  // duplicateScene (no live data to capture from).
+  captureSceneStateAsNew: (sceneId: string) => string | null
 
   // Engine state mirror
   setEngineState: (s: EngineState) => void
@@ -1283,7 +1289,9 @@ export const useStore = create<State>((set, get) => ({
   clipTemplates: loadTemplates(),
 
   setSession: (s) => {
-    const propagated = backfillTrackArgSpecsFromPool(propagateDefaults(s))
+    const propagated = applyV0512Migrations(
+      backfillTrackArgSpecsFromPool(propagateDefaults(s))
+    )
     // Apply session-level OSC listener port (v0.5.10). When the
     // session carries a listenerPort, push it to the main-process
     // listener immediately so reopening a saved session re-binds
@@ -3240,6 +3248,19 @@ export const useStore = create<State>((set, get) => ({
             if (track?.argSpec && track.argSpec.length > 0) {
               cell.value = buildInitialValueFromArgSpec(track.argSpec)
             }
+            // Template-kind tracks (Instrument-template "header" rows)
+            // host the group-trigger UI button, not a data-emitting
+            // cell. Force oscEnabled=false at create time so the
+            // serialized session data matches the engine's hard
+            // invariant (template-kind tracks NEVER emit OSC — see
+            // engine.ts oscEmitAllowed gate). Without this, legacy
+            // session captures and any future bulk-create code path
+            // would keep generating ghost cells that the engine
+            // silently drops but show up as unrouted "/dataflou/value 0"
+            // packets on downstream consumers when forwarded.
+            if (track?.kind === 'template') {
+              cell.oscEnabled = false
+            }
             // Inherit the Parameter row's MIDI default. Lookup
             // order:
             //   1. The Parameter row's own `midiOut` (edited from
@@ -4774,6 +4795,65 @@ export const useStore = create<State>((set, get) => ({
     return newSceneId
   },
 
+  // (v0.5.12) Like duplicateScene, but overwrites each cell's `value`
+  // with the engine's currently-emitted live string for that scene+track.
+  // The live string already reflects:
+  //   • the source scene's cell.value (base)
+  //   • sequencer step / modulator output
+  //   • per-arg pins
+  //   • Hardware Mode catch overrides (the controller's live values)
+  // So the resulting new scene is a SNAPSHOT of what's coming out of
+  // the engine at this instant — perfect for "tweak with the controller,
+  // save the result" workflow without re-capturing OSC manually.
+  //
+  // When the source scene is NOT the currently-active scene, the engine
+  // has no live values for it; fall back to copying the original cell
+  // values (same as duplicateScene). The new scene name is suffixed
+  // with " (capture)" instead of " (copy)" so the user can tell at a
+  // glance which entries came from a live capture vs a plain dup.
+  captureSceneStateAsNew: (sceneId) => {
+    const st = get()
+    const scene = st.session.scenes.find((s) => s.id === sceneId)
+    if (!scene) return null
+    const liveRow = st.engine.currentValueBySceneAndTrack[sceneId] ?? {}
+    const newSceneId = `s_${Math.random().toString(36).slice(2, 9)}`
+    const newCells: Record<string, Cell> = {}
+    for (const [tid, cell] of Object.entries(scene.cells)) {
+      const liveStr = liveRow[tid]
+      // Only overwrite when the live string is non-empty AND looks like
+      // a token list (the engine's recordLiveValue produces a space-
+      // separated number string; defensive guard against any future
+      // change that might put a status string here).
+      const useLive =
+        typeof liveStr === 'string' && liveStr.length > 0
+      newCells[tid] = useLive ? { ...cell, value: liveStr } : { ...cell }
+    }
+    const existingNames = st.session.scenes.map((s) => s.name)
+    const baseName = `${scene.name} (capture)`
+    const newScene: Scene = {
+      ...scene,
+      id: newSceneId,
+      name: uniqueCopyName(baseName, existingNames),
+      cells: newCells
+    }
+    // (v0.5.12) Insert the new scene directly AFTER the source scene
+    // in the grid, not at the end. Workflow rationale: the user
+    // captures while looking at the source; they expect the result to
+    // appear adjacent for immediate compare / re-trigger. Appending to
+    // the end would scroll-off-screen on long sessions and break the
+    // visual association. duplicateScene still appends (preserving its
+    // historical behaviour — different mental model: "make me a copy"
+    // vs "save what I'm hearing").
+    set((s) => {
+      const srcIdx = s.session.scenes.findIndex((x) => x.id === sceneId)
+      const insertAt = srcIdx < 0 ? s.session.scenes.length : srcIdx + 1
+      const next = s.session.scenes.slice()
+      next.splice(insertAt, 0, newScene)
+      return { session: { ...s.session, scenes: next } }
+    })
+    return newSceneId
+  },
+
   setEngineState: (s) => set({ engine: s })
 }))
 
@@ -5392,6 +5472,85 @@ function backfillTrackArgSpecsFromPool(s: Session): Session {
     return { ...t, argSpec: fn.argSpec.map((a) => ({ ...a })) }
   })
   return { ...s, tracks: tracksUpdated }
+}
+
+// (v0.5.12) Session-load migration that cleans up legacy data drift.
+//
+// SCOPE: template-kind cells with oscEnabled === true. The engine's
+// hard invariant (engine.ts oscEmitAllowed gate) already blocks
+// these from emitting at runtime regardless, but the on-disk flag
+// misleadingly suggests they DO emit — confusing for anyone reading
+// the JSON, grepping the file, or building tooling around it. Force
+// false at load time so the data matches the semantics. Engine fix
+// is the runtime defense; this is the data-cleanliness defense.
+//
+// NOT INCLUDED — and a CAUTIONARY TALE worth documenting because
+// the candidate migration looked obviously good but was actively
+// destructive:
+//
+//   ❌ "Strip legacy 'compositor 0 ' prefix from cell values."
+//
+// In v0.5.12 dev, this migration was implemented and reverted before
+// shipping. The prefix LOOKS like a vestigial takeover-gate artifact
+// (pre-v0.5.5 PD `[route compositor]` patterns required it), and at
+// the OSC wire level the engine ignores it for `fixed`-spec slots
+// (`spec.fixed` overrides the wire value at emit time). But the
+// cell.value string is POSITIONALLY INDEXED against argSpec — every
+// token's position in the space-separated string maps to argSpec[N]
+// by index. For OCTOCOSME's /A/strips/pots, argSpec is:
+//
+//   [0] fixed string "compositor"   ← "structural" but indexed
+//   [1] fixed int 0                  ← "structural" but indexed
+//   [2] HAUTEUR1 (editable float)
+//   ...
+//   [13] MODB4 (editable float)
+//
+// Stripping tokens [0..1] shifts every editable slot by 2 — the
+// Inspector then displays HAUTEUR1's UI binding showing MODA3's
+// value, HAUTEUR2 shows MODA4's value, and so on. Editing through
+// the Inspector writes the new value into the wrong argSpec slot,
+// silently corrupting the cell. The fix for the original symptom
+// (Capture mode showing alternating "compositor" / "192.168.101.191"
+// senders) is instead the loopback flag on DiscoveredOscDevice, not
+// touching cell.value.
+//
+// If you ever want to revisit this — the architecturally-correct
+// path is to make cell.value carry ONLY editable-slot tokens and
+// have the engine inject fixed-slot values at emit time. That's a
+// data-model change touching every multi-arg consumer (Inspector,
+// engine emit, capture, draw mode, MIDI mapping), not a session
+// migration.
+//
+// The kept migration is IDEMPOTENT — re-running produces the same
+// output. It only sets a flag to false; it cannot corrupt data.
+function applyV0512Migrations(s: Session): Session {
+  // Build a set of template-kind track ids in one pass so the per-cell
+  // loop below is O(1) per cell.
+  const templateTrackIds = new Set<string>()
+  for (const t of s.tracks) {
+    if (t.kind === 'template') templateTrackIds.add(t.id)
+  }
+  let templateCellsFixed = 0
+  const scenes = s.scenes.map((sc) => {
+    let sceneChanged = false
+    const nextCells: typeof sc.cells = {}
+    for (const [tid, cell] of Object.entries(sc.cells)) {
+      let nextCell = cell
+      if (templateTrackIds.has(tid) && nextCell.oscEnabled !== false) {
+        nextCell = { ...nextCell, oscEnabled: false }
+        templateCellsFixed += 1
+        sceneChanged = true
+      }
+      nextCells[tid] = nextCell
+    }
+    return sceneChanged ? { ...sc, cells: nextCells } : sc
+  })
+  if (templateCellsFixed > 0) {
+    console.info(
+      `[v0.5.12 migration] template-cell oscEnabled forced false: ${templateCellsFixed}`
+    )
+  }
+  return { ...s, scenes }
 }
 
 // Soft-migrate a saved sequencer block. Old sessions only carried steps

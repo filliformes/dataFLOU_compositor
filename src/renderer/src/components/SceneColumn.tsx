@@ -579,6 +579,36 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                 <span className="text-muted text-[10px] ml-1">Ctrl+Alt+D</span>
               )}
             </button>
+            {/* (v0.5.12) Capture the engine's live emitted values
+                (including Hardware Mode catches from a physical
+                controller) into a new scene cloned from this one.
+                Use case: pick a base scene, tweak parameters via the
+                controller, save the resulting state without manually
+                editing cell values. Only meaningful for a SINGLE
+                selected scene that is currently active — the engine
+                needs to be emitting from it to have live values to
+                capture. When the scene isn't active, the menu item is
+                still visible (so the user can DISCOVER it exists) but
+                falls back to a plain duplicate. */}
+            {menu.targets.length === 1 && (
+              <button
+                className="w-full text-left px-3 py-1 hover:bg-panel2"
+                onClick={() => {
+                  setMenu(null)
+                  const st = useStore.getState()
+                  const newId = st.captureSceneStateAsNew(sceneId)
+                  if (newId) st.setFocusedScene(newId)
+                }}
+                title={
+                  "Snapshot the engine's CURRENTLY-EMITTED values into a new scene cloned from this one. Captures everything that's live right now — including Hardware Mode overrides from a physical controller, sequencer step values, modulator output, and per-arg pins.\n\n" +
+                  "Best when this scene is the currently-active scene: trigger it, tweak any parameter via the controller, then right-click → Capture current state. The new scene preserves everything you just adjusted, no manual cell editing required.\n\n" +
+                  "If the scene isn't currently active, falls back to a plain Duplicate (no live values to capture)."
+                }
+              >
+                Capture current state as new scene
+                <span className="text-muted text-[10px] ml-1">live</span>
+              </button>
+            )}
             <div className="border-t border-border my-1" />
             <button
               className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"
@@ -759,10 +789,10 @@ function InstrumentTriggerCell({
               ? 'Bound — click to re-learn this Instrument trigger'
               : 'Click then send a MIDI message to bind this Instrument trigger'
             : empty
-              ? 'No Parameters on this scene yet — add cells under this Instrument first'
+              ? 'Group trigger (Instrument header row). This is a CONTAINER — it has no OSC of its own; clicking it fires every Parameter row underneath. Add cells to the Parameter rows below to populate this group.'
               : anyChildActive
-                ? `Stop ${childrenWithCells.length} Parameter${childrenWithCells.length === 1 ? '' : 's'} of this Instrument`
-                : `Trigger ${childrenWithCells.length} Parameter${childrenWithCells.length === 1 ? '' : 's'} of this Instrument`
+                ? `Group trigger — stop ${childrenWithCells.length} Parameter${childrenWithCells.length === 1 ? '' : 's'} of this Instrument. The header itself emits no OSC; it just batches the children.`
+                : `Group trigger — fire ${childrenWithCells.length} Parameter${childrenWithCells.length === 1 ? '' : 's'} of this Instrument together. The header itself emits no OSC; it just batches the children.`
         }
       >
         {anyChildActive ? (

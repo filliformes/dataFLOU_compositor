@@ -78,7 +78,18 @@ export class OscNetworkListener {
   // device map) so a broadcast spammer can't OOM us.
   private forwardDiag = new Map<
     string,
-    { ip: string; port: number; received: number; suppressed: number; forwarded: number }
+    {
+      ip: string
+      port: number
+      received: number
+      suppressed: number
+      forwarded: number
+      // (v0.5.12) wall-clock ms when this source most recently sent
+      // any packet. Used by the renderer to surface "configured HW
+      // Mode source is silent" warnings without relying on per-poll
+      // counter-delta comparison.
+      lastSeenAtMs: number
+    }
   >()
   // Push callback invoked by external code on each tick of the IPC
   // batching timer (set up in main/index.ts). Same shape as OscSender.
@@ -150,7 +161,8 @@ export class OscNetworkListener {
         port: e.port,
         received: e.received,
         suppressed: e.suppressed,
-        forwarded: e.forwarded
+        forwarded: e.forwarded,
+        lastSeenAtMs: e.lastSeenAtMs
       })
     })
     // Most-active first so the source we care about (typically a
@@ -360,7 +372,8 @@ export class OscNetworkListener {
                     port: diagPort,
                     received: 0,
                     suppressed: 0,
-                    forwarded: 0
+                    forwarded: 0,
+                    lastSeenAtMs: 0
                   }
                   this.forwardDiag.set(key, entry)
                 }
@@ -369,6 +382,10 @@ export class OscNetworkListener {
                 entry.received += 1
                 if (suppressed) entry.suppressed += 1
                 else entry.forwarded += 1
+                // (v0.5.12) timestamp every observation so the UI can
+                // detect "this source has been silent for >5s" and
+                // show the HardwareModeSection yellow warning badge.
+                entry.lastSeenAtMs = Date.now()
               }
             }
             // Skip if no forward targets — avoids a Buffer copy and
@@ -607,7 +624,13 @@ export class OscNetworkListener {
         firstSeen: now,
         lastSeen: now,
         packetCount: 0,
-        addresses: []
+        addresses: [],
+        // (v0.5.12) Flag loopback sources so the UI can de-emphasize
+        // them. dataFLOU's own scene-to-loopback-bus pattern shows
+        // up as packets from 127.0.0.1:<ephemeral>; without this
+        // flag the user sees a "discovered device" that's actually
+        // themselves.
+        isLoopback: ip === '127.0.0.1' || ip === '::1'
       }
       this.devices.set(key, dev)
     }

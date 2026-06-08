@@ -848,6 +848,11 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
   const rebindAllHardwareModes = useStore(
     (s) => s.rebindAllHardwareModesToDevice
   )
+  // (v0.5.12) Per-template right-click bind feeds these into the
+  // NetworkDeviceRow menu so each Pool template appears as its own
+  // "Bind to <name>" action.
+  const poolTemplates = useStore((s) => s.session.pool.templates)
+  const setTemplateHardwareMode = useStore((s) => s.setTemplateHardwareMode)
   // Port input is local (mirrored from session.listenerPort if set,
   // else status.port from main, else the localStorage fallback). We
   // don't bind it directly to any of those because the user edits
@@ -1082,6 +1087,21 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
               // once without editing each template by hand.
               onRebindAllHardwareModes={() =>
                 rebindAllHardwareModes(d.ip, d.port)
+              }
+              // (v0.5.12) Per-template bind data + handler. Pass
+              // every Pool template (built-in OR user) so the right-
+              // click menu lists them all — built-ins are HW-Mode
+              // configurable even though their definition is read-
+              // only (per HardwareModeSection comment, HW Mode is a
+              // per-session preference, not a template-definition
+              // change).
+              bindableTemplates={poolTemplates}
+              onBindTemplate={(tid, ip, port) =>
+                setTemplateHardwareMode(tid, {
+                  enabled: true,
+                  deviceIp: ip,
+                  devicePort: port
+                })
               }
             />
           ))}
@@ -1326,6 +1346,25 @@ function HwModeSuppressPanel(): JSX.Element {
                   >
                     fwd: {exact?.forwarded ?? 0}
                   </span>
+                  {/* (v0.5.12) Last-seen wall-clock. Stale lastSeen
+                      reveals the "configured source is silent"
+                      condition even when the counter is healthy
+                      (counters never decrease — they could be
+                      historical). */}
+                  {typeof exact?.lastSeenAtMs === 'number' && exact.lastSeenAtMs > 0 && (
+                    <span
+                      className="ml-auto"
+                      title={`Wall-clock of most recent packet from ${hw.deviceIp}:${hw.devicePort}.`}
+                      style={{
+                        color:
+                          Date.now() - exact.lastSeenAtMs < 5000
+                            ? 'rgb(var(--c-success))'
+                            : 'rgb(var(--c-warning, 234 179 8))'
+                      }}
+                    >
+                      {formatAge(Date.now() - exact.lastSeenAtMs)} ago
+                    </span>
+                  )}
                 </div>
                 {mismatches.length > 0 && (
                   <div
@@ -1362,7 +1401,9 @@ function NetworkDeviceRow({
   onToggleExpand,
   onMaterialiseForDrag,
   onCancelMaterialise,
-  onRebindAllHardwareModes
+  onRebindAllHardwareModes,
+  bindableTemplates,
+  onBindTemplate
 }: {
   device: DiscoveredOscDevice
   expanded: boolean
@@ -1382,6 +1423,15 @@ function NetworkDeviceRow({
   // walks templates with `hardwareMode` set and updates them in
   // place. No-op on templates without a hardwareMode block.
   onRebindAllHardwareModes: () => void
+  // (v0.5.12) All Pool templates the user might want to bind THIS
+  // device to (per-template right-click action). Already filtered
+  // upstream to skip read-only / builtin templates the user can't
+  // edit. Empty array hides the per-template section of the menu.
+  bindableTemplates: import('@shared/types').InstrumentTemplate[]
+  // (v0.5.12) Per-template bind handler — sets the chosen template's
+  // hardwareMode.{deviceIp, devicePort, enabled} to this device's
+  // ip:port and true, auto-enabling HW Mode if it was off.
+  onBindTemplate: (templateId: string, ip: string, port: number) => void
 }): JSX.Element {
   // Right-click context menu. We track the mouse coords so the
   // floating menu lands where the user clicked. State lives here
@@ -1470,7 +1520,28 @@ function NetworkDeviceRow({
         >
           {expanded ? '▾' : '▸'}
         </button>
-        <span className="font-mono text-[11px] truncate">{device.id}</span>
+        <span
+          className="font-mono text-[11px] truncate"
+          style={device.isLoopback ? { opacity: 0.55, fontStyle: 'italic' } : undefined}
+        >
+          {device.id}
+        </span>
+        {/* (v0.5.12) Loopback tag — packets from 127.0.0.1 / ::1 are
+            dataFLOU's own scene-to-listener-bus emissions, not a
+            real external device. De-emphasize visually so the user
+            doesn't pick them by mistake. */}
+        {device.isLoopback && (
+          <span
+            className="text-[9px] uppercase px-1 rounded-sm shrink-0"
+            style={{
+              color: 'rgb(var(--c-muted))',
+              border: '1px solid rgb(var(--c-border, 60 60 60) / 0.6)'
+            }}
+            title="Source IP is loopback (127.0.0.1 or ::1). This is dataFLOU's own scene-to-listener-bus pattern echoing back. Not bindable to Hardware Mode."
+          >
+            self loopback
+          </span>
+        )}
         {/* Activity dot — green when we just heard from the device,
             grey once it's been quiet for >2s. */}
         <span
@@ -1524,22 +1595,66 @@ function NetworkDeviceRow({
         createPortal(
           <div
             className="fixed z-[1000] bg-panel border border-border rounded shadow-lg text-[11px] py-1"
-            style={{ left: ctxMenu.x, top: ctxMenu.y, minWidth: 240 }}
+            style={{ left: ctxMenu.x, top: ctxMenu.y, minWidth: 260 }}
             onMouseDown={(e) => e.stopPropagation()}
           >
             <div className="px-2 py-1 text-[10px] text-muted border-b border-border/60">
               <span className="font-mono">{device.id}</span>
+              {device.isLoopback && (
+                <span className="ml-2 italic">(self loopback — HW Mode binding disabled)</span>
+              )}
             </div>
             <button
-              className="block w-full text-left px-3 py-1.5 hover:bg-panel2"
+              className="block w-full text-left px-3 py-1.5 hover:bg-panel2 disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled={!!device.isLoopback}
               onClick={() => {
                 onRebindAllHardwareModes()
                 setCtxMenu(null)
               }}
-              title="For every Pool template that has Hardware Mode configured, set its source device to this ip:port. Templates without HW Mode are untouched."
+              title={
+                device.isLoopback
+                  ? 'Loopback sources cannot drive Hardware Mode — binding to one would suppress your scene\'s own emissions, breaking your forward-bus pattern.'
+                  : 'For every Pool template that has Hardware Mode configured, set its source device to this ip:port. Templates without HW Mode are untouched.'
+              }
             >
               Rebind every HW-Moded Instrument to this device
             </button>
+            {/* (v0.5.12) Per-template bind. Shows every Pool template;
+                clicking one binds JUST THAT template to this device's
+                ip:port (auto-enabling HW Mode if it wasn't on yet).
+                Eliminates the manual-typing-port trap that bit Vincent
+                this session — the user picks the device they SEE, no
+                guessing source ports. */}
+            {!device.isLoopback && bindableTemplates.length > 0 && (
+              <>
+                <div className="border-t border-border/60 mt-1 pt-1" />
+                <div className="px-2 py-0.5 text-[9px] uppercase tracking-wide text-muted">
+                  Bind to template
+                </div>
+                {bindableTemplates.map((t) => {
+                  const alreadyBound =
+                    t.hardwareMode?.deviceIp === device.ip &&
+                    t.hardwareMode?.devicePort === device.port
+                  return (
+                    <button
+                      key={t.id}
+                      className="block w-full text-left px-3 py-1 hover:bg-panel2 truncate"
+                      onClick={() => {
+                        onBindTemplate(t.id, device.ip, device.port)
+                        setCtxMenu(null)
+                      }}
+                      title={`Set ${t.name}.hardwareMode = { deviceIp: '${device.ip}', devicePort: ${device.port}, enabled: true }. Auto-enables HW Mode if disabled.`}
+                    >
+                      {alreadyBound ? '✓ ' : '  '}
+                      {t.name}
+                      {t.hardwareMode?.enabled === false && (
+                        <span className="text-muted text-[9px] ml-1">(HW Mode off)</span>
+                      )}
+                    </button>
+                  )
+                })}
+              </>
+            )}
           </div>,
           document.body
         )}

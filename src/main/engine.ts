@@ -1203,9 +1203,27 @@ export class SceneEngine {
     if (!this.session) return false
     for (const tpl of this.session.pool.templates) {
       const hw = tpl.hardwareMode
-      if (hw && hw.enabled && hw.deviceIp === ip && hw.devicePort === port) {
-        return true
+      if (!hw || !hw.enabled) continue
+      if (hw.deviceIp !== ip) continue
+      // (v0.5.12) deviceMatch: 'ipOnly' skips the port-equality check
+      // for controllers with ephemeral source ports. Default ('ipPort'
+      // or undefined) keeps the strict per-port match — correct for
+      // fixed-source-port firmware like the OCTOCOSME Teensy.
+      if ((hw.deviceMatch ?? 'ipPort') === 'ipPort' && hw.devicePort !== port) {
+        continue
       }
+      // (v0.5.12) alwaysForward opts out of suppression. The packet
+      // matches a HW Mode template AND the engine still consumes it
+      // via handleHardwareInput, but the forward path is allowed to
+      // proceed too — necessary when the user wants the controller
+      // to keep reaching downstream consumers (PD, Max, etc.) even
+      // when no scene is playing (suppression alone would close the
+      // path session-wide). Trade-off: during scene playback,
+      // downstream sees both the raw forward AND the engine's caught
+      // value (dual emission). Acceptable for last-write-wins
+      // consumers OR when the user disables HW Mode during playback.
+      if (hw.alwaysForward) continue
+      return true
     }
     return false
   }
@@ -1254,12 +1272,14 @@ export class SceneEngine {
     // scan is cheap; if it ever becomes hot we can pre-index it.
     const matchedTemplates = this.session.pool.templates.filter((tpl) => {
       const hw = tpl.hardwareMode
-      return (
-        !!hw &&
-        hw.enabled &&
-        hw.deviceIp === ip &&
-        hw.devicePort === port
-      )
+      if (!hw || !hw.enabled) return false
+      if (hw.deviceIp !== ip) return false
+      // (v0.5.12) deviceMatch: 'ipOnly' allows any source port for
+      // this IP. See HardwareModeConfig.deviceMatch docstring.
+      if ((hw.deviceMatch ?? 'ipPort') === 'ipPort' && hw.devicePort !== port) {
+        return false
+      }
+      return true
     })
     if (matchedTemplates.length === 0) return
     // Update movement state regardless of template match (so future
@@ -2771,8 +2791,27 @@ export class SceneEngine {
       // this tick. Undefined / true means "emit" (default). MIDI is
       // independent — a cell with OSC off + MIDI on still emits
       // MIDI normally.
+      //
+      // Hard invariant: template-kind tracks (Instrument-template
+      // headers, e.g. "OCTOCOSME" row) NEVER emit OSC. Their cells
+      // are group-trigger buttons in the UI — they fire all child
+      // Parameter cells in their column, but the template-track cell
+      // itself is a UI container, not a data emitter. Older session
+      // data (and a since-fixed cell-create path) sometimes
+      // backfilled template-kind cells with `oscEnabled: true` + a
+      // placeholder address/value (e.g. "/dataflou/value 0"), which
+      // then leaked one packet per scene trigger to whatever
+      // destination got defaulted in. Gating at the engine layer
+      // makes the fix robust against any present-or-future data
+      // model drift: even if cell.oscEnabled is true, kind ===
+      // 'template' wins. MIDI emission is intentionally NOT gated
+      // here — template tracks could theoretically host a MIDI
+      // group-trigger pattern in a future revision; the bug is
+      // OSC-specific.
       const oscEmitAllowed =
-        (cell.oscEnabled ?? true) && (track?.oscEnabled ?? true)
+        track?.kind !== 'template' &&
+        (cell.oscEnabled ?? true) &&
+        (track?.oscEnabled ?? true)
       if (this.isTrackEffectivelyDisabled(trackId)) continue
 
       // Live-recompute `seqGenRanges` when the user toggles

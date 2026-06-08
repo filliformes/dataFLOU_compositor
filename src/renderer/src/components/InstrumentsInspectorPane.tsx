@@ -1338,14 +1338,40 @@ function SavedSceneInspector({
 
 function Field({
   label,
-  children
+  children,
+  tooltip
 }: {
   label: string
   children: React.ReactNode
+  // (v0.5.12) Optional descriptive tooltip. When present:
+  //   - the whole field gets a native hover-title (so hovering ANY
+  //     part of the field surfaces the description)
+  //   - a small "ⓘ" affordance renders next to the label so the
+  //     user can DISCOVER that help exists for this field (most
+  //     people don't hover-probe random labels for tooltips)
+  // Used for fields with non-obvious semantics — e.g. Hardware Mode's
+  // Catch tol and Movement Δ which require a mental model of how
+  // soft-takeover works to set sensibly.
+  tooltip?: string
 }): JSX.Element {
   return (
-    <label className="flex flex-col gap-0.5">
-      <span className="label">{label}</span>
+    <label className="flex flex-col gap-0.5" title={tooltip}>
+      <span className="label flex items-center gap-1">
+        <span>{label}</span>
+        {tooltip && (
+          <span
+            className="inline-flex items-center justify-center w-3 h-3 rounded-full text-[8px] cursor-help select-none shrink-0"
+            style={{
+              border: '1px solid rgb(var(--c-muted))',
+              color: 'rgb(var(--c-muted))'
+            }}
+            title={tooltip}
+            aria-label={`Help: ${label}`}
+          >
+            i
+          </span>
+        )}
+      </span>
       {children}
     </label>
   )
@@ -1390,7 +1416,16 @@ export function HardwareModeSection({
     !hw.appliesToTrackIds || hw.appliesToTrackIds.length === 0
   return (
     <div className="border border-border rounded p-1.5 flex flex-col gap-1.5 bg-panel2/30">
-      <label className="flex items-center gap-1.5 cursor-pointer">
+      <label
+        className="flex items-center gap-1.5 cursor-pointer"
+        title={
+          "Hardware Mode does TWO things at once:\n\n" +
+          "1. ENGINE — catch-mode soft-takeover. When ON, moving the controller within tolerance of the scene's current value 'catches' that slot — the controller takes over per-slot until released (RESET) or scene change (PERSIST).\n\n" +
+          "2. NETWORK — forward-path suppression. When ON, raw controller packets are NOT forwarded to downstream consumers (PD, Max) — the engine's caught value is the single source of truth per parameter, preventing dual-emission flicker.\n\n" +
+          "Turning Hardware Mode OFF disables BOTH at once. If a scene is also playing, dual emission resumes immediately — the same raw controller bytes that the scene's caught values used to suppress now arrive at the downstream too. Visible as flicker for any parameter the controller and scene both touch.\n\n" +
+          "If you want the controller to reach downstream consumers EVEN WHEN NO SCENE IS PLAYING (rehearsal, soundcheck), keep HW Mode ON and enable 'Always forward' below — that's the safer escape hatch."
+        }
+      >
         <input
           type="checkbox"
           checked={!!hw.enabled}
@@ -1401,6 +1436,16 @@ export function HardwareModeSection({
         <span className="label" style={{ color: hw.enabled ? 'rgb(var(--c-danger))' : undefined }}>
           Hardware Mode
         </span>
+        <span
+          className="inline-flex items-center justify-center w-3 h-3 rounded-full text-[8px] cursor-help select-none shrink-0"
+          style={{
+            border: '1px solid rgb(var(--c-muted))',
+            color: 'rgb(var(--c-muted))'
+          }}
+          aria-label="Help: Hardware Mode"
+        >
+          i
+        </span>
         {hw.enabled && (
           <span
             className="text-[9px] font-bold"
@@ -1408,6 +1453,19 @@ export function HardwareModeSection({
           >
             ON
           </span>
+        )}
+        {/* (v0.5.12) Self-diagnostic — when Hardware Mode is on but
+            the engine hasn't seen a packet from the configured source
+            in the last 5s, surface a yellow warning here. Catches the
+            #1 silent-failure mode: wrong devicePort, controller off,
+            firewall blocking, or wrong listener port. Polls every
+            500ms while the section is rendered. */}
+        {hw.enabled && hw.deviceIp.length > 0 && (
+          <HardwareModeStatusDot
+            deviceIp={hw.deviceIp}
+            devicePort={hw.devicePort}
+            deviceMatch={hw.deviceMatch ?? 'ipPort'}
+          />
         )}
       </label>
       {hw.enabled && (
@@ -1435,11 +1493,17 @@ export function HardwareModeSection({
               }}
             >
               <option value="">— pick a discovered device —</option>
-              {networkDevices.map((d) => (
-                <option key={d.id} value={`${d.ip}:${d.port}`}>
-                  {d.ip}:{d.port} ({d.addresses.length} addr)
-                </option>
-              ))}
+              {/* (v0.5.12) Hard-exclude loopback sources. Binding HW
+                  Mode to dataFLOU's own loopback would suppress the
+                  scene's emissions to its own bus, breaking the
+                  forward-to-many pattern users build. */}
+              {networkDevices
+                .filter((d) => !d.isLoopback)
+                .map((d) => (
+                  <option key={d.id} value={`${d.ip}:${d.port}`}>
+                    {d.ip}:{d.port} ({d.addresses.length} addr)
+                  </option>
+                ))}
             </select>
             {networkDevices.length === 0 && (
               <span className="text-[9px] text-muted italic mt-0.5">
@@ -1452,7 +1516,14 @@ export function HardwareModeSection({
           {/* Mode — 'reset' (default) re-arms catch on every scene
               change; 'persist' lets a mid-show knob-turn keep
               overriding through scene transitions. */}
-          <Field label="Catch lifecycle">
+          <Field
+            label="Catch lifecycle"
+            tooltip={
+              "What happens to ALREADY-CAUGHT slots when a new scene fires. " +
+              "RESET: every catch is released. The new scene's values resume; if you want to keep controlling, you must re-catch by moving the controller within tolerance of the NEW scene's value for that slot. Best when the scene IS the truth and the controller is for temporary live nudges. " +
+              "PERSIST: caught slots keep their hardware override across the scene change. If you were holding a knob mid-show, your hand keeps controlling that slot through the transition. Best when the controller IS the truth and scenes provide a starting template."
+            }
+          >
             <select
               className="input text-[11px] py-0.5 w-full"
               value={hw.mode}
@@ -1466,10 +1537,86 @@ export function HardwareModeSection({
               <option value="persist">Persist across scene changes</option>
             </select>
           </Field>
+          {/* (v0.5.12) Source-match strictness. 'ipPort' (default) is
+              correct for controllers with a fixed UDP source port
+              (e.g. OCTOCOSME Teensy uses udp.begin(8888)). 'ipOnly'
+              relaxes the check so any source port from the same IP
+              counts as this controller — necessary for senders that
+              bind ephemeral source ports (Lemur, TouchOSC, most
+              custom Max/PD/Python OSC clients). When the
+              HwModeSuppressPanel shows ⚠ PORT MISMATCH on this
+              template, switching to 'ipOnly' is the fix. */}
+          <Field
+            label="Source match"
+            tooltip={
+              "How strictly the engine matches inbound OSC packets against the configured Device. " +
+              "EXACT ip:port (default): packet must come from the exact IP AND source port shown in Device above. Correct when the controller binds a fixed source port (OCTOCOSME Teensy uses udp.begin(8888) which fixes its source port). " +
+              "IP only: packet matches when source IP matches, regardless of source port. Use when the controller sends from an ephemeral source port that changes per packet — most software OSC senders: Lemur, TouchOSC, ad-hoc Max/PD/Python OSC clients. " +
+              "If the HW Mode Suppress panel (Pool > Network) shows ⚠ PORT MISMATCH on this template, switching to 'IP only' is the fix."
+            }
+          >
+            <select
+              className="input text-[11px] py-0.5 w-full"
+              value={hw.deviceMatch ?? 'ipPort'}
+              onChange={(e) =>
+                setHardwareMode(template.id, {
+                  deviceMatch: e.target.value as 'ipPort' | 'ipOnly'
+                })
+              }
+            >
+              <option value="ipPort">Exact ip:port (default — fixed-port firmware)</option>
+              <option value="ipOnly">IP only (ephemeral source ports)</option>
+            </select>
+          </Field>
+          {/* (v0.5.12) Always-forward toggle. Default OFF preserves
+              v0.5.11 forward-suppression behaviour. ON lets the raw
+              forward path through even though HW Mode is consuming
+              the packet — necessary for controller-always-reaches-PD
+              workflows (rehearsal without a scene playing, soundcheck,
+              etc.). Render as a single inline checkbox + label so it
+              doesn't disrupt the grid of select/input fields. */}
+          <label
+            className="flex items-center gap-1.5 cursor-pointer text-[11px]"
+            title={
+              "When ON, the OSC forward path is NOT suppressed for this controller — packets reach downstream consumers (PD, Max, etc.) even while Hardware Mode is enabled.\n\n" +
+              "Default OFF: suppress raw forward whenever the controller's packet arrives. The engine's caught value is the ONLY thing downstream sees per parameter. Clean single emission, no dual values, no flicker — BUT the controller is silent at downstream consumers whenever no scene is playing (no cells to emit through).\n\n" +
+              "ON: don't suppress. Raw controller bytes always reach downstream. Use when you need the controller to keep playing through PD/Max during soundcheck, rehearsal, or any session where no scene is active.\n\n" +
+              "Trade-off when ON during scene playback: downstream sees BOTH the raw controller value AND the engine's caught-and-emitted value for every caught slot. Most downstream consumers handle this fine (last-write-wins), but it CAN re-introduce flicker for consumers that average or sum incoming values. Test your downstream before relying on it."
+            }
+          >
+            <input
+              type="checkbox"
+              checked={!!hw.alwaysForward}
+              onChange={(e) =>
+                setHardwareMode(template.id, {
+                  alwaysForward: e.target.checked
+                })
+              }
+            />
+            <span>Always forward (controller reaches PD/Max even with no scene)</span>
+            <span
+              className="inline-flex items-center justify-center w-3 h-3 rounded-full text-[8px] cursor-help select-none shrink-0"
+              style={{
+                border: '1px solid rgb(var(--c-muted))',
+                color: 'rgb(var(--c-muted))'
+              }}
+              aria-label="Help: Always forward"
+            >
+              i
+            </span>
+          </label>
           {/* Tolerances — sensible defaults shown; advanced users can
               tighten / loosen. */}
           <div className="grid grid-cols-2 gap-1">
-            <Field label="Catch tol (% range)">
+            <Field
+              label="Catch tol (% range)"
+              tooltip={
+                "Soft-takeover window. After Hardware Mode is enabled, the controller is IGNORED until its value crosses within this tolerance of the scene's currently-emitted value for that slot. Then the slot 'catches' — the controller takes over from where the scene was, no audible/visible jump. " +
+                'Higher (e.g. 10%) = easier to catch but a bigger possible step at the moment of capture. ' +
+                'Lower (e.g. 1%) = stricter catch, smoother handoff, requires you to nudge the controller more precisely toward the scene value. ' +
+                "Default 2%. Tune up if the controller feels 'dead' (catch never triggers because you can't hit a narrow window); tune down if you hear/see a step when catch engages."
+              }
+            >
               <BoundedNumberInput
                 className="input text-[11px] py-0.5 w-full"
                 value={Math.round(hw.catchTolerance * 1000) / 10}
@@ -1480,9 +1627,24 @@ export function HardwareModeSection({
                 }
                 min={0}
                 max={100}
+                // commitOn='blur' to avoid per-keystroke round-trip:
+                // the value goes through Math.round(x * 1000)/10 on
+                // display and /100 on commit, so 5.55% becomes 5.5%
+                // after one round-trip. Under the OSC monitor's
+                // constant store-tick pressure that snap-back was
+                // visible as drop-focus while typing.
+                commitOn="blur"
               />
             </Field>
-            <Field label="Movement Δ (% range)">
+            <Field
+              label="Movement Δ (% range)"
+              tooltip={
+                "Movement threshold. The controller must change its value by at least this much within the movement window (~300 ms by default) to count as 'the user is actively moving this knob'. Static streams below this delta are ignored, so a controller that broadcasts the same value 200+ Hz when idle (typical of OCTOCOSME Teensy firmware, TouchOSC, etc.) doesn't constantly try to take over. " +
+                'Higher (e.g. 5%) = needs a deliberate gesture to engage; ignores tiny twitches, noise, vibration. ' +
+                'Lower (e.g. 0.1%) = ultra-sensitive; catches the slightest finger motion but may trigger on idle noise / drift from cheap pots. ' +
+                "Default 0.5%. Raise it if the slot keeps catching when you didn't intend to; lower it if you need a feather-touch."
+              }
+            >
               <BoundedNumberInput
                 className="input text-[11px] py-0.5 w-full"
                 value={Math.round(hw.movementThreshold * 1000) / 10}
@@ -1493,6 +1655,7 @@ export function HardwareModeSection({
                 }
                 min={0}
                 max={100}
+                commitOn="blur"
               />
             </Field>
           </div>
@@ -1615,4 +1778,93 @@ function resolveOsc(t: InstrumentTemplate, fn: InstrumentFunction): string {
   const base = t.oscAddressBase ?? ''
   const trimmed = base.endsWith('/') ? base.slice(0, -1) : base
   return `${trimmed}/${path}`
+}
+
+// (v0.5.12) Self-diagnostic dot rendered next to the "Hardware Mode"
+// label. Polls the forward-diag IPC at 2 Hz and uses each entry's
+// `lastSeenAtMs` to decide whether the configured source has been
+// silent. Status:
+//   🔴 red    — packets observed AND being forwarded (suppression
+//               failed; SHOULD be impossible if engine.isHardwareModeSource
+//               is wired correctly, surfaces as 🔥 DUAL EMISSION in the
+//               Pool panel)
+//   🟢 green  — packets observed AND suppressed in the last 5s (healthy)
+//   🟡 yellow — no matching packets in the last 5s; controller offline,
+//               wrong devicePort, firewall blocking, or wrong listener
+//               port. Most common silent-failure mode after enabling
+//               Hardware Mode for the first time. Hovers a hint.
+// The dot is purely informational — clicking does nothing. The full
+// per-source diagnostics live in the Pool > Network > HW Mode
+// Suppress panel; this dot just surfaces the headline at the point
+// of configuration.
+function HardwareModeStatusDot({
+  deviceIp,
+  devicePort,
+  deviceMatch
+}: {
+  deviceIp: string
+  devicePort: number
+  deviceMatch: 'ipPort' | 'ipOnly'
+}): JSX.Element {
+  const [lastSeenAtMs, setLastSeenAtMs] = useState<number | null>(null)
+  const [forwarded, setForwarded] = useState<number>(0)
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    async function poll(): Promise<void> {
+      const next = await window.api?.networkGetForwardDiag?.()
+      if (cancelled || !Array.isArray(next)) return
+      // ipOnly: pick the most-recently-seen entry from this IP
+      // (regardless of port). ipPort: require exact match.
+      let bestLastSeen = 0
+      let totalForwarded = 0
+      for (const e of next) {
+        if (e.ip !== deviceIp) continue
+        if (deviceMatch === 'ipPort' && e.port !== devicePort) continue
+        if (typeof e.lastSeenAtMs === 'number' && e.lastSeenAtMs > bestLastSeen) {
+          bestLastSeen = e.lastSeenAtMs
+        }
+        totalForwarded += e.forwarded
+      }
+      setLastSeenAtMs(bestLastSeen > 0 ? bestLastSeen : null)
+      setForwarded(totalForwarded)
+    }
+    void poll()
+    const pollId = setInterval(() => void poll(), 500)
+    // Tick the component every second so the "X seconds ago" stale
+    // check re-evaluates even when the diag itself hasn't changed.
+    const tickId = setInterval(() => setTick((t) => (t + 1) & 0xffff), 1000)
+    return () => {
+      cancelled = true
+      clearInterval(pollId)
+      clearInterval(tickId)
+    }
+  }, [deviceIp, devicePort, deviceMatch])
+  const now = Date.now()
+  const stale = lastSeenAtMs === null || now - lastSeenAtMs > 5000
+  // Color + tooltip dispatch. Order matters: red (active danger) >
+  // yellow (silent) > green (healthy).
+  let color: string
+  let title: string
+  if (!stale && forwarded > 0) {
+    color = 'rgb(var(--c-danger))'
+    title = `Dual-emission detected: ${forwarded} packets from ${deviceIp}:${devicePort} reached Forward without being suppressed. Check Pool > Network > HW Mode Suppress for full diagnosis.`
+  } else if (stale) {
+    const matchHint = deviceMatch === 'ipOnly' ? ' (matching ANY port on this IP)' : ''
+    title =
+      lastSeenAtMs === null
+        ? `No packets observed from ${deviceIp}${deviceMatch === 'ipPort' ? `:${devicePort}` : ''}${matchHint} since dataFLOU started. Controller offline? Wrong listener port? Firewall blocking? See Pool > Network for what IS arriving.`
+        : `No packets from ${deviceIp}${deviceMatch === 'ipPort' ? `:${devicePort}` : ''}${matchHint} in the last ${Math.floor((now - lastSeenAtMs) / 1000)}s.`
+    color = 'rgb(var(--c-warning, 234 179 8))'
+  } else {
+    color = 'rgb(var(--c-success))'
+    title = `Receiving + suppressing packets from ${deviceIp}${deviceMatch === 'ipPort' ? `:${devicePort}` : ''}.`
+  }
+  return (
+    <span
+      className="inline-block w-1.5 h-1.5 rounded-full ml-1 shrink-0"
+      style={{ background: color }}
+      title={title}
+    />
+  )
 }

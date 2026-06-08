@@ -1195,6 +1195,35 @@ export interface HardwareModeConfig {
   // bound (the UI shows "(pick a device)" until the user selects).
   deviceIp: string
   devicePort: number
+  // (v0.5.12) How strict the source-match is for inbound packets.
+  //   'ipPort' (default) — packet must match BOTH deviceIp AND
+  //       devicePort. Correct when the controller binds a fixed
+  //       source port (OCTOCOSME Teensy uses udp.begin(8888) which
+  //       fixes its source port).
+  //   'ipOnly' — packet matches when source IP matches, regardless
+  //       of source port. Use when the controller sends from an
+  //       ephemeral source port (most software OSC senders: Lemur,
+  //       TouchOSC, ad-hoc Max/PD patches, scripts). Without this
+  //       option the engine.isHardwareModeSource() check would
+  //       silently miss every packet because rinfo.port keeps
+  //       changing per packet — visible in the HwModeSuppressPanel
+  //       as ⚠ PORT MISMATCH.
+  deviceMatch?: 'ipPort' | 'ipOnly'
+  // (v0.5.12) When true, the OSC forward path does NOT suppress
+  // packets from this controller — they pass through to all forward
+  // targets in addition to Hardware Mode's engine-side emission.
+  // Use case: the user wants the controller to keep reaching
+  // downstream consumers (PD, Max, etc.) even when no scene is
+  // playing — without this flag, suppression closes the path
+  // session-wide whenever HW Mode is enabled, so a controller-only
+  // soundcheck / rehearsal session falls silent at the downstream.
+  // Trade-off: during scene playback, BOTH the raw forward AND the
+  // engine's caught value reach the downstream (dual emission for
+  // every caught slot). Acceptable when the downstream consumer is
+  // tolerant of duplicate OSC (most are — last-write-wins) or when
+  // the user disables HW Mode during playback. Default false (keep
+  // current suppress-always behaviour).
+  alwaysForward?: boolean
   // 'reset' (default) re-arms catch on every scene change; 'persist'
   // keeps the caught state across scene transitions so a knob-turn
   // mid-show keeps overriding the new scene's value until released.
@@ -1859,6 +1888,16 @@ export interface DiscoveredOscDevice {
   // Set of OSC paths this device has emitted. Capped at 256 to keep
   // pathological floods (e.g. a streaming bundle per pixel) bounded.
   addresses: DiscoveredOscAddress[]
+  // (v0.5.12) True when the source IP is loopback (127.0.0.1 or ::1).
+  // Loopback sources are typically dataFLOU itself: scene cells that
+  // target 127.0.0.1:<listenerPort> as a "broadcast bus" pattern
+  // loop right back into the listener with an ephemeral source port.
+  // The UI flags these with "(self loopback)" to disambiguate them
+  // from real external devices, and Hardware Mode's device picker
+  // hard-excludes them — you should never bind HW Mode to your own
+  // loopback by accident (the v0.5.11 forward-suppression would then
+  // suppress your scene's own emissions, breaking the bus pattern).
+  isLoopback?: boolean
 }
 
 // Status snapshot pushed to the renderer alongside the device list —
@@ -1887,6 +1926,13 @@ export interface ForwardDiagEntry {
   received: number
   suppressed: number
   forwarded: number
+  // (v0.5.12) Wall-clock ms of the most recent packet observed from
+  // this source. Lets the UI distinguish "configured source has gone
+  // silent" (stale lastSeenAtMs > 5s ago) from "actively streaming"
+  // even when the counter snapshot looks identical between polls.
+  // Optional for backward compatibility with renderer code that
+  // doesn't yet read it.
+  lastSeenAtMs?: number
 }
 
 // One OSC forward destination. dataFLOU listens on `session.defaultDestPort`

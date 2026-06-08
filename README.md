@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--0511)
+- [Release notes](#release-notes--0512)
+  - [0.5.12](#release-notes--0512)
   - [0.5.11](#release-notes--0511)
   - [0.5.10](#release-notes--0510)
   - [0.5.9](#release-notes--059)
@@ -70,6 +71,8 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
+- **Hardware Mode UX hardening (v0.5.12)**: live status dot next to the "Hardware Mode" label (🟢 healthy / 🟡 enabled-but-no-packets / 🔴 dual-emission), `deviceMatch: 'ipOnly'` toggle for controllers with ephemeral source ports (Lemur, TouchOSC, ad-hoc software OSC), `alwaysForward` opt-out so the controller can reach downstream consumers (PD, Max) even when no scene is playing, info-popup tooltips on every Hardware Mode field, right-click "Bind to template" actions on Network Discovery rows (per-template, eliminates the manual-typing-source-port trap), and a "self loopback" flag that excludes dataFLOU's own emissions from HW Mode bindings + the Capture popup's device list.
+- **Capture current state as new scene (v0.5.12)**: right-click any scene → "Capture current state as new scene" snapshots the engine's currently-emitted values for every cell on the scene (including Hardware Mode catches from a physical controller, sequencer step, modulator output, per-arg pins) into a new scene cloned from the source. Inserted directly adjacent to the source in the grid. Workflow: trigger a base scene, tweak via controller, right-click → capture. Named `<source> (capture)`.
 - **Gesture modulator (v0.5.8)**: record an X/Y stream by dragging on a square surface in the Inspector and use it as a modulator. The polyline + a crayon-style cursor render LIVE while you draw (canvas pinned-centered so it doesn't shift). On playback the engine loops the captured curve at the modulator's standard Rate (Hz or BPM-synced), and a coloured **playhead dot** animates on the canvas at ~30 Hz so you SEE the curve being traced. Three **Play modes** (Forward / Backward / Ping-Pong), a **Wiggle** knob (0–100 %, sinusoidal back-and-forth jitter on the playhead - modulatable by Modulation 2 as the third "Shape" target), and an **Output** picker: `XY` (X → slot 0, Y → slot 1) or `Merged` (radial distance √(x² + y²)/√2 broadcast to every slot). Two-channel fan-out via `gestureChannelFor`.
 - **Two-stage modulator - Modulation 2 (v0.5.7, expanded v0.5.8 + v0.5.9)**: every clip carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode, Gesture Wiggle). **Every modulator type** is now usable as Modulation 2 (v0.5.8): LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random, Ramp, Arpeggiator (Gesture-as-Mod-2 reserved for a future revision). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value - Mod 2's modulation breathes around whatever you author. The orange "live" overlay tint is gated on Modulation 2 being enabled, so it doesn't fire when nothing is actually modulating. Mod 2 also gets its own Routing-matrix column for per-slot gating.
 - **Modulation 2 → Sequencer (v0.5.9)**: Modulation 2 now also has a parallel route into the cell's Sequencer (in addition to its existing route into Modulation 1). Inspector's Mod 2 section renders TWO Targets blocks: "Mod 1 Targets" and "Seq Targets". The Seq block's Shape label is mode-aware - Rotation for Euclidean, Seed for Density, Rule for Cellular, Ring A Length for Polyrhythm, Bias for Drift, Probability for Ratchet, Decay for Bounce. **Rate** targets bpm + stepMs; **Depth** universally targets the **Generative wildness slider** (`genAmount`) - making Modulation 2 → Sequencer a "calm ↔ chaotic" breathing source for generative sequencer modes. Routing matrix grows a new M2>S column next to M2>1.
@@ -568,6 +571,70 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.5.12
+
+A Hardware Mode UX hardening + workflow pass. The headline is **closing every silent-failure mode** in Hardware Mode that bit show-day setup: a live status dot next to the HW Mode label, a `deviceMatch: ipOnly` toggle for controllers with ephemeral source ports, right-click "Bind to template" on Network Discovery rows, a `alwaysForward` opt-out for controller-without-scene workflows, info-popup tooltips on every Hardware Mode field, and a new "Capture current state as new scene" right-click action that snapshots the engine's live emitted values (including HW Mode catches) into a new scene cloned from the source. Plus loopback flag in Network Discovery, Capture loopback filter, and legacy `oscEnabled` cleanup on session load.
+
+### Hardware Mode status dot
+
+A small coloured dot now sits next to the "Hardware Mode" label in the Instrument Inspector. Polls `network:getForwardDiag` at 2 Hz against the configured `deviceIp`/`devicePort` and shows:
+- 🟢 **green** - packets observed AND suppressed in the last 5 s (healthy)
+- 🟡 **yellow** - HW Mode enabled but no matching packets in the last 5 s (controller offline, wrong devicePort, firewall blocking, wrong listener port - the most common silent-failure mode after first-time setup)
+- 🔴 **red** - packets observed AND being forwarded too (dual emission detected, would have surfaced as ⚠ DUAL EMISSION in the Pool's HW Mode Suppress panel)
+
+Single point of "is my controller getting through" at the place where you configure it - no need to flip to the Pool · Network tab to confirm.
+
+### `deviceMatch: 'ipOnly'` toggle
+
+New "Source match" dropdown in the Hardware Mode section. Default `Exact ip:port` keeps the v0.5.5 strict match - correct when the controller binds a fixed source port (OCTOCOSME Teensy uses `udp.begin(8888)` which fixes its source port). New `IP only` option relaxes the check to match any source port from the configured IP - necessary for software OSC senders that bind ephemeral source ports per packet (Lemur, TouchOSC, ad-hoc Max/PD/Python OSC clients). When the HW Mode Suppress panel shows **⚠ PORT MISMATCH** for a template, switching to `IP only` is the fix. Engine reads `template.hardwareMode.deviceMatch` in both `isHardwareModeSource` (the v0.5.11 forward-suppression hook) and `handleHardwareInput` (the per-packet catch-mode entry point), so both paths stay in lockstep.
+
+### `alwaysForward` toggle
+
+New checkbox in the Hardware Mode section: **"Always forward (controller reaches PD/Max even with no scene)"**. Default OFF preserves v0.5.11 forward-suppression behaviour (clean single emission per parameter). ON lets the raw forward path through even though Hardware Mode is consuming the packet - the engine STILL catches the controller into scene cells AND the downstream consumers (PD, Max, anything in Forward targets) STILL get the raw bytes. Use case: when no scene is playing, suppression alone would close the controller's path to downstream consumers entirely - this gap broke standalone controller use during rehearsal / soundcheck. Trade-off: during scene playback, downstream sees both the raw forward AND the engine's caught value (dual emission for caught slots); most downstream consumers handle this fine (last-write-wins). Opt-in escape hatch documented in the field's tooltip.
+
+### Right-click "Bind to template" from Network Discovery
+
+The right-click menu on a Pool · Network device row gets per-template **Bind to <Template name>** actions below the existing "Rebind every HW-Moded Instrument" batch action. Each per-template item sets that template's `hardwareMode.{deviceIp, devicePort, enabled}` to this device's source ip:port in one click, auto-enabling HW Mode if it was off. Templates already bound to this exact device show a ✓ prefix. Eliminates the manual-typing-source-port trap that was the most common Hardware Mode config bug. Loopback sources (127.0.0.1 / ::1) are hard-excluded from this list - you can't accidentally bind HW Mode to dataFLOU's own scene-to-loopback-bus emissions.
+
+### Loopback flag in Network Discovery + Capture filter
+
+`DiscoveredOscDevice` carries a new `isLoopback?: boolean` flag set in `observe()` when the source IP is `127.0.0.1` or `::1`. Affects three UIs:
+- **Network Discovery row**: loopback devices render with a muted italic ID + a "self loopback" tag.
+- **Hardware Mode device picker**: hard-excluded (`networkDevices.filter(d => !d.isLoopback)`).
+- **Capture popup**: hard-excluded from the device list, the auto-pick, and the per-row chips. Eliminates the per-row "compositor / 192.168.101.191" flicker that appeared when dataFLOU's own loopback emissions and a real hardware controller both pumped packets into the listener.
+
+### Capture current state as new scene
+
+The scene right-click menu gets a new **"Capture current state as new scene"** action between Duplicate and Delete (single-scene only). Reads the engine's `currentValueBySceneAndTrack[sceneId][trackId]` for each cell on the source scene and writes the live string into the new scene's cell value. Live string already reflects: source scene's base value → sequencer step → modulator output → per-arg pins → **Hardware Mode catches**. So the workflow is: trigger a base scene → tweak via OCTOCOSME → right-click → Capture current state. The new scene appears inserted **directly after** the source in the grid (not appended) so the visual association is preserved. Named `<source> (capture)` (vs Duplicate's `(copy)`). When the right-clicked scene is not currently active (engine has no live values), falls back to plain duplicate.
+
+### HW Mode Suppress panel: per-source `lastSeenAtMs`
+
+`ForwardDiagEntry` carries a new optional `lastSeenAtMs` field set on every packet in the listener's per-source counters map. The HW Mode Suppress panel's per-template card uses it to render a green / yellow "X seconds ago" badge alongside the counter trio - reveals "configured source has gone silent" even when the static counter snapshot looks healthy.
+
+### Info-popup tooltips on Hardware Mode fields
+
+The local `Field` component in `InstrumentsInspectorPane.tsx` learned an optional `tooltip?: string` prop. When set, renders a small circled `i` affordance next to the label (discoverable - users don't randomly hover labels) and propagates a native `title` to the wrapping label so hovering anywhere in the field surfaces the description. Applied to every non-obvious Hardware Mode field: Hardware Mode checkbox itself, Catch lifecycle, Source match, Catch tol, Movement Δ, Always forward. Tooltip strings cover the WHY + the trade-off + the tune-up/tune-down decision at the point of configuration.
+
+### Session-load migration: template-kind `oscEnabled` cleanup
+
+`applyV0512Migrations()` runs in `setSession()`. Walks `session.scenes[].cells` and force-sets `oscEnabled = false` on every cell whose track has `kind === 'template'`. Template-kind tracks (Instrument-template "header" rows) host the group-trigger UI button, not data-emitting cells; the engine's `oscEmitAllowed` gate already blocked emission at runtime, but the on-disk flag was lying. Cleans up the ghost `/dataflou/value 0`-style packets that some legacy sessions emitted on every scene trigger. Logs a one-line summary to the dev console (`[v0.5.12 migration] template-cell oscEnabled forced false: N`). Idempotent and non-destructive (only flips a flag).
+
+**Migration NOT included** (and a cautionary tale documented in the source): stripping the `compositor 0` prefix from cell values was implemented and reverted before shipping. The prefix looks like a vestigial pre-v0.5.5 takeover-gate artifact, but `cell.value` is **positionally indexed** against `argSpec` - stripping the two-token prefix shifts every editable slot by 2, silently corrupting multi-arg cells with `fixed` argSpec entries (OCTOCOSME `/A/strips/pots` is the worst case: editing HAUTEUR1 would write into MODA3). The fix for the original symptom (Capture flicker) lives in the loopback filter instead, not in touching cell.value.
+
+### Group-trigger cell tooltip
+
+`InstrumentTriggerCell`'s tooltip now explicitly says "Group trigger ... The header itself emits no OSC; it just batches the children." Closes the loop on the engine + factory + on-disk template-kind-is-not-data-emitting invariant. Pairs with the migration above.
+
+### `BoundedNumberInput commitOn="blur"` opt-in
+
+The shared `BoundedNumberInput` component learned an opt-in `commitOn?: 'change' | 'blur'` prop. `'change'` (default) preserves all existing behaviour across the codebase. `'blur'` defers upstream `onChange` until the input loses focus / Enter / Escape - local `str` state still updates every keystroke so the input is visually responsive, just the parent isn't told until the user finishes typing. Used by the Hardware Mode Catch tol / Movement Δ inputs because their values go through a non-bijective transform (`Math.round(x * 1000) / 10` on display, `/100` on commit) - per-keystroke commits caused snap-back and, under the constant store re-render pressure from the OSC monitor, focus loss while typing. Blur-only commit fixes both.
+
+### Engine: per-template HW source match honors `deviceMatch`
+
+`engine.isHardwareModeSource(ip, port)` (the v0.5.11 forward-suppression predicate) and `engine.handleHardwareInput(...)` (the per-packet catch-mode entry point) both honor `template.hardwareMode.deviceMatch`. When `deviceMatch === 'ipOnly'`, the port-equality check is skipped. When `template.hardwareMode.alwaysForward === true`, `isHardwareModeSource` returns false (so the forward path proceeds) even though `handleHardwareInput` still consumes the packet.
 
 ---
 
@@ -1679,8 +1746,11 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.5:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.12:
 
+- ✅ **Hardware Mode UX hardening (v0.5.12)**: live status dot at the configuration site, `deviceMatch: 'ipOnly'` toggle for ephemeral-port senders, `alwaysForward` opt-out so the controller reaches downstream even with no scene playing, info-popup tooltips on every field, right-click "Bind to template" from Network Discovery rows, loopback flag + Capture-popup filter.
+- ✅ **Capture current state as new scene (v0.5.12)**: right-click any scene → snapshot the engine's live emitted values (incl. Hardware Mode catches) into a new scene cloned from the source, inserted adjacent.
+- ✅ **Session-load migration: template-kind OSC cleanup (v0.5.12)**: legacy `oscEnabled: true` on template-header cells forced false on load; matches the engine's runtime invariant.
 - ✅ **Hardware Mode**: drive any cell's args from a physical OSC controller with catch-mode soft-takeover, per-template config, multi-instance scope, per-arg locks, RESET / PERSIST modes, live red highlighting on caught slots.
 - ✅ **Per-sequence-slot overrides**: duration + follow-action per placement; same scene in two slots can have independent timing AND independent next-actions.
 - ✅ **Velocity Humanize**: 0–100 % jitter rolling at the same rate as modulator-driven note edges, with live wire-accurate badge display.

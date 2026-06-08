@@ -30,6 +30,22 @@ interface Props {
   // the next render — used by the Sequence view to "land" on the
   // Duration field after the user drops a scene into a Scene Step.
   autoFocusToken?: number
+  // Commit cadence:
+  //   'change' (default) — fire onChange on every parseable keystroke.
+  //                        Good for sliders / number nudges where the
+  //                        parent state should track live.
+  //   'blur'             — only commit on blur, Enter, or Escape.
+  //                        Use when the value goes through a
+  //                        non-bijective transform in the parent
+  //                        (e.g. `Math.round(x * 1000) / 10` for
+  //                        a percentage stored as 0..1), where the
+  //                        per-keystroke round-trip would produce
+  //                        snap-back / focus-loss patterns on a
+  //                        frequently re-rendering parent. The local
+  //                        `str` state still tracks every keystroke
+  //                        live, just the parent isn't told until
+  //                        the user finishes typing.
+  commitOn?: 'change' | 'blur'
 }
 
 export function BoundedNumberInput({
@@ -42,7 +58,8 @@ export function BoundedNumberInput({
   className,
   title,
   disabled,
-  autoFocusToken
+  autoFocusToken,
+  commitOn = 'change'
 }: Props): JSX.Element {
   const [str, setStr] = useState(formatValue(value, integer))
   const focused = useRef(false)
@@ -169,6 +186,15 @@ export function BoundedNumberInput({
         // useEffect bails on subsequent external value updates.
         dirty.current = true
         setStr(v)
+        // commitOn='blur' defers ALL upstream commits until onBlur
+        // fires (or Enter/Escape). The local str still updates every
+        // keystroke so the input is visually responsive; the parent
+        // just doesn't see the value until the user finishes typing.
+        // Use this when the parent applies a non-bijective transform
+        // (e.g. percentage round-trip) — per-keystroke commits there
+        // cause snap-back and, under high parent re-render pressure,
+        // focus loss.
+        if (commitOn === 'blur') return
         // Live commit only for a fully-parsable value. Empty / sign-
         // only / dot-only intermediaries leave the parent value
         // untouched until blur.

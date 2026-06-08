@@ -114,7 +114,23 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   // Selected device id for OSC captures — the user picks one of
   // the currently-discovered senders from the dropdown. We default
   // to the most-recently-active device when the popup opens.
-  const networkDevices = useStore((s) => s.networkDevices)
+  // (v0.5.12) Filter loopback sources OUT of the Capture device
+  // list entirely. Capture is for snapshotting an external sender
+  // (a hardware controller, TouchOSC tablet, etc.) into a Pool
+  // Instrument; dataFLOU's own scene-to-loopback-bus emissions are
+  // not a capture source. Worse: loopback packets carry the cell's
+  // own value as args[0] (e.g. "compositor" prefix on OCTOCOSME
+  // cells), which made the Capture display appear to alternate
+  // between the real hardware's args[0] and "compositor" depending
+  // on which source pumped a packet most recently — confusing
+  // visual flicker. Hide loopback at the source: the per-row
+  // chips, the dropdown options, and the auto-pick all consume
+  // this filtered list.
+  const networkDevicesRaw = useStore((s) => s.networkDevices)
+  const networkDevices = useMemo(
+    () => networkDevicesRaw.filter((d) => !d.isLoopback),
+    [networkDevicesRaw]
+  )
   const networkStatus = useStore((s) => s.networkStatus)
   const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
   const poolTemplates = useStore((s) => s.session.pool.templates)
