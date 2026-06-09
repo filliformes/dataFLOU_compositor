@@ -42,8 +42,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--0514)
-  - [0.5.14](#release-notes--0514)
+- [Release notes](#release-notes--0513)
   - [0.5.13](#release-notes--0513)
   - [0.5.12](#release-notes--0512)
   - [0.5.11](#release-notes--0511)
@@ -73,7 +72,7 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
-- **Hardware Mode UX hardening (v0.5.12 + v0.5.13)**: live status dot next to the "Hardware Mode" label (🟢 healthy / 🟡 enabled-but-no-packets / 🔴 dual-emission), `deviceMatch: 'ipOnly'` toggle for controllers with ephemeral source ports (Lemur, TouchOSC, ad-hoc software OSC), `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream consumers (PD, Max) only when no scene is playing (auto-flipping via `engine.activeSceneId`), **int + bool slots catch on value change** (v0.5.14 — no threshold, no idle-time window; a flip after an hour idle catches instantly, while a streaming controller's unchanged state can't steal slots back from a freshly-triggered scene), info-popup tooltips on every Hardware Mode field, right-click "Bind to template" actions on Network Discovery rows (per-template, eliminates the manual-typing-source-port trap), and a "self loopback" flag that excludes dataFLOU's own emissions from HW Mode bindings + the Capture popup's device list.
+- **Hardware Mode UX hardening (v0.5.12 + v0.5.13)**: live status dot next to the "Hardware Mode" label (🟢 healthy / 🟡 enabled-but-no-packets / 🔴 dual-emission), `deviceMatch: 'ipOnly'` toggle for controllers with ephemeral source ports (Lemur, TouchOSC, ad-hoc software OSC), `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream consumers (PD, Max) only when no scene is playing (auto-flipping via `engine.activeSceneId`), **int + bool slots catch on value change** (v0.5.13 — no threshold, no idle-time window; a flip after an hour idle catches instantly, while a streaming controller's unchanged state can't steal slots back from a freshly-triggered scene), info-popup tooltips on every Hardware Mode field, right-click "Bind to template" actions on Network Discovery rows (per-template, eliminates the manual-typing-source-port trap), and a "self loopback" flag that excludes dataFLOU's own emissions from HW Mode bindings + the Capture popup's device list.
 - **Capture current state as new scene (v0.5.12)**: right-click any scene → "Capture current state as new scene" snapshots the engine's currently-emitted values for every cell on the scene (including Hardware Mode catches from a physical controller, sequencer step, modulator output, per-arg pins) into a new scene cloned from the source. Inserted directly adjacent to the source in the grid. Workflow: trigger a base scene, tweak via controller, right-click → capture. Named `<source> (capture)`.
 - **Gesture modulator (v0.5.8)**: record an X/Y stream by dragging on a square surface in the Inspector and use it as a modulator. The polyline + a crayon-style cursor render LIVE while you draw (canvas pinned-centered so it doesn't shift). On playback the engine loops the captured curve at the modulator's standard Rate (Hz or BPM-synced), and a coloured **playhead dot** animates on the canvas at ~30 Hz so you SEE the curve being traced. Three **Play modes** (Forward / Backward / Ping-Pong), a **Wiggle** knob (0–100 %, sinusoidal back-and-forth jitter on the playhead - modulatable by Modulation 2 as the third "Shape" target), and an **Output** picker: `XY` (X → slot 0, Y → slot 1) or `Merged` (radial distance √(x² + y²)/√2 broadcast to every slot). Two-channel fan-out via `gestureChannelFor`.
 - **Two-stage modulator - Modulation 2 (v0.5.7, expanded v0.5.8 + v0.5.9)**: every clip carries an optional SECOND modulator that modulates **Modulation 1's Rate, Depth, and a context-aware Shape parameter** (LFO shape morph, S&H/Random Distribution, Strange Attractor Chaos, Chaos r, Slew Rise/Fall, Envelope Sustain, Ramp Curve, Arpeggiator Mode, Gesture Wiggle). **Every modulator type** is now usable as Modulation 2 (v0.5.8): LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random, Ramp, Arpeggiator (Gesture-as-Mod-2 reserved for a future revision). Three math modes (Multiplicative / Additive / Mix). Per-target enable + amount knob. The Modulation 1 sub-editors **animate in real-time**: sliders and number inputs overlay the engine's live effective values at ~30 Hz while still letting you edit the base value - Mod 2's modulation breathes around whatever you author. The orange "live" overlay tint is gated on Modulation 2 being enabled, so it doesn't fire when nothing is actually modulating. Mod 2 also gets its own Routing-matrix column for per-slot gating.
@@ -576,13 +575,16 @@ src/
 
 ---
 
-## Release notes - 0.5.14
+## Release notes - 0.5.13
 
-**Patch release — third and final iteration of the discrete-slot catch gate.** v0.5.13 fixed "slow single switch press doesn't catch" but introduced the opposite failure: with a controller that **streams** its state continuously (the OCTOCOSME broadcasts at a fixed rate), every discrete slot re-caught on the very first packet after a scene trigger cleared catches — so scenes could never assert their saved switch data. The hardware state always won. "Works TOO good."
+**Single-purpose patch release: Hardware Mode discrete-slot catch.** Two failure modes, one gate:
+
+1. **After v0.5.12, slow single switch increments never caught** — fast turning worked, one-press-then-wait didn't. The int/bool catch path sat behind the float movement detector, whose `movementWindowMs` aging treats a long-idle flip as "not moving" and whose two-sample baseline eats the first packet entirely.
+2. **The obvious counter-fix (catch on ANY packet) fails the other way** for controllers that **stream** their state continuously (the OCTOCOSME broadcasts at a fixed rate): the first packet after a scene trigger cleared catches would instantly re-catch every discrete slot, so scenes could never assert their saved switch data. The hardware state always won. (This variant briefly shipped as the first v0.5.13 build — withdrawn and replaced by this one.)
 
 ### Fix
 
-Discrete (`int` / `bool`) slots now catch on **value change** (`changedPerSlot`): did this slot's value differ from the device's previous transmission? No movement threshold (integer deltas are always ≥ 1), no `movementWindowMs` aging (a switch flipped after an hour idle is exactly as intentional as one flipped immediately).
+Discrete (`int` / `bool`) slots now gate on **value change** (`changedPerSlot`): did this slot's value differ from the device's previous transmission? No movement threshold (integer deltas are always ≥ 1), no `movementWindowMs` aging (a switch flipped after an hour idle is exactly as intentional as one flipped immediately). A re-send of an **unchanged** value — a static stream, or a multi-arg packet where only a sibling slot flipped — is not a change and cannot catch.
 
 The resulting contract:
 
@@ -591,31 +593,9 @@ The resulting contract:
 - **Multi-arg packet where only one switch flipped** (e.g. `/B/strips/switches` with 8 bools) → only the flipped slot catches; siblings stay under scene control
 - **Float slots unchanged** — still the classic v0.5.5 movement detector (threshold + aging window)
 
-### Gate history (three attempts, for the record)
-
-| version | discrete gate | failure mode |
-|---|---|---|
-| v0.5.12 | `movingPerSlot` (threshold + aged window) | slow single increments never caught — "fast turn works, slow press doesn't" |
-| v0.5.13 | none (any packet catches) | streaming controllers re-caught everything instantly after scene triggers — scenes couldn't assert saved data |
-| v0.5.14 | `changedPerSlot` (any value change, no timing window) | — |
+Soft-takeover exists to protect smooth float handoffs; a switch, instrument selector, or kill toggle has nothing smooth to protect — any **value change** IS the user's intentional input.
 
 Only file changed: `src/main/engine.ts` (`handleHardwareInput`). No session migration, no schema change, no UI change.
-
----
-
-## Release notes - 0.5.13
-
-**Single-purpose patch release**: Hardware Mode discrete-slot catch was still failing on slow single increments after v0.5.12 — fast turning worked, one-press-then-wait didn't. Root cause: the v0.5.12 int/bool instant-catch path was placed AFTER the per-slot movement gate (`if (!movingPerSlot[i]) continue`), and movement detection requires TWO samples (the first OSC packet establishes the baseline and is never counted as moving). So a switch press = one packet = always `moving = false` → caught only on the second press. Fast turning streams enough packets in to trip the gate.
-
-### Fix
-
-Discrete slots (`int` / `bool`) now bypass the movement gate entirely. Soft-takeover exists to protect smooth float handoffs — there's nothing smooth to protect on a switch, an instrument selector, or a kill toggle. Any OSC packet for a discrete slot catches on the first frame.
-
-Side effect by design: if a multi-arg packet arrives where only one bool flipped (e.g. `/B/strips/switches [0,1,0,0,0,0,0,0]` while the scene reads `[0,0,0,0,0,0,0,0]`), all 8 slots catch on that first packet. The 7 unchanged slots' override equals the scene value, so no visible change. Subsequent flips work as expected. This matches the user-perceived contract: "any contact = I'm driving this now."
-
-Float slots are unchanged — they still gate on movement detection + percentage tolerance.
-
-Only file changed: `src/main/engine.ts` (one block inside `handleHardwareInput`). No session migration, no schema change, no UI change.
 
 ---
 
@@ -1827,9 +1807,9 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.14:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.13:
 
-- ✅ **Hardware Mode discrete-slot catch on value change (v0.5.14)**: int + bool slots catch the moment their value differs from the device's previous transmission — no threshold, no idle-time window. Slow single presses catch instantly (the v0.5.12 bug), and a streaming controller's unchanged state can no longer steal slots back from a freshly-triggered scene (the v0.5.13 bug). Fixes the OCTOCOSME instrument selector, INTERVALLE, KILL switches, GLOBAL_MODE / TOUCH_MODE — while letting scenes assert their saved switch data.
+- ✅ **Hardware Mode discrete-slot catch on value change (v0.5.13)**: int + bool slots catch the moment their value differs from the device's previous transmission — no threshold, no idle-time window. Slow single presses catch instantly (the v0.5.12 bug), and a streaming controller's unchanged state can no longer steal slots back from a freshly-triggered scene. Fixes the OCTOCOSME instrument selector, INTERVALLE, KILL switches, GLOBAL_MODE / TOUCH_MODE — while letting scenes assert their saved switch data.
 - ✅ **Hardware Mode UX hardening (v0.5.12)**: live status dot at the configuration site, `deviceMatch: 'ipOnly'` toggle for ephemeral-port senders, `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream only when no scene is playing (auto-flipping via `engine.activeSceneId`), int + bool slots catch instantly under HW Mode (v0.5.12 introduced the type-aware branch; v0.5.13 finished the job by moving it ahead of the movement gate), info-popup tooltips on every field, right-click "Bind to template" from Network Discovery rows, loopback flag + Capture-popup filter.
 - ✅ **Capture current state as new scene (v0.5.12)**: right-click any scene → snapshot the engine's live emitted values (incl. Hardware Mode catches) into a new scene cloned from the source, inserted adjacent.
 - ✅ **Session-load migration: template-kind OSC cleanup (v0.5.12)**: legacy `oscEnabled: true` on template-header cells forced false on load; matches the engine's runtime invariant.

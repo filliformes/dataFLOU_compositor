@@ -1308,7 +1308,7 @@ export class SceneEngine {
     // it's working with. Movement is a property of the hardware
     // input, not of the override target.
     const movingPerSlot: boolean[] = []
-    // (v0.5.14) Parallel per-slot "value changed at all?" flags, used
+    // (v0.5.13) Parallel per-slot "value changed at all?" flags, used
     // as the catch gate for DISCRETE (int/bool) slots. Distinct from
     // movingPerSlot: no movementThreshold scaling, no movementWindowMs
     // aging — a delta of >= 1 integer step IS the user's intent, no
@@ -1406,7 +1406,7 @@ export class SceneEngine {
               ? track.argSpec[i].type
               : undefined
           const isDiscrete = argType === 'int' || argType === 'bool'
-          // Two different gates (v0.5.14):
+          // Two different gates (v0.5.13):
           //
           // FLOAT slots → movingPerSlot: movementThreshold +
           // movementWindowMs aging, the classic soft-takeover
@@ -1417,21 +1417,23 @@ export class SceneEngine {
           // threshold (integer deltas are always >= 1), no aging
           // window (a switch flipped after an hour idle is exactly as
           // intentional as one flipped immediately — the aged gate
-          // was why slow single increments felt dead pre-v0.5.13).
+          // was why slow single increments felt dead in v0.5.12).
           //
-          // History of this gate, because we got it wrong twice:
+          // History of this gate, because we got it wrong twice
+          // while iterating on the v0.5.13 fix:
           // - v0.5.12: discrete catch behind movingPerSlot → the aged
           //   window killed slow single increments ("fast turn works,
           //   slow press doesn't").
-          // - v0.5.13: discrete catch on ANY packet, no gate → a
-          //   controller that STREAMS its state (OCTOCOSME broadcasts
-          //   continuously) re-caught every discrete slot on the
-          //   first packet after a scene trigger cleared catches, so
-          //   scenes could never assert their saved switch data
-          //   ("works TOO good").
-          // - v0.5.14: discrete catch on VALUE CHANGE. Static streams
-          //   and sibling-slot multi-arg updates don't re-catch;
-          //   an actual flip catches instantly regardless of timing.
+          // - v0.5.13 first build (withdrawn): discrete catch on ANY
+          //   packet, no gate → a controller that STREAMS its state
+          //   (OCTOCOSME broadcasts continuously) re-caught every
+          //   discrete slot on the first packet after a scene trigger
+          //   cleared catches, so scenes could never assert their
+          //   saved switch data ("works TOO good").
+          // - v0.5.13 final: discrete catch on VALUE CHANGE. Static
+          //   streams and sibling-slot multi-arg updates don't
+          //   re-catch; an actual flip catches instantly regardless
+          //   of timing.
           if (isDiscrete ? !changedPerSlot[i] : !movingPerSlot[i]) continue
           const hwVal = numericArgs[i]
           const catchKey = `${track.id}|${i}`
@@ -1454,7 +1456,7 @@ export class SceneEngine {
           // audible/visible jumps on continuous params (smooth
           // floats). Discrete params have no smooth handoff to
           // protect — any VALUE CHANGE is the user's intentional
-          // input (changedPerSlot gated us above, v0.5.14). In a
+          // input (changedPerSlot gated us above, v0.5.13). In a
           // multi-arg packet (e.g. /B/strips/switches with 8 bools)
           // only the slots that actually flipped catch; the siblings
           // stay under scene control.
