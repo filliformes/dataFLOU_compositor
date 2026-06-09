@@ -42,8 +42,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--05121)
-  - [0.5.12.1](#release-notes--05121)
+- [Release notes](#release-notes--0512)
   - [0.5.12](#release-notes--0512)
   - [0.5.11](#release-notes--0511)
   - [0.5.10](#release-notes--0510)
@@ -575,54 +574,9 @@ src/
 
 ---
 
-## Release notes - 0.5.12.1
-
-Patch on top of v0.5.12 that closes the architectural gap exposed by `alwaysForward`.
-
-### `forwardMode: 'suppress' | 'always' | 'whenIdle'`
-
-v0.5.12 shipped a binary `alwaysForward` toggle on `HardwareModeConfig`. Users in OCTOCOSME-shape live workflows hit a real gap:
-
-- `alwaysForward = false`: clean single-emission during scene playback (no flicker), but the controller is silent at downstream consumers (PD, Max) whenever no scene is playing — breaks rehearsal / soundcheck.
-- `alwaysForward = true`: controller always reaches downstream, but dual-emission during scene playback produces visible flicker.
-
-Neither half of the toggle is correct on its own. v0.5.12.1 replaces the boolean with a 3-state enum:
-
-```typescript
-forwardMode?: 'suppress' | 'always' | 'whenIdle'
-```
-
-- **`'suppress'`** (default) — preserves v0.5.11 behaviour: never forward HW-Mode-bound packets. Clean single emission, no flicker. Controller silent when no scene plays.
-- **`'always'`** — preserves v0.5.12 `alwaysForward: true` behaviour: never suppress, forward always proceeds. Engine still consumes via `handleHardwareInput`, but downstream also receives raw bytes. Dual emission during playback (last-write-wins consumers handle it fine).
-- **`'whenIdle'`** — NEW. Suppress DURING scene playback (no flicker), forward when no scene is active (controller reaches downstream during rehearsal / soundcheck / between scenes). The engine consults its own `activeSceneId` at packet-arrival time, so the policy flips automatically on scene start/stop without any UI action. This is the mode you want for live shows.
-
-### Backward compatibility
-
-Legacy v0.5.12 sessions with `alwaysForward: true` continue working: `engine.isHardwareModeSource()` resolves `forwardMode ?? (alwaysForward ? 'always' : 'suppress')`. The HardwareModeSection UI's new dropdown writes `forwardMode` directly and clears `alwaysForward`, so the moment the user touches the control, the session migrates to the new field cleanly. No session-load migration needed — the fallback in the engine handles unmigrated data.
-
-### UI surface
-
-The "Always forward" checkbox in the HardwareModeSection is replaced with a "Forward to downstream" dropdown carrying all three options + tooltip-documented trade-offs. Single point of decision at the configuration site.
-
-### Files touched
-
-- `src/shared/types.ts` — `forwardMode?: 'suppress' | 'always' | 'whenIdle'` added; `alwaysForward?` documented as deprecated.
-- `src/main/engine.ts` — `isHardwareModeSource()` reads `forwardMode` with `alwaysForward` fallback; consults `this.activeSceneId` for `'whenIdle'` mode.
-- `src/renderer/src/components/InstrumentsInspectorPane.tsx` — checkbox → dropdown, expanded tooltip.
-
-### Hardware Mode int-aware catch
-
-A second bug fix folded into v0.5.12.1: the catch-tolerance logic was using a percentage-of-range model that breaks down for integer slots. For an int slot like OCTOCOSME's `/A/strips/switches` (instrument selector 0-7) with a 5% catchTolerance, the engine computed `tol = 0.05 * 6 = 0.3`. But integer deltas are always 0, 1, 2... — anything off-by-1 fails because `1 > 0.3`. The encoder had to land EXACTLY on the scene's integer to catch, which broke "turn the encoder, it takes over" for any switch / selector / discrete control.
-
-**Fix**: in `engine.handleHardwareInput`, when the slot's `track.argSpec[i].type` is `'int'` or `'bool'`, skip the tolerance check entirely and catch on first detected movement (movement detection is already gated upstream by `movingPerSlot[i]`). For `'float'` (and `'string'` as fallback), the existing tolerance-based soft-takeover is preserved — soft-takeover only makes sense for continuous params where there's a smooth-handoff to protect against. Discrete params have no audible/visible jump on integer transitions; any movement IS the intentional input.
-
-This makes OCTOCOSME's instrument selectors, INTERVALLE encoder, and KILL switches behave intuitively under Hardware Mode for the first time. Float pots (HAUTEUR, MODA, MODB, Global FX) continue to use the v0.5.5 percentage-based catch.
-
----
-
 ## Release notes - 0.5.12
 
-A Hardware Mode UX hardening + workflow pass. The headline is **closing every silent-failure mode** in Hardware Mode that bit show-day setup: a live status dot next to the HW Mode label, a `deviceMatch: ipOnly` toggle for controllers with ephemeral source ports, right-click "Bind to template" on Network Discovery rows, a `alwaysForward` opt-out for controller-without-scene workflows, info-popup tooltips on every Hardware Mode field, and a new "Capture current state as new scene" right-click action that snapshots the engine's live emitted values (including HW Mode catches) into a new scene cloned from the source. Plus loopback flag in Network Discovery, Capture loopback filter, and legacy `oscEnabled` cleanup on session load.
+A Hardware Mode UX hardening + workflow pass. The headline is **closing every silent-failure mode** in Hardware Mode that bit show-day setup: a live status dot next to the HW Mode label, a `deviceMatch: ipOnly` toggle for controllers with ephemeral source ports, right-click "Bind to template" on Network Discovery rows, a 3-state `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy that lets the controller reach downstream consumers (PD, Max) only when no scene is playing (auto-flipping via engine.activeSceneId), int + bool slots that catch INSTANTLY under Hardware Mode (no more "encoder feels dead unless I land on the exact int"), info-popup tooltips on every Hardware Mode field, and a new "Capture current state as new scene" right-click action that snapshots the engine's live emitted values (including HW Mode catches) into a new scene cloned from the source. Plus loopback flag in Network Discovery, Capture loopback filter, and legacy `oscEnabled` cleanup on session load.
 
 ### Hardware Mode status dot
 
@@ -680,7 +634,43 @@ The shared `BoundedNumberInput` component learned an opt-in `commitOn?: 'change'
 
 ### Engine: per-template HW source match honors `deviceMatch`
 
-`engine.isHardwareModeSource(ip, port)` (the v0.5.11 forward-suppression predicate) and `engine.handleHardwareInput(...)` (the per-packet catch-mode entry point) both honor `template.hardwareMode.deviceMatch`. When `deviceMatch === 'ipOnly'`, the port-equality check is skipped. When `template.hardwareMode.alwaysForward === true`, `isHardwareModeSource` returns false (so the forward path proceeds) even though `handleHardwareInput` still consumes the packet.
+`engine.isHardwareModeSource(ip, port)` (the v0.5.11 forward-suppression predicate) and `engine.handleHardwareInput(...)` (the per-packet catch-mode entry point) both honor `template.hardwareMode.deviceMatch`. When `deviceMatch === 'ipOnly'`, the port-equality check is skipped.
+
+### `forwardMode: 'suppress' | 'always' | 'whenIdle'` (replaces the in-flight `alwaysForward` boolean)
+
+The `alwaysForward` boolean shipped briefly in an internal v0.5.12 build but exposed an architectural gap: neither half of the toggle was correct alone.
+
+- `alwaysForward = false`: clean single-emission during scene playback (no flicker), but the controller is silent at downstream consumers (PD, Max) whenever no scene is playing — breaks rehearsal / soundcheck.
+- `alwaysForward = true`: controller always reaches downstream, but dual-emission during scene playback produces visible flicker.
+
+v0.5.12 ships a 3-state enum instead:
+
+```typescript
+forwardMode?: 'suppress' | 'always' | 'whenIdle'
+```
+
+- **`'suppress'`** (default) — preserves v0.5.11 behaviour: never forward HW-Mode-bound packets. Clean single emission, no flicker. Controller silent when no scene plays.
+- **`'always'`** — never suppress, forward always proceeds. Engine still consumes via `handleHardwareInput`, but downstream also receives raw bytes. Dual emission during playback (last-write-wins consumers handle it fine).
+- **`'whenIdle'`** (recommended for live shows) — suppress DURING scene playback (no flicker), forward when no scene is active. The engine consults its own `activeSceneId` at packet-arrival time, so the policy flips automatically on scene start/stop without any UI action.
+
+Backward compat: legacy sessions with `alwaysForward: true` continue working — `isHardwareModeSource()` resolves `forwardMode ?? (alwaysForward ? 'always' : 'suppress')`. The "Always forward" checkbox is replaced with a "Forward to downstream" dropdown carrying all three options + tooltip-documented trade-offs; the dropdown writes `forwardMode` directly and clears `alwaysForward` on first touch.
+
+### Hardware Mode int + bool instant catch
+
+The v0.5.5 catch-tolerance logic uses a percentage-of-range model that breaks down for integer and boolean slots. For an int slot like OCTOCOSME's `/A/strips/switches` (instrument selector 0-7) with a 5% catchTolerance, the engine computed `tol = 0.05 * 6 = 0.3`. But integer deltas are always 0, 1, 2... — anything off-by-1 fails because `1 > 0.3`. The encoder had to land EXACTLY on the scene's integer to catch, which broke "turn the encoder, it takes over" for any switch / selector / discrete control.
+
+**Fix**: in `engine.handleHardwareInput`, when the slot's `track.argSpec[i].type` is `'int'` or `'bool'`, skip the tolerance check entirely and catch on first detected movement (movement detection is already gated upstream by `movingPerSlot[i]`). For `'float'` (and `'string'` as fallback), the existing tolerance-based soft-takeover is preserved — soft-takeover only makes sense for continuous params where there's a smooth-handoff to protect against. Discrete params have no audible/visible jump on integer transitions; any movement IS the intentional input.
+
+For OCTOCOSME specifically, all four switch-typed tracks now behave correctly under Hardware Mode for the first time:
+
+| Track | OSC address | Slot types → behavior |
+|---|---|---|
+| Voice Instruments | `/A/strips/switches` | INSTRU1-4 (int) → instant catch |
+| Voice Kills | `/B/strips/switches` | KILL1-4 (bool) → instant catch |
+| Intervalle | `/A/global/switches` | INTERVALLE (int) → instant catch |
+| Global / Touch Mode | `/B/global/switches` | GLOBAL_MODE, TOUCH_MODE (bool) → instant catch |
+
+Float pots (HAUTEUR, MODA, MODB, Global FX) continue using the existing 5% catch tolerance — smooth handoff preserved.
 
 ---
 
@@ -1794,7 +1784,7 @@ Live‑performance polish + Ramp + autosave.
 
 A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.12:
 
-- ✅ **Hardware Mode UX hardening (v0.5.12)**: live status dot at the configuration site, `deviceMatch: 'ipOnly'` toggle for ephemeral-port senders, `alwaysForward` opt-out so the controller reaches downstream even with no scene playing, info-popup tooltips on every field, right-click "Bind to template" from Network Discovery rows, loopback flag + Capture-popup filter.
+- ✅ **Hardware Mode UX hardening (v0.5.12)**: live status dot at the configuration site, `deviceMatch: 'ipOnly'` toggle for ephemeral-port senders, `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream only when no scene is playing (auto-flipping via `engine.activeSceneId`), int + bool slots catch instantly under HW Mode (was percentage-based, broke for discrete params), info-popup tooltips on every field, right-click "Bind to template" from Network Discovery rows, loopback flag + Capture-popup filter.
 - ✅ **Capture current state as new scene (v0.5.12)**: right-click any scene → snapshot the engine's live emitted values (incl. Hardware Mode catches) into a new scene cloned from the source, inserted adjacent.
 - ✅ **Session-load migration: template-kind OSC cleanup (v0.5.12)**: legacy `oscEnabled: true` on template-header cells forced false on load; matches the engine's runtime invariant.
 - ✅ **Hardware Mode**: drive any cell's args from a physical OSC controller with catch-mode soft-takeover, per-template config, multi-instance scope, per-arg locks, RESET / PERSIST modes, live red highlighting on caught slots.
