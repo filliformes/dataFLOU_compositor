@@ -1383,7 +1383,23 @@ export class SceneEngine {
             : null  // null = unlocked, hardware controls all slots
         for (let i = 0; i < numericArgs.length; i++) {
           if (lockedSlots && !lockedSlots.includes(i)) continue
-          if (!movingPerSlot[i]) continue
+          // Resolve argType BEFORE the movement gate. Discrete slots
+          // (int/bool) need to bypass movement detection entirely —
+          // see the explainer block below.
+          const argType =
+            track.argSpec && track.argSpec[i]
+              ? track.argSpec[i].type
+              : undefined
+          const isDiscrete = argType === 'int' || argType === 'bool'
+          // Float gate: skip if no movement detected. Discrete slots
+          // do NOT use this gate (see next block) — a single switch
+          // press generates ONE OSC packet, and `movingPerSlot[i]` is
+          // `false` for the first observation of any slot (line ~1316
+          // returns false when prev is undefined). So an int gated
+          // behind movement only ever catches on the SECOND press —
+          // exactly the "fast turn catches, slow single increment
+          // doesn't" symptom that prompted this fix.
+          if (!isDiscrete && !movingPerSlot[i]) continue
           const hwVal = numericArgs[i]
           const catchKey = `${track.id}|${i}`
           if (this.hardwareCaught.get(catchKey)) {
@@ -1391,7 +1407,7 @@ export class SceneEngine {
             this.hardwareOverride.set(catchKey, hwVal)
             continue
           }
-          // (v0.5.12.1) Integer-aware catch path. For discrete slots
+          // (v0.5.12 fix) Integer-aware catch path. For discrete slots
           // (encoder positions, instrument selectors, KILL switches,
           // bool flags), the percentage-based tolerance breaks UX —
           // integer deltas are always ≥1, but a tolerance like 5% on
@@ -1405,13 +1421,14 @@ export class SceneEngine {
           // audible/visible jumps on continuous params (smooth
           // floats). Discrete params have no smooth handoff to
           // protect — any movement IS the user's intentional input.
-          // So for int/bool slots, catch instantly on first detected
-          // movement (movingPerSlot[i] already gated us above).
-          const argType =
-            track.argSpec && track.argSpec[i]
-              ? track.argSpec[i].type
-              : undefined
-          if (argType === 'int' || argType === 'bool') {
+          // So for int/bool slots, catch instantly on first OSC
+          // packet for the slot, regardless of `movingPerSlot[i]`.
+          // Side effect: if the hardware sends a multi-arg packet
+          // (e.g. /B/strips/switches [0,1,0,0,0,0,0,0]) where only
+          // one bool flipped, all 8 slots catch on packet 1 — but
+          // the 7 unchanged slots' override equals the scene value,
+          // so no visible change. Subsequent flips work as expected.
+          if (isDiscrete) {
             this.hardwareCaught.set(catchKey, true)
             this.hardwareOverride.set(catchKey, hwVal)
             continue
