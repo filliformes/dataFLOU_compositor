@@ -42,7 +42,8 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--0512)
+- [Release notes](#release-notes--05121)
+  - [0.5.12.1](#release-notes--05121)
   - [0.5.12](#release-notes--0512)
   - [0.5.11](#release-notes--0511)
   - [0.5.10](#release-notes--0510)
@@ -571,6 +572,51 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.5.12.1
+
+Patch on top of v0.5.12 that closes the architectural gap exposed by `alwaysForward`.
+
+### `forwardMode: 'suppress' | 'always' | 'whenIdle'`
+
+v0.5.12 shipped a binary `alwaysForward` toggle on `HardwareModeConfig`. Users in OCTOCOSME-shape live workflows hit a real gap:
+
+- `alwaysForward = false`: clean single-emission during scene playback (no flicker), but the controller is silent at downstream consumers (PD, Max) whenever no scene is playing — breaks rehearsal / soundcheck.
+- `alwaysForward = true`: controller always reaches downstream, but dual-emission during scene playback produces visible flicker.
+
+Neither half of the toggle is correct on its own. v0.5.12.1 replaces the boolean with a 3-state enum:
+
+```typescript
+forwardMode?: 'suppress' | 'always' | 'whenIdle'
+```
+
+- **`'suppress'`** (default) — preserves v0.5.11 behaviour: never forward HW-Mode-bound packets. Clean single emission, no flicker. Controller silent when no scene plays.
+- **`'always'`** — preserves v0.5.12 `alwaysForward: true` behaviour: never suppress, forward always proceeds. Engine still consumes via `handleHardwareInput`, but downstream also receives raw bytes. Dual emission during playback (last-write-wins consumers handle it fine).
+- **`'whenIdle'`** — NEW. Suppress DURING scene playback (no flicker), forward when no scene is active (controller reaches downstream during rehearsal / soundcheck / between scenes). The engine consults its own `activeSceneId` at packet-arrival time, so the policy flips automatically on scene start/stop without any UI action. This is the mode you want for live shows.
+
+### Backward compatibility
+
+Legacy v0.5.12 sessions with `alwaysForward: true` continue working: `engine.isHardwareModeSource()` resolves `forwardMode ?? (alwaysForward ? 'always' : 'suppress')`. The HardwareModeSection UI's new dropdown writes `forwardMode` directly and clears `alwaysForward`, so the moment the user touches the control, the session migrates to the new field cleanly. No session-load migration needed — the fallback in the engine handles unmigrated data.
+
+### UI surface
+
+The "Always forward" checkbox in the HardwareModeSection is replaced with a "Forward to downstream" dropdown carrying all three options + tooltip-documented trade-offs. Single point of decision at the configuration site.
+
+### Files touched
+
+- `src/shared/types.ts` — `forwardMode?: 'suppress' | 'always' | 'whenIdle'` added; `alwaysForward?` documented as deprecated.
+- `src/main/engine.ts` — `isHardwareModeSource()` reads `forwardMode` with `alwaysForward` fallback; consults `this.activeSceneId` for `'whenIdle'` mode.
+- `src/renderer/src/components/InstrumentsInspectorPane.tsx` — checkbox → dropdown, expanded tooltip.
+
+### Hardware Mode int-aware catch
+
+A second bug fix folded into v0.5.12.1: the catch-tolerance logic was using a percentage-of-range model that breaks down for integer slots. For an int slot like OCTOCOSME's `/A/strips/switches` (instrument selector 0-7) with a 5% catchTolerance, the engine computed `tol = 0.05 * 6 = 0.3`. But integer deltas are always 0, 1, 2... — anything off-by-1 fails because `1 > 0.3`. The encoder had to land EXACTLY on the scene's integer to catch, which broke "turn the encoder, it takes over" for any switch / selector / discrete control.
+
+**Fix**: in `engine.handleHardwareInput`, when the slot's `track.argSpec[i].type` is `'int'` or `'bool'`, skip the tolerance check entirely and catch on first detected movement (movement detection is already gated upstream by `movingPerSlot[i]`). For `'float'` (and `'string'` as fallback), the existing tolerance-based soft-takeover is preserved — soft-takeover only makes sense for continuous params where there's a smooth-handoff to protect against. Discrete params have no audible/visible jump on integer transitions; any movement IS the intentional input.
+
+This makes OCTOCOSME's instrument selectors, INTERVALLE encoder, and KILL switches behave intuitively under Hardware Mode for the first time. Float pots (HAUTEUR, MODA, MODB, Global FX) continue to use the v0.5.5 percentage-based catch.
 
 ---
 

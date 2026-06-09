@@ -1209,21 +1209,39 @@ export interface HardwareModeConfig {
   //       changing per packet — visible in the HwModeSuppressPanel
   //       as ⚠ PORT MISMATCH.
   deviceMatch?: 'ipPort' | 'ipOnly'
-  // (v0.5.12) When true, the OSC forward path does NOT suppress
-  // packets from this controller — they pass through to all forward
-  // targets in addition to Hardware Mode's engine-side emission.
-  // Use case: the user wants the controller to keep reaching
-  // downstream consumers (PD, Max, etc.) even when no scene is
-  // playing — without this flag, suppression closes the path
-  // session-wide whenever HW Mode is enabled, so a controller-only
-  // soundcheck / rehearsal session falls silent at the downstream.
-  // Trade-off: during scene playback, BOTH the raw forward AND the
-  // engine's caught value reach the downstream (dual emission for
-  // every caught slot). Acceptable when the downstream consumer is
-  // tolerant of duplicate OSC (most are — last-write-wins) or when
-  // the user disables HW Mode during playback. Default false (keep
-  // current suppress-always behaviour).
+  // (v0.5.12, DEPRECATED in v0.5.12.1) Boolean toggle that maps to
+  // `forwardMode: 'always'` when true. Kept for back-compat: when
+  // forwardMode is undefined AND alwaysForward is true, the engine
+  // treats it as forwardMode === 'always'. New sessions should set
+  // forwardMode directly; the UI clears alwaysForward whenever the
+  // user picks any forwardMode option.
   alwaysForward?: boolean
+  // (v0.5.12.1) Forward-path suppression policy. Three modes:
+  //   'suppress' (default) — never forward HW-Moded packets to
+  //       downstream consumers (v0.5.11 behaviour). The engine's
+  //       catch-mode emission via cells is the SINGLE source of
+  //       truth per parameter. Clean single emission, no flicker.
+  //       Trade-off: the controller is invisible at downstream
+  //       consumers (PD, Max) whenever no scene is playing — the
+  //       cell-emit path has nothing to do without an active scene.
+  //   'always' — never suppress. Raw controller bytes always pass
+  //       through. Engine STILL consumes packets via
+  //       handleHardwareInput so catch-mode works during playback,
+  //       but downstream also receives the raw bytes. Trade-off:
+  //       during scene playback, downstream sees both the raw
+  //       forward AND the engine's caught value (dual emission;
+  //       visible as flicker on consumers that don't tolerate
+  //       duplicate OSC).
+  //   'whenIdle' — forward only when engine.activeSceneId === null
+  //       (no scene currently playing). Best of both worlds for
+  //       OCTOCOSME-shape live workflows: clean single emission
+  //       DURING scene playback, controller-reaches-downstream
+  //       BETWEEN scenes (rehearsal, soundcheck, idle moments).
+  //       The engine consults its own activeSceneId at
+  //       isHardwareModeSource() call time, so the suppression
+  //       state flips automatically on scene start/stop without
+  //       any UI action from the user.
+  forwardMode?: 'suppress' | 'always' | 'whenIdle'
   // 'reset' (default) re-arms catch on every scene change; 'persist'
   // keeps the caught state across scene transitions so a knob-turn
   // mid-show keeps overriding the new scene's value until released.

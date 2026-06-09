@@ -1568,43 +1568,59 @@ export function HardwareModeSection({
               <option value="ipOnly">IP only (ephemeral source ports)</option>
             </select>
           </Field>
-          {/* (v0.5.12) Always-forward toggle. Default OFF preserves
-              v0.5.11 forward-suppression behaviour. ON lets the raw
-              forward path through even though HW Mode is consuming
-              the packet — necessary for controller-always-reaches-PD
-              workflows (rehearsal without a scene playing, soundcheck,
-              etc.). Render as a single inline checkbox + label so it
-              doesn't disrupt the grid of select/input fields. */}
-          <label
-            className="flex items-center gap-1.5 cursor-pointer text-[11px]"
-            title={
-              "When ON, the OSC forward path is NOT suppressed for this controller — packets reach downstream consumers (PD, Max, etc.) even while Hardware Mode is enabled.\n\n" +
-              "Default OFF: suppress raw forward whenever the controller's packet arrives. The engine's caught value is the ONLY thing downstream sees per parameter. Clean single emission, no dual values, no flicker — BUT the controller is silent at downstream consumers whenever no scene is playing (no cells to emit through).\n\n" +
-              "ON: don't suppress. Raw controller bytes always reach downstream. Use when you need the controller to keep playing through PD/Max during soundcheck, rehearsal, or any session where no scene is active.\n\n" +
-              "Trade-off when ON during scene playback: downstream sees BOTH the raw controller value AND the engine's caught-and-emitted value for every caught slot. Most downstream consumers handle this fine (last-write-wins), but it CAN re-introduce flicker for consumers that average or sum incoming values. Test your downstream before relying on it."
+          {/* (v0.5.12.1) Forward-path policy. Replaces v0.5.12's
+              binary alwaysForward checkbox with a three-state select:
+              'suppress' (default — clean single emission, controller
+              silent when no scene playing), 'whenIdle' (suppress
+              during playback, forward when idle — best of both worlds
+              for live shows), 'always' (never suppress — accept dual
+              emission during playback so controller always reaches
+              downstream). Legacy alwaysForward boolean is honored as
+              'always' when forwardMode is undefined; saving via this
+              control writes forwardMode and clears alwaysForward. */}
+          <Field
+            label="Forward to downstream"
+            tooltip={
+              "Controls whether the OSC forward path (controller → downstream consumers like PD / Max) is suppressed while Hardware Mode is consuming the controller via its engine catch path.\n\n" +
+              "SUPPRESS (default): never forward HW-Mode-bound controller packets. The engine's caught value is the SINGLE source per parameter — clean, no dual emission, no flicker. Trade-off: the controller is silent at downstream consumers whenever no scene is playing (rehearsal, soundcheck, idle moments).\n\n" +
+              "WHEN IDLE — recommended for live: suppress DURING scene playback (no flicker), forward when no scene is active. The engine's activeSceneId is consulted at packet-arrival time, so the policy flips automatically on scene start/stop without any UI action. Best of both worlds for OCTOCOSME-shape workflows.\n\n" +
+              "ALWAYS: never suppress. Raw controller bytes always pass through to downstream consumers, even during scene playback. The engine STILL catches values into cells via handleHardwareInput. Trade-off: during scene playback, downstream sees both the raw forward AND the engine's caught value (dual emission, visible as flicker for consumers that don't tolerate duplicate OSC). Acceptable for last-write-wins consumers."
             }
           >
-            <input
-              type="checkbox"
-              checked={!!hw.alwaysForward}
-              onChange={(e) =>
-                setHardwareMode(template.id, {
-                  alwaysForward: e.target.checked
-                })
+            <select
+              className="input text-[11px] py-0.5 w-full"
+              value={
+                hw.forwardMode ??
+                (hw.alwaysForward ? 'always' : 'suppress')
               }
-            />
-            <span>Always forward (controller reaches PD/Max even with no scene)</span>
-            <span
-              className="inline-flex items-center justify-center w-3 h-3 rounded-full text-[8px] cursor-help select-none shrink-0"
-              style={{
-                border: '1px solid rgb(var(--c-muted))',
-                color: 'rgb(var(--c-muted))'
+              onChange={(e) => {
+                const mode = e.target.value as
+                  | 'suppress'
+                  | 'always'
+                  | 'whenIdle'
+                // Write forwardMode AND clear the legacy alwaysForward
+                // so old sessions migrate cleanly the moment the user
+                // touches this control. setTemplateHardwareMode does a
+                // patch-merge so passing { alwaysForward: undefined }
+                // would re-set it to undefined; we set false instead
+                // (semantically equivalent for back-compat readers).
+                setHardwareMode(template.id, {
+                  forwardMode: mode,
+                  alwaysForward: false
+                })
               }}
-              aria-label="Help: Always forward"
             >
-              i
-            </span>
-          </label>
+              <option value="suppress">
+                Suppress (default — no flicker; controller silent when idle)
+              </option>
+              <option value="whenIdle">
+                When idle (recommended — no flicker + controller reaches PD/Max between scenes)
+              </option>
+              <option value="always">
+                Always (controller always reaches PD/Max — dual emission during playback)
+              </option>
+            </select>
+          </Field>
           {/* Tolerances — sensible defaults shown; advanced users can
               tighten / loosen. */}
           <div className="grid grid-cols-2 gap-1">

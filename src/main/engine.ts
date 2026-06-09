@@ -1212,17 +1212,24 @@ export class SceneEngine {
       if ((hw.deviceMatch ?? 'ipPort') === 'ipPort' && hw.devicePort !== port) {
         continue
       }
-      // (v0.5.12) alwaysForward opts out of suppression. The packet
-      // matches a HW Mode template AND the engine still consumes it
-      // via handleHardwareInput, but the forward path is allowed to
-      // proceed too — necessary when the user wants the controller
-      // to keep reaching downstream consumers (PD, Max, etc.) even
-      // when no scene is playing (suppression alone would close the
-      // path session-wide). Trade-off: during scene playback,
-      // downstream sees both the raw forward AND the engine's caught
-      // value (dual emission). Acceptable for last-write-wins
-      // consumers OR when the user disables HW Mode during playback.
-      if (hw.alwaysForward) continue
+      // (v0.5.12.1) forwardMode replaces v0.5.12's binary alwaysForward
+      // with three policies: 'suppress' (default, current v0.5.11
+      // behaviour — never forward), 'always' (never suppress — opt
+      // out of forward-suppression entirely, v0.5.12 alwaysForward=true
+      // behaviour), and 'whenIdle' (forward only when no scene is
+      // currently playing — best of both worlds for live workflows
+      // where the user wants clean single-emission during scene
+      // playback AND controller-reaches-downstream during rehearsal /
+      // soundcheck / between scenes).
+      //
+      // Legacy alwaysForward boolean (from v0.5.12 sessions) is
+      // honored as 'always' when forwardMode is undefined; new
+      // sessions set forwardMode directly and the UI clears
+      // alwaysForward whenever the user picks any forwardMode option.
+      const fwdMode: 'suppress' | 'always' | 'whenIdle' =
+        hw.forwardMode ?? (hw.alwaysForward ? 'always' : 'suppress')
+      if (fwdMode === 'always') continue
+      if (fwdMode === 'whenIdle' && this.activeSceneId === null) continue
       return true
     }
     return false
@@ -1384,9 +1391,34 @@ export class SceneEngine {
             this.hardwareOverride.set(catchKey, hwVal)
             continue
           }
-          // Not yet caught — check against currently-emitted scene
-          // value. Pull from the most recent ts.lastSentNumeric for
-          // this track. If nothing's been emitted yet, skip until
+          // (v0.5.12.1) Integer-aware catch path. For discrete slots
+          // (encoder positions, instrument selectors, KILL switches,
+          // bool flags), the percentage-based tolerance breaks UX —
+          // integer deltas are always ≥1, but a tolerance like 5% on
+          // a 0-7 range maps to 0.35 absolute, so |hwVal - sceneVal|
+          // is either 0 (exact match → catches) or ≥1 (any miss →
+          // fails). The encoder feels dead unless the user lands
+          // exactly on the scene's int, which breaks "turn the
+          // encoder and it takes over" for switches/selectors.
+          //
+          // Semantic argument: soft-takeover exists to prevent
+          // audible/visible jumps on continuous params (smooth
+          // floats). Discrete params have no smooth handoff to
+          // protect — any movement IS the user's intentional input.
+          // So for int/bool slots, catch instantly on first detected
+          // movement (movingPerSlot[i] already gated us above).
+          const argType =
+            track.argSpec && track.argSpec[i]
+              ? track.argSpec[i].type
+              : undefined
+          if (argType === 'int' || argType === 'bool') {
+            this.hardwareCaught.set(catchKey, true)
+            this.hardwareOverride.set(catchKey, hwVal)
+            continue
+          }
+          // Float-typed slot (or unknown — fall back to existing
+          // tolerance check). Pull the most recent ts.lastSentNumeric
+          // for this track. If nothing's been emitted yet, skip until
           // the scene actually produces a value.
           const ts = this.tracks.get(track.id)
           const sceneVal = ts?.lastSentNumeric?.[i]
