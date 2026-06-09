@@ -1308,12 +1308,27 @@ export class SceneEngine {
     // it's working with. Movement is a property of the hardware
     // input, not of the override target.
     const movingPerSlot: boolean[] = []
+    // (v0.5.14) Parallel per-slot "value changed at all?" flags, used
+    // as the catch gate for DISCRETE (int/bool) slots. Distinct from
+    // movingPerSlot: no movementThreshold scaling, no movementWindowMs
+    // aging — a delta of >= 1 integer step IS the user's intent, no
+    // matter how long ago the previous change was. Crucially, a
+    // re-send of an UNCHANGED value (static stream from a controller
+    // that broadcasts state continuously, or a multi-arg packet where
+    // only a sibling slot flipped) is NOT a change — so it can't
+    // re-catch slots right after a scene trigger cleared them.
+    const changedPerSlot: boolean[] = []
     for (let i = 0; i < numericArgs.length; i++) {
       const prev = prevVals[i]
       const prevTs = prevChange[i] ?? 0
       const cur = numericArgs[i]
       if (typeof prev !== 'number' || typeof cur !== 'number') {
         movingPerSlot.push(false)
+        // First-ever observation of this slot: baseline only, no
+        // delta to measure. (For streaming controllers the baseline
+        // warms within one packet of app start, so this is invisible
+        // in practice.)
+        changedPerSlot.push(false)
       } else {
         // Use any matching template's movementThreshold (they SHOULD
         // all be similar; pick the first). MovementWindowMs gates
@@ -1328,6 +1343,7 @@ export class SceneEngine {
         // value, prev === cur for every packet → no movement.
         const moving = delta > hw.movementThreshold && !aged
         movingPerSlot.push(moving)
+        changedPerSlot.push(delta > 0)
         if (delta > 0) {
           // Always update the cache when value changed, so the next
           // packet sees a fresh baseline. (If we only updated on
@@ -1384,22 +1400,39 @@ export class SceneEngine {
         for (let i = 0; i < numericArgs.length; i++) {
           if (lockedSlots && !lockedSlots.includes(i)) continue
           // Resolve argType BEFORE the movement gate. Discrete slots
-          // (int/bool) need to bypass movement detection entirely —
-          // see the explainer block below.
+          // (int/bool) use their own gate — see below.
           const argType =
             track.argSpec && track.argSpec[i]
               ? track.argSpec[i].type
               : undefined
           const isDiscrete = argType === 'int' || argType === 'bool'
-          // Float gate: skip if no movement detected. Discrete slots
-          // do NOT use this gate (see next block) — a single switch
-          // press generates ONE OSC packet, and `movingPerSlot[i]` is
-          // `false` for the first observation of any slot (line ~1316
-          // returns false when prev is undefined). So an int gated
-          // behind movement only ever catches on the SECOND press —
-          // exactly the "fast turn catches, slow single increment
-          // doesn't" symptom that prompted this fix.
-          if (!isDiscrete && !movingPerSlot[i]) continue
+          // Two different gates (v0.5.14):
+          //
+          // FLOAT slots → movingPerSlot: movementThreshold +
+          // movementWindowMs aging, the classic soft-takeover
+          // movement detector. Unchanged since v0.5.5.
+          //
+          // DISCRETE slots → changedPerSlot: did the value change AT
+          // ALL since the device's previous transmission? No
+          // threshold (integer deltas are always >= 1), no aging
+          // window (a switch flipped after an hour idle is exactly as
+          // intentional as one flipped immediately — the aged gate
+          // was why slow single increments felt dead pre-v0.5.13).
+          //
+          // History of this gate, because we got it wrong twice:
+          // - v0.5.12: discrete catch behind movingPerSlot → the aged
+          //   window killed slow single increments ("fast turn works,
+          //   slow press doesn't").
+          // - v0.5.13: discrete catch on ANY packet, no gate → a
+          //   controller that STREAMS its state (OCTOCOSME broadcasts
+          //   continuously) re-caught every discrete slot on the
+          //   first packet after a scene trigger cleared catches, so
+          //   scenes could never assert their saved switch data
+          //   ("works TOO good").
+          // - v0.5.14: discrete catch on VALUE CHANGE. Static streams
+          //   and sibling-slot multi-arg updates don't re-catch;
+          //   an actual flip catches instantly regardless of timing.
+          if (isDiscrete ? !changedPerSlot[i] : !movingPerSlot[i]) continue
           const hwVal = numericArgs[i]
           const catchKey = `${track.id}|${i}`
           if (this.hardwareCaught.get(catchKey)) {
@@ -1420,14 +1453,11 @@ export class SceneEngine {
           // Semantic argument: soft-takeover exists to prevent
           // audible/visible jumps on continuous params (smooth
           // floats). Discrete params have no smooth handoff to
-          // protect — any movement IS the user's intentional input.
-          // So for int/bool slots, catch instantly on first OSC
-          // packet for the slot, regardless of `movingPerSlot[i]`.
-          // Side effect: if the hardware sends a multi-arg packet
-          // (e.g. /B/strips/switches [0,1,0,0,0,0,0,0]) where only
-          // one bool flipped, all 8 slots catch on packet 1 — but
-          // the 7 unchanged slots' override equals the scene value,
-          // so no visible change. Subsequent flips work as expected.
+          // protect — any VALUE CHANGE is the user's intentional
+          // input (changedPerSlot gated us above, v0.5.14). In a
+          // multi-arg packet (e.g. /B/strips/switches with 8 bools)
+          // only the slots that actually flipped catch; the siblings
+          // stay under scene control.
           if (isDiscrete) {
             this.hardwareCaught.set(catchKey, true)
             this.hardwareOverride.set(catchKey, hwVal)
