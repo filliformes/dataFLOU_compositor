@@ -1,6 +1,6 @@
 # dataFLOU_compositor
 
-**Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of Pure Data / Ableton / another machine, **3‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
+**Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of another software or another machine, **3‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
 
 ![dataFLOU_compositor - Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
