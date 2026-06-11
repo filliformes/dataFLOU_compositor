@@ -4720,6 +4720,15 @@ export const useStore = create<State>((set, get) => ({
   },
 
   removeSavedScene: async (id) => {
+    // Cancel any pending debounced library write for this id BEFORE the
+    // delete — otherwise a debounced save armed by a name/notes/duration
+    // edit within the last 400ms would fire after sceneLibraryRemove and
+    // rewrite the just-deleted file to disk (resurrecting it on next load).
+    const pending = savedSceneSaveTimers.get(id)
+    if (pending) {
+      clearTimeout(pending)
+      savedSceneSaveTimers.delete(id)
+    }
     try {
       await window.api?.sceneLibraryRemove?.(id)
     } catch (e) {

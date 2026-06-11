@@ -24,6 +24,7 @@ import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import type { NextMode, Scene } from '@shared/types'
 import { ResizeHandle } from './ResizeHandle'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { UncontrolledTextInput, UncontrolledTextarea } from './UncontrolledInput'
 import { GenerativeButton } from './GenerativePopover'
 import {
   POOL_SAVED_SCENE_DRAG_MIME,
@@ -1281,21 +1282,21 @@ export function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
           onChange={(e) => updateScene(scene.id, { color: e.target.value })}
           title="Scene color"
         />
-        <input
+        <UncontrolledTextInput
           className="input flex-1 min-w-0 text-[13px] font-medium"
           value={scene.name}
-          onChange={(e) => updateScene(scene.id, { name: e.target.value })}
+          onChange={(v) => updateScene(scene.id, { name: v })}
           placeholder="Scene name"
         />
       </div>
 
       <div className="flex flex-col gap-1">
         <span className="label">Notes</span>
-        <textarea
+        <UncontrolledTextarea
           className="input text-[12px] resize-none"
           rows={3}
           value={scene.notes}
-          onChange={(e) => updateScene(scene.id, { notes: e.target.value })}
+          onChange={(v) => updateScene(scene.id, { notes: v })}
           placeholder="Free-form notes"
         />
       </div>

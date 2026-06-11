@@ -1034,11 +1034,17 @@ function CellScalingSection({
 function RoutingMiniKnob({
   value,
   onChange,
-  title
+  title,
+  resetValue = 0
 }: {
   value: number // 0..100
   onChange: (v: number) => void
   title?: string
+  // Value a double-click resets to. Defaults to 0 (correct for Delay /
+  // Variation); knobs whose default isn't 0 (e.g. the M2 > Value amount
+  // knob, default 50%) pass their own so dbl-click restores the default
+  // instead of zeroing.
+  resetValue?: number
 }): JSX.Element {
   const dragRef = useRef<{
     startY: number
@@ -1110,9 +1116,9 @@ function RoutingMiniKnob({
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
-      onDoubleClick={() => onChange(0)}
+      onDoubleClick={() => onChange(resetValue)}
     >
-      <title>{title ?? `Variation ${value}% — drag vertically · shift = fine · dbl-click = 0`}</title>
+      <title>{title ?? `Variation ${value}% — drag vertically · shift = fine · dbl-click = ${resetValue}`}</title>
       {/* Background track */}
       <path
         d={`M ${cx + radius * Math.cos(arcStart)} ${cy + radius * Math.sin(arcStart)} A ${radius} ${radius} 0 ${bgLarge} 1 ${cx + radius * Math.cos(bgEnd)} ${cy + radius * Math.sin(bgEnd)}`}
@@ -3710,7 +3716,8 @@ function Mod2Section({
           <RoutingMiniKnob
             value={(m2.valueAmount ?? 0.5) * 100}
             onChange={(v) => patchValueAmount(v / 100)}
-            title="M2 > Value amount — drag vertically, dbl-click resets to 0"
+            resetValue={50}
+            title="M2 > Value amount — drag vertically, dbl-click resets to 50%"
           />
           <BoundedNumberInput
             className="input w-14 text-center tabular-nums px-1 py-0 text-[11px] leading-tight"

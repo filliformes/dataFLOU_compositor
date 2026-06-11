@@ -5729,8 +5729,10 @@ function computeRampGain(
   // is computed EXACTLY like 'normal' (same edge clamps, same curve);
   // only the final output mapping differs, so 'from' threads into the
   // caller's depth/scaling pipeline identically to 'normal'.
-  const fromValue = ramp.fromValue ?? 0
-  const toValue = ramp.toValue ?? 1
+  // Number.isFinite (not ??) so a malformed/NaN value from a hand-edited
+  // session can't propagate NaN through the ramp output for this slot.
+  const fromValue = Number.isFinite(ramp.fromValue) ? (ramp.fromValue as number) : 0
+  const toValue = Number.isFinite(ramp.toValue) ? (ramp.toValue as number) : 1
   // Loop mode: take elapsed time modulo the ramp period so the curve
   // retriggers every period instead of holding at 1 after completing.
   // Normal/Inverted/From: clamp at edges (start before, end after).

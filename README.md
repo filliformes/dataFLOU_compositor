@@ -645,6 +645,15 @@ Enabling Mod 2 with the **M2>1** column unchecked was still letting Mod 2 affect
 
 - README: fixed 23 broken Table-of-Contents anchor links and normalized the heading / emphasis hierarchy.
 
+### Post-release hardening
+
+A multi-agent review pass over the whole v0.5.14 diff surfaced a few low-risk issues, fixed in place:
+
+- **Deleting a Pool scene right after editing it could resurrect it** — the debounced linked-scene library write (new in this release) wasn't cancelled on delete, so a pending write fired after the delete. `removeSavedScene` now cancels it first.
+- Ramp "From" `From` / `To` values are `Number.isFinite`-guarded so a malformed session can't emit NaN.
+- The **M2 > Value amount** knob's double-click now resets to its 50% default instead of 0%.
+- The Sequence/Grid Scene-Info panel's name + notes fields are now uncontrolled inputs (no keystroke/caret race while a scene plays).
+
 ### Known parked item
 
 - View-switch grid-scroll preservation was reverted — the earlier attempt interfered with horizontal mouse-wheel scrolling. (Unrelated: if your horizontal wheel only scrolls one direction, that's a mouse-driver mapping issue, not dataFLOU — `Shift` + the vertical wheel scrolls horizontally both ways as a built-in workaround.)
