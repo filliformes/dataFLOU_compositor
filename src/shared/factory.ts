@@ -109,7 +109,9 @@ export const DEFAULT_RAMP: RampParams = {
   curvePct: 0, // linear
   sync: 'free',
   totalMs: 1000,
-  mode: 'normal'
+  mode: 'normal',
+  fromValue: 0, // 'from' mode start (default makes 'from' == 'normal')
+  toValue: 1 // 'from' mode end
 }
 
 export const DEFAULT_ARPEGGIATOR: ArpeggiatorParams = {
@@ -217,7 +219,15 @@ export const DEFAULT_MODULATION2: Modulation = {
     depth: { enabled: false, amount: 50 },
     shape: { enabled: false, amount: 50 }
   },
-  targetMode: 'multiplicative'
+  targetMode: 'multiplicative',
+  // Mod 2 → Value direct route. The route itself is opt-in PER SLOT
+  // via `cell.routing.modulation2Direct` (inverted default — false /
+  // missing = unrouted), so pre-loading a 50 % amount here just means
+  // the user hears something the moment they tick an "M2" slot in
+  // the Routing matrix. 'add' = sum the offsets with the Mod 1
+  // contribution (the most predictable of the three math modes).
+  valueAmount: 0.5,
+  valueMath: 'add'
 }
 
 // ---- Arpeggiator helpers ----

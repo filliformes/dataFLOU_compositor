@@ -272,7 +272,7 @@ interface TrackState {
   // lenSec, so the new mode settles at its final value immediately
   // and the change "doesn't seem to do anything." Resetting
   // triggerTime makes the new ramp fire from t=0.
-  prevRampMode: 'normal' | 'inverted' | 'loop' | null
+  prevRampMode: 'normal' | 'inverted' | 'loop' | 'from' | null
   // Arpeggiator state
   arpStepIdx: number        // current step index into the ladder (0..N-1)
   arpPatternIdx: number     // current index into the pattern array (deterministic modes)
@@ -990,6 +990,13 @@ export class SceneEngine {
   // no-op and doesn't allocate or scan templates on every incoming
   // packet. Recomputed on every `updateSession`.
   private hasAnyHardwareModeEnabled = false
+  // (Bug 5) One-shot flag set by `markSessionLoaded()` (called from the
+  // session-load IPC handlers in main/index.ts). The NEXT updateSession
+  // restores HW catch state from `session.hardwareState`, then the flag
+  // clears. Replaces the old `liveMapEmpty` heuristic, which would
+  // resurrect just-cleared catches whenever a routine session push
+  // (autosave, undo, an in-flight edit) raced a scene-trigger clear.
+  private sessionLoadPending = false
 
   // ── Generative Scene Sequencer state (v0.5.10) ───────────────────
   // Ring of recently-played scene IDs (newest at end). Drives the
@@ -1198,6 +1205,17 @@ export class SceneEngine {
    * typically have <10 templates so a Map index isn't worth the
    * coherency overhead vs. updateSession.
    */
+  /** (Bug 7) True while any track is still fading out ('stopping'
+   *  morph-out in progress). Used by the 'whenIdle' forward policy so
+   *  the controller stays suppressed until the fade actually finishes,
+   *  not just until activeSceneId is nulled. */
+  private isAnyTrackStopping(): boolean {
+    for (const ts of this.tracks.values()) {
+      if (ts.stopping) return true
+    }
+    return false
+  }
+
   isHardwareModeSource(ip: string, port: number): boolean {
     if (!this.hasAnyHardwareModeEnabled) return false
     if (!this.session) return false
@@ -1229,7 +1247,20 @@ export class SceneEngine {
       const fwdMode: 'suppress' | 'always' | 'whenIdle' =
         hw.forwardMode ?? (hw.alwaysForward ? 'always' : 'suppress')
       if (fwdMode === 'always') continue
-      if (fwdMode === 'whenIdle' && this.activeSceneId === null) continue
+      // (Bug 7 FIX) 'whenIdle' must treat a scene that's still fading
+      // out as NOT idle. stopScene() nulls activeSceneId immediately,
+      // but tracks linger in 'stopping' state (morph-out, up to several
+      // seconds). If we un-suppressed during that fade, the controller
+      // would byte-forward downstream WHILE the engine is still emitting
+      // the fading cell values → dual emission. Idle = no active scene
+      // AND no track currently stopping.
+      if (
+        fwdMode === 'whenIdle' &&
+        this.activeSceneId === null &&
+        !this.isAnyTrackStopping()
+      ) {
+        continue
+      }
       return true
     }
     return false
@@ -1272,11 +1303,11 @@ export class SceneEngine {
     // when HW Mode was off. Cached on session update via
     // `this.hasAnyHardwareModeEnabled`.
     if (!this.hasAnyHardwareModeEnabled) return
-    const deviceKey = `${ip}:${port}`
     const now = Date.now()
     // Find matching templates whose HW Mode is enabled + bound to
     // this device. Most sessions have 0-1 such templates so this
     // scan is cheap; if it ever becomes hot we can pre-index it.
+    let anyIpOnly = false
     const matchedTemplates = this.session.pool.templates.filter((tpl) => {
       const hw = tpl.hardwareMode
       if (!hw || !hw.enabled) return false
@@ -1286,9 +1317,32 @@ export class SceneEngine {
       if ((hw.deviceMatch ?? 'ipPort') === 'ipPort' && hw.devicePort !== port) {
         return false
       }
+      if ((hw.deviceMatch ?? 'ipPort') === 'ipOnly') anyIpOnly = true
       return true
     })
     if (matchedTemplates.length === 0) return
+    // (Bug 1 FIX) When ANY matching template is 'ipOnly', key movement
+    // state by ip ALONE — an ephemeral-port sender churns its source
+    // port every packet, so an `${ip}:${port}` key would give every
+    // packet a fresh (empty) movement map (movingPerSlot / changedPerSlot
+    // forever false → nothing ever catches) and leak one map entry per
+    // port. The ip-only key keeps a single stable baseline per device.
+    const deviceKey = anyIpOnly ? ip : `${ip}:${port}`
+    // (Bug 1 FIX) Cap the per-device movement maps and evict oldest —
+    // nothing ever clears these, so without a bound a churning source
+    // (or many devices) grows them unbounded. Map preserves insertion
+    // order, so the first key is the oldest.
+    const MAX_HW_MOVEMENT_DEVICES = 256
+    if (
+      !this.hardwareLastValues.has(deviceKey) &&
+      this.hardwareLastValues.size >= MAX_HW_MOVEMENT_DEVICES
+    ) {
+      const oldest = this.hardwareLastValues.keys().next().value
+      if (oldest !== undefined) {
+        this.hardwareLastValues.delete(oldest)
+        this.hardwareLastChangeMs.delete(oldest)
+      }
+    }
     // Update movement state regardless of template match (so future
     // matches don't have to re-prime). Per-device, per-address.
     let perDevValues = this.hardwareLastValues.get(deviceKey)
@@ -1322,7 +1376,13 @@ export class SceneEngine {
       const prev = prevVals[i]
       const prevTs = prevChange[i] ?? 0
       const cur = numericArgs[i]
-      if (typeof prev !== 'number' || typeof cur !== 'number') {
+      // (Bug 6 FIX) Number.isFinite() instead of typeof === 'number':
+      // typeof NaN === 'number', so a non-numeric arg (which the
+      // network layer maps to NaN) would otherwise store NaN as the
+      // baseline; |cur − NaN| is NaN, NaN > threshold is false forever,
+      // and the slot never recovers. Treat non-finite prev/cur as "no
+      // delta to measure" so the slot re-baselines cleanly below.
+      if (!Number.isFinite(prev) || !Number.isFinite(cur)) {
         movingPerSlot.push(false)
         // First-ever observation of this slot: baseline only, no
         // delta to measure. (For streaming controllers the baseline
@@ -1336,12 +1396,14 @@ export class SceneEngine {
         const hw = matchedTemplates[0].hardwareMode!
         const delta = Math.abs(cur - prev)
         const aged = now - prevTs > hw.movementWindowMs
-        // Moving if the delta crossed the threshold OR if we've gone
-        // movementWindowMs without any change AND the new value
-        // differs from the cached one (an end-of-static-burst
-        // movement). For a controller that streams 200 Hz the same
-        // value, prev === cur for every packet → no movement.
-        const moving = delta > hw.movementThreshold && !aged
+        // (Bug 3 FIX) Per the comment contract: moving when the delta
+        // crossed the threshold OR when we've gone movementWindowMs
+        // without a change AND the value now differs (end-of-static-
+        // burst / slow knob turn). The old `delta > threshold && !aged`
+        // meant slow turns (packets > movementWindowMs apart) could
+        // never catch. For a controller that streams the same value at
+        // 200 Hz, delta === 0 for every packet → still no movement.
+        const moving = delta > hw.movementThreshold || (aged && delta > 0)
         movingPerSlot.push(moving)
         changedPerSlot.push(delta > 0)
         if (delta > 0) {
@@ -1357,8 +1419,12 @@ export class SceneEngine {
     // Initialise any uninitialised slots so the next packet has a
     // baseline to compare against. Don't classify them as moving on
     // the first observation (no delta to measure).
+    // (Bug 6 FIX) Number.isFinite() on both the existing baseline AND
+    // the incoming value: a non-finite incoming arg must NOT be stored
+    // as a baseline (it would poison every future |cur − NaN| compare),
+    // and a previously-poisoned NaN baseline must re-initialise.
     for (let i = 0; i < numericArgs.length; i++) {
-      if (typeof prevVals[i] !== 'number') {
+      if (!Number.isFinite(prevVals[i]) && Number.isFinite(numericArgs[i])) {
         prevVals[i] = numericArgs[i]
         prevChange[i] = now
       }
@@ -1406,6 +1472,20 @@ export class SceneEngine {
               ? track.argSpec[i].type
               : undefined
           const isDiscrete = argType === 'int' || argType === 'bool'
+          // Takeover mode (Feature: Catch / Jump). 'catch' (default,
+          // or absent for back-compat) keeps the classic soft-takeover
+          // for FLOAT slots: the controller value must approach the
+          // scene value within catchTolerance before it takes over.
+          // 'jump' makes FLOAT slots catch on the first detected VALUE
+          // CHANGE — exactly like the discrete (int/bool) path always
+          // has — so any controller movement takes over instantly with
+          // no tolerance/approach required. Discrete slots are already
+          // instant; jump leaves them untouched.
+          const jumpMode = hw.takeover === 'jump'
+          // A slot uses the "changed → catch instantly, no tolerance"
+          // rule when it's discrete OR when jump mode is on. Otherwise
+          // it uses the classic float soft-takeover (movement + tol).
+          const instantCatch = isDiscrete || jumpMode
           // Two different gates (v0.5.13):
           //
           // FLOAT slots → movingPerSlot: movementThreshold +
@@ -1434,14 +1514,27 @@ export class SceneEngine {
           //   streams and sibling-slot multi-arg updates don't
           //   re-catch; an actual flip catches instantly regardless
           //   of timing.
-          if (isDiscrete ? !changedPerSlot[i] : !movingPerSlot[i]) continue
           const hwVal = numericArgs[i]
           const catchKey = `${track.id}|${i}`
+          // (Bug 33 FIX) Already-caught refresh runs BEFORE the
+          // movement/change gate. Catches restored from
+          // session.hardwareState carry NO override value, so if the
+          // refresh sat below the gate, a streaming-but-static
+          // controller (delta 0 every packet → gate continues) could
+          // never populate hardwareOverride and the slot stayed frozen
+          // at the scene value. An already-caught slot must self-heal
+          // its override on ANY packet, regardless of movement.
           if (this.hardwareCaught.get(catchKey)) {
-            // Already caught — just refresh the override value.
-            this.hardwareOverride.set(catchKey, hwVal)
+            if (Number.isFinite(hwVal)) this.hardwareOverride.set(catchKey, hwVal)
             continue
           }
+          // Movement/change gate applies only to NOT-yet-caught slots:
+          // a fresh catch still requires the user to actually move
+          // (float) or change (discrete) the control. In jump mode a
+          // float slot uses the discrete changedPerSlot gate so the
+          // very first value change qualifies (no movementThreshold /
+          // aging window needed).
+          if (instantCatch ? !changedPerSlot[i] : !movingPerSlot[i]) continue
           // (v0.5.12 fix) Integer-aware catch path. For discrete slots
           // (encoder positions, instrument selectors, KILL switches,
           // bool flags), the percentage-based tolerance breaks UX —
@@ -1460,7 +1553,12 @@ export class SceneEngine {
           // multi-arg packet (e.g. /B/strips/switches with 8 bools)
           // only the slots that actually flipped catch; the siblings
           // stay under scene control.
-          if (isDiscrete) {
+          //
+          // Jump-mode float slots take the SAME branch: changedPerSlot
+          // gated us above, so reaching here means the user moved the
+          // control — catch it instantly with no tolerance check, just
+          // like a discrete flip. (catchTolerance is unused in jump.)
+          if (instantCatch) {
             this.hardwareCaught.set(catchKey, true)
             this.hardwareOverride.set(catchKey, hwVal)
             continue
@@ -1493,28 +1591,61 @@ export class SceneEngine {
    *  keeps driving the new scene's parameter. */
   private clearHardwareCatchIfReset(): void {
     if (!this.session) return
-    // Only clear when AT LEAST ONE active HW template is in 'reset'
-    // mode. If every active template is 'persist', skip the clear.
-    const hasResetMode = this.session.pool.templates.some((tpl) => {
+    // (Bug 4 FIX) Clear ONLY the catches whose track belongs to an
+    // enabled reset-mode template. The old code wiped the WHOLE maps as
+    // soon as any one template was reset-mode, which also cleared
+    // persist-mode templates' catches (their whole point is to survive
+    // scene changes). Build the set of reset-mode source-template ids,
+    // resolve which tracks descend from them, and delete only those
+    // `${trackId}|${slot}` entries.
+    const resetTemplateIds = new Set<string>()
+    for (const tpl of this.session.pool.templates) {
       const hw = tpl.hardwareMode
-      return !!hw && hw.enabled && hw.mode === 'reset'
-    })
-    if (!hasResetMode) return
-    this.hardwareCaught.clear()
-    this.hardwareOverride.clear()
+      if (hw && hw.enabled && hw.mode === 'reset') resetTemplateIds.add(tpl.id)
+    }
+    if (resetTemplateIds.size === 0) return
+    const resetTrackIds = new Set<string>()
+    for (const t of this.session.tracks) {
+      if (t.sourceTemplateId && resetTemplateIds.has(t.sourceTemplateId)) {
+        resetTrackIds.add(t.id)
+      }
+    }
+    if (resetTrackIds.size === 0) return
+    for (const k of Array.from(this.hardwareCaught.keys())) {
+      const pipe = k.indexOf('|')
+      const trackId = pipe > 0 ? k.slice(0, pipe) : k
+      if (resetTrackIds.has(trackId)) this.hardwareCaught.delete(k)
+    }
+    for (const k of Array.from(this.hardwareOverride.keys())) {
+      const pipe = k.indexOf('|')
+      const trackId = pipe > 0 ? k.slice(0, pipe) : k
+      if (resetTrackIds.has(trackId)) this.hardwareOverride.delete(k)
+    }
+  }
+
+  /**
+   * (Bug 5) Signal that the NEXT `updateSession` carries a freshly
+   * LOADED session (file open / autosave restore), so its
+   * `hardwareState.caughtByTrack` should prime the engine's catch map
+   * exactly once. Called from the session-load IPC handlers in
+   * main/index.ts. Every OTHER updateSession (autosave snapshot, undo,
+   * in-flight edits) leaves the flag unset and never resurrects
+   * just-cleared catches.
+   */
+  markSessionLoaded(): void {
+    this.sessionLoadPending = true
   }
 
   updateSession(next: Session): void {
     const prevTickRate = this.session?.tickRateHz
     const prevMidiEnabled = this.session?.midiEnabled
-    // Detect "fresh session load" so we can prime the HW catch state
-    // from `next.hardwareState` exactly once. Heuristic: the engine's
-    // own catch map is currently EMPTY (which is true at boot and
-    // after an explicit `stop()`, but also after every catch has
-    // been released — fine, priming an empty session into an empty
-    // map is a no-op). Subsequent updateSession calls (autosave,
-    // undo, in-flight session edits) leave the live map alone.
-    const liveMapEmpty = this.hardwareCaught.size === 0
+    // (Bug 5 FIX) Restore HW catch state from `next.hardwareState` only
+    // when a real session LOAD signalled `markSessionLoaded()`. The old
+    // `liveMapEmpty` heuristic fired on ANY updateSession whose catch
+    // map happened to be empty, so a session push racing a scene-trigger
+    // clear could resurrect catches the trigger had just released.
+    const restoreHwState = this.sessionLoadPending
+    this.sessionLoadPending = false
     this.session = next
     // Refresh the fast-path flag for handleHardwareInput. Cheap to
     // recompute on session updates (a few-dozen templates max), and
@@ -1530,7 +1661,7 @@ export class SceneEngine {
     // "this slot is caught" so the renderer's red highlight comes
     // back immediately, and the engine substitutes the HW value
     // (once it arrives) instead of waiting for a fresh re-catch.
-    if (liveMapEmpty && next.hardwareState?.caughtByTrack) {
+    if (restoreHwState && next.hardwareState?.caughtByTrack) {
       const map = next.hardwareState.caughtByTrack
       for (const trackId of Object.keys(map)) {
         const slots = map[trackId] ?? []
@@ -1539,6 +1670,36 @@ export class SceneEngine {
             this.hardwareCaught.set(`${trackId}|${slotIdx}`, true)
           }
         }
+      }
+    }
+    // (Bug 2 FIX) Drop caught/override entries for any track whose
+    // source template's Hardware Mode is missing or DISABLED. Without
+    // this, disabling HW Mode (or deleting/disabling its template) left
+    // the slot frozen at the last hardware value forever — the emit
+    // loop reads hardwareCaught with no enabled-check, and
+    // clearHardwareCatchIfReset only runs on scene change when an
+    // ENABLED reset template still exists. Recomputed cheaply on every
+    // session update so a HW-Mode-off toggle releases its slots at once.
+    {
+      const hwEnabledTemplateIds = new Set<string>()
+      for (const tpl of next.pool.templates) {
+        if (tpl.hardwareMode?.enabled === true) hwEnabledTemplateIds.add(tpl.id)
+      }
+      const hwActiveTrackIds = new Set<string>()
+      for (const t of next.tracks) {
+        if (t.sourceTemplateId && hwEnabledTemplateIds.has(t.sourceTemplateId)) {
+          hwActiveTrackIds.add(t.id)
+        }
+      }
+      for (const k of Array.from(this.hardwareCaught.keys())) {
+        const pipe = k.indexOf('|')
+        const trackId = pipe > 0 ? k.slice(0, pipe) : k
+        if (!hwActiveTrackIds.has(trackId)) this.hardwareCaught.delete(k)
+      }
+      for (const k of Array.from(this.hardwareOverride.keys())) {
+        const pipe = k.indexOf('|')
+        const trackId = pipe > 0 ? k.slice(0, pipe) : k
+        if (!hwActiveTrackIds.has(trackId)) this.hardwareOverride.delete(k)
       }
     }
     // Propagate the global MIDI on/off to the sender. Flipping off
@@ -3472,6 +3633,21 @@ export class SceneEngine {
             const trackPinArr = track?.persistentSlots
             const trackPinVals = track?.persistentValues
             const argSpecRnd = track?.argSpec
+            // (Bug 34 FIX) The Random path previously `continue`d past
+            // the per-slot routing logic, so the routing matrix was
+            // ignored — the Random modulator drove ALL slots regardless
+            // of the MOD column checkboxes. Replicate the main path's
+            // per-slot routing here: modulator-off → emit the cell.value
+            // seed token; routing delays gate the slot until elapsed;
+            // variation factors scale the contribution; and the new
+            // M2-direct column contributes when routed.
+            const rnd2 = cell.modulation2
+            const mod2Enabled = rnd2?.enabled === true && !ts.stopping
+            const m2Amt = (() => {
+              const raw = rnd2?.valueAmount ?? 0.5
+              return raw < 0 ? 0 : raw > 1 ? 1 : raw
+            })()
+            const m2Math = rnd2?.valueMath ?? 'add'
             const args: Array<{
               type: 'i' | 'f' | 's' | 'T' | 'F'
               value: number | string | boolean
@@ -3511,13 +3687,69 @@ export class SceneEngine {
                   return { type: 'i' as const, value: Math.round(pinnedFinal) }
                 }
               }
-              // 3. Default — random-generated value (the original logic).
+              // (Bug 34 FIX) Per-slot routing gates — mirror the main
+              // per-slot loop. Slot index `i` is the emit slot; the
+              // routing arrays are indexed the same way. Delay acts as a
+              // gate until `triggerTime + delayMs`; modulator-off swaps
+              // the random value for the seed token; variation scales
+              // the contribution.
+              const slotDelayMs = cell.routing?.delays?.[i] ?? 0
+              const slotPostDelay =
+                slotDelayMs <= 0 || t - ts.triggerTime >= slotDelayMs
+              const routingModOn =
+                slotPostDelay && cell.routing?.modulator?.[i] !== false
+              const variationPct = cell.routing?.variations?.[i] ?? 0
+              const variationFactor =
+                variationPct > 0
+                  ? 1 + (ts.routingVariationFactors[i] ?? 0) * (variationPct / 100)
+                  : 1
+              // Seed token for this slot. Colour expands each value
+              // token into an RGB triplet (3 entries per token), so map
+              // entry index → token index accordingly; int/float are 1:1.
+              const tokenIdx =
+                rnd.valueType === 'colour' ? Math.floor(i / 3) : i
+              const seedVal = readNumber(rawTokens[tokenIdx] ?? '') ?? 0
+              // (Bug 34 FIX) Modulator routed OFF for this slot → emit
+              // the cell.value seed token instead of the random sample
+              // (matches the main path's "modulator-off → use seed").
+              if (!routingModOn) {
+                if (rnd.valueType === 'float' || cell.scaleToUnit) {
+                  const sv = cell.scaleToUnit ? normalise(seedVal) : seedVal
+                  return { type: 'f' as const, value: sv }
+                }
+                return { type: 'i' as const, value: Math.round(seedVal) }
+              }
+              // 3. Default — random-generated value, with per-slot
+              //    variation applied to the deviation from the seed so
+              //    the routing Variation knob behaves like the main path
+              //    (0% = identical across slots, higher = more spread).
+              let rv = seedVal + (v - seedVal) * variationFactor
+              // (Bug 34 FIX) Modulation 2 → Value (direct) contribution,
+              // gated per slot by `routing.modulation2Direct[i] === true`
+              // (defaults FALSE, so the explicit check is load-bearing).
+              // Mirrors the main path: intensity from M2's valueAmount,
+              // combined per valueMath, scaled by the same variation.
+              if (
+                mod2Enabled &&
+                slotPostDelay &&
+                cell.routing?.modulation2Direct?.[i] === true
+              ) {
+                const m2Offset =
+                  mod2NormBipolar * Math.max(Math.abs(rv), 1) * m2Amt * variationFactor
+                if (m2Math === 'mult') {
+                  rv = rv * (1 + mod2NormBipolar * m2Amt * variationFactor)
+                } else if (m2Math === 'mix') {
+                  rv = 0.5 * rv + 0.5 * (rv + m2Offset)
+                } else {
+                  rv = rv + m2Offset
+                }
+              }
               if (rnd.valueType === 'float') {
                 if (cell.scaleToUnit) {
-                  return { type: 'f' as const, value: normalise(v) }
+                  return { type: 'f' as const, value: normalise(rv) }
                 }
                 // Quantize to 1e-11 for stable output.
-                const q = Math.round(v * 1e11) / 1e11
+                const q = Math.round(rv * 1e11) / 1e11
                 return { type: 'f' as const, value: q }
               }
               // int or colour — integer output in [rndLo, rndHi].
@@ -3525,7 +3757,7 @@ export class SceneEngine {
               // the rest of the engine's scaleToUnit convention) so
               // the receiver sees actual proportions instead of a
               // collapsed 0/1.
-              const n = Math.round(v)
+              const n = Math.round(rv)
               if (cell.scaleToUnit) {
                 return { type: 'f' as const, value: normalise(n) }
               }
@@ -4103,6 +4335,14 @@ export class SceneEngine {
       // computation when nothing routes to "original" so the common
       // path stays a single computeModNorm call.
       let modNormOriginal = modNorm
+      // Original-ramp gain for unrouted slots. Mod 2 → Rate patches the
+      // ramp timing (rampMs / totalMs), so a slot with Mod 2 routing
+      // OFF needs the gain recomputed from the ORIGINAL ramp params.
+      // Envelope needs no equivalent — its shape is never patched, so
+      // `envGain` is already Mod-2-independent (only depth is gated, in
+      // the per-slot loop). Defaults to `rampGain` so the common path is
+      // untouched.
+      let rampGainOriginal = rampGain
       const anySlotBypassesMod2 =
         cell.modulation2?.enabled === true &&
         Array.isArray(cell.routing?.modulation2) &&
@@ -4121,6 +4361,16 @@ export class SceneEngine {
             (t - ts.triggerTime) / 1000,
             this.currentSceneDurationSec(ts.activeSceneId),
             this.session.globalBpm
+          )
+        } else if (
+          cell.modulation.enabled &&
+          !ts.stopping &&
+          cell.modulation.type === 'ramp'
+        ) {
+          rampGainOriginal = computeRampGain(
+            mod1OriginalForSlots.ramp,
+            (t - ts.triggerTime) / 1000,
+            this.currentSceneDurationSec(ts.activeSceneId)
           )
         }
       }
@@ -4302,14 +4552,37 @@ export class SceneEngine {
           if (cell.modulation.type === 'envelope') {
             // Multiplicative envelope, depth-mixed. depth=0% → no effect
             // (output = center); depth=100% → full VCA shape (out = center * env).
-            const depth01 = cell.modulation.depthPct / 100
+            // Routing.modulation2 per-slot gate — see arpeggiator branch
+            // below. Mod 2 only patches `depthPct` for envelope (the
+            // envelope shape itself is never patched, so `envGain` is
+            // already Mod-2-independent); using the original depth for an
+            // unrouted slot fully removes Mod 2's effect there.
+            const slotMod2On =
+              cell.modulation2?.enabled !== true ||
+              cell.routing?.modulation2?.[idx] !== false
+            const depthSlot = slotMod2On
+              ? cell.modulation.depthPct
+              : mod1OriginalForSlots.depthPct
+            const depth01 = depthSlot / 100
             out = center * (1 - depth01 + depth01 * envGain)
           } else if (cell.modulation.type === 'ramp') {
             // One-shot 0→1 ramp, depth-mixed identically to envelope. Once
             // the ramp completes, rampGain stays at 1 so the output settles
             // at `center` (modulator becomes neutral, as requested).
-            const depth01 = cell.modulation.depthPct / 100
-            out = center * (1 - depth01 + depth01 * rampGain)
+            // Routing.modulation2 per-slot gate — Mod 2 can patch BOTH the
+            // ramp depth (`depthPct`) AND the ramp timing (`ramp.rampMs` /
+            // `totalMs`, which feeds `rampGain`). For an unrouted slot use
+            // the original depth AND the original-ramp gain so Mod 2 has
+            // zero effect there.
+            const slotMod2On =
+              cell.modulation2?.enabled !== true ||
+              cell.routing?.modulation2?.[idx] !== false
+            const depthSlot = slotMod2On
+              ? cell.modulation.depthPct
+              : mod1OriginalForSlots.depthPct
+            const rampGainSlot = slotMod2On ? rampGain : rampGainOriginal
+            const depth01 = depthSlot / 100
+            out = center * (1 - depth01 + depth01 * rampGainSlot)
           } else if (cell.modulation.type === 'arpeggiator') {
             // Arp: ladder built fresh per token from this token's center so
             // multi-arg Value ("10 20") arps each token independently.
@@ -4406,6 +4679,60 @@ export class SceneEngine {
             } else {
               out = center + slotModNorm * magnitude * variationFactor
             }
+          }
+        }
+        // ── Modulation 2 → Value (direct) ─────────────────────────
+        // Mod 2's bipolar signal applied STRAIGHT to this slot's
+        // value — same pipeline stage as Mod 1's contribution above
+        // (before Scaling POST / scaleToUnit / Int Scale / pitch
+        // snap / HW override / pin, and scalingMode 'pre' already
+        // clamped `center` upstream exactly as it does for Mod 1).
+        // Gated per slot by `routing.modulation2Direct[idx]`, which —
+        // UNLIKE every other routing array — defaults FALSE
+        // (missing = unrouted), so the explicit `=== true` check is
+        // load-bearing. The per-slot Delay gate (slotPostDelay) and
+        // Variation factor apply to this contribution exactly as
+        // they do to the Mod 1 / Sequencer ones.
+        //
+        // Intensity comes from Mod 2's DEDICATED `valueAmount`
+        // (0..1, default 0.5) — NOT its Depth knob. The magnitude
+        // scaling mirrors Mod 1's non-arp branch:
+        // max(|center|, 1) so near-zero seeds still move.
+        //
+        // Combination with the Mod 1-modulated value follows
+        // `valueMath`, mirroring the M2>1 ModulationTargetMode
+        // semantics (applyMod2ToMod1):
+        //   add  — sum the offsets:  out += m2Offset
+        //          (additive: base + mod2 × range × amount)
+        //   mult — multiplicative:   out ×= 1 + mod2 × amount
+        //          (base × (1 + mod2 × amount))
+        //   mix  — 50/50 crossfade between the Mod 1-modulated value
+        //          and the Mod 2-only-modulated value (center +
+        //          m2Offset).
+        // A slot with BOTH M2-direct and M2>1 routed receives Mod 2
+        // twice (directly + through Mod 1's params) — documented
+        // stacking, no mutual exclusion.
+        if (
+          cell.modulation2?.enabled === true &&
+          !ts.stopping &&
+          slotPostDelay &&
+          cell.routing?.modulation2Direct?.[idx] === true
+        ) {
+          const m2cfg = cell.modulation2
+          const amtRaw = m2cfg.valueAmount ?? 0.5
+          const amt = amtRaw < 0 ? 0 : amtRaw > 1 ? 1 : amtRaw
+          const m2Offset =
+            mod2NormBipolar *
+            Math.max(Math.abs(center), 1) *
+            amt *
+            variationFactor
+          const math = m2cfg.valueMath ?? 'add'
+          if (math === 'mult') {
+            out = out * (1 + mod2NormBipolar * amt * variationFactor)
+          } else if (math === 'mix') {
+            out = 0.5 * out + 0.5 * (center + m2Offset)
+          } else {
+            out = out + m2Offset
           }
         }
         // Smart scaleToUnit auto-range.
@@ -5381,7 +5708,9 @@ function computeRampGain(
     curvePct: number
     sync: 'synced' | 'free' | 'freeSync'
     totalMs: number
-    mode?: 'normal' | 'inverted' | 'loop'
+    mode?: 'normal' | 'inverted' | 'loop' | 'from'
+    fromValue?: number
+    toValue?: number
   },
   elapsedSec: number,
   sceneDurSec: number
@@ -5395,16 +5724,28 @@ function computeRampGain(
     lenSec = Math.max(0.0001, (ramp.rampMs ?? 0) / 1000)
   }
   const mode = ramp.mode ?? 'normal'
+  // 'from' mode endpoints. Defaults (0 → 1) make 'from' identical to
+  // 'normal' until the user overrides them. The base progress p below
+  // is computed EXACTLY like 'normal' (same edge clamps, same curve);
+  // only the final output mapping differs, so 'from' threads into the
+  // caller's depth/scaling pipeline identically to 'normal'.
+  const fromValue = ramp.fromValue ?? 0
+  const toValue = ramp.toValue ?? 1
   // Loop mode: take elapsed time modulo the ramp period so the curve
   // retriggers every period instead of holding at 1 after completing.
-  // Normal/Inverted: clamp at edges (0 before, 1/0 after).
+  // Normal/Inverted/From: clamp at edges (start before, end after).
   let lin: number
   if (mode === 'loop') {
     if (elapsedSec <= 0) lin = 0
     else lin = (elapsedSec % lenSec) / lenSec
   } else {
-    if (elapsedSec <= 0) return mode === 'inverted' ? 1 : 0
-    if (elapsedSec >= lenSec) return mode === 'inverted' ? 0 : 1
+    // Edge clamps. 'from' uses the same 0/1 progress edges as 'normal'
+    // (then maps p through fromValue→toValue): before start → progress
+    // 0 → fromValue; after end → progress 1 → toValue.
+    if (elapsedSec <= 0)
+      return mode === 'inverted' ? 1 : mode === 'from' ? fromValue : 0
+    if (elapsedSec >= lenSec)
+      return mode === 'inverted' ? 0 : mode === 'from' ? toValue : 1
     lin = elapsedSec / lenSec
   }
   const curve = ramp.curvePct ?? 0
@@ -5416,7 +5757,12 @@ function computeRampGain(
         : Math.pow(lin, 1 + (Math.abs(curve) / 100) * 4)
   // Inverted mode flips the ramp vertically so it falls 1 → 0 instead
   // of rising 0 → 1 (curve shape preserved, just mirrored).
-  return mode === 'inverted' ? 1 - shaped : shaped
+  if (mode === 'inverted') return 1 - shaped
+  // 'from' mode: map the base progress p (= shaped, exactly the value
+  // 'normal' returns) onto the user's endpoints. depth/scaling apply
+  // downstream identically to normal mode.
+  if (mode === 'from') return fromValue + (toValue - fromValue) * shaped
+  return shaped
 }
 
 // ─────────────────────────────────────────────────────────────────

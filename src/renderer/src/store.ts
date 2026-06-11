@@ -475,6 +475,8 @@ export function buildSessionForSave(
     trackColumnWidth: number
     editorNotesHeight: number
     oscMonitorHeight: number
+    scenePaletteWidth: number
+    sceneInfoPanelHeight: number
     tracksCollapsed: boolean
     scenesCollapsed: boolean
   }>
@@ -500,10 +502,19 @@ export function buildSessionForSave(
       trackColumnWidth: state.trackColumnWidth,
       editorNotesHeight: state.editorNotesHeight,
       oscMonitorHeight: state.oscMonitorHeight,
+      // (#18) Persist the Sequence-view pane dimensions alongside their
+      // siblings so they survive a save/reload.
+      scenePaletteWidth: state.scenePaletteWidth,
+      sceneInfoPanelHeight: state.sceneInfoPanelHeight,
       tracksCollapsed: state.tracksCollapsed,
       scenesCollapsed: state.scenesCollapsed
     },
-    ...(hardwareState ? { hardwareState } : {})
+    // (#13) Always OVERWRITE the key with the CURRENT value (possibly
+    // undefined) — spreading conditionally kept a stale file-loaded
+    // catch blob alive after the engine released every catch, so dead
+    // catches resurrected on reopen. JSON.stringify drops the undefined
+    // key on save, so an empty catch state serializes to absent.
+    hardwareState
   }
 }
 
@@ -543,6 +554,46 @@ export function setPoolLibraryCache(payload: {
 // up: `(copy 1)`, `(copy 2)`, …. Duplicating an already-numbered
 // copy strips the existing suffix first so we don't accumulate
 // `(copy) (copy) (copy)` chains.
+// (#17) Generate a collision-free scene id. The old inline
+// `s_${Math.random().toString(36).slice(2, 9)}` could produce a SHORT
+// id (random base-36 can have leading-zero loss) with NO guard against
+// reusing an id already on the grid. This loops until the fixed-length
+// `s_` id is unique against the supplied existing-id set.
+function makeSceneId(existingIds: Iterable<string>): string {
+  const taken = existingIds instanceof Set ? existingIds : new Set(existingIds)
+  for (;;) {
+    // pad to a fixed 7-char suffix so the id is always `s_` + 7 chars.
+    const suffix = Math.random().toString(36).slice(2, 9).padEnd(7, '0')
+    const id = `s_${suffix}`
+    if (!taken.has(id)) return id
+  }
+}
+
+// (#20) Debounced disk persistence for the linked-SavedScene mirror.
+// updateScene's mirror runs on every keystroke when editing a linked
+// scene's name/notes/duration; the in-store set() must stay immediate
+// (the UI reads it), but the window.api.sceneLibrarySave disk write is
+// expensive and only the final value matters. Coalesce per savedSceneId
+// with a 400ms trailing debounce — the latest payload wins, one write
+// per edit-burst. Keyed by id so editing two linked scenes doesn't
+// clobber each other's pending write.
+const savedSceneSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+function debouncedSceneLibrarySave(saved: { id: string }): void {
+  const existing = savedSceneSaveTimers.get(saved.id)
+  if (existing) clearTimeout(existing)
+  savedSceneSaveTimers.set(
+    saved.id,
+    setTimeout(() => {
+      savedSceneSaveTimers.delete(saved.id)
+      try {
+        void window.api?.sceneLibrarySave?.(saved as never)
+      } catch (e) {
+        console.warn('[debouncedSceneLibrarySave] failed:', (e as Error).message)
+      }
+    }, 400)
+  )
+}
+
 function uniqueCopyName(srcName: string, existingNames: string[]): string {
   const stripRe = /\s*\(copy(?:\s+\d+)?\)$/
   const base = srcName.replace(stripRe, '')
@@ -1142,6 +1193,14 @@ interface Actions {
   // duplicateScene (no live data to capture from).
   captureSceneStateAsNew: (sceneId: string) => string | null
 
+  // (v0.5.14) Update sceneId IN PLACE with the engine's live emitted
+  // values (including Hardware Mode overrides) — the in-place sibling
+  // of captureSceneStateAsNew. Returns true when at least one cell
+  // value actually changed. No fallback when the scene isn't active:
+  // there are no live values to commit, so it's a no-op (the menu item
+  // is disabled in that case).
+  updateSceneToCurrent: (sceneId: string) => boolean
+
   // Engine state mirror
   setEngineState: (s: EngineState) => void
 }
@@ -1395,6 +1454,20 @@ export const useStore = create<State>((set, get) => ({
       Number.isFinite(ui.oscMonitorHeight)
     ) {
       uiPatch.oscMonitorHeight = clampInt(ui.oscMonitorHeight, 120, 800)
+    }
+    // (#18) Restore the Sequence-view pane dimensions, clamped to the
+    // same bounds their live setters use.
+    if (
+      typeof ui.scenePaletteWidth === 'number' &&
+      Number.isFinite(ui.scenePaletteWidth)
+    ) {
+      uiPatch.scenePaletteWidth = clampInt(ui.scenePaletteWidth, 200, 1200)
+    }
+    if (
+      typeof ui.sceneInfoPanelHeight === 'number' &&
+      Number.isFinite(ui.sceneInfoPanelHeight)
+    ) {
+      uiPatch.sceneInfoPanelHeight = clampInt(ui.sceneInfoPanelHeight, 80, 1600)
     }
     if (typeof ui.tracksCollapsed === 'boolean') {
       uiPatch.tracksCollapsed = ui.tracksCollapsed
@@ -3043,7 +3116,16 @@ export const useStore = create<State>((set, get) => ({
       const scene = makeScene(st.session.scenes.length)
       // New scenes live only in the palette; users drag them explicitly into
       // the sequencer when they're ready.
-      return { session: { ...st.session, scenes: [...st.session.scenes, scene] } }
+      // (FEATURE B) Insert directly AFTER the currently-focused scene,
+      // falling back to append when nothing is focused (or the focused
+      // id no longer exists in the grid).
+      const focusIdx = st.session.focusedSceneId
+        ? st.session.scenes.findIndex((s) => s.id === st.session.focusedSceneId)
+        : -1
+      const next = st.session.scenes.slice()
+      if (focusIdx >= 0) next.splice(focusIdx + 1, 0, scene)
+      else next.push(scene)
+      return { session: { ...st.session, scenes: next } }
     }),
   addSilenceScene: () =>
     set((st) => {
@@ -3188,11 +3270,9 @@ export const useStore = create<State>((set, get) => ({
         sv.id === updatedSaved.id ? updatedSaved : sv
       )
     }))
-    try {
-      void window.api?.sceneLibrarySave?.(updatedSaved)
-    } catch (e) {
-      console.warn('[updateScene] linked SavedScene sync failed:', (e as Error).message)
-    }
+    // (#20) In-store update above is immediate; disk write is debounced
+    // per savedSceneId so a name/notes/duration edit-burst writes once.
+    debouncedSceneLibrarySave(updatedSaved)
   },
   setSceneMidi: (id, binding) =>
     set((st) => ({
@@ -4707,7 +4787,8 @@ export const useStore = create<State>((set, get) => ({
       if (!newTid) continue
       newCells[newTid] = { ...cell }
     }
-    const newSceneId = `s_${Math.random().toString(36).slice(2, 9)}`
+    // (#17) Collision-guarded fixed-length id instead of a raw random.
+    const newSceneId = makeSceneId(st.session.scenes.map((s) => s.id))
     const newScene: Scene = {
       id: newSceneId,
       name: saved.sceneMeta.name,
@@ -4774,7 +4855,8 @@ export const useStore = create<State>((set, get) => ({
     const st = get()
     const scene = st.session.scenes.find((s) => s.id === sceneId)
     if (!scene) return null
-    const newSceneId = `s_${Math.random().toString(36).slice(2, 9)}`
+    // (#17) Collision-guarded fixed-length id instead of a raw random.
+    const newSceneId = makeSceneId(st.session.scenes.map((s) => s.id))
     // Clone cells one-by-one so a future field addition to Cell
     // doesn't accidentally skip a slot. Track ids stay the same —
     // duplicating a scene doesn't add sidebar rows.
@@ -4787,11 +4869,25 @@ export const useStore = create<State>((set, get) => ({
       ...scene,
       id: newSceneId,
       name: uniqueCopyName(scene.name, existingNames),
-      cells: newCells
+      cells: newCells,
+      // (#14) The `{...scene}` spread carries linkedSavedSceneId +
+      // midiTrigger. Left intact, renaming the copy mirrors over the
+      // SOURCE's Pool library entry (via updateScene) and both scenes
+      // answer the same MIDI trigger. Sever both on the copy.
+      linkedSavedSceneId: undefined,
+      midiTrigger: undefined
     }
-    set((s) => ({
-      session: { ...s.session, scenes: [...s.session.scenes, newScene] }
-    }))
+    // (FEATURE A) Insert the duplicate directly AFTER the source scene
+    // (same splice pattern captureSceneStateAsNew uses) rather than
+    // appending — the copy lands adjacent for immediate compare /
+    // re-trigger instead of scrolling off the end on long sessions.
+    set((s) => {
+      const srcIdx = s.session.scenes.findIndex((x) => x.id === sceneId)
+      const insertAt = srcIdx < 0 ? s.session.scenes.length : srcIdx + 1
+      const next = s.session.scenes.slice()
+      next.splice(insertAt, 0, newScene)
+      return { session: { ...s.session, scenes: next } }
+    })
     return newSceneId
   },
 
@@ -4816,7 +4912,8 @@ export const useStore = create<State>((set, get) => ({
     const scene = st.session.scenes.find((s) => s.id === sceneId)
     if (!scene) return null
     const liveRow = st.engine.currentValueBySceneAndTrack[sceneId] ?? {}
-    const newSceneId = `s_${Math.random().toString(36).slice(2, 9)}`
+    // (#17) Collision-guarded fixed-length id instead of a raw random.
+    const newSceneId = makeSceneId(st.session.scenes.map((s) => s.id))
     const newCells: Record<string, Cell> = {}
     for (const [tid, cell] of Object.entries(scene.cells)) {
       const liveStr = liveRow[tid]
@@ -4834,16 +4931,20 @@ export const useStore = create<State>((set, get) => ({
       ...scene,
       id: newSceneId,
       name: uniqueCopyName(baseName, existingNames),
-      cells: newCells
+      cells: newCells,
+      // (#14) Sever the source's Pool link + MIDI trigger so the
+      // capture doesn't mirror over the source's library entry or
+      // double-answer its trigger.
+      linkedSavedSceneId: undefined,
+      midiTrigger: undefined
     }
     // (v0.5.12) Insert the new scene directly AFTER the source scene
     // in the grid, not at the end. Workflow rationale: the user
     // captures while looking at the source; they expect the result to
     // appear adjacent for immediate compare / re-trigger. Appending to
     // the end would scroll-off-screen on long sessions and break the
-    // visual association. duplicateScene still appends (preserving its
-    // historical behaviour — different mental model: "make me a copy"
-    // vs "save what I'm hearing").
+    // visual association. (FEATURE A) duplicateScene now does the same
+    // — both actions insert directly after the source.
     set((s) => {
       const srcIdx = s.session.scenes.findIndex((x) => x.id === sceneId)
       const insertAt = srcIdx < 0 ? s.session.scenes.length : srcIdx + 1
@@ -4852,6 +4953,48 @@ export const useStore = create<State>((set, get) => ({
       return { session: { ...s.session, scenes: next } }
     })
     return newSceneId
+  },
+
+  // (v0.5.14) In-place sibling of captureSceneStateAsNew: stamp the
+  // engine's currently-emitted values (HW Mode overrides, sequencer
+  // steps, modulator output, pins — everything live) into THIS scene's
+  // cells instead of cloning a new scene. Only the active scene has
+  // live rows in currentValueBySceneAndTrack, so this is a no-op for
+  // inactive scenes by construction. Unchanged cells keep their object
+  // identity; the scenes array is rebuilt immutably so the global undo
+  // subscriber snapshots the change.
+  updateSceneToCurrent: (sceneId) => {
+    const st = get()
+    const scene = st.session.scenes.find((s) => s.id === sceneId)
+    if (!scene) return false
+    const liveRow = st.engine.currentValueBySceneAndTrack[sceneId]
+    if (!liveRow) return false
+    let changed = false
+    const cells: Record<string, Cell> = {}
+    for (const [tid, cell] of Object.entries(scene.cells)) {
+      const liveStr = liveRow[tid]
+      if (typeof liveStr === 'string' && liveStr.length > 0 && liveStr !== cell.value) {
+        cells[tid] = { ...cell, value: liveStr }
+        changed = true
+      } else {
+        cells[tid] = cell
+      }
+    }
+    if (!changed) return false
+    set((s) => ({
+      session: {
+        ...s.session,
+        scenes: s.session.scenes.map((x) => (x.id === sceneId ? { ...x, cells } : x))
+      }
+    }))
+    // Cell-value writes don't trip updateScene's Pool mirror (it only
+    // mirrors header fields like name/color), so refresh the linked
+    // library entry explicitly — otherwise the saved scene in the Pool
+    // would silently go stale relative to the grid.
+    if (scene.linkedSavedSceneId) {
+      void get().updateSavedSceneFromGrid(scene.linkedSavedSceneId)
+    }
+    return true
   },
 
   setEngineState: (s) => set({ engine: s })
@@ -5255,8 +5398,22 @@ function propagateDefaults(s: Session): Session {
                 mode: (() => {
                   const raw = (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)
                     ?.mode
-                  return raw === 'inverted' || raw === 'loop' ? raw : 'normal'
-                })()
+                  return raw === 'inverted' || raw === 'loop' || raw === 'from'
+                    ? raw
+                    : 'normal'
+                })(),
+                // 'from' mode endpoints — round-trip these or the user's
+                // From/To values get laundered to the defaults on every
+                // load→save cycle. Default 0 / 1 (which makes 'from'
+                // behave like 'normal' until the user edits them).
+                fromValue:
+                  typeof (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.fromValue === 'number'
+                    ? (m!.ramp as RampParams).fromValue
+                    : DEFAULT_RAMP.fromValue,
+                toValue:
+                  typeof (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.toValue === 'number'
+                    ? (m!.ramp as RampParams).toValue
+                    : DEFAULT_RAMP.toValue
               },
               arpeggiator: {
                 steps: (m?.arpeggiator as Partial<typeof DEFAULT_ARPEGGIATOR> | undefined)?.steps ?? DEFAULT_ARPEGGIATOR.steps,
@@ -5881,6 +6038,22 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
         : {}),
       ...(typeof hwRaw.args === 'object' && hwRaw.args
         ? { args: hwRaw.args as Record<string, number[]> }
+        : {}),
+      // (#12) Forward-routing fields MUST round-trip — the prior copy
+      // block dropped them, laundering the user's real session on every
+      // load→save cycle. Validate each against its allowed value(s).
+      ...(hwRaw.forwardMode === 'suppress' ||
+      hwRaw.forwardMode === 'always' ||
+      hwRaw.forwardMode === 'whenIdle'
+        ? { forwardMode: hwRaw.forwardMode }
+        : {}),
+      ...(hwRaw.deviceMatch === 'ipOnly' ? { deviceMatch: hwRaw.deviceMatch } : {}),
+      ...(hwRaw.alwaysForward === true ? { alwaysForward: true } : {}),
+      // Takeover (catch / jump) MUST round-trip too — a prior bug
+      // dropped new hardwareMode fields on load. Only copy through a
+      // recognised value; absent/invalid falls back to 'catch' at use.
+      ...(hwRaw.takeover === 'catch' || hwRaw.takeover === 'jump'
+        ? { takeover: hwRaw.takeover }
         : {})
     }
   }

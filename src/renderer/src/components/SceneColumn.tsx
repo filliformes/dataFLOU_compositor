@@ -147,6 +147,23 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
     }
     if (e.shiftKey) selectSceneRange(sceneId)
     else setFocusedScene(sceneId)
+    // If the user clicked DIRECTLY on an editable control in the header
+    // (the duration / name input, the next-mode select), let it keep
+    // focus — skip the focus-release blur below entirely. Otherwise the
+    // rAF blur steals focus to <body>, and the user's subsequent
+    // keystrokes route to GLOBAL shortcuts instead of the field. Real
+    // bug this caused: typing "40" into Duration fired scenes 4 and 10
+    // via App.tsx's number-key scene triggers (those guard on
+    // isEditableTarget(e.target), which was <body> once focus was
+    // stolen).
+    const tgt = e.target
+    const clickedEditable =
+      tgt instanceof HTMLElement &&
+      (tgt.tagName === 'INPUT' ||
+        tgt.tagName === 'TEXTAREA' ||
+        tgt.tagName === 'SELECT' ||
+        tgt.isContentEditable)
+    if (clickedEditable) return
     // The scene-header div is the parent of every inline scene
     // editor input (name, duration, notes, next-mode select). After
     // a focus change, Chromium can leave any previously-focused
@@ -155,12 +172,20 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
     // holding a sticky pseudo-focus that swallows the next click
     // on the freshly-rendered scene-header inputs. rAF blur +
     // body.focus releases it so the user can type into the scene
-    // name / duration immediately without an alt-tab.
+    // name / duration immediately without an alt-tab. Guarded so it
+    // never blurs an editable element that legitimately holds focus.
     requestAnimationFrame(() => {
-      if (document.activeElement instanceof HTMLElement) {
-        document.activeElement.blur()
+      const ae = document.activeElement
+      if (
+        ae instanceof HTMLElement &&
+        ae.tagName !== 'INPUT' &&
+        ae.tagName !== 'TEXTAREA' &&
+        ae.tagName !== 'SELECT' &&
+        !ae.isContentEditable
+      ) {
+        ae.blur()
+        document.body.focus?.()
       }
-      document.body.focus?.()
     })
   }
 
@@ -268,19 +293,23 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
               trigger()
             }}
           />
-          <input
+          <UncontrolledTextInput
             // `size` makes the input hug its own text (native <input size>
             // attribute). Minimum 3 so tiny names still leave room to click;
             // + 1 gives a trailing space so the caret doesn't clip on the
             // last character. Paired with the column's `fit-content` width,
             // this gives us per-scene adaptive widths.
+            // Uncontrolled like the expanded header's name input — this
+            // component re-renders at engine rate while a scene plays,
+            // and a plain controlled input loses in-flight keystrokes
+            // to the re-render race.
             size={Math.max(3, scene.name.length + 1)}
             className="input text-[11px] font-semibold py-0.5"
             value={scene.name}
             disabled={showMode}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
-            onChange={(e) => updateScene(sceneId, { name: e.target.value })}
+            onChange={(v) => updateScene(sceneId, { name: v })}
           />
         </div>
       ) : (
@@ -454,10 +483,13 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             onMouseDown={(e) => e.stopPropagation()}
           >
             {/* Arm / clear cue — single-scene action (greyed out when a
-                multi-selection is active to avoid ambiguity). */}
+                multi-selection is active to avoid ambiguity). Uses the
+                subscribed `isArmed` selector (top of component) — NOT
+                getState() — so the label live-updates if the armed
+                scene changes while the menu is open (A hotkey, MIDI). */}
             {menu.targets.length === 1 && (
               <>
-                {useStore.getState().armedSceneId === sceneId ? (
+                {isArmed ? (
                   <button
                     className="w-full text-left px-3 py-1 hover:bg-panel2"
                     onClick={() => {
@@ -609,6 +641,40 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                 <span className="text-muted text-[10px] ml-1">live</span>
               </button>
             )}
+            {/* (v0.5.14) In-place sibling of the capture above: stamp
+                the engine's live emitted values (incl. Hardware Mode
+                overrides) into THIS scene's cells. Disabled when the
+                scene isn't the active one — there are no live values
+                to commit, and silently writing a scene's own stored
+                values back would read as "it worked" when it didn't. */}
+            {menu.targets.length === 1 &&
+              (() => {
+                const isLive =
+                  useStore.getState().engine.currentValueBySceneAndTrack[sceneId] !==
+                  undefined
+                return (
+                  <button
+                    className={
+                      'w-full text-left px-3 py-1 ' +
+                      (isLive ? 'hover:bg-panel2' : 'text-muted cursor-not-allowed')
+                    }
+                    disabled={!isLive}
+                    onClick={() => {
+                      setMenu(null)
+                      useStore.getState().updateSceneToCurrent(sceneId)
+                    }}
+                    title={
+                      isLive
+                        ? "Overwrite THIS scene's cell values with the engine's currently-emitted values — including Hardware Mode overrides from a physical controller, sequencer step values, modulator output, and per-arg pins.\n\n" +
+                          'Workflow: trigger the scene, tweak via the controller until it sounds right, then right-click → Update scene to current settings. The scene now plays back exactly what you hear. Undo-able (Ctrl+Z).'
+                        : 'Only available while this scene is playing — the engine has no live values for an inactive scene.'
+                    }
+                  >
+                    Update scene to current settings
+                    <span className="text-muted text-[10px] ml-1">live</span>
+                  </button>
+                )
+              })()}
             <div className="border-t border-border my-1" />
             <button
               className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"

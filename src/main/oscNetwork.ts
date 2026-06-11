@@ -43,6 +43,11 @@ const ADDRESS_TTL_MS = 60_000
 
 export class OscNetworkListener {
   private udp: osc.UDPPort | null = null
+  // (Bug 9) True while an openUdp() promise is in flight (port
+  // constructed, awaiting 'ready'/'error'). Guards against a
+  // double-enable racing two sockets onto the same listener port —
+  // which would clobber the healthy one and leak its fd.
+  private udpOpening = false
   private port = DEFAULT_PORT
   private enabled = false
   private lastError = ''
@@ -254,6 +259,12 @@ export class OscNetworkListener {
    */
   private forwardPacket(buf: Buffer): void {
     if (this.forwardTargets.length === 0) return
+    // (Bug 11 FIX) Bail when NO target is enabled, BEFORE the socket is
+    // lazy-created below. setForwardTargets() closes the forward socket
+    // when the list goes all-disabled; without this guard the next
+    // received packet would re-create it (the old early-out only checked
+    // `length`, not enabled-ness), leaking an fd for nothing.
+    if (!this.forwardTargets.some((t) => t.enabled)) return
     // Lazy-create the outbound socket on first send. Bound to port 0
     // so the OS picks an ephemeral source port. Bind to 0.0.0.0 so
     // routing follows the host's normal outbound table — same NIC
@@ -330,6 +341,17 @@ export class OscNetworkListener {
 
   private openUdp(): Promise<void> {
     return new Promise((resolve) => {
+      // (Bug 9 FIX) Bail when a listener is already open OR an open is
+      // in flight. Without this, a double-enable (two setEnabled(true)
+      // calls before the first 'ready' fires) constructs a SECOND
+      // UDPPort on the same port; its bind fails or, worse, its 'ready'
+      // overwrites `this.udp` and leaks the first socket's fd. Idempotent
+      // re-enable: resolve immediately, leave the healthy listener alone.
+      if (this.udp || this.udpOpening) {
+        resolve()
+        return
+      }
+      this.udpOpening = true
       const port = new osc.UDPPort({
         localAddress: '0.0.0.0',
         localPort: this.port,
@@ -337,6 +359,7 @@ export class OscNetworkListener {
       })
       let settled = false
       port.on('ready', () => {
+        this.udpOpening = false
         this.enabled = true
         this.lastError = ''
         this.udp = port
@@ -366,17 +389,23 @@ export class OscNetworkListener {
               const key = `${diagIp}:${diagPort}`
               let entry = this.forwardDiag.get(key)
               if (!entry) {
-                if (this.forwardDiag.size < MAX_DEVICES) {
-                  entry = {
-                    ip: diagIp,
-                    port: diagPort,
-                    received: 0,
-                    suppressed: 0,
-                    forwarded: 0,
-                    lastSeenAtMs: 0
-                  }
-                  this.forwardDiag.set(key, entry)
+                // (Bug 8 FIX) At cap, EVICT the oldest-by-lastSeen entry
+                // instead of refusing the new source. Source-port churn
+                // (ephemeral senders) would otherwise fill the map with
+                // dead entries and leave every genuinely-new sender
+                // silently untracked in the diagnostic panel.
+                if (this.forwardDiag.size >= MAX_DEVICES) {
+                  this.evictOldestForwardDiag()
                 }
+                entry = {
+                  ip: diagIp,
+                  port: diagPort,
+                  received: 0,
+                  suppressed: 0,
+                  forwarded: 0,
+                  lastSeenAtMs: 0
+                }
+                this.forwardDiag.set(key, entry)
               }
               if (entry) {
                 entry.received += 1
@@ -422,9 +451,15 @@ export class OscNetworkListener {
         if (!settled) {
           // Bind failed during open — drop the half-built port and
           // surface failure via the resolved status snapshot.
+          // (Bug 9 FIX) Only clear state owned by THIS failing socket:
+          // close `port`, clear `udpOpening`. Do NOT blindly null
+          // `this.udp` / `this.enabled` — a pre-ready failure must not
+          // clobber a previously-healthy listener (whose `this.udp` is
+          // a DIFFERENT port object). `this.udp` is only ever assigned
+          // in the 'ready' handler, so it never points at `port` here.
           settled = true
-          this.enabled = false
-          this.udp = null
+          this.udpOpening = false
+          if (!this.udp) this.enabled = false
           try {
             port.close()
           } catch {
@@ -478,10 +513,13 @@ export class OscNetworkListener {
         port.open()
       } catch (e) {
         // Synchronous throw — same handling as the async error path.
+        // (Bug 9 FIX) Clear only this failing open's state; don't null a
+        // healthy prior `this.udp` (none should exist given the top
+        // guard, but stay symmetric with the pre-ready error branch).
         console.error('[OSC Network] open failed:', (e as Error).message)
         this.lastError = (e as Error).message
-        this.enabled = false
-        this.udp = null
+        this.udpOpening = false
+        if (!this.udp) this.enabled = false
         if (!settled) {
           settled = true
           resolve()
@@ -506,6 +544,12 @@ export class OscNetworkListener {
       }
       const port = this.udp
       if (!port) {
+        // (Bug 9) Defensive: if a close races an in-flight open (udp
+        // not yet assigned), clear the in-flight flag so a later
+        // re-enable isn't permanently blocked by the top-of-openUdp
+        // guard. The in-flight open's own error/ready handlers will
+        // still close their orphaned port.
+        this.udpOpening = false
         this.enabled = false
         resolve()
         return
@@ -579,6 +623,36 @@ export class OscNetworkListener {
     this.onShouldSuppressForwardHook = fn
   }
 
+  // (Bug 8) Evict the discovered device whose lastSeen is oldest, to
+  // make room for a new sender once the map is at MAX_DEVICES. Keeps
+  // the freshest senders (the ones the user actually cares about) and
+  // sheds stale ephemeral-port churn.
+  private evictOldestDevice(): void {
+    let oldestKey: string | null = null
+    let oldestSeen = Infinity
+    this.devices.forEach((dev, key) => {
+      if (dev.lastSeen < oldestSeen) {
+        oldestSeen = dev.lastSeen
+        oldestKey = key
+      }
+    })
+    if (oldestKey !== null) this.devices.delete(oldestKey)
+  }
+
+  // (Bug 8) Evict the forward-diagnostic entry whose lastSeenAtMs is
+  // oldest, mirroring evictOldestDevice for the diag map.
+  private evictOldestForwardDiag(): void {
+    let oldestKey: string | null = null
+    let oldestSeen = Infinity
+    this.forwardDiag.forEach((entry, key) => {
+      if (entry.lastSeenAtMs < oldestSeen) {
+        oldestSeen = entry.lastSeenAtMs
+        oldestKey = key
+      }
+    })
+    if (oldestKey !== null) this.forwardDiag.delete(oldestKey)
+  }
+
   private observe(
     ip: string,
     port: number,
@@ -614,9 +688,12 @@ export class OscNetworkListener {
     const now = Date.now()
     let dev = this.devices.get(key)
     if (!dev) {
-      // New sender. Refuse to grow past MAX_DEVICES so a broadcast
-      // flood can't OOM the listener.
-      if (this.devices.size >= MAX_DEVICES) return
+      // (Bug 8 FIX) At cap, EVICT the oldest-by-lastSeen device instead
+      // of refusing the new one. With source-port churn the map fills
+      // with stale ephemeral-port entries and a genuinely-new sender
+      // would never appear in the Network tab. A broadcast flood still
+      // can't OOM us — the map size stays bounded at MAX_DEVICES.
+      if (this.devices.size >= MAX_DEVICES) this.evictOldestDevice()
       dev = {
         id: key,
         ip,
@@ -630,7 +707,9 @@ export class OscNetworkListener {
         // up as packets from 127.0.0.1:<ephemeral>; without this
         // flag the user sees a "discovered device" that's actually
         // themselves.
-        isLoopback: ip === '127.0.0.1' || ip === '::1'
+        // (Bug 10 FIX) Flag the whole 127.0.0.0/8 loopback block, not
+        // just the canonical 127.0.0.1 — any 127.x.y.z is loopback.
+        isLoopback: ip === '::1' || ip.startsWith('127.')
       }
       this.devices.set(key, dev)
     }

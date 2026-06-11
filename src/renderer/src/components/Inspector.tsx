@@ -67,6 +67,30 @@ import {
 //
 // Position space: integer 0..1000 (what the <input type="range"> sees).
 // Value space: integer 10..60000 ms (what the engine stores).
+
+// ─────────────────────────────────────────────────────────────────
+// M2 → M1 routing gate (for the Mod-1-side LIVE overlays).
+//
+// Modulation 2 only "breathes" Modulation 1's editor (rate / depth /
+// shape / wiggle / etc.) when Mod 2 is enabled AND its M2>1 routing
+// column isn't fully unticked. Mirrors the engine's per-slot rule
+// (`routing.modulation2[idx] !== false`): if the routing array is a
+// NON-EMPTY array whose EVERY entry === false, the whole column is
+// off, so Mod 2 has zero effect on Mod 1 and the overlay must not
+// animate. undefined / partial / any-true ⇒ active (default routed).
+//
+// Called OUTSIDE the Zustand selectors so the selector can still
+// return a literal, reference-stable `null` when inactive (skips the
+// 30 Hz live re-render via default reference-equality).
+function isM2toM1Active(cell: Cell): boolean {
+  if (cell.modulation2?.enabled !== true) return false
+  const r = cell.routing?.modulation2
+  if (Array.isArray(r) && r.length > 0 && r.every((b) => b === false)) {
+    return false
+  }
+  return true
+}
+
 function sliderToStepMs(pos: number): number {
   const p = Math.max(0, Math.min(1000, pos))
   if (p <= 500) return Math.round(10 + (p / 500) * (1000 - 10))
@@ -1147,6 +1171,12 @@ function CellRoutingSection({
   const modOn = (i: number): boolean => cell.routing?.modulator?.[i] !== false
   const mod2On = (i: number): boolean =>
     cell.routing?.modulation2?.[i] !== false
+  // ⚠️ INVERTED DEFAULT — Mod 2 → Value direct routes default FALSE
+  // (missing = unrouted), unlike every other routing array. Must be
+  // an explicit `=== true` check, never `!== false`. See the field
+  // comment in @shared/types.ts.
+  const mod2DirectOn = (i: number): boolean =>
+    cell.routing?.modulation2Direct?.[i] === true
   const mod2SeqOn = (i: number): boolean =>
     cell.routing?.modulation2Seq?.[i] !== false
   const seqOn = (i: number): boolean => cell.routing?.sequencer?.[i] !== false
@@ -1157,8 +1187,14 @@ function CellRoutingSection({
   // "irrelevant right now" rather than "go ahead and change me").
   const mod2Enabled = cell.modulation2?.enabled === true
   // Type alias for the per-slot routing direction we mutate. New
-  // 'modulation2Seq' branch covers the Mod 2 -> Sequencer column.
-  type RoutingDir = 'modulator' | 'modulation2' | 'modulation2Seq' | 'sequencer'
+  // 'modulation2Seq' branch covers the Mod 2 -> Sequencer column;
+  // 'modulation2Direct' the Mod 2 -> Value direct column.
+  type RoutingDir =
+    | 'modulator'
+    | 'modulation2'
+    | 'modulation2Direct'
+    | 'modulation2Seq'
+    | 'sequencer'
   // Set a tick to an explicit value (used by both click and the
   // click+drag paint mode). Lazily initialises the arrays so old
   // sessions don't carry empty arrays around.
@@ -1166,6 +1202,9 @@ function CellRoutingSection({
     const curMod = cell.routing?.modulator ? cell.routing.modulator.slice() : []
     const curMod2 = cell.routing?.modulation2
       ? cell.routing.modulation2.slice()
+      : []
+    const curMod2Direct = cell.routing?.modulation2Direct
+      ? cell.routing.modulation2Direct.slice()
       : []
     const curMod2Seq = cell.routing?.modulation2Seq
       ? cell.routing.modulation2Seq.slice()
@@ -1176,15 +1215,21 @@ function CellRoutingSection({
         ? curMod
         : direction === 'modulation2'
           ? curMod2
-          : direction === 'modulation2Seq'
-            ? curMod2Seq
-            : curSeq
+          : direction === 'modulation2Direct'
+            ? curMod2Direct
+            : direction === 'modulation2Seq'
+              ? curMod2Seq
+              : curSeq
     arr[slotIdx] = value
     onChange({
       routing: {
         modulator: direction === 'modulator' ? curMod : cell.routing?.modulator,
         modulation2:
           direction === 'modulation2' ? curMod2 : cell.routing?.modulation2,
+        modulation2Direct:
+          direction === 'modulation2Direct'
+            ? curMod2Direct
+            : cell.routing?.modulation2Direct,
         modulation2Seq:
           direction === 'modulation2Seq'
             ? curMod2Seq
@@ -1205,6 +1250,10 @@ function CellRoutingSection({
         modulator: direction === 'modulator' ? arr : cell.routing?.modulator,
         modulation2:
           direction === 'modulation2' ? arr : cell.routing?.modulation2,
+        modulation2Direct:
+          direction === 'modulation2Direct'
+            ? arr
+            : cell.routing?.modulation2Direct,
         modulation2Seq:
           direction === 'modulation2Seq'
             ? arr
@@ -1224,6 +1273,7 @@ function CellRoutingSection({
       routing: {
         modulator: cell.routing?.modulator,
         modulation2: cell.routing?.modulation2,
+        modulation2Direct: cell.routing?.modulation2Direct,
         modulation2Seq: cell.routing?.modulation2Seq,
         sequencer: cell.routing?.sequencer,
         delays: arr,
@@ -1243,6 +1293,7 @@ function CellRoutingSection({
       routing: {
         modulator: cell.routing?.modulator,
         modulation2: cell.routing?.modulation2,
+        modulation2Direct: cell.routing?.modulation2Direct,
         modulation2Seq: cell.routing?.modulation2Seq,
         sequencer: cell.routing?.sequencer,
         delays: cell.routing?.delays,
@@ -1277,13 +1328,20 @@ function CellRoutingSection({
     '  Mod         - Modulation 1 -> this slot (untick -> slot uses cell.value seed)\n' +
     '  Mod 2 -> 1  - Modulation 2 modulates Modulation 1 on this slot (untick ->\n' +
     '                slot reads the ORIGINAL Modulation 1 params, bypassing Mod 2)\n' +
+    '  M2          - Modulation 2 modulates this slot\'s VALUE directly, like\n' +
+    '                Modulation 1 does. Intensity = the "M2 > Value amount" knob\n' +
+    '                in the Modulation 2 section; combined with the Mod 1 value\n' +
+    '                per the Add / Mult / Mix selector there. UNCHECKED by\n' +
+    '                default. Stacking with M2>1 on the same slot doubles\n' +
+    "                Mod 2's influence on that slot.\n" +
     '  Mod 2 -> S  - Modulation 2 modulates the Sequencer (bpm / shape / genAmount).\n' +
     '                If EVERY slot is unticked, the Mod 2 -> Seq routing is\n' +
     '                disabled cell-wide. Any ticked slot enables the routing.\n' +
     '  Seq         - Sequencer -> this slot\n' +
     '  Delay       - ms before Mod / Seq engage after each trigger\n' +
     '  Var         - random 0..100 % scaling of the modulator amplitude per trigger\n\n' +
-    'Default (all ticked, Delay 0, Variation 0) = previous behaviour.\n\n' +
+    'Default (all ticked EXCEPT the M2 column which is unticked, Delay 0,\n' +
+    'Variation 0) = previous behaviour.\n\n' +
     'Beaten by:\n' +
     '  - argSpec.fixed (protocol prefixes always emit their declared value)\n' +
     '  - Pin (a pinned slot ignores routing entirely and emits the captured value)\n\n' +
@@ -1309,13 +1367,14 @@ function CellRoutingSection({
       <div
         className="grid gap-x-1.5 gap-y-0.5 items-center text-[10px] mx-auto"
         style={{
-          // Columns: [slot name | Mod | Mod 2 -> Mod 1 | spacer | Mod 2 -> Seq | Seq | Delay | Var].
-          // The two "Mod 2" columns are kept close but separated by
-          // a slim spacer column so the user reads them as TWO
-          // distinct features (Mod 2 -> Mod 1 vs Mod 2 -> Sequencer).
-          // Left-to-right reading order is Mod 1 -> Mod 2 chain ->
-          // Sequencer chain -> per-slot timing controls.
-          gridTemplateColumns: 'auto 22px 22px 12px 22px 22px 56px 76px'
+          // Columns: [slot name | Mod | Mod 2 -> Mod 1 | Mod 2 -> Value | Mod 2 -> Seq | Seq | Delay | Var].
+          // The five checkbox columns (MOD, M2>1, M2, M2>S, SEQ) are
+          // all the SAME width with the SAME uniform 6px gap (gap-x-1.5)
+          // so they read as one evenly-spaced band — the new M2
+          // (direct) column sits centred as the 3rd of 5, balanced like
+          // the rest. Left-to-right reading order is Mod 1 -> Mod 2
+          // chain -> Sequencer chain -> per-slot timing controls.
+          gridTemplateColumns: 'auto 24px 24px 24px 24px 24px 56px 76px'
         }}
         onMouseLeave={() => {
           // If the user leaves the matrix while still painting we
@@ -1353,9 +1412,22 @@ function CellRoutingSection({
         >
           ⇆
         </button>
-        {/* Spacer between the two Mod 2 columns — visual separation
-            so the user reads the columns as distinct features. */}
-        <span />
+        <button
+          className="routing-bulk"
+          onClick={() => {
+            const allOn = slots.every((s) => mod2DirectOn(s.idx))
+            setAll('modulation2Direct', !allOn)
+          }}
+          title={
+            mod2Enabled
+              ? 'Toggle every Modulation 2 -> Value (direct) slot on / off'
+              : 'Modulation 2 is disabled on this cell - enable it in the Modulation 2 section above'
+          }
+          disabled={!mod2Enabled}
+          style={mod2Enabled ? undefined : { opacity: 0.4, cursor: 'default' }}
+        >
+          ⇆
+        </button>
         <button
           className="routing-bulk"
           onClick={() => {
@@ -1403,8 +1475,16 @@ function CellRoutingSection({
         >
           M2&gt;1
         </span>
-        {/* Spacer between Mod2>1 and Mod2>Seq column labels */}
-        <span />
+        <span
+          className={`text-[9px] uppercase tracking-wide text-center ${mod2Enabled ? 'text-muted' : 'text-muted/40'}`}
+          title={
+            mod2Enabled
+              ? "Modulation 2 -> Value (direct) per slot. Mod 2 modulates this slot's VALUE directly, exactly like Modulation 1 does — intensity from the \"M2 > Value amount\" knob in the Modulation 2 section, combined with the Mod 1-modulated value per the Add / Mult / Mix selector there. Unchecked by default. WARNING: ticking M2 AND M2>1 on the same slot stacks both routes — Mod 2's influence on that slot is doubled."
+              : 'Modulation 2 disabled on this cell - column is inert until you enable it.'
+          }
+        >
+          M2
+        </span>
         <span
           className={`text-[9px] uppercase tracking-wide text-center ${mod2Enabled ? 'text-muted' : 'text-muted/40'}`}
           title={
@@ -1481,8 +1561,39 @@ function CellRoutingSection({
               }
               aria-pressed={mod2On(s.idx)}
             />
-            {/* Visual spacer column between the two Mod 2 sub-columns. */}
-            <span />
+            {/* Modulation 2 -> Value DIRECT per-slot gate. INVERTED
+                default: unchecked (= unrouted) unless explicitly
+                ticked — unlike every other column. Inert when
+                Modulation 2 is disabled on the cell (still renders
+                so the column layout doesn't jump). */}
+            <button
+              className={`routing-tick ${mod2DirectOn(s.idx) ? 'routing-tick-on' : ''}`}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                if (!mod2Enabled) return
+                const next = !mod2DirectOn(s.idx)
+                setTick('modulation2Direct', s.idx, next)
+                setDragMode({ direction: 'modulation2Direct', setTo: next })
+              }}
+              onMouseEnter={() => {
+                if (!mod2Enabled) return
+                if (
+                  dragMode &&
+                  dragMode.direction === 'modulation2Direct' &&
+                  mod2DirectOn(s.idx) !== dragMode.setTo
+                ) {
+                  setTick('modulation2Direct', s.idx, dragMode.setTo)
+                }
+              }}
+              disabled={!mod2Enabled}
+              style={mod2Enabled ? undefined : { opacity: 0.35, cursor: 'default' }}
+              title={
+                mod2Enabled
+                  ? `Modulation 2 -> Value (direct) on ${s.name}${mod2DirectOn(s.idx) ? ' (routed)' : ' (unrouted - default)'} - Mod 2 modulates this slot's value directly, like Modulation 1 does (intensity = "M2 > Value amount" knob, math = Add/Mult/Mix selector in the Modulation 2 section). WARNING: stacking with M2>1 on the same slot doubles Mod 2's influence on it. Drag to paint`
+                  : 'Modulation 2 is disabled on this cell - enable it in the Modulation 2 section above first'
+              }
+              aria-pressed={mod2DirectOn(s.idx)}
+            />
             {/* Modulation 2 -> Sequencer per-slot gate. Cell-level
                 semantics: if EVERY slot's flag is false, Mod 2 ->
                 Seq is bypassed cell-wide (the engine skips
@@ -3232,6 +3343,19 @@ function Mod2Section({
   function patchTargetMode(mode: ModulationTargetMode): void {
     u({ modulation2: { ...m2, targetMode: mode } })
   }
+  // Mod 2 -> Value direct route. `valueAmount` is stored 0..1 (UI
+  // shows 0..100 %); rounded to 4 decimals so the %-display round-
+  // trip is bijective (avoids the snap-back-while-typing class of
+  // bug — see BoundedNumberInput's commitOn prop docs).
+  function patchValueAmount(v01: number): void {
+    const clamped = Math.max(0, Math.min(1, v01))
+    u({
+      modulation2: { ...m2, valueAmount: Math.round(clamped * 10000) / 10000 }
+    })
+  }
+  function patchValueMath(mode: 'add' | 'mult' | 'mix'): void {
+    u({ modulation2: { ...m2, valueMath: mode } })
+  }
   // Context-aware label for the third target. Reads Modulation 1's
   // current type so the label changes live as the user switches
   // Modulation 1's type. Each label names the ACTUAL knob being
@@ -3401,6 +3525,9 @@ function Mod2Section({
         "Modulation 1's stored values aren't mutated — each tick the engine\n" +
         'builds an "effective Modulation 1" from Modulation 2\'s signal +\n' +
         'the targets below.\n\n' +
+        'It can also modulate the Sequencer (Seq Targets) and the cell\'s\n' +
+        'value slots DIRECTLY (Value (direct) + the "M2" column in the\n' +
+        'Routing matrix).\n\n' +
         'Types: LFO, S&H, Slew, Chaos, Strange Attractor work as\n' +
         "second-stage signals. Envelope, Ramp, Arp, Random are not\n" +
         "available — they're note/time-targeted, not continuous."
@@ -3525,6 +3652,79 @@ function Mod2Section({
         shapeUsable={shapeMetaSeq.usable}
         modeSelector={null}
       />
+      {/* ── Value (direct) sub-block (Mod 2 -> Value slots) ───────── */}
+      {/* Third parallel route: Mod 2's bipolar signal applied
+          STRAIGHT to the cell's value slots, exactly like Mod 1's
+          contribution. Per-slot opt-in via the "M2" column in the
+          Routing matrix (all UNROUTED by default — inverted default
+          vs the other routing columns). Intensity comes from the
+          dedicated "M2 > Value amount" knob below, NOT Mod 2's Depth
+          knob. Its own math selector (independent of the M2>1
+          targetMode dropdown above) picks how the direct
+          contribution combines with the Mod 1-modulated value. */}
+      <div className="flex flex-col gap-2 pt-2 border-t border-border mt-1">
+        <div className="flex items-center gap-2">
+          <span
+            className="label"
+            title={
+              "Mod 2 -> Value (direct). Modulation 2's bipolar signal modulates the\n" +
+              "cell's value slots DIRECTLY, exactly like Modulation 1 does — in\n" +
+              'addition to the Mod 1 / Seq target routes above.\n\n' +
+              'Per-slot opt-in via the "M2" column in the Routing matrix below\n' +
+              '(all slots UNROUTED by default). The matrix\'s per-slot Delay (ms)\n' +
+              'and Variation (%) apply to this contribution too.\n\n' +
+              'Math (how it combines with the Mod 1-modulated value on a slot):\n' +
+              'Add  - sum the offsets (default).\n' +
+              'Mult - multiply: value x (1 + mod2 x amount).\n' +
+              'Mix  - 50/50 crossfade between the Mod 1-modulated value and the\n' +
+              '       Mod 2-only-modulated value.\n\n' +
+              'Heads-up: a slot with BOTH "M2" and "M2>1" ticked receives Mod 2\n' +
+              "twice (directly + through Mod 1's params) — doubled influence."
+            }
+          >
+            Value (direct)
+          </span>
+          <select
+            className="input text-[10px] py-0.5 w-auto"
+            style={{ width: 'fit-content' }}
+            value={m2.valueMath ?? 'add'}
+            onChange={(e) =>
+              patchValueMath(e.target.value as 'add' | 'mult' | 'mix')
+            }
+            title="Math mode for combining the Mod 2 -> Value direct contribution with the Mod 1-modulated value: Add = sum the offsets, Mult = multiply (value x (1 + mod2 x amount)), Mix = 50/50 crossfade"
+          >
+            <option value="add">Add</option>
+            <option value="mult">Mult</option>
+            <option value="mix">Mix</option>
+          </select>
+        </div>
+        <div
+          className="flex items-center gap-2 text-[11px]"
+          title={
+            'Intensity of the Mod 2 -> Value direct route (0..100 %). Dedicated\n' +
+            "knob — Mod 2's Depth knob does NOT drive this route. Slots opt in\n" +
+            'via the "M2" column in the Routing matrix below.'
+          }
+        >
+          <span className="w-32 shrink-0">M2 &gt; Value amount</span>
+          <RoutingMiniKnob
+            value={(m2.valueAmount ?? 0.5) * 100}
+            onChange={(v) => patchValueAmount(v / 100)}
+            title="M2 > Value amount — drag vertically, dbl-click resets to 0"
+          />
+          <BoundedNumberInput
+            className="input w-14 text-center tabular-nums px-1 py-0 text-[11px] leading-tight"
+            value={Math.round((m2.valueAmount ?? 0.5) * 10000) / 100}
+            onChange={(v) => patchValueAmount(v / 100)}
+            min={0}
+            max={100}
+            step={0.01}
+            commitOn="blur"
+            title="M2 > Value amount (0..100 %) — how strongly Modulation 2 modulates the routed value slots directly"
+          />
+          <span className="text-[10px] text-muted">%</span>
+        </div>
+      </div>
     </CollapsibleSection>
   )
 }
@@ -3738,11 +3938,11 @@ function GestureEditor({
       y: Math.max(0, Math.min(1, livePlayheadY as number))
     }
   }, [hasPlayhead, livePlayheadX, livePlayheadY])
-  // Wiggle overlay — only tints orange when Mod 2 is enabled AND
-  // could actually be modulating wiggle. Same gate the other
-  // editors use.
-  const liveOverlay =
-    isMod2 || cell.modulation2?.enabled !== true ? null : liveStore
+  // Wiggle overlay — only tints orange when Mod 2 is actually driving
+  // Mod 1 (enabled AND the M2>1 routing column isn't fully unticked).
+  // Same gate every Mod-1-side editor uses.
+  const m2toM1Active = isM2toM1Active(cell)
+  const liveOverlay = isMod2 || !m2toM1Active ? null : liveStore
   const liveWiggle = liveOverlay?.gestureWiggle
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
@@ -3750,13 +3950,13 @@ function GestureEditor({
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
       <CompactRateControls
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
 
       {/* Centred XY canvas spanning all 3 grid columns. */}
@@ -3865,14 +4065,15 @@ function LfoEditor({
   // null it out when this editor is for Mod 2 so its controls don't
   // animate against unrelated data.
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   // Pull the values we'll overlay. `??` falls back to the stored
   // values when the engine isn't streaming (cell not armed, Mod 2
   // off, or the streamed sample doesn't have this field populated).
@@ -4109,14 +4310,15 @@ function ArpEditor({
   // Live Mod 1 sample — suppressed when this editor is editing Mod 2
   // itself (Mod 2's own arpMode isn't modulated by anything).
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveArpMode = live?.arpMode
   const liveRateHz = live?.rateHz
   const liveDepthPct = live?.depthPct
@@ -4350,14 +4552,15 @@ function RandomEditor({
   // Live overlay (suppressed for Mod 2 self-editing). Random's
   // continuous param Mod 2 targets is `distribution`.
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveDist = live?.randomDistribution
   const liveRateHz = live?.rateHz
   const liveDepthPct = live?.depthPct
@@ -4586,7 +4789,7 @@ function CompactRateControls({
   m,
   uMod,
   isMod2,
-  mod2Enabled
+  m2Active
 }: {
   m: import('@shared/types').Modulation
   uMod: (patch: Partial<import('@shared/types').Modulation>) => void
@@ -4594,24 +4797,24 @@ function CompactRateControls({
   // Mod 2 section (Mod 2's rate is the modulator, it isn't itself
   // being modulated by anything we surface here).
   isMod2?: boolean
-  // Whether Modulation 2 is enabled on the parent cell — when false,
-  // the live stream is still flowing (it carries other data like
-  // the Gesture playhead) but the orange overlay shouldn't tint
-  // these controls, because nothing is actually modulating them.
-  mod2Enabled?: boolean
+  // Whether Modulation 2 is actually driving Modulation 1 on the
+  // parent cell (enabled AND its M2>1 routing column isn't fully
+  // unticked) — when false, the live stream is still flowing (it
+  // carries other data like the Gesture playhead) but the orange
+  // overlay shouldn't tint these controls, because nothing is
+  // actually modulating them. Computed by the caller (isM2toM1Active).
+  m2Active?: boolean
 }): JSX.Element {
   // Live effective Mod 1 from the store. Suppressed when this helper
-  // is rendered inside Modulation 2's section (isMod2) OR when Mod 2
-  // is disabled on the cell (mod2Enabled false) — the stored values
-  // and the live values are identical in that case, so any orange
-  // tint would be misleading "modulation off but UI says it's on".
+  // is rendered inside Modulation 2's section (isMod2) OR when M2→M1
+  // isn't active (m2Active false) — the stored values and the live
+  // values are identical in that case, so any orange tint would be
+  // misleading "modulation off but UI says it's on".
   // Selector returns stable null when overlay should be off — see
   // matching comment in the per-modulator editors. Cuts the 30 Hz
   // re-render of every parent that uses this helper down to 0 Hz
-  // whenever Mod 2 is disabled on the cell.
-  const live = useStore((s) =>
-    isMod2 || !mod2Enabled ? null : s.mod1Live
-  )
+  // whenever M2→M1 is inactive on the cell.
+  const live = useStore((s) => (isMod2 || !m2Active ? null : s.mod1Live))
   const liveRateHz = live?.rateHz
   return (
     <>
@@ -4723,23 +4926,24 @@ function CompactDepthMode({
   m,
   uMod,
   isMod2,
-  mod2Enabled
+  m2Active
 }: {
   m: import('@shared/types').Modulation
   uMod: (patch: Partial<import('@shared/types').Modulation>) => void
   isMod2?: boolean
-  mod2Enabled?: boolean
+  // True when Mod 2 is actually driving Mod 1 (enabled AND M2>1
+  // routing column not fully unticked). Computed by the caller
+  // (isM2toM1Active).
+  m2Active?: boolean
 }): JSX.Element {
-  // Suppress the orange overlay when Mod 2 is off (live values equal
-  // base values, so no actual modulation to highlight) or when this
-  // helper is rendered inside Modulation 2's section.
+  // Suppress the orange overlay when M2→M1 isn't active (live values
+  // equal base values, so no actual modulation to highlight) or when
+  // this helper is rendered inside Modulation 2's section.
   // Selector returns stable null when overlay should be off — see
   // matching comment in the per-modulator editors. Cuts the 30 Hz
   // re-render of every parent that uses this helper down to 0 Hz
-  // whenever Mod 2 is disabled on the cell.
-  const live = useStore((s) =>
-    isMod2 || !mod2Enabled ? null : s.mod1Live
-  )
+  // whenever M2→M1 is inactive on the cell.
+  const live = useStore((s) => (isMod2 || !m2Active ? null : s.mod1Live))
   const liveDepthPct = live?.depthPct
   return (
     <>
@@ -4809,14 +5013,15 @@ function SampleHoldEditor({
   const globalBpm = useStore((s) => s.session.globalBpm)
   // Live overlay (suppressed when this editor is editing Mod 2 itself).
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveDist = live?.shDistribution
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
@@ -4830,13 +5035,13 @@ function SampleHoldEditor({
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
       <CompactRateControls
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
 
       <span className="label">Smooth</span>
@@ -4924,12 +5129,11 @@ function SlewEditor({
 }): JSX.Element {
   const m = cell.modulation
   const s = m.slew
-  // Live overlay (suppressed in Mod 2 self-edit).
-  // Selector returns stable null when overlay should be off — see
-  // matching comment in the other editors.
-  const live = useStore((st) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : st.mod1Live
-  )
+  // Live overlay (suppressed in Mod 2 self-edit, or when M2→M1 isn't
+  // active). Selector returns stable null when overlay should be off —
+  // see matching comment in the other editors.
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((st) => (isMod2 || !m2toM1Active ? null : st.mod1Live))
   const liveRise = live?.slewRiseMs
   const liveFall = live?.slewFallMs
   const globalBpm = useStore((st) => st.session.globalBpm)
@@ -4945,13 +5149,13 @@ function SlewEditor({
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
       <CompactRateControls
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
 
       <span className="label">Rise</span>
@@ -5041,14 +5245,15 @@ function ChaosEditor({
   const m = cell.modulation
   const c = m.chaos
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveR = live?.chaosR
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
@@ -5062,13 +5267,13 @@ function ChaosEditor({
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
       <CompactRateControls
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
 
       <span className="label">r</span>
@@ -5122,14 +5327,15 @@ function AttractorEditor({
 }): JSX.Element {
   const m = cell.modulation
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveChaos = live?.attractorChaos
   const liveSpeed = live?.attractorSpeed
   // Defensive fallback for sessions saved before the Attractor type
@@ -5151,7 +5357,7 @@ function AttractorEditor({
         m={m}
         uMod={uMod}
         isMod2={isMod2}
-        mod2Enabled={cell.modulation2?.enabled}
+        m2Active={m2toM1Active}
       />
 
       <span className="label">Type</span>
@@ -5252,14 +5458,15 @@ function RampEditor({
 }): JSX.Element {
   const m = cell.modulation
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveCurve = live?.rampCurvePct
   const liveDepthPct = live?.depthPct
   const liveRampMs = live?.rampMs
@@ -5376,20 +5583,54 @@ function RampEditor({
           value={ramp.mode ?? 'normal'}
           onChange={(e) =>
             uRamp({
-              mode: e.target.value as 'normal' | 'inverted' | 'loop'
+              mode: e.target.value as 'normal' | 'inverted' | 'loop' | 'from'
             })
           }
           title={
             'Normal: one-shot 0 → 1 (default).\n' +
             'Inverted: one-shot 1 → 0 (mirror of Normal).\n' +
-            'Loop: 0 → 1 ramp repeats forever (retriggers each period).'
+            'Loop: 0 → 1 ramp repeats forever (retriggers each period).\n' +
+            'From: one-shot From → To over the ramp time (depth/curve apply as in Normal).'
           }
         >
           <option value="normal">Normal</option>
           <option value="inverted">Inverted</option>
           <option value="loop">Loop</option>
+          <option value="from">From</option>
         </select>
         <span />
+
+        {/* 'From' mode endpoints — revealed only when mode === 'from'.
+            commitOn='blur' avoids the per-keystroke snap-back bug.
+            Wide bounds (negative / >1 allowed) because users may ramp
+            raw OSC values, not just unit floats. */}
+        {(ramp.mode ?? 'normal') === 'from' && (
+          <>
+            <span className="label">From</span>
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5"
+              min={-10000}
+              max={10000}
+              value={ramp.fromValue ?? 0}
+              onChange={(v) => uRamp({ fromValue: v })}
+              commitOn="blur"
+              title="Ramp start value (default 0). Negatives and values >1 allowed."
+            />
+            <span />
+
+            <span className="label">To</span>
+            <BoundedNumberInput
+              className="input text-[11px] py-0.5"
+              min={-10000}
+              max={10000}
+              value={ramp.toValue ?? 1}
+              onChange={(v) => uRamp({ toValue: v })}
+              commitOn="blur"
+              title="Ramp end value (default 1). Negatives and values >1 allowed."
+            />
+            <span />
+          </>
+        )}
 
         {ramp.sync === 'free' && (
           <>
@@ -5619,14 +5860,15 @@ function EnvelopeEditor({
   isMod2?: boolean
 }): JSX.Element {
   // Selector returns a STABLE null when the overlay should be off
-  // (Mod 2 disabled on this cell, or this editor is editing Mod 2
-  // itself) — Zustand's default reference-equality then skips the
+  // (this editor is editing Mod 2 itself, OR M2→M1 isn't active —
+  // Mod 2 disabled on the cell, or its M2>1 routing column fully
+  // unticked) — Zustand's default reference-equality then skips the
   // re-render at the engine's 30 Hz live-emit cadence. When the
   // overlay is on, the editor re-renders each live sample as
-  // intended.
-  const live = useStore((s) =>
-    isMod2 || cell.modulation2?.enabled !== true ? null : s.mod1Live
-  )
+  // intended. The active boolean is computed OUTSIDE the selector so
+  // the `null` branch stays a literal (reference-stable).
+  const m2toM1Active = isM2toM1Active(cell)
+  const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveSus = live?.envelopeSustain
   const liveDepthPct = live?.depthPct
   const m = cell.modulation

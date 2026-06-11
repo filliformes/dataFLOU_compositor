@@ -1089,13 +1089,15 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
                 rebindAllHardwareModes(d.ip, d.port)
               }
               // (v0.5.12) Per-template bind data + handler. Pass
-              // every Pool template (built-in OR user) so the right-
-              // click menu lists them all — built-ins are HW-Mode
-              // configurable even though their definition is read-
-              // only (per HardwareModeSection comment, HW Mode is a
-              // per-session preference, not a template-definition
-              // change).
-              bindableTemplates={poolTemplates}
+              // every NON-DRAFT Pool template (built-in OR user) so
+              // the right-click menu lists them all — built-ins are
+              // HW-Mode configurable even though their definition is
+              // read-only (per HardwareModeSection comment, HW Mode
+              // is a per-session preference, not a template-
+              // definition change). Hidden draft templates (mid-
+              // materialise drag artifacts) are excluded — they're
+              // not visible anywhere else in the UI.
+              bindableTemplates={poolTemplates.filter((t) => !t.draft)}
               onBindTemplate={(tid, ip, port) =>
                 setTemplateHardwareMode(tid, {
                   enabled: true,
@@ -1425,8 +1427,9 @@ function NetworkDeviceRow({
   onRebindAllHardwareModes: () => void
   // (v0.5.12) All Pool templates the user might want to bind THIS
   // device to (per-template right-click action). Already filtered
-  // upstream to skip read-only / builtin templates the user can't
-  // edit. Empty array hides the per-template section of the menu.
+  // upstream to skip hidden draft templates; built-ins ARE included
+  // (HW Mode is a per-session preference, not a template-definition
+  // edit). Empty array hides the per-template section of the menu.
   bindableTemplates: import('@shared/types').InstrumentTemplate[]
   // (v0.5.12) Per-template bind handler — sets the chosen template's
   // hardwareMode.{deviceIp, devicePort, enabled} to this device's
@@ -1703,13 +1706,38 @@ function ListeningPill({
   const tooltip = status.enabled
     ? `Listening — point your OSC sender (OCTOCOSME, TouchOSC, etc.) at ${ipDisplay}:${status.port}. Other local IPs: ${status.localAddresses.join(', ') || '(none detected)'}. Click to stop listening, double-click to open Capture.`
     : status.lastError
-      ? `Listener failed to bind on port ${status.port}: ${status.lastError}. Most likely another app already owns this port — change the Default OSC port in the top toolbar to one that's free, then configure your sender to match.`
-      : 'Click to start listening for incoming OSC on the Default OSC port.'
+      ? `Listener failed to bind on port ${status.port}: ${status.lastError}. Most likely another app already owns this port — change the "Listen on" port in the top toolbar to one that's free, then configure your sender to match.`
+      : 'Click to start listening for incoming OSC on the "Listen on" port (top toolbar).'
+  // Single-click toggles the listener; double-click opens Capture.
+  // A raw onClick + onDoubleClick pair fires the click handler TWICE
+  // before the dblclick lands — the listener socket would bounce
+  // off/on (churn) right before Capture opened. Standard fix: delay
+  // the single-click action past the double-click window and cancel
+  // it when a dblclick arrives.
+  const clickTimer = useRef<number | null>(null)
+  useEffect(
+    () => () => {
+      if (clickTimer.current !== null) window.clearTimeout(clickTimer.current)
+    },
+    []
+  )
   return (
     <button
       className="flex items-center gap-1 px-1.5 py-0 rounded border border-border bg-panel2 hover:bg-panel3 text-[9px] leading-tight shrink-0 whitespace-nowrap"
-      onClick={onToggle}
-      onDoubleClick={onDoubleClick}
+      onClick={() => {
+        if (clickTimer.current !== null) window.clearTimeout(clickTimer.current)
+        clickTimer.current = window.setTimeout(() => {
+          clickTimer.current = null
+          onToggle()
+        }, 250)
+      }}
+      onDoubleClick={() => {
+        if (clickTimer.current !== null) {
+          window.clearTimeout(clickTimer.current)
+          clickTimer.current = null
+        }
+        onDoubleClick()
+      }}
       title={tooltip}
     >
       <span

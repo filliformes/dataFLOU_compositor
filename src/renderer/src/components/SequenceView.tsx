@@ -1218,7 +1218,13 @@ function SceneInfoPanelWrapper({
   )
 }
 
-function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
+// Exported: the Grid view's right-side Inspector pane (EditView's
+// EditInspector) renders this same panel when a scene header is
+// clicked in the grid, so scene editing feels identical across both
+// views. Self-contained — everything it needs comes from the store +
+// the `scene` prop (SlotOverridePanel inside self-hides when no
+// sequence slot is selected, which is always the case in Grid view).
+export function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
   const updateScene = useStore((s) => s.updateScene)
   const removeScene = useStore((s) => s.removeScene)
   const showMode = useStore((s) => s.showMode)

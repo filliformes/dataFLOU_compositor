@@ -12,6 +12,7 @@ import TrackSidebar from './TrackSidebar'
 import SceneColumn from './SceneColumn'
 import Inspector from './Inspector'
 import InstrumentsInspectorPane from './InstrumentsInspectorPane'
+import { SceneInfoPanel } from './SequenceView'
 import { ResizeHandle } from './ResizeHandle'
 import { Modal } from './Modal'
 import {
@@ -269,6 +270,18 @@ function EditInspector({
   selectedTrack: ReturnType<typeof useStore.getState>['selectedTrack']
 }): JSX.Element | null {
   const visible = useStore((s) => s.editInspectorVisible)
+  // Scene Inspector branch — clicking a scene header in the grid
+  // calls setFocusedScene(id), which clears poolSelection /
+  // selectedCell / selectedTrack (the store's selection mutex). When
+  // nothing else is selected and a scene is focused, render the SAME
+  // SceneInfoPanel the Sequence view shows under its palette, so
+  // scene editing (name / notes / Dur / Next / Morph-in / Weight) is
+  // available from the Grid view too.
+  const focusedScene = useStore(
+    (s) =>
+      s.session.scenes.find((sc) => sc.id === s.session.focusedSceneId) ??
+      null
+  )
   if (!visible) return null
   return (
     <div
@@ -293,6 +306,8 @@ function EditInspector({
           <Inspector mode="cell" />
         ) : selectedTrack ? (
           <Inspector mode="track" />
+        ) : focusedScene ? (
+          <SceneInfoPanel scene={focusedScene} />
         ) : (
           <InspectorEmpty />
         )}

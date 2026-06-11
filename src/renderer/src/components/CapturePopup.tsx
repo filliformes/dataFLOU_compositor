@@ -181,7 +181,18 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   // Auto-pick the freshest device on mount + when the listener
   // surfaces a new device (the user may need to start a packet
   // flowing from their hardware before any device shows up).
+  // If the selected device VANISHES from the list while the popup
+  // is open (listener cleared / restarted), clear the stale id so
+  // the auto-pick can re-fire on the next device arrival instead
+  // of sticking forever on a dead selection.
   useEffect(() => {
+    if (
+      selectedDeviceId &&
+      !networkDevices.some((d) => d.id === selectedDeviceId)
+    ) {
+      setSelectedDeviceId('')
+      return
+    }
     if (!selectedDeviceId && networkDevices.length > 0) {
       setSelectedDeviceId(networkDevices[0].id)
     }
@@ -221,6 +232,29 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode])
+  // Restore the listener's pre-open state when the popup closes.
+  // Without this, opening Capture with the listener OFF silently
+  // left it ON after Cancel/Save — the socket stayed bound and the
+  // ListeningPill flipped without the user ever asking for it.
+  // Read live store state inside the cleanup (not the mount-time
+  // closure) so we restore against the CURRENT port/devices.
+  useEffect(() => {
+    return () => {
+      if (listenerWasOnAtOpen.current) return
+      const st = useStore.getState()
+      if (!st.networkStatus.enabled) return
+      void window.api
+        ?.networkSetEnabled?.(false, st.networkStatus.port)
+        .then((next) => {
+          if (next) {
+            useStore.getState().setNetworkSnapshot(
+              useStore.getState().networkDevices,
+              next
+            )
+          }
+        })
+    }
+  }, [])
 
   // MIDI capture buffer — only filled when mode === 'midi-instrument'.
   // Key format: `${kind}|${channel}|${number}` so a CC#7 on ch1 is
@@ -340,11 +374,20 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   // The previous version auto-filled it with the captured device
   // name or "MIDI Capture", which the user then had to delete every
   // time they saved a capture — annoying for a workflow that
-  // captures many scenes in a row. Now the user types a name (or
-  // leaves blank and Save uses a sensible fallback derived at
-  // commit time). `userTouchedName` is retained for any future
-  // auto-suggest UX that opts in, but the effect below is a no-op.
-  const userTouchedName = useRef(false)
+  // captures many scenes in a row. The name is REQUIRED: Save stays
+  // disabled and commitSave refocuses the input while it's blank.
+
+  // (item 30) 1 Hz tick while the popup is open so the freshness
+  // dots + "last seen" ages in CaptureAddressRow /
+  // SceneForInstrumentRow keep counting between network pushes —
+  // they're computed from Date.now() at render time, so without
+  // this they'd freeze until an unrelated re-render. Same pattern
+  // as PoolPane's NetworkTab age ticker.
+  const [, ageTick] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => ageTick((n) => n + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   return createPortal(
     <div
@@ -445,10 +488,7 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
                   ref={nameInputRef}
                   className="input flex-1 text-[12px]"
                   value={name}
-                  onChange={(e) => {
-                    userTouchedName.current = true
-                    setName(e.target.value)
-                  }}
+                  onChange={(e) => setName(e.target.value)}
                   placeholder="My OSC Instrument"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') commitSave()
@@ -477,10 +517,7 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
                 ref={nameInputRef}
                 className="input flex-1 text-[12px]"
                 value={name}
-                onChange={(e) => {
-                  userTouchedName.current = true
-                  setName(e.target.value)
-                }}
+                onChange={(e) => setName(e.target.value)}
                 placeholder={
                   mode === 'midi-instrument'
                     ? 'My MIDI Controller'
@@ -1655,24 +1692,6 @@ async function saveSceneForExistingInstrument(
 }
 
 // ── Misc helpers ─────────────────────────────────────────────────
-
-function defaultOscName(dev: DiscoveredOscDevice): string {
-  // Lift the most-common root path segment as the suggested name.
-  const rootCounts = new Map<string, number>()
-  for (const a of dev.addresses) {
-    const m = /^\/?([^/]+)/.exec(a.path)
-    if (m) rootCounts.set(m[1], (rootCounts.get(m[1]) ?? 0) + 1)
-  }
-  let bestRoot = ''
-  let bestN = 0
-  rootCounts.forEach((n, root) => {
-    if (n > bestN) {
-      bestN = n
-      bestRoot = root
-    }
-  })
-  return bestRoot || `OSC ${dev.ip}`
-}
 
 function pickColor(seed: string): string {
   // Tiny deterministic hash → HSL → hex.

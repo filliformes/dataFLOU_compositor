@@ -1,6 +1,6 @@
 # dataFLOU_compositor
 
-**Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of another software or another machine, **3‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
+**Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of another software or another machine, **100‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
 
 ![dataFLOU_compositor - Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
@@ -25,14 +25,14 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
   - [Sequence view + Timeline](#sequence-view)
   - [Transport (bottom bar)](#transport-bottom-bar)
   - [Cue system](#cue-system)
-  - [Scene‑to‑scene Morph](#scene-to-scene-morph)
+  - [Scene‑to‑scene Morph](#scenetoscene-morph)
   - [Clips (cells)](#clips-cells)
-  - [Sequencer - 9 modes](#sequencer--9-modes)
+  - [Sequencer - 9 modes](#sequencer---9-modes)
   - [Generative mode](#generative-mode)
-  - [Modulators - 8 types with live visuals](#modulators--8-types-with-live-visuals)
-  - [Smart Scale 0.0 – 1.0 (auto‑range)](#smart-scale-00--10-auto-range)
+  - [Modulators - 8 types with live visuals](#modulators---8-types-with-live-visuals)
+  - [Smart Scale 0.0 – 1.0 (auto‑range)](#smart-scale-00--10-autorange)
   - [Hold vs Last rest behaviour](#hold-vs-last-rest-behaviour)
-  - [Multi‑arg parameters + pinned slots](#multi-arg-parameters--pinned-slots)
+  - [Multi‑arg parameters + pinned slots](#multiarg-parameters--pinned-slots)
   - [Templates & bulk actions](#templates--bulk-actions)
   - [OSC monitor](#osc-monitor)
   - [Autosave + crash recovery](#autosave--crash-recovery)
@@ -42,24 +42,24 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
-- [Release notes](#release-notes--0513)
-  - [0.5.13](#release-notes--0513)
-  - [0.5.12](#release-notes--0512)
-  - [0.5.11](#release-notes--0511)
-  - [0.5.10](#release-notes--0510)
-  - [0.5.9](#release-notes--059)
-  - [0.5.8](#release-notes--058)
-  - [0.5.7](#release-notes--057)
-  - [0.5.6](#release-notes--056)
-  - [0.5.5](#release-notes--055)
-  - [0.5.1](#release-notes--051)
-  - [0.5.0](#release-notes--050)
-  - [0.4.5](#release-notes--045)
-  - [0.4.1](#release-notes--041)
-  - [0.4.0](#release-notes--040)
-  - [0.3.6](#release-notes--036)
-  - [0.3.5](#release-notes--035)
-  - [0.3.0](#release-notes--030)
+- [Release notes - 0.5.14](#release-notes---0514)
+- [Release notes - 0.5.13](#release-notes---0513)
+- [Release notes - 0.5.12](#release-notes---0512)
+- [Release notes - 0.5.11](#release-notes---0511)
+- [Release notes - 0.5.10](#release-notes---0510)
+- [Release notes - 0.5.9](#release-notes---059)
+- [Release notes - 0.5.8](#release-notes---058)
+- [Release notes - 0.5.7](#release-notes---057)
+- [Release notes - 0.5.6](#release-notes---056)
+- [Release notes - 0.5.5](#release-notes---055)
+- [Release notes - 0.5.1](#release-notes---051)
+- [Release notes - 0.5.0](#release-notes---050)
+- [Release notes - 0.4.5](#release-notes---045)
+- [Release notes - 0.4.1](#release-notes---041)
+- [Release notes - 0.4.0](#release-notes---040)
+- [Release notes - 0.3.6](#release-notes---036)
+- [Release notes - 0.3.5](#release-notes---035)
+- [Release notes - 0.3.0](#release-notes---030)
 - [Project status](#project-status)
 - [License](#license)
 
@@ -101,7 +101,7 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **Saved Scene Inspector (v0.5)**: left‑click any Saved Scene in the Pool to inspect/edit its name, color, notes, duration, multiplier, morph‑in, next‑mode, plus a read‑only Contents breakdown showing every Instrument + Parameter + captured cell value the scene carries.
 - **Multi‑value OSC**: space‑separated entries in a clip's Value field become multiple OSC args in a single message. Every modulator treats each entry independently. **Pin individual slots** to freeze them while the sequencer / modulator drives the rest, with a **two‑level pin model (v0.5)**: the Parameter Inspector sets a row default; each clip can override (true / false / inherit) so Scene A can pin a slot while Scene B leaves it modulated.
 - **Per‑arg post‑modulation Scaling (v0.5)**: new collapsible section in the Cell Inspector between Values and Timing. Clamps each arg's output to a user‑chosen `[min, max]` band AFTER modulators / sequencer but BEFORE Scale 0.0–1.0 and MIDI Scale. Lets you tame extreme values from a Random / Chaos / Generative source without rewriting the whole sequencer. Per‑cell, per‑arg.
-- **3‑deep undo / redo (v0.5)**: Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Snapshot ring buffer (3 past + 3 future), 500 ms coalesce so typing bursts count as one undoable edit. Buttons live in the prefs sub‑toolbar with depth indicators. History resets on session load.
+- **100‑deep undo / redo (v0.5, expanded to 100 in v0.5.14)**: Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Snapshot ring buffer (100 past + 100 future), 500 ms coalesce so typing bursts count as one undoable edit. Buttons live in the prefs sub‑toolbar with depth indicators. History resets on session load.
 - **Smart Scale 0.0 – 1.0**: auto‑ranges each parameter's actual min/max into `[0, 1]` instead of blunt‑clamping. Works for sequencer cycles, modulator outputs, even multi‑arg colour channels.
 - **Ten modulation types with live visualisations**: **LFO**, **Ramp** (Normal / Inverted / Loop), **Envelope (ADSR)**, **Arpeggiator** (with mode‑aware playback patterns), **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map), **Strange Attractor** (v0.5.7 - Lorenz / Aizawa / Thomas / Rössler / Rössler-4D / Lü-4D, 3-/4-channel fan-out), and **Gesture** (v0.5.8 - XY recorder with live crayon preview, Wiggle, Forward / Backward / Ping-Pong playback; 2-channel fan-out or merged radial). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet); per‑modulator preview SVG redraws as you tweak. Each cell can stack a SECOND modulator (Modulation 2) that modulates Modulation 1's Rate / Depth / context-aware Shape - see top of the feature list.
 - **Ten sequencer modes**: **Steps**, **Euclidean**, **Polyrhythm** (two interlocking rings), **Density** (per‑step probability), **Cellular** (1‑D Wolfram automaton with Seed LFO), **Drift** (Brownian playhead), **Ratchet** (sub‑pulse bursts with 7 shaping modes), **Bounce** (geometrically accelerating step duration), **Draw** (free‑form curve up to 1024 steps), and **Address** (v0.5.7 - CV-style playhead driven by the Modulator's output, three sub-modes). Each has its own inspector preview.
@@ -572,6 +572,82 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.5.14
+
+A large correctness + features release: **8 new features**, **35 bug fixes** (a multi-agent review pass over the whole v0.5.13 surface, plus issues found in live use), a routing-gate fix, and a README cleanup. Highlights below; the full bug list follows.
+
+### New features
+
+- **Modulation 2 → direct value routing.** Mod 2 can now modulate a clip's parameter **value** directly — a third routing column **M2** in the Cell Inspector's routing matrix (column order: MOD · M2>1 · **M2** · M2>S · SEQ), with its own ALL toggle, defaulting all-unchecked. A new **M2 > Value amount** knob (default 50%) and an **Add / Mult / Mix** math selector control how it combines with Mod 1 when both drive the same slot. Per-slot Delay / Variation apply as for the other routes. Stacking with M2>1 is allowed (tooltip warns it doubles Mod 2's influence).
+- **Hardware Mode "Takeover: Catch / Jump"** (opt-in per template, default Catch). **Jump** makes any controller value change take over a parameter instantly — no soft-takeover approach, no catch tolerance. For switches/selectors and for performers who want the knob's current position to win immediately. Catch (the v0.5.5 soft-takeover) stays the default.
+- **Ramp modulator "From" mode.** A fourth Ramp mode beside Normal / Inverted / Loop: two number boxes (**From** / **To**) let the ramp run between arbitrary values (including negative and >1 raw OSC values) over the ramp's time/curve, composing with depth exactly like Normal mode.
+- **"Update scene to current settings"** — right-click a scene (under "Capture current state as new scene"). Stamps the engine's currently-emitted values — Hardware Mode overrides included, plus sequencer steps, modulator output, per-arg pins — into THIS scene's cells in place. Disabled when the scene isn't playing (no live values). Undo-able; refreshes the linked Pool entry.
+- **Scene Inspector in Grid view.** Clicking a scene header in the Grid now shows the Scene Inspector (name / notes / Dur / Next / Morph / Weight) in the inspector pane, exactly like the Sequence view.
+- **Duplicate / new scene insert adjacent.** Duplicating a scene, and creating a new scene, now insert directly **after** the source / focused scene instead of at the end of the timeline.
+- **Undo depth 3 → 100.** The undo history now stores structural-shared session references instead of deep clones (the store is strictly copy-on-write), so 100 levels cost less memory and CPU than the old 3 did. A dev-only deep-freeze guard catches any future in-place mutation loudly.
+
+### Modulation 2 routing-gate fix
+
+Enabling Mod 2 with the **M2>1** column unchecked was still letting Mod 2 affect Mod 1 — both in the Inspector's live "breathing" overlays (they keyed only on Mod 2 being *enabled*, not *routed*) and, in the **envelope** and **ramp** engine paths, in the actual output (those two branches weren't gated per-slot like the others). Both are fixed: all Mod-1-side overlays and every modulator path now honor the per-slot M2>1 routing. The **M2** column spacing was also evened out.
+
+### Bug fixes
+
+**Hardware Mode (engine):**
+
+1. `deviceMatch: 'ipOnly'` now keys movement state by IP alone — it was keyed by `ip:port`, so ephemeral-port senders never caught and leaked one map entry per packet. Added an eviction cap.
+2. Disabling Hardware Mode now clears caught overrides — they used to freeze a parameter at the last hardware value forever.
+3. Slow float-knob turns now catch (the movement gate matched its own spec: cross-threshold OR aged-with-change).
+4. A `reset`-mode scene change no longer wipes `persist`-mode templates' catches.
+5. Catch state is restored from the session only on a real load, not on every session push (fixes a resurrection race).
+6. Non-finite OSC args no longer permanently poison a slot's movement baseline.
+7. `whenIdle` forward no longer un-suppresses during a scene's fade-out (dual-emission).
+33. Catches restored from a saved session now self-heal on the first packet (already-caught check moved ahead of the change gate).
+34. The **Random** modulator now honors the routing matrix — it was ignoring the per-slot MOD column and driving all slots. Now respects MOD/Delay/Variation and the new M2-direct route too.
+
+**Network:**
+
+8. Forward-diagnostics and discovered-device maps evict the oldest entry instead of refusing new senders at the cap.
+9. Double-enabling the OSC listener no longer clobbers a healthy socket (fd leak).
+10. Loopback detection covers all `127.x.y.z` addresses, not just `127.0.0.1`.
+11. The forward socket isn't recreated by the next packet when all forward targets are disabled.
+
+**Sessions / persistence:**
+
+12. `forwardMode` / `deviceMatch` / `alwaysForward` are no longer **stripped on session load** — the load-time sanitizer dropped them, so "When idle" / "IP only" reverted to defaults on every reopen (and re-saved stripped). This was the cause of Hardware Mode silently failing to forward to downstream after reopening a session.
+13. Released catches no longer resurrect — stale `hardwareState` is cleared on save.
+14. "Capture current state as new scene" / "Duplicate scene" no longer copy the source's Pool-library link or MIDI trigger (renaming the copy used to overwrite the source's saved entry).
+15. Undo / redo sanitizes dangling selections (could crash the Inspector).
+16. Linked Pool scenes re-sync after undo / redo.
+17. Scene-id generation guards against collisions.
+18. Scene-palette and info-panel sizes now persist across restarts.
+20. The linked-scene library disk write is debounced (was one write per keystroke).
+
+**UI:**
+
+19. Saved-scene **Notes** no longer drops focus / loses characters while typing.
+21. Saved-scene Duration / Multiplier / Morph commit on blur (were one disk write per keystroke).
+22. The Capture popup restores the OSC listener to its prior state on close.
+23. The Hardware Mode tooltip points at the current "Forward to downstream" control (was the removed "Always forward" checkbox).
+24. The listener bind-error tooltip points at the correct "Listen on" port.
+25. The Hardware Mode device picker shows a configured-but-offline binding instead of "pick a device".
+26. The per-parameter arg-slot lock can now lock out all slots (unchecking the last one used to silently re-check everything).
+27. The "Bind to template" menu hides hidden draft templates.
+28. Double-clicking the Listening pill no longer toggles the listener twice before opening Capture.
+29. The collapsed-mode scene-name input no longer drops focus.
+30. Capture-popup freshness dots tick live; 31. and re-pick a device when the list repopulates.
+32. The scene Arm / Clear-arm menu label no longer goes stale while open.
+35. **Typing a multi-digit duration in a scene header no longer triggers other scenes.** The header's focus-release blur was stealing focus to `<body>`, so digits typed into the Duration field (e.g. "40") leaked to the global number-key scene-trigger shortcut and fired scenes 4 and 10. The header click now keeps focus on an editable control the user clicked into.
+
+### Docs
+
+- README: fixed 23 broken Table-of-Contents anchor links and normalized the heading / emphasis hierarchy.
+
+### Known parked item
+
+- View-switch grid-scroll preservation was reverted — the earlier attempt interfered with horizontal mouse-wheel scrolling. (Unrelated: if your horizontal wheel only scrolls one direction, that's a mouse-driver mapping issue, not dataFLOU — `Shift` + the vertical wheel scrolls horizontally both ways as a built-in workaround.)
 
 ---
 
@@ -1807,8 +1883,9 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.13:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.14:
 
+- ✅ **Correctness + features pass (v0.5.14)**: Modulation 2 → direct value routing (new M2 column), Hardware Mode Catch/Jump takeover, Ramp "From" mode, "Update scene to current settings", Scene Inspector in Grid view, adjacent scene insert, undo depth raised to 100, plus 35 bug fixes — including `forwardMode`/`deviceMatch` no longer being stripped on session load, the Random modulator now honoring the routing matrix, and typing a duration no longer firing scene triggers.
 - ✅ **Hardware Mode discrete-slot catch on value change (v0.5.13)**: int + bool slots catch the moment their value differs from the device's previous transmission — no threshold, no idle-time window. Slow single presses catch instantly (the v0.5.12 bug), and a streaming controller's unchanged state can no longer steal slots back from a freshly-triggered scene. Fixes the OCTOCOSME instrument selector, INTERVALLE, KILL switches, GLOBAL_MODE / TOUCH_MODE — while letting scenes assert their saved switch data.
 - ✅ **Hardware Mode UX hardening (v0.5.12)**: live status dot at the configuration site, `deviceMatch: 'ipOnly'` toggle for ephemeral-port senders, `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream only when no scene is playing (auto-flipping via `engine.activeSceneId`), int + bool slots catch instantly under HW Mode (v0.5.12 introduced the type-aware branch; v0.5.13 finished the job by moving it ahead of the movement gate), info-popup tooltips on every field, right-click "Bind to template" from Network Discovery rows, loopback flag + Capture-popup filter.
 - ✅ **Capture current state as new scene (v0.5.12)**: right-click any scene → snapshot the engine's live emitted values (incl. Hardware Mode catches) into a new scene cloned from the source, inserted adjacent.

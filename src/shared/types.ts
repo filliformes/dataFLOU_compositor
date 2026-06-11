@@ -262,7 +262,19 @@ export interface RampParams {
   //   'normal'   — one-shot 0 → 1 ramp, holds at 1 after completing (default)
   //   'inverted' — one-shot 1 → 0 ramp (mirror of normal), holds at 0
   //   'loop'     — repeats the 0 → 1 ramp forever, retriggering at every period
-  mode: 'normal' | 'inverted' | 'loop'
+  //   'from'     — one-shot ramp interpolating fromValue → toValue over the
+  //                ramp time (instead of the fixed 0 → 1). The base progress p
+  //                is computed exactly like 'normal' (respecting curvePct and
+  //                the rampMs/sync timing); the output is then mapped to
+  //                fromValue + (toValue - fromValue) * p. depth/curve apply as
+  //                in normal mode, so 'from' composes identically with depthPct
+  //                and the cell's scaling.
+  mode: 'normal' | 'inverted' | 'loop' | 'from'
+  // 'from' mode endpoints. Defaults: fromValue 0, toValue 1 (which makes
+  // 'from' identical to 'normal' until the user changes them). Allowed to be
+  // negative or >1 — users may ramp raw OSC values, not just unit floats.
+  fromValue?: number  // ramp start value (default 0)
+  toValue?: number    // ramp end value (default 1)
 }
 
 export interface Modulation {
@@ -329,6 +341,30 @@ export interface Modulation {
   // Optional + back-compat: undefined / missing entries mean "no
   // sequencer target active" so v0.5.8 sessions load unchanged.
   targetsSeq?: ModulationTargets
+  // ── Stage-2 → direct Value routing ────────────────────────────────
+  // When this Modulation acts as stage-2 (i.e. assigned to
+  // Cell.modulation2), these two fields configure the M2 → VALUE
+  // direct route: Mod 2's bipolar [-1,+1] signal applied STRAIGHT to
+  // the cell's per-arg value slots, exactly like Mod 1's contribution
+  // — in addition to (not instead of) the M2>1 / M2>S routes above.
+  // Gated per slot by `cell.routing.modulation2Direct[i]` (which,
+  // unlike every other routing array, defaults FALSE — see the
+  // comment on that field).
+  //
+  // `valueAmount` is the DEDICATED intensity for this route (0..1,
+  // default 0.5). Deliberately NOT the Depth knob — Depth keeps
+  // shaping Mod 2's own signal as before.
+  //
+  // `valueMath` picks how the M2-direct contribution combines with
+  // the Mod 1-modulated value on slots where BOTH routes are active
+  // (mirrors the M2>1 ModulationTargetMode trio's semantics):
+  //   'add'  - sum the offsets: out = mod1Out + m2Offset    [default]
+  //   'mult' - multiplicative:  out = mod1Out * (1 + mod2 * amount)
+  //   'mix'  - 50/50 crossfade between the Mod 1-modulated value and
+  //            the Mod 2-only-modulated value (center + m2Offset).
+  // Optional + back-compat: missing fields read as the defaults.
+  valueAmount?: number
+  valueMath?: 'add' | 'mult' | 'mix'
 }
 
 // Two-stage routing — how Mod 2's bipolar signal touches each of
@@ -728,6 +764,29 @@ export interface Cell {
     // routing. Lets a multi-arg bundle have, say, slot 0 = full
     // Mod 2 → Seq wildness while slot 1 stays metronomic.
     modulation2Seq?: boolean[]
+    // Per-slot Modulation 2 → VALUE direct gate.
+    //
+    // ⚠️ INVERTED DEFAULT — READ THIS BEFORE TOUCHING ⚠️
+    // Unlike EVERY other routing array in this struct (where a
+    // missing entry / missing array means `true` = routed), this one
+    // defaults FALSE: a missing array or missing entry means
+    // UNROUTED. Only an explicit `modulation2Direct[i] === true`
+    // routes Mod 2's signal directly into slot i's value. Rationale:
+    // the feature shipped after v0.5.14, and the owner wants (a) the
+    // new "M2" matrix column all-unchecked on fresh + legacy cells,
+    // and (b) free backward compat — old sessions must load with
+    // zero behaviour change without any migration. Engine + UI must
+    // both check `=== true`, never `!== false`.
+    //
+    // When true, Mod 2's bipolar output modulates the slot's value
+    // directly (same pipeline stage as Mod 1's contribution), scaled
+    // by `modulation2.valueAmount` and combined with the Mod 1-
+    // modulated value per `modulation2.valueMath`. The per-slot
+    // `delays` / `variations` below apply to this contribution
+    // exactly as they do to the Mod 1 / Sequencer ones. May be
+    // ticked TOGETHER with `modulation2[i]` (M2>1) — no mutual
+    // exclusion — which stacks Mod 2's influence on that slot.
+    modulation2Direct?: boolean[]
     sequencer?: boolean[]
     // Per-slot Delay (ms) — gates the modulator + sequencer
     // contribution for this slot until `delay` ms have elapsed
@@ -1246,7 +1305,21 @@ export interface HardwareModeConfig {
   // keeps the caught state across scene transitions so a knob-turn
   // mid-show keeps overriding the new scene's value until released.
   mode: 'reset' | 'persist'
+  // Takeover behaviour for FLOAT slots.
+  //   'catch' (default, or absent for back-compat) — soft-takeover: a
+  //       controller value only assumes control of a parameter once it
+  //       approaches the scene's current value within catchTolerance.
+  //       Prevents audible/visible jumps when grabbing a knob whose
+  //       physical position differs from the scene value.
+  //   'jump' — instant takeover: any controller VALUE CHANGE takes over
+  //       immediately, with no tolerance/approach required (exactly how
+  //       discrete int/bool slots already behave). catchTolerance is
+  //       irrelevant in this mode.
+  // Discrete (int/bool) slots are always instant regardless of this
+  // setting — there is no smooth handoff to protect.
+  takeover?: 'catch' | 'jump'
   // Catch tolerance — fraction of the param's full range. 0.02 = 2%.
+  // Unused when takeover === 'jump'.
   catchTolerance: number
   // Movement detection — value must change by ≥ movementThreshold
   // within `movementWindowMs` to be treated as "user is moving the
@@ -1712,6 +1785,10 @@ export interface SessionUiState {
   trackColumnWidth?: number
   editorNotesHeight?: number
   oscMonitorHeight?: number
+  // (#18) Sequence-view left-column width + scene info panel height —
+  // resizable but previously never persisted. Optional for back-compat.
+  scenePaletteWidth?: number
+  sceneInfoPanelHeight?: number
   tracksCollapsed?: boolean
   scenesCollapsed?: boolean
 }

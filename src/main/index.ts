@@ -314,7 +314,15 @@ app.whenReady().then(async () => {
     appQuitting = true
     mainWindow?.close()
   })
-  ipcMain.handle('session:open', () => sessionIO.open(mainWindow))
+  ipcMain.handle('session:open', async () => {
+    const result = await sessionIO.open(mainWindow)
+    // (Bug 5) Mark the upcoming session push as a real LOAD so the
+    // engine primes HW catch state from `hardwareState` exactly once.
+    // Only when a session was actually returned (user didn't cancel the
+    // dialog and the file parsed).
+    if (result) engine.markSessionLoaded()
+    return result
+  })
 
   // ---------- IPC: Network discovery ----------
   // Pool drawer's Network tab uses these to bind/unbind the passive
@@ -393,7 +401,14 @@ app.whenReady().then(async () => {
   safeHandle('autosave:list', () => autosave.listAutosaves())
   // Load DOES want to propagate failures (so the user sees the parse
   // error in the integrity dialog). Leave it on the raw ipcMain.handle.
-  ipcMain.handle('autosave:load', (_e, path: string) => autosave.loadAutosave(path))
+  ipcMain.handle('autosave:load', async (_e, path: string) => {
+    const session = await autosave.loadAutosave(path)
+    // (Bug 5) A crash-recovery restore is a real session LOAD — prime
+    // the engine's HW catch state from `hardwareState` exactly once on
+    // the renderer's follow-up updateSession.
+    engine.markSessionLoaded()
+    return session
+  })
 
   createWindow()
 

@@ -13,7 +13,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
-import { UncontrolledTextInput } from './UncontrolledInput'
+import { UncontrolledTextInput, UncontrolledTextarea } from './UncontrolledInput'
 import type {
   FunctionParamNature,
   FunctionParamType,
@@ -1124,14 +1124,15 @@ function SavedSceneInspector({
           </Field>
         </div>
         <Field label="Notes">
-          <textarea
+          {/* Uncontrolled like the Name field above — updateSavedScene is
+              async and the library push-back would otherwise revert
+              in-flight typing (lost chars / caret jumps). */}
+          <UncontrolledTextarea
             className="input italic text-[11px] leading-snug w-full"
             style={{ height: 56, resize: 'vertical' }}
             placeholder="Notes…"
             value={sc.sceneMeta.notes ?? ''}
-            onChange={(e) =>
-              updateSavedScene(sc.id, { notes: e.target.value })
-            }
+            onChange={(v) => updateSavedScene(sc.id, { notes: v })}
           />
         </Field>
         <div className="grid grid-cols-3 gap-1">
@@ -1142,6 +1143,7 @@ function SavedSceneInspector({
               onChange={(v) => updateSavedScene(sc.id, { durationSec: v })}
               min={0.5}
               max={300}
+              commitOn="blur"
             />
           </Field>
           <Field label="Multiplier">
@@ -1152,6 +1154,7 @@ function SavedSceneInspector({
               min={1}
               max={128}
               integer
+              commitOn="blur"
             />
           </Field>
           <Field label="Morph (ms)">
@@ -1162,6 +1165,7 @@ function SavedSceneInspector({
               min={0}
               max={60000}
               integer
+              commitOn="blur"
             />
           </Field>
         </div>
@@ -1423,7 +1427,7 @@ export function HardwareModeSection({
           "1. ENGINE — catch-mode soft-takeover. When ON, moving the controller within tolerance of the scene's current value 'catches' that slot — the controller takes over per-slot until released (RESET) or scene change (PERSIST).\n\n" +
           "2. NETWORK — forward-path suppression. When ON, raw controller packets are NOT forwarded to downstream consumers (PD, Max) — the engine's caught value is the single source of truth per parameter, preventing dual-emission flicker.\n\n" +
           "Turning Hardware Mode OFF disables BOTH at once. If a scene is also playing, dual emission resumes immediately — the same raw controller bytes that the scene's caught values used to suppress now arrive at the downstream too. Visible as flicker for any parameter the controller and scene both touch.\n\n" +
-          "If you want the controller to reach downstream consumers EVEN WHEN NO SCENE IS PLAYING (rehearsal, soundcheck), keep HW Mode ON and enable 'Always forward' below — that's the safer escape hatch."
+          "If you want the controller to reach downstream consumers EVEN WHEN NO SCENE IS PLAYING (rehearsal, soundcheck), keep HW Mode ON and set 'Forward to downstream' below to 'When idle' (recommended for live shows) — that's the safer escape hatch."
         }
       >
         <input
@@ -1493,6 +1497,16 @@ export function HardwareModeSection({
               }}
             >
               <option value="">— pick a discovered device —</option>
+              {/* Configured-but-not-discovered binding: keep showing
+                  the real ip:port instead of silently falling back to
+                  the "— pick —" placeholder. Same pattern as the MIDI
+                  port picker's "(disconnected)" option above. */}
+              {deviceKey &&
+                !networkDevices.some(
+                  (d) => !d.isLoopback && `${d.ip}:${d.port}` === deviceKey
+                ) && (
+                  <option value={deviceKey}>{deviceKey} (not discovered)</option>
+                )}
               {/* (v0.5.12) Hard-exclude loopback sources. Binding HW
                   Mode to dataFLOU's own loopback would suppress the
                   scene's emissions to its own bus, breaking the
@@ -1621,12 +1635,43 @@ export function HardwareModeSection({
               </option>
             </select>
           </Field>
+          {/* Takeover — Catch (soft) vs Jump (instant). Governs how a
+              FLOAT slot takes over from scene playback. */}
+          <Field
+            label="Takeover"
+            tooltip={
+              "How a FLOAT slot grabs control from the scene when you move the controller.\n\n" +
+              "CATCH (default — soft-takeover): the controller is ignored until its value approaches the scene's current value within 'Catch tol' below. Only then does the slot take over, so there's no audible/visible jump — the controller picks up exactly where the scene left off. Best when controller and scene positions differ and a jump would be jarring.\n\n" +
+              "JUMP (instant): ANY controller movement takes over immediately, with no tolerance/approach required — exactly how discrete switches/encoders already behave. The value may step on capture (controller position ≠ scene value), but takeover is instant and predictable. Best for live grabs where you want the knob to respond the moment you touch it.\n\n" +
+              "Discrete (int/bool) slots are always instant regardless of this setting. In JUMP mode the 'Catch tol' field is unused."
+            }
+          >
+            <select
+              className="input text-[11px] py-0.5 w-full"
+              value={hw.takeover ?? 'catch'}
+              onChange={(e) =>
+                setHardwareMode(template.id, {
+                  takeover: e.target.value as 'catch' | 'jump'
+                })
+              }
+            >
+              <option value="catch">
+                Catch (default — soft-takeover within tolerance)
+              </option>
+              <option value="jump">
+                Jump (any movement takes over instantly)
+              </option>
+            </select>
+          </Field>
           {/* Tolerances — sensible defaults shown; advanced users can
               tighten / loosen. */}
           <div className="grid grid-cols-2 gap-1">
             <Field
               label="Catch tol (% range)"
               tooltip={
+                (hw.takeover === 'jump'
+                  ? 'Not used in Jump mode (any movement takes over instantly).\n\n'
+                  : '') +
                 "Soft-takeover window. After Hardware Mode is enabled, the controller is IGNORED until its value crosses within this tolerance of the scene's currently-emitted value for that slot. Then the slot 'catches' — the controller takes over from where the scene was, no audible/visible jump. " +
                 'Higher (e.g. 10%) = easier to catch but a bigger possible step at the moment of capture. ' +
                 'Lower (e.g. 1%) = stricter catch, smoother handoff, requires you to nudge the controller more precisely toward the scene value. ' +
@@ -1634,12 +1679,21 @@ export function HardwareModeSection({
               }
             >
               <BoundedNumberInput
-                className="input text-[11px] py-0.5 w-full"
+                className="input text-[11px] py-0.5 w-full disabled:opacity-40"
                 value={Math.round(hw.catchTolerance * 1000) / 10}
                 onChange={(v) =>
                   setHardwareMode(template.id, {
                     catchTolerance: Math.max(0, Math.min(100, v)) / 100
                   })
+                }
+                // Catch tolerance is irrelevant in Jump mode — disable
+                // and grey it with an explanatory tooltip so the user
+                // understands why it's inert.
+                disabled={hw.takeover === 'jump'}
+                title={
+                  hw.takeover === 'jump'
+                    ? 'Not used in Jump mode (any movement takes over instantly)'
+                    : undefined
                 }
                 min={0}
                 max={100}
@@ -1727,12 +1781,29 @@ export function HardwareModeSection({
               {template.functions
                 .filter((fn) => (fn.argSpec?.length ?? 0) > 1)
                 .map((fn) => {
-                  const locked = hw.args?.[fn.id] ?? []
+                  const lockedRaw = hw.args?.[fn.id] ?? []
+                  // [-1] is the explicit "NO slots" sentinel. Empty
+                  // array means "all slots" (the default), so
+                  // unchecking the last checked slot can't store []
+                  // — the engine would read it as "all" and every
+                  // checkbox would silently re-check. The engine
+                  // matches slots via lockedSlots.includes(i), so -1
+                  // never matches a real slot and locks HW out of
+                  // every slot harmlessly.
+                  const noneLocked =
+                    lockedRaw.length === 1 && lockedRaw[0] === -1
+                  const locked = noneLocked ? [] : lockedRaw
+                  const allSlots = !noneLocked && locked.length === 0
                   const argCount = fn.argSpec!.length
                   return (
                     <div
                       key={fn.id}
                       className="flex items-center gap-1 text-[10px]"
+                      title={
+                        noneLocked
+                          ? `No slots — hardware is locked out of every arg slot of "${fn.name}". Check at least one slot to let the controller catch it again.`
+                          : undefined
+                      }
                     >
                       <span className="text-muted shrink-0" style={{ width: 80 }}>
                         {fn.name}
@@ -1745,10 +1816,9 @@ export function HardwareModeSection({
                         >
                           <input
                             type="checkbox"
-                            checked={locked.length === 0 || locked.includes(i)}
+                            checked={allSlots || locked.includes(i)}
                             onChange={(e) => {
-                              const isAll = locked.length === 0
-                              const startList = isAll
+                              const startList = allSlots
                                 ? Array.from({ length: argCount }, (_, k) => k)
                                 : locked
                               const next = e.target.checked
@@ -1763,7 +1833,9 @@ export function HardwareModeSection({
                                   // Empty array = "all" (the default).
                                   // Storing [0..N-1] explicitly is equivalent
                                   // semantically — we normalise to empty.
-                                  [fn.id]: allChecked ? [] : next
+                                  // [-1] = explicitly NONE (see above).
+                                  [fn.id]:
+                                    allChecked ? [] : next.length === 0 ? [-1] : next
                                 }
                               })
                             }}
@@ -1771,6 +1843,11 @@ export function HardwareModeSection({
                           <span className="tabular-nums">{i}</span>
                         </label>
                       ))}
+                      {noneLocked && (
+                        <span className="text-[9px] text-muted italic shrink-0">
+                          no slots
+                        </span>
+                      )}
                     </div>
                   )
                 })}
