@@ -1223,6 +1223,13 @@ export interface InstrumentTemplate {
   // filters out devices that stream constant values when idle (so
   // dataFLOU only listens when the user is actually moving a knob).
   hardwareMode?: HardwareModeConfig
+  // Input Conditioning (v0.6) — ordered smoothing/filter chain applied
+  // to this Instrument's incoming Hardware-Mode stream before catch
+  // logic + State Triggers. See InputConditionerConfig.
+  inputConditioner?: InputConditionerConfig
+  // State Triggers (v0.6) — "Wekinator-lite" pose/state detectors on
+  // the incoming Hardware-Mode stream firing MIDI + scene actions.
+  stateTriggers?: StateTrigger[]
 }
 
 // Per-Instrument Hardware Mode configuration. When enabled, dataFLOU
@@ -1332,12 +1339,190 @@ export interface HardwareModeConfig {
   // empty array = HW controls ALL slots. Use this to surgically
   // limit which slots of a multi-arg bundle the hardware can drive.
   args?: Record<string, number[]>
+  // (v0.6) Per-parameter input→output scaling. Key:
+  // InstrumentFunction.id. Maps the device's native value range onto
+  // the parameter's output range BEFORE the catch-tolerance
+  // comparison and override storage — so a controller sending
+  // 0..360° can catch (and drive) a parameter whose scene values
+  // live in 0..1. Applied AFTER Input Conditioning. Inversion is
+  // supported by swapping out bounds (e.g. out 1..0); the result is
+  // always clamped to the out range. Movement Δ detection stays in
+  // DEVICE units (it runs per-address before per-parameter resolution).
+  scaling?: Record<string, HardwareScaleConfig>
   // Which Track instances this HW Mode applies to. Empty / undefined
   // = applies to EVERY Track instantiated from this template (every
   // copy in the grid). Listing specific track ids narrows the scope
   // to those instances only. Lets the user have two copies of the
   // same Instrument template, one HW-driven and one scene-driven.
   appliesToTrackIds?: string[]
+}
+
+// (v0.6) One Parameter's hardware-input scaling. `in` bounds describe
+// what the DEVICE sends (after Input Conditioning); `out` bounds are
+// the range the parameter's scene values live in. Linear map + clamp:
+//   out = outMin + (v − inMin) / (inMax − inMin) · (outMax − outMin)
+// Swapped out bounds invert the response. Degenerate in-range
+// (inMax ≈ inMin) outputs outMin.
+export interface HardwareScaleConfig {
+  enabled: boolean
+  inMin: number
+  inMax: number
+  outMin: number
+  outMax: number
+}
+
+// ── Input Conditioning (v0.6) ────────────────────────────────────────
+// A PiPo-style ordered chain of stream-processing stages applied to
+// incoming OSC values from this Instrument's Hardware-Mode device,
+// BEFORE movement detection / catch logic / overrides / State
+// Triggers. Each stage is a small named unit with 1-2 knobs
+// (Plaquette-style); the chain runs top-to-bottom per arg slot.
+//
+// Applied at the top of engine.handleHardwareInput(), so everything
+// downstream (catch gates, red cell display, MIDI emission, State
+// Trigger matching) sees the conditioned stream.
+
+export type InputStageType =
+  | 'oneEuro'    // adaptive low-pass (Casiez 1€): smooth when slow, fast when fast
+  | 'smooth'     // one-pole EMA with half-life (same math as the Slew modulator)
+  | 'median'     // windowed median — spike / outlier killer
+  | 'slewLimit'  // hard max rate clamp in units/sec (bounds worst-case jumps)
+  | 'deadband'   // ignore changes smaller than epsilon (kills idle chatter)
+  | 'autoRange'  // adaptive min/max tracker, outputs 0..1 (MinMaxScaler-style)
+
+export interface InputStage {
+  id: string
+  type: InputStageType
+  enabled: boolean
+  // (v0.6) OSC-address scope. undefined / '' = apply to EVERY address
+  // the instrument's HW device sends (the original behaviour). A
+  // specific address (e.g. "/mpu/euler/roll", matching a Parameter's
+  // resolved OSC address) = only that address's slots pass through
+  // this stage. Lets one instrument smooth some inputs and not others,
+  // and lets the Parameter inspector reflect exactly which stages
+  // touch a given Parameter.
+  address?: string
+  // oneEuro — minCutoffHz: baseline smoothing at rest (lower = smoother,
+  // more lag on slow moves; typical 1.0). beta: speed coefficient (higher
+  // = less lag on fast moves; typical 0.005-0.1). Tuning recipe: set
+  // beta 0, lower minCutoff until rest jitter is gone; then raise beta
+  // until fast-move lag is acceptable.
+  minCutoffHz?: number
+  beta?: number
+  // smooth — exponential half-life in ms. y += (x - y) · (1 - 2^(-dt/HL))
+  halfLifeMs?: number
+  // median — window length (odd, 3/5/7). Longer = stronger spike
+  // rejection, more latency (window/2 samples).
+  window?: number
+  // slewLimit — max change per second, in the value's own units.
+  maxPerSec?: number
+  // deadband — minimum |delta| from the last OUTPUT value before the
+  // output moves. In the value's own units.
+  epsilon?: number
+  // autoRange — how fast the tracked min/max CONTRACT toward the
+  // recent signal, as a half-life in ms. Expansion is instantaneous
+  // (a new peak immediately widens the range); contraction forgets
+  // old extremes so a sensor that once spiked doesn't stay squashed
+  // forever. 0 = never contract (pure running min/max).
+  contractHalfLifeMs?: number
+}
+
+export interface InputConditionerConfig {
+  enabled: boolean
+  // Ordered chain — runs top to bottom. Empty = pass-through.
+  stages: InputStage[]
+  // Per-arg-slot opt-out: slot indices listed here bypass the whole
+  // chain (e.g. keep a button/int slot raw while smoothing the floats).
+  slotBypass?: number[]
+}
+
+// ── State Triggers (v0.6) ────────────────────────────────────────────
+// "Wekinator-lite": named states of the Hardware-Mode device's incoming
+// OSC values. When the live (conditioned) input matches a state's
+// detector, the state ENTERS and fires its actions; when it stops
+// matching (with hysteresis + dwell debouncing) it EXITS. Detectors
+// come in two flavors:
+//   'rules'   — explicit per-address/slot conditions, AND-combined.
+//               Deterministic + debuggable.
+//   'learned' — captured by demonstration: hold the pose, hit Record,
+//               the engine stores centroid + per-dim variance over the
+//               recorded snapshots. At runtime a variance-weighted
+//               normalized distance yields a 0..1 match score; entering
+//               = score >= threshold. Nearest-centroid classification's
+//               practical little sibling (k-NN à la Wekinator, distilled).
+
+export type StateTriggerMode =
+  | 'enterExit'  // note-on / CC-A at enter, note-off / CC-B at exit (default)
+  | 'oneShot'    // fire once at enter, re-arm after exit
+  | 'continuous' // stream the live match score as a CC (0..127), change-gated
+
+export type StateRuleOp = 'eq' | 'range' | 'gt' | 'lt'
+
+export interface StateRule {
+  // OSC address as seen from the device (matches Track.defaultOscAddress
+  // resolution, e.g. "/mpu/euler/roll").
+  address: string
+  // Arg slot index within that address's bundle. 0 for single-value.
+  slot: number
+  op: StateRuleOp
+  // eq: value == a (within tol). range: a <= value <= b. gt: value > a.
+  // lt: value < a.
+  a: number
+  b?: number
+  // Absolute tolerance for 'eq' (defaults handled engine-side).
+  tol?: number
+}
+
+export interface LearnedState {
+  // Dimensions in centroid/variance order. Captured at Record time from
+  // every address+slot the device emitted during the window.
+  dims: { address: string; slot: number }[]
+  centroid: number[]
+  // Per-dim variance from the recording (floored engine-side so a
+  // perfectly-still dim doesn't produce a divide-by-zero razor edge).
+  variance: number[]
+  // Match threshold 0..1 — live score >= threshold = state entered.
+  threshold: number
+}
+
+export interface StateMidiAction {
+  enabled: boolean
+  portName: string
+  channel: number
+  kind: 'note' | 'cc'
+  // kind 'note': note number + velocity; enter = noteOn, exit = noteOff.
+  note?: number
+  velocity?: number
+  // kind 'cc': cc number; enter sends ccEnterValue, exit sends
+  // ccExitValue. In 'continuous' mode the live match score streams to
+  // this CC instead (0..127) and enter/exit values are ignored.
+  cc?: number
+  ccEnterValue?: number
+  ccExitValue?: number
+}
+
+export interface StateTrigger {
+  id: string
+  name: string
+  enabled: boolean
+  detector: 'rules' | 'learned'
+  mode: StateTriggerMode
+  // Exit hysteresis as a fraction of the enter condition (0..0.5):
+  // rules exit when any rule misses by more than hysteresis × its span;
+  // learned exits when score < threshold × (1 - hysteresis). Prevents
+  // boundary chatter.
+  hysteresisPct: number
+  // The state must match continuously for this long before entering.
+  dwellMs: number
+  rules: StateRule[]
+  learned?: LearnedState
+  actions: {
+    midi?: StateMidiAction
+    // Fire a dataFLOU scene at enter (the IMU literally plays the
+    // compositor). Exit does not stop the scene — scenes have their own
+    // lifecycle; this is a trigger, not a gate.
+    triggerSceneId?: string
+  }
 }
 
 // Standalone Parameter template — a single-Function blueprint that lives
@@ -1791,6 +1976,15 @@ export interface SessionUiState {
   sceneInfoPanelHeight?: number
   tracksCollapsed?: boolean
   scenesCollapsed?: boolean
+  // (v0.6) Per-scope frame settings for the Input Conditioning scopes,
+  // keyed `${templateId}|${address}|${slot}`. Each Parameter's scope
+  // keeps its own time window / value range / height. View state, not
+  // undo-tracked; mirrored from the module-scope scopePrefs Map at
+  // save time.
+  scopePrefs?: Record<
+    string,
+    { windowSec: number; yMin: number; yMax: number; height: number; inited: boolean }
+  >
 }
 
 // ---- IPC payloads ----
@@ -1830,6 +2024,18 @@ export interface EngineState {
   // that haven't played yet. Lets the renderer show the jittered
   // velocity in the cell tile so Humanize "moves" visibly.
   lastEmittedVelocityByCell?: Record<string, number>
+  // (v0.6) Live hardware-input readout, keyed by OSC address. `raw` =
+  // the values the controller last sent, `cond` = those values after
+  // Input Conditioning, `t` = wall-clock ms of arrival (freshness).
+  // Only present for addresses seen from a Hardware-Mode device in the
+  // last ~5s. The Parameter sidebar shows a red dot + value: `raw` when
+  // that Parameter's Input Scaling is off, or scale(`cond`) when it's
+  // on (matching exactly what drives the parameter). Absent when no
+  // HW-Mode device is active.
+  hardwareLiveByAddress?: Record<
+    string,
+    { raw: number[]; cond: number[]; t: number }
+  >
   // Per-scene most-recent generative auto-rolled duration (ms).
   // Each entry = the duration the engine rolled the last time it
   // triggered that scene under generative mode. The Scene Inspector
@@ -2197,6 +2403,31 @@ export interface ExposedApi {
   // sourced from package.json at app start. Renderer reads this
   // once on mount to bake the version into `document.title`.
   appGetVersion: () => Promise<string>
+  // v0.6 -- Input Conditioning live scope. Poll with the watch you
+  // want; the call itself registers/refreshes that watch (TTL-kept,
+  // multiple concurrent watchers supported) and returns its ring
+  // buffer of {t, raw, cond} samples. Stop polling and the watch
+  // expires within ~1.5s → zero per-packet cost. Pass null to poll
+  // nothing (returns []).
+  conditionerGetScope: (
+    watch: { templateId: string; address: string; slot: number } | null,
+    windowMs?: number
+  ) => Promise<{ t: number; raw: number; cond: number }[]>
+  // v0.6 -- State Triggers: live match scores + active flags, keyed
+  // `${templateId}|${stateId}`. Polled ~10 Hz while the section is
+  // expanded.
+  stateTriggerGetLive: () => Promise<{
+    scores: Record<string, number>
+    active: Record<string, boolean>
+  }>
+  // v0.6 -- learn-by-demonstration recording. Engine collects the
+  // bound device's conditioned stream for durationMs and resolves with
+  // the reduced model (or null when the device stayed silent).
+  stateTriggerRecord: (
+    templateId: string,
+    stateId: string,
+    durationMs: number
+  ) => Promise<LearnedState | null>
   // Push channel — fired on a 250ms timer whenever the device map has
   // changed (new sender, new address, or fresh packet count). Status
   // is bundled in so port-rebinds and bind errors round-trip too.

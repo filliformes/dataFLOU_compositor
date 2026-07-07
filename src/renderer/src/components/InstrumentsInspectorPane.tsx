@@ -13,6 +13,8 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { InputConditioningSection } from './InputConditioningSection'
+import { StateTriggersSection } from './StateTriggersSection'
 import { UncontrolledTextInput, UncontrolledTextarea } from './UncontrolledInput'
 import type {
   FunctionParamNature,
@@ -135,6 +137,12 @@ function TemplateInspector({
             templates because HW Mode is a per-session preference,
             not a definitional change to the template. */}
         <HardwareModeSection template={template} />
+
+        {/* Input Conditioning + State Triggers (v0.6) — both operate
+            on the HW-Mode input stream, so they sit right under it.
+            Same "user preference, editable on builtins" contract. */}
+        <InputConditioningSection template={template} />
+        <StateTriggersSection template={template} />
 
         <Field label="Description">
           <UncontrolledTextInput
@@ -1857,6 +1865,106 @@ export function HardwareModeSection({
                   Parameter's only slot. No per-slot lock UI needed.
                 </span>
               )}
+            </div>
+          </Field>
+          {/* (v0.6) Per-parameter hardware scaling — maps the device's
+              native value range onto each Parameter's output range
+              BEFORE the catch-tolerance comparison, so a 0..360°
+              sensor can catch a 0..1 scene value. Engine-side:
+              applyHardwareScale in handleHardwareInput's slot loop. */}
+          <Field
+            label="Per-parameter scaling (device → output)"
+            tooltip={
+              'Rescales each Parameter\'s incoming hardware values from the DEVICE range (In) to the parameter\'s OUTPUT range (Out) before anything else uses them.\n\n' +
+              'Applied BEFORE the catch-tolerance comparison — so a sensor sending 0..360° can catch and drive a parameter whose scene values live in 0..1. Without scaling, such a catch can never succeed.\n\n' +
+              'Swap the Out bounds (e.g. 1 → 0) to invert the response. Output is always clamped to the Out range.\n\n' +
+              'Note: Movement Δ detection still operates in DEVICE units (it runs per-address, before per-parameter resolution). Applied after Input Conditioning.'
+            }
+          >
+            <div className="flex flex-col gap-0.5">
+              {template.functions.map((fn) => {
+                const sc = hw.scaling?.[fn.id]
+                const patchScale = (
+                  p: Partial<NonNullable<typeof sc>>
+                ): void => {
+                  setHardwareMode(template.id, {
+                    scaling: {
+                      ...(hw.scaling ?? {}),
+                      [fn.id]: {
+                        enabled: false,
+                        inMin: 0,
+                        inMax: 1,
+                        // Seed Out from the Parameter's declared range
+                        // (ParamMeta min/max) — usually exactly what
+                        // the scene values live in.
+                        outMin: fn.min ?? 0,
+                        outMax: fn.max ?? 1,
+                        ...sc,
+                        ...p
+                      }
+                    }
+                  })
+                }
+                return (
+                  <div key={fn.id} className="flex items-center gap-1 text-[10px] flex-wrap">
+                    <label
+                      className="flex items-center gap-1 shrink-0"
+                      style={{ width: 92 }}
+                      title={`Enable scaling for "${fn.name}"`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={sc?.enabled === true}
+                        onChange={(e) => patchScale({ enabled: e.target.checked })}
+                      />
+                      <span className="text-muted truncate">{fn.name}</span>
+                    </label>
+                    {sc?.enabled && (
+                      <>
+                        <span className="label">In</span>
+                        <BoundedNumberInput
+                          className="input w-12 text-[10px] text-right tabular-nums"
+                          value={sc.inMin}
+                          min={-1e9}
+                          max={1e9}
+                          commitOn="blur"
+                          onChange={(v) => patchScale({ inMin: v })}
+                          title="Device range low (what the controller sends)"
+                        />
+                        <BoundedNumberInput
+                          className="input w-12 text-[10px] text-right tabular-nums"
+                          value={sc.inMax}
+                          min={-1e9}
+                          max={1e9}
+                          commitOn="blur"
+                          onChange={(v) => patchScale({ inMax: v })}
+                          title="Device range high"
+                        />
+                        <span className="text-muted">→</span>
+                        <span className="label">Out</span>
+                        <BoundedNumberInput
+                          className="input w-12 text-[10px] text-right tabular-nums"
+                          value={sc.outMin}
+                          min={-1e9}
+                          max={1e9}
+                          commitOn="blur"
+                          onChange={(v) => patchScale({ outMin: v })}
+                          title="Output range low (swap with high to invert)"
+                        />
+                        <BoundedNumberInput
+                          className="input w-12 text-[10px] text-right tabular-nums"
+                          value={sc.outMax}
+                          min={-1e9}
+                          max={1e9}
+                          commitOn="blur"
+                          onChange={(v) => patchScale({ outMax: v })}
+                          title="Output range high (swap with low to invert)"
+                        />
+                      </>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </Field>
         </>

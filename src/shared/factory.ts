@@ -459,6 +459,114 @@ export const DEFAULT_MIDI_OUT: import('./types').MidiOut = {
   gateLengthMs: 0
 }
 
+// (v0.6) Per-parameter hardware scaling — shared linear map + clamp so
+// the engine (catch pipeline) and the renderer (live track readout)
+// agree exactly. Swapped out bounds invert; degenerate in-range → outMin.
+export function scaleHardwareValue(
+  cfg: import('./types').HardwareScaleConfig,
+  v: number
+): number {
+  if (!Number.isFinite(v)) return v
+  const inSpan = cfg.inMax - cfg.inMin
+  if (Math.abs(inSpan) < 1e-12) return cfg.outMin
+  const t = (v - cfg.inMin) / inSpan
+  const out = cfg.outMin + t * (cfg.outMax - cfg.outMin)
+  const lo = Math.min(cfg.outMin, cfg.outMax)
+  const hi = Math.max(cfg.outMin, cfg.outMax)
+  return Math.max(lo, Math.min(hi, out))
+}
+
+// ---------- Input Conditioning (v0.6) ----------
+
+// Per-type parameter defaults for a freshly-added conditioning stage.
+// One Euro defaults follow Casiez's recommendations (minCutoff ≈ 1 Hz,
+// small beta) — good starting point for 50 Hz gestural sensors like
+// the MPU9150 IMU. Median window 3 is the cheapest spike killer.
+export function makeInputStage(
+  type: import('./types').InputStageType
+): import('./types').InputStage {
+  const base = { id: uid('istg_'), type, enabled: true }
+  switch (type) {
+    case 'oneEuro':
+      return { ...base, minCutoffHz: 1.0, beta: 0.02 }
+    case 'smooth':
+      return { ...base, halfLifeMs: 60 }
+    case 'median':
+      return { ...base, window: 3 }
+    case 'slewLimit':
+      return { ...base, maxPerSec: 2 }
+    case 'deadband':
+      return { ...base, epsilon: 0.002 }
+    case 'autoRange':
+      return { ...base, contractHalfLifeMs: 0 }
+  }
+}
+
+export const DEFAULT_INPUT_CONDITIONER: import('./types').InputConditionerConfig = {
+  enabled: false,
+  stages: [],
+  slotBypass: []
+}
+
+// Human-readable labels + one-line hints for the stage picker UI.
+export const INPUT_STAGE_INFO: Record<
+  import('./types').InputStageType,
+  { label: string; hint: string }
+> = {
+  oneEuro: {
+    label: '1€ Filter',
+    hint: 'Adaptive low-pass: smooth when slow, responsive when fast. THE gestural-sensor filter.'
+  },
+  smooth: {
+    label: 'Smooth',
+    hint: 'One-pole exponential smoothing with a half-life. Cheap and predictable.'
+  },
+  median: {
+    label: 'Median',
+    hint: 'Windowed median — removes single-sample spikes smoothing cannot.'
+  },
+  slewLimit: {
+    label: 'Slew Limit',
+    hint: 'Hard cap on change rate (units/sec). Bounds worst-case jumps.'
+  },
+  deadband: {
+    label: 'Deadband',
+    hint: 'Ignore changes smaller than ε. Silences idle chatter from streaming sensors.'
+  },
+  autoRange: {
+    label: 'Auto Range',
+    hint: 'Tracks observed min/max and rescales to 0..1 — raw sensors become normalized without firmware changes.'
+  }
+}
+
+// ---------- State Triggers (v0.6) ----------
+
+export function makeStateTrigger(index: number): import('./types').StateTrigger {
+  return {
+    id: uid('sttr_'),
+    name: `State ${index + 1}`,
+    enabled: true,
+    detector: 'rules',
+    mode: 'enterExit',
+    hysteresisPct: 0.1,
+    dwellMs: 80,
+    rules: [],
+    actions: {
+      midi: {
+        enabled: true,
+        portName: '',
+        channel: 1,
+        kind: 'note',
+        note: 60,
+        velocity: 100,
+        cc: 20,
+        ccEnterValue: 127,
+        ccExitValue: 0
+      }
+    }
+  }
+}
+
 // Build a Euclidean rhythm pattern — `pulses` active hits distributed as
 // evenly as possible across `steps` total slots, then rotated by
 // `rotation` (modulo `steps`). Returns a boolean[] of length `steps`

@@ -17,11 +17,16 @@ import type {
   Cell,
   EngineState,
   GenerativeConfig,
+  InputConditionerConfig,
+  InputStage,
+  InstrumentTemplate,
+  LearnedState,
   LfoShape,
   Modulation,
   Scene,
   SequencerParams,
   Session,
+  StateTrigger,
   Track
 } from '@shared/types'
 import {
@@ -31,6 +36,63 @@ import {
   SCENE_WEIGHT_MAX,
   SCENE_WEIGHT_MIN
 } from '@shared/types'
+
+// ── Input Conditioning runtime shapes (v0.6) ─────────────────────────
+// One entry per arg slot per conditioner key; `stages[i]` is the
+// filter state for the template chain's i-th stage. Every field is
+// optional — lazily initialised on first sample per stage type.
+interface ConditionerStageState {
+  // oneEuro
+  xHat?: number
+  dxHat?: number
+  // smooth
+  y?: number
+  // median — ring of the last `window` samples (newest at end)
+  ring?: number[]
+  // slewLimit
+  out?: number
+  // deadband
+  lastOut?: number
+  // autoRange — leaky min/max envelope
+  min?: number
+  max?: number
+}
+interface ConditionerSlotState {
+  lastT: number
+  stages: ConditionerStageState[]
+}
+// (v0.6) Per-parameter hardware scaling: linear map from the device's
+// native range onto the parameter's output range, clamped. Swapped out
+// bounds invert. Degenerate in-range returns outMin (no divide-by-~0).
+function applyHardwareScale(
+  cfg: import('@shared/types').HardwareScaleConfig,
+  v: number
+): number {
+  if (!Number.isFinite(v)) return v
+  const inSpan = cfg.inMax - cfg.inMin
+  if (Math.abs(inSpan) < 1e-12) return cfg.outMin
+  const t = (v - cfg.inMin) / inSpan
+  const out = cfg.outMin + t * (cfg.outMax - cfg.outMin)
+  const lo = Math.min(cfg.outMin, cfg.outMax)
+  const hi = Math.max(cfg.outMin, cfg.outMax)
+  return Math.max(lo, Math.min(hi, out))
+}
+
+// Hard cap on distinct (template|device|address) conditioner keys so a
+// port-churning source can't grow the map unbounded (same rationale as
+// MAX_HW_MOVEMENT_DEVICES).
+const MAX_CONDITIONER_KEYS = 512
+// Scope ring length: ~40 s of 50 Hz packets, so the UI can offer an
+// editable time window up to ~30 s without starving. Each poll can
+// request a windowMs to bound how much of this it actually ships.
+const CONDITIONER_SCOPE_LEN = 2000
+// How long a scope watch survives without being polled. Long enough
+// that leaving a Parameter inspector and coming back within 5 minutes
+// finds the scope still populated + rolling (the engine keeps
+// collecting samples for live watches even while nobody is looking —
+// it's a cheap array push per matching packet). After this it's
+// pruned and its buffer freed.
+const CONDITIONER_SCOPE_TTL_MS = 5 * 60 * 1000
 
 // Generative history ring buffer length. Caps the no-repeat memory
 // and the shuffle-cycle "already played" set. ~24 entries covers a
@@ -1026,6 +1088,69 @@ export class SceneEngine {
   // updateSession when the session changes; cleared on first read.
   private generativeSimDirty = true
 
+  // ── Input Conditioning runtime state (v0.6) ──────────────────────
+  // Per (templateId | deviceKey | address) → per-slot array of
+  // per-stage filter states (index-parallel to the template's
+  // conditioner.stages). All numeric fields lazily initialised on the
+  // first sample so a chain edit mid-stream re-warms cleanly.
+  private conditionerState: Map<string, ConditionerSlotState[]> = new Map()
+  // Live scope taps for the Input Conditioning UI. Keyed
+  // `${templateId}|${address}|${slot}` so MULTIPLE surfaces can watch
+  // at once (the Instrument section's scope AND a Parameter
+  // inspector's scope). TTL model: polling a watch refreshes its
+  // lastPollMs; handleHardwareInput prunes watches not polled in
+  // ~1.5s, so a closed/unmounted scope stops costing anything without
+  // any explicit teardown. Empty map = zero per-packet cost.
+  private conditionerScopes: Map<
+    string,
+    {
+      templateId: string
+      address: string
+      slot: number
+      lastPollMs: number
+      buf: { t: number; raw: number; cond: number }[]
+    }
+  > = new Map()
+
+  // ── Live hardware input readout (v0.6) ───────────────────────────
+  // Latest RAW incoming values per OSC address (across all HW-Mode
+  // devices), with a wall-clock stamp for freshness. Emitted (pruned
+  // by age) in EngineState so each Parameter row's sidebar can show a
+  // red dot + the value the controller is currently sending to its
+  // address — a live monitor independent of catch state. Keyed by
+  // address; multiple devices sharing an address is a non-issue in
+  // practice (last write wins).
+  private hardwareLiveByAddress: Map<
+    string,
+    { raw: number[]; cond: number[]; atMs: number }
+  > = new Map()
+
+  // ── State Trigger runtime state (v0.6) ───────────────────────────
+  // Latest CONDITIONED values per device, per address — the working
+  // memory rules/learned detectors match against. A state can span
+  // several addresses; each packet refreshes one address and the
+  // detector reads the latest snapshot of all of them.
+  private stateInputLatest: Map<string, Map<string, number[]>> = new Map()
+  // Per `${templateId}|${stateId}` detector state machine.
+  private stateTriggerRuntime: Map<
+    string,
+    { active: boolean; matchSince: number; lastCcSent: number }
+  > = new Map()
+  // Live match score per `${templateId}|${stateId}` — polled by the
+  // renderer's State Triggers section (10 Hz while expanded) rather
+  // than pushed through emitState, keeping the 50 Hz packet path off
+  // the heavyweight state-emit.
+  private stateTriggerLive: Map<string, number> = new Map()
+  // In-flight learn-by-demonstration recording session, or null.
+  private stateRecording: {
+    templateId: string
+    stateId: string
+    until: number
+    samples: Map<string, number[][]>
+    finalize: (result: LearnedState | null) => void
+    timer: NodeJS.Timeout
+  } | null = null
+
   async start(): Promise<void> {
     await this.sender.start()
     this.startTicker()
@@ -1160,6 +1285,27 @@ export class SceneEngine {
     for (const k of Object.keys(hardwareCaughtByTrack)) {
       hardwareCaughtByTrack[k].sort((a, b) => a - b)
     }
+    // (v0.6) Flatten the live hardware readout, pruning addresses not
+    // seen in the last 5 s so a controller that stops streaming stops
+    // showing a stale value. Only emitted when non-empty.
+    let hardwareLiveByAddress:
+      | Record<string, { raw: number[]; cond: number[]; t: number }>
+      | undefined
+    if (this.hardwareLiveByAddress.size > 0) {
+      const nowMs = Date.now()
+      for (const [addr, entry] of this.hardwareLiveByAddress) {
+        if (nowMs - entry.atMs > 5000) {
+          this.hardwareLiveByAddress.delete(addr)
+          continue
+        }
+        if (!hardwareLiveByAddress) hardwareLiveByAddress = {}
+        hardwareLiveByAddress[addr] = {
+          raw: entry.raw,
+          cond: entry.cond,
+          t: entry.atMs
+        }
+      }
+    }
     // Flatten the per-scene rolled-duration map into a Record only
     // when non-empty -- keeps the IPC payload tight at boot and
     // when generative mode has never been used.
@@ -1183,7 +1329,8 @@ export class SceneEngine {
       lastEmittedVelocityByCell: lastVel,
       ...(generativeRolledBySceneId
         ? { generativeRolledBySceneId }
-        : {})
+        : {}),
+      ...(hardwareLiveByAddress ? { hardwareLiveByAddress } : {})
     })
   }
 
@@ -1328,6 +1475,69 @@ export class SceneEngine {
     // forever false → nothing ever catches) and leak one map entry per
     // port. The ip-only key keeps a single stable baseline per device.
     const deviceKey = anyIpOnly ? ip : `${ip}:${port}`
+    // ── Input Conditioning (v0.6) ─────────────────────────────────
+    // Apply the FIRST matched template's enabled conditioner chain to
+    // the raw args BEFORE movement detection, so catch gates, override
+    // values, State Triggers, and the red live display all see the
+    // conditioned stream. "First matched" follows the existing
+    // matchedTemplates[0] precedent used for movement thresholds —
+    // one device is bound to one template in every real session.
+    const rawArgs = numericArgs
+    const condTpl = matchedTemplates.find(
+      (t) =>
+        t.inputConditioner?.enabled &&
+        t.inputConditioner.stages.some((s) => s.enabled)
+    )
+    if (condTpl) {
+      numericArgs = this.applyInputConditioning(
+        condTpl,
+        deviceKey,
+        address,
+        numericArgs,
+        now
+      )
+    }
+    // Live readout: stash the RAW incoming values for this address so
+    // the Parameter sidebar can show "what the controller is sending".
+    // Capped so a flood of distinct addresses can't grow it unbounded.
+    if (this.hardwareLiveByAddress.size >= 256 && !this.hardwareLiveByAddress.has(address)) {
+      const oldest = this.hardwareLiveByAddress.keys().next().value
+      if (oldest !== undefined) this.hardwareLiveByAddress.delete(oldest)
+    }
+    // Store BOTH raw and conditioned (post-Input-Conditioning) so the
+    // track readout can show the raw stream OR the scaled-of-conditioned
+    // value (scaling is applied to the conditioned value in the catch
+    // loop below, so the renderer scales `cond` to match exactly).
+    this.hardwareLiveByAddress.set(address, {
+      raw: rawArgs.slice(),
+      cond: numericArgs.slice(),
+      atMs: now
+    })
+    // Scope taps for the conditioning UI — push raw vs conditioned for
+    // every LIVE watch on this (template, address, slot). Taps even
+    // when no chain is enabled (cond === raw) so the scope shows the
+    // live signal while the user is still assembling the chain. Prune
+    // stale watches (not polled recently) so a closed scope stops
+    // costing anything.
+    if (this.conditionerScopes.size > 0) {
+      for (const [k, w] of this.conditionerScopes) {
+        if (now - w.lastPollMs > CONDITIONER_SCOPE_TTL_MS) {
+          this.conditionerScopes.delete(k)
+          continue
+        }
+        if (
+          w.address === address &&
+          w.slot >= 0 &&
+          w.slot < rawArgs.length &&
+          matchedTemplates.some((t) => t.id === w.templateId)
+        ) {
+          w.buf.push({ t: now, raw: rawArgs[w.slot], cond: numericArgs[w.slot] })
+          if (w.buf.length > CONDITIONER_SCOPE_LEN) {
+            w.buf.splice(0, w.buf.length - CONDITIONER_SCOPE_LEN)
+          }
+        }
+      }
+    }
     // (Bug 1 FIX) Cap the per-device movement maps and evict oldest —
     // nothing ever clears these, so without a bound a churning source
     // (or many devices) grows them unbounded. Map preserves insertion
@@ -1463,6 +1673,13 @@ export class SceneEngine {
           hw.args && hw.args[fnId] && hw.args[fnId].length > 0
             ? hw.args[fnId]
             : null  // null = unlocked, hardware controls all slots
+        // (v0.6) Per-parameter hardware scaling — resolved once per
+        // track, applied to every slot's hwVal below. MUST happen
+        // before the catch-tolerance comparison so catches are
+        // evaluated in the parameter's OUTPUT space (a 0..360°
+        // device could otherwise never approach a 0..1 scene value).
+        const hwScale =
+          hw.scaling && hw.scaling[fnId]?.enabled ? hw.scaling[fnId] : null
         for (let i = 0; i < numericArgs.length; i++) {
           if (lockedSlots && !lockedSlots.includes(i)) continue
           // Resolve argType BEFORE the movement gate. Discrete slots
@@ -1514,7 +1731,9 @@ export class SceneEngine {
           //   streams and sibling-slot multi-arg updates don't
           //   re-catch; an actual flip catches instantly regardless
           //   of timing.
-          const hwVal = numericArgs[i]
+          const hwVal = hwScale
+            ? applyHardwareScale(hwScale, numericArgs[i])
+            : numericArgs[i]
           const catchKey = `${track.id}|${i}`
           // (Bug 33 FIX) Already-caught refresh runs BEFORE the
           // movement/change gate. Catches restored from
@@ -1583,6 +1802,531 @@ export class SceneEngine {
         }
       }
     }
+
+    // ── State Triggers + learn-recording (v0.6) ───────────────────
+    // Refresh the per-device latest-values snapshot with the
+    // CONDITIONED args, feed an in-flight Record session, then run
+    // every matched template's state detectors against the snapshot.
+    let latestByAddress = this.stateInputLatest.get(deviceKey)
+    if (!latestByAddress) {
+      latestByAddress = new Map()
+      this.stateInputLatest.set(deviceKey, latestByAddress)
+      // Same eviction discipline as the movement maps.
+      if (this.stateInputLatest.size > MAX_CONDITIONER_KEYS) {
+        const oldest = this.stateInputLatest.keys().next().value
+        if (oldest !== undefined && oldest !== deviceKey) {
+          this.stateInputLatest.delete(oldest)
+        }
+      }
+    }
+    latestByAddress.set(address, numericArgs.slice())
+    const rec = this.stateRecording
+    if (rec && matchedTemplates.some((t) => t.id === rec.templateId)) {
+      if (now <= rec.until) {
+        let arr = rec.samples.get(address)
+        if (!arr) {
+          arr = []
+          rec.samples.set(address, arr)
+        }
+        arr.push(numericArgs.slice())
+      } else {
+        this.finishStateRecording()
+      }
+    }
+    for (const tpl of matchedTemplates) {
+      // Don't fire triggers on the template being recorded — the user
+      // is deliberately holding a pose; firing mid-record is noise.
+      if (rec && rec.templateId === tpl.id) continue
+      if (tpl.stateTriggers && tpl.stateTriggers.length > 0) {
+        this.evaluateStateTriggers(tpl, latestByAddress, now)
+      }
+    }
+  }
+
+  // ── Input Conditioning chain (v0.6) ───────────────────────────────
+  // Runs the template's enabled stages over every arg slot. Filter
+  // state is keyed (templateId | deviceKey | address); slot states are
+  // index-parallel to the chain so edits re-warm from scratch when the
+  // stage count changes.
+  private applyInputConditioning(
+    tpl: InstrumentTemplate,
+    deviceKey: string,
+    address: string,
+    args: number[],
+    now: number
+  ): number[] {
+    const cfg = tpl.inputConditioner as InputConditionerConfig
+    const key = `${tpl.id}|${deviceKey}|${address}`
+    let slots = this.conditionerState.get(key)
+    if (!slots) {
+      slots = []
+      if (this.conditionerState.size >= MAX_CONDITIONER_KEYS) {
+        const oldest = this.conditionerState.keys().next().value
+        if (oldest !== undefined) this.conditionerState.delete(oldest)
+      }
+      this.conditionerState.set(key, slots)
+    }
+    const bypass = cfg.slotBypass ?? []
+    const out = args.slice()
+    for (let i = 0; i < out.length; i++) {
+      if (!Number.isFinite(out[i])) continue
+      if (bypass.includes(i)) continue
+      let st = slots[i]
+      // Re-warm when the chain length changed (stage added/removed) —
+      // stale per-stage state from a different chain shape is garbage.
+      if (!st || st.stages.length !== cfg.stages.length) {
+        st = {
+          lastT: now,
+          stages: cfg.stages.map(() => ({}))
+        }
+        slots[i] = st
+      }
+      // dt in seconds, clamped: a long gap (sensor unplugged) re-warms
+      // rather than producing one giant integration step.
+      const dtSec = Math.min(2, Math.max(0.001, (now - st.lastT) / 1000))
+      let v = out[i]
+      for (let s = 0; s < cfg.stages.length; s++) {
+        const stage = cfg.stages[s]
+        if (!stage.enabled) continue
+        // (v0.6) Address targeting — a stage with an explicit address
+        // only touches that address. Empty/undefined = all addresses.
+        if (stage.address && stage.address !== address) continue
+        v = this.applyStage(stage, st.stages[s], v, dtSec)
+      }
+      st.lastT = now
+      out[i] = v
+    }
+    return out
+  }
+
+  // One stage, one slot, one sample. `ss` is this stage's persistent
+  // state for the slot; mutated in place.
+  private applyStage(
+    stage: InputStage,
+    ss: ConditionerStageState,
+    x: number,
+    dtSec: number
+  ): number {
+    switch (stage.type) {
+      case 'oneEuro': {
+        // Casiez 1€: EMA whose cutoff rises with speed.
+        //   alpha(dt, fc) = 1 / (1 + tau/dt), tau = 1/(2π·fc)
+        const minCutoff = Math.max(0.01, stage.minCutoffHz ?? 1.0)
+        const beta = Math.max(0, stage.beta ?? 0.02)
+        if (ss.xHat === undefined || !Number.isFinite(ss.xHat)) {
+          ss.xHat = x
+          ss.dxHat = 0
+          return x
+        }
+        const alphaFor = (fc: number): number => {
+          const tau = 1 / (2 * Math.PI * fc)
+          return 1 / (1 + tau / dtSec)
+        }
+        const dx = (x - ss.xHat) / dtSec
+        // Derivative low-passed at a fixed 1 Hz (paper's dcutoff).
+        const aD = alphaFor(1.0)
+        ss.dxHat = (ss.dxHat ?? 0) + aD * (dx - (ss.dxHat ?? 0))
+        const cutoff = minCutoff + beta * Math.abs(ss.dxHat)
+        const aX = alphaFor(cutoff)
+        ss.xHat = ss.xHat + aX * (x - ss.xHat)
+        return ss.xHat
+      }
+      case 'smooth': {
+        // Same one-pole shape as the Slew modulator's filter:
+        //   y += (x − y) · (1 − 2^(−dtMs / halfLife))
+        const hl = Math.max(1, stage.halfLifeMs ?? 60)
+        if (ss.y === undefined || !Number.isFinite(ss.y)) {
+          ss.y = x
+          return x
+        }
+        const alpha = 1 - Math.pow(2, (-dtSec * 1000) / hl)
+        ss.y += (x - ss.y) * alpha
+        return ss.y
+      }
+      case 'median': {
+        const w = Math.max(3, Math.min(9, Math.floor(stage.window ?? 3)) | 1)
+        if (!ss.ring) ss.ring = []
+        ss.ring.push(x)
+        if (ss.ring.length > w) ss.ring.splice(0, ss.ring.length - w)
+        const sorted = ss.ring.slice().sort((a, b) => a - b)
+        return sorted[Math.floor(sorted.length / 2)]
+      }
+      case 'slewLimit': {
+        const rate = Math.max(0, stage.maxPerSec ?? 2)
+        if (ss.out === undefined || !Number.isFinite(ss.out)) {
+          ss.out = x
+          return x
+        }
+        const maxStep = rate * dtSec
+        const delta = x - ss.out
+        ss.out += Math.max(-maxStep, Math.min(maxStep, delta))
+        return ss.out
+      }
+      case 'deadband': {
+        const eps = Math.max(0, stage.epsilon ?? 0.002)
+        if (ss.lastOut === undefined || !Number.isFinite(ss.lastOut)) {
+          ss.lastOut = x
+          return x
+        }
+        if (Math.abs(x - ss.lastOut) < eps) return ss.lastOut
+        ss.lastOut = x
+        return x
+      }
+      case 'autoRange': {
+        // Leaky min/max envelope → rescale to 0..1. Expansion is
+        // instant; contraction (when configured) forgets old extremes
+        // with a half-life so one historic spike doesn't squash the
+        // live range forever.
+        if (ss.min === undefined || !Number.isFinite(ss.min)) ss.min = x
+        if (ss.max === undefined || !Number.isFinite(ss.max)) ss.max = x
+        if (x < ss.min) ss.min = x
+        if (x > ss.max) ss.max = x
+        const hl = stage.contractHalfLifeMs ?? 0
+        if (hl > 0) {
+          const k = 1 - Math.pow(2, (-dtSec * 1000) / Math.max(1, hl))
+          ss.min += (x - ss.min) * k
+          ss.max -= (ss.max - x) * k
+          if (ss.min > ss.max) {
+            ss.min = x
+            ss.max = x
+          }
+        }
+        const range = ss.max - ss.min
+        // Degenerate range (first samples of a static stream): center.
+        if (range < 1e-9) return 0.5
+        return (x - ss.min) / range
+      }
+    }
+  }
+
+  // ── State Trigger evaluation (v0.6) ───────────────────────────────
+  // Runs every enabled trigger of one template against the device's
+  // latest conditioned snapshot. Enter requires the detector to match
+  // continuously for dwellMs; exit uses a hysteresis-expanded region
+  // so boundary jitter can't machine-gun MIDI.
+  private evaluateStateTriggers(
+    tpl: InstrumentTemplate,
+    latestByAddress: Map<string, number[]>,
+    now: number
+  ): void {
+    const midiOk = this.session?.midiEnabled === true
+    for (const trig of tpl.stateTriggers ?? []) {
+      const key = `${tpl.id}|${trig.id}`
+      if (!trig.enabled) {
+        this.stateTriggerLive.delete(key)
+        continue
+      }
+      let rt = this.stateTriggerRuntime.get(key)
+      if (!rt) {
+        rt = { active: false, matchSince: 0, lastCcSent: -1 }
+        this.stateTriggerRuntime.set(key, rt)
+      }
+      const { score, matched, matchedWithHysteresis } = this.computeStateMatch(
+        trig,
+        latestByAddress
+      )
+      this.stateTriggerLive.set(key, score)
+      const m = trig.actions.midi
+      const canMidi = midiOk && m?.enabled === true && !!m.portName
+      // Continuous mode: stream the live score as a CC, change-gated so
+      // a static pose doesn't spam identical bytes at packet rate.
+      if (trig.mode === 'continuous' && canMidi && m!.kind === 'cc') {
+        const ccVal = Math.max(0, Math.min(127, Math.round(score * 127)))
+        if (ccVal !== rt.lastCcSent) {
+          rt.lastCcSent = ccVal
+          this.midiSender.sendCc(
+            m!.portName,
+            m!.channel,
+            Math.max(0, Math.min(127, Math.floor(m!.cc ?? 20))),
+            ccVal
+          )
+        }
+      }
+      if (!rt.active) {
+        if (matched) {
+          if (rt.matchSince === 0) rt.matchSince = now
+          if (now - rt.matchSince >= Math.max(0, trig.dwellMs)) {
+            rt.active = true
+            rt.matchSince = 0
+            this.fireStateEnter(trig, canMidi)
+          }
+        } else {
+          rt.matchSince = 0
+        }
+      } else if (!matchedWithHysteresis) {
+        rt.active = false
+        rt.matchSince = 0
+        this.fireStateExit(trig, canMidi)
+      }
+    }
+  }
+
+  // Detector → {score 0..1, matched, matchedWithHysteresis}. Rules give
+  // a graded score (mean closeness across rules) so continuous mode is
+  // useful with rules too; learned gives a Gaussian-ish closeness to
+  // the recorded centroid.
+  private computeStateMatch(
+    trig: StateTrigger,
+    latestByAddress: Map<string, number[]>
+  ): { score: number; matched: boolean; matchedWithHysteresis: boolean } {
+    const hyst = Math.max(0, Math.min(0.5, trig.hysteresisPct))
+    if (trig.detector === 'learned') {
+      const L = trig.learned
+      if (!L || L.dims.length === 0) {
+        return { score: 0, matched: false, matchedWithHysteresis: false }
+      }
+      let sumZ2 = 0
+      for (let i = 0; i < L.dims.length; i++) {
+        const d = L.dims[i]
+        const args = latestByAddress.get(d.address)
+        const v = args?.[d.slot]
+        if (typeof v !== 'number' || !Number.isFinite(v)) {
+          // Unseen dimension → treat as ~3σ away rather than unknown:
+          // a pose can't match while part of it has never arrived.
+          sumZ2 += 9
+          continue
+        }
+        const c = L.centroid[i]
+        // Variance floor keeps a perfectly-still recorded dim from
+        // becoming a razor edge (divide-by-~zero).
+        const floor = Math.pow(0.015 * Math.max(Math.abs(c), 0.05), 2)
+        const varF = Math.max(L.variance[i], floor, 1e-8)
+        const dz = v - c
+        sumZ2 += (dz * dz) / varF
+      }
+      const score = Math.exp(-0.5 * (sumZ2 / L.dims.length))
+      const thr = Math.max(0.001, Math.min(1, L.threshold))
+      return {
+        score,
+        matched: score >= thr,
+        matchedWithHysteresis: score >= thr * (1 - hyst)
+      }
+    }
+    // Rules — AND-combined. Each rule contributes a "distance outside
+    // the accepted region" normalized by the rule's span; hysteresis
+    // widens the region for the exit test.
+    if (trig.rules.length === 0) {
+      return { score: 0, matched: false, matchedWithHysteresis: false }
+    }
+    let all = true
+    let allH = true
+    let closeness = 0
+    for (const rule of trig.rules) {
+      const args = latestByAddress.get(rule.address)
+      const v = args?.[rule.slot]
+      if (typeof v !== 'number' || !Number.isFinite(v)) {
+        all = false
+        allH = false
+        continue
+      }
+      // Per-op span used to normalize distance + scale hysteresis.
+      const tol =
+        rule.tol ?? Math.max(0.02 * Math.max(Math.abs(rule.a), 0.5), 1e-4)
+      let dist = 0 // 0 = inside the region
+      let span = 1
+      switch (rule.op) {
+        case 'eq': {
+          dist = Math.max(0, Math.abs(v - rule.a) - tol)
+          span = Math.max(tol, 1e-9)
+          break
+        }
+        case 'range': {
+          const lo = Math.min(rule.a, rule.b ?? rule.a)
+          const hi = Math.max(rule.a, rule.b ?? rule.a)
+          dist = v < lo ? lo - v : v > hi ? v - hi : 0
+          span = Math.max(hi - lo, 1e-9)
+          break
+        }
+        case 'gt': {
+          dist = v > rule.a ? 0 : rule.a - v
+          span = Math.max(Math.abs(rule.a) * 0.1, tol)
+          break
+        }
+        case 'lt': {
+          dist = v < rule.a ? 0 : v - rule.a
+          span = Math.max(Math.abs(rule.a) * 0.1, tol)
+          break
+        }
+      }
+      const dNorm = dist / span
+      if (dNorm > 0) all = false
+      if (dNorm > hyst) allH = false
+      closeness += Math.max(0, 1 - Math.min(1, dNorm))
+    }
+    return {
+      score: closeness / trig.rules.length,
+      matched: all,
+      // Exit only when some rule leaves the hysteresis-widened region.
+      matchedWithHysteresis: allH
+    }
+  }
+
+  private fireStateEnter(trig: StateTrigger, canMidi: boolean): void {
+    const m = trig.actions.midi
+    if (canMidi && m && trig.mode !== 'continuous') {
+      if (m.kind === 'note') {
+        const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
+        const vel = Math.max(1, Math.min(127, Math.floor(m.velocity ?? 100)))
+        this.midiSender.sendNoteOn(m.portName, m.channel, note, vel)
+      } else {
+        const cc = Math.max(0, Math.min(127, Math.floor(m.cc ?? 20)))
+        const val = Math.max(0, Math.min(127, Math.floor(m.ccEnterValue ?? 127)))
+        this.midiSender.sendCc(m.portName, m.channel, cc, val)
+      }
+    }
+    // Scene trigger fires at enter for EVERY mode — it's a trigger,
+    // not a gate; the scene lives its own lifecycle afterwards.
+    const sceneId = trig.actions.triggerSceneId
+    if (sceneId && this.session?.scenes.some((s) => s.id === sceneId)) {
+      this.triggerScene(sceneId)
+    }
+  }
+
+  private fireStateExit(trig: StateTrigger, canMidi: boolean): void {
+    if (trig.mode !== 'enterExit') return
+    const m = trig.actions.midi
+    if (!canMidi || !m) return
+    if (m.kind === 'note') {
+      const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
+      this.midiSender.sendNoteOff(m.portName, m.channel, note)
+    } else {
+      const cc = Math.max(0, Math.min(127, Math.floor(m.cc ?? 20)))
+      const val = Math.max(0, Math.min(127, Math.floor(m.ccExitValue ?? 0)))
+      this.midiSender.sendCc(m.portName, m.channel, cc, val)
+    }
+  }
+
+  // ── State Trigger public API (IPC surface) ────────────────────────
+
+  /** Live match scores + active flags, polled by the renderer's State
+   *  Triggers section (~10 Hz while expanded). */
+  getStateTriggerLive(): {
+    scores: Record<string, number>
+    active: Record<string, boolean>
+  } {
+    const scores: Record<string, number> = {}
+    const active: Record<string, boolean> = {}
+    this.stateTriggerLive.forEach((v, k) => {
+      scores[k] = v
+    })
+    this.stateTriggerRuntime.forEach((rt, k) => {
+      if (rt.active) active[k] = true
+    })
+    return { scores, active }
+  }
+
+  /** Learn-by-demonstration: collect the device's conditioned stream
+   *  for `durationMs`, then reduce to centroid + variance per
+   *  (address, slot). Resolves null when nothing was received (device
+   *  silent / not bound). One recording at a time — a new call
+   *  finalizes the previous one immediately. */
+  recordStateTrigger(
+    templateId: string,
+    stateId: string,
+    durationMs: number
+  ): Promise<LearnedState | null> {
+    if (this.stateRecording) this.finishStateRecording()
+    return new Promise((resolve) => {
+      const ms = Math.max(250, Math.min(30000, durationMs))
+      // Safety timer: finalize even if the stream stops mid-recording
+      // (small grace past the window so the packet path usually wins).
+      const timer = setTimeout(() => this.finishStateRecording(), ms + 400)
+      this.stateRecording = {
+        templateId,
+        stateId,
+        until: Date.now() + ms,
+        samples: new Map(),
+        finalize: resolve,
+        timer
+      }
+    })
+  }
+
+  private finishStateRecording(): void {
+    const rec = this.stateRecording
+    if (!rec) return
+    this.stateRecording = null
+    clearTimeout(rec.timer)
+    const dims: { address: string; slot: number }[] = []
+    const centroid: number[] = []
+    const variance: number[] = []
+    const addresses = Array.from(rec.samples.keys()).sort()
+    for (const address of addresses) {
+      const rows = rec.samples.get(address)!
+      if (rows.length === 0) continue
+      const slotCount = rows.reduce((m, r) => Math.max(m, r.length), 0)
+      for (let slot = 0; slot < slotCount; slot++) {
+        let n = 0
+        let mean = 0
+        for (const r of rows) {
+          const v = r[slot]
+          if (typeof v === 'number' && Number.isFinite(v)) {
+            n++
+            mean += v
+          }
+        }
+        if (n === 0) continue
+        mean /= n
+        let varSum = 0
+        for (const r of rows) {
+          const v = r[slot]
+          if (typeof v === 'number' && Number.isFinite(v)) {
+            const d = v - mean
+            varSum += d * d
+          }
+        }
+        dims.push({ address, slot })
+        centroid.push(mean)
+        variance.push(varSum / n)
+      }
+    }
+    rec.finalize(
+      dims.length > 0
+        ? { dims, centroid, variance, threshold: 0.8 }
+        : null
+    )
+  }
+
+  // ── Conditioner scope public API (IPC surface) ────────────────────
+
+  // Poll (and implicitly register/refresh) a scope watch. Returns the
+  // watch's ring buffer of {t, raw, cond} samples. Multiple watchers
+  // coexist; each is keyed by (templateId, address, slot) and kept
+  // alive by polling — stop polling and handleHardwareInput prunes it.
+  getConditionerScope(
+    watch: { templateId: string; address: string; slot: number } | null,
+    windowMs?: number
+  ): { t: number; raw: number; cond: number }[] {
+    if (!watch) return []
+    const key = `${watch.templateId}|${watch.address}|${watch.slot}`
+    let w = this.conditionerScopes.get(key)
+    if (!w) {
+      // Cap the number of concurrent watches — a UI bug spamming fresh
+      // keys can't grow this unbounded.
+      if (this.conditionerScopes.size >= 32) {
+        const oldest = this.conditionerScopes.keys().next().value
+        if (oldest !== undefined) this.conditionerScopes.delete(oldest)
+      }
+      w = {
+        templateId: watch.templateId,
+        address: watch.address,
+        slot: watch.slot,
+        lastPollMs: Date.now(),
+        buf: []
+      }
+      this.conditionerScopes.set(key, w)
+    }
+    w.lastPollMs = Date.now()
+    // Ship only the requested time window (bounds IPC regardless of
+    // how much history the ring holds). Absent/invalid = whole buffer.
+    if (typeof windowMs === 'number' && windowMs > 0 && w.buf.length > 0) {
+      const cutoff = Date.now() - windowMs
+      // buf is time-ordered; find the first in-window index.
+      let i = w.buf.length
+      while (i > 0 && w.buf[i - 1].t >= cutoff) i--
+      return i > 0 ? w.buf.slice(i) : w.buf
+    }
+    return w.buf
   }
 
   /** Clear all hardware catch state. Called on scene change when any
@@ -1767,6 +2511,30 @@ export class SceneEngine {
     // only grow when new devices appear; safe to leave across track
     // changes. (Cleared explicitly on session load via stop()/start()
     // if needed.)
+    // (v0.6) Prune Input Conditioning + State Trigger runtime for
+    // templates/triggers that no longer exist — same leak discipline
+    // as the hardware maps above. conditionerState keys are
+    // `${tplId}|${deviceKey}|${address}`; trigger keys `${tplId}|${trigId}`.
+    {
+      const tplIds = new Set(next.pool.templates.map((t) => t.id))
+      const trigKeys = new Set<string>()
+      for (const t of next.pool.templates) {
+        for (const trg of t.stateTriggers ?? []) {
+          trigKeys.add(`${t.id}|${trg.id}`)
+        }
+      }
+      for (const k of Array.from(this.conditionerState.keys())) {
+        const pipe = k.indexOf('|')
+        const tplId = pipe > 0 ? k.slice(0, pipe) : k
+        if (!tplIds.has(tplId)) this.conditionerState.delete(k)
+      }
+      for (const k of Array.from(this.stateTriggerRuntime.keys())) {
+        if (!trigKeys.has(k)) this.stateTriggerRuntime.delete(k)
+      }
+      for (const k of Array.from(this.stateTriggerLive.keys())) {
+        if (!trigKeys.has(k)) this.stateTriggerLive.delete(k)
+      }
+    }
     // Prune liveValues entries for scenes or tracks that no longer exist.
     // Without this, switching between sessions with lots of scenes over an
     // app lifetime leaks O(scenes × tracks) string entries in `liveValues`

@@ -31,6 +31,7 @@ import {
   type PoolParameterDragPayload,
   type PoolTemplateDragPayload
 } from './PoolPane'
+import { scaleHardwareValue } from '@shared/factory'
 import type { InstrumentTemplate } from '@shared/types'
 
 // MIME for in-sidebar row reorder drags. Keeps row drags from being
@@ -431,6 +432,20 @@ export default function TrackSidebar(): JSX.Element {
                   meaningful on Function rows; Template rows already
                   show the "HW Mode On" badge below. */}
               {!isTemplate && <TrackHwCaughtDot trackId={t.id} />}
+              {/* (v0.6) Live hardware-input readout — red dot + the
+                  value the controller is currently sending to THIS
+                  Parameter's OSC address. Only shows when the parent
+                  Instrument has Hardware Mode enabled and a value has
+                  arrived recently. Independent of catch state (the
+                  caught dot above is about override; this is about
+                  "what is the sensor sending right now"). */}
+              {!isTemplate && (
+                <TrackHwLiveValue
+                  templateId={t.sourceTemplateId}
+                  fnId={t.sourceFunctionId}
+                  address={t.defaultOscAddress}
+                />
+              )}
             </div>
             {/* TEMPLATE label + +PARAM trigger share the baseline
                 row under the name input. Both use text-[9px] so they
@@ -706,5 +721,78 @@ function TrackHwCaughtDot({ trackId }: { trackId: string }): JSX.Element | null 
       title="Hardware Mode is overriding at least one arg slot of this Parameter."
       aria-hidden
     />
+  )
+}
+
+// (v0.6) Live hardware-input readout for a Parameter row. Shows a red
+// dot + the raw values the controller is currently sending to this
+// Parameter's OSC address. Gated on the parent Instrument's Hardware
+// Mode being enabled AND a value having arrived recently (the engine
+// prunes addresses unseen for >5s, so this vanishes when the device
+// stops). Dot fades when the value is >1s stale so a frozen number
+// doesn't read as live.
+function TrackHwLiveValue({
+  templateId,
+  fnId,
+  address
+}: {
+  templateId?: string
+  fnId?: string
+  address?: string
+}): JSX.Element | null {
+  // Separate selectors so each returns a STABLE reference (boolean /
+  // the scaling config object) — avoids a fresh-object re-render on
+  // every 20 Hz engine emit. Only `entry` legitimately changes live.
+  const hwEnabled = useStore((s) => {
+    if (!templateId) return false
+    const tpl = s.session.pool.templates.find((t) => t.id === templateId)
+    return tpl?.hardwareMode?.enabled === true
+  })
+  const sc = useStore((s) => {
+    if (!templateId || !fnId) return undefined
+    const tpl = s.session.pool.templates.find((t) => t.id === templateId)
+    return tpl?.hardwareMode?.scaling?.[fnId]
+  })
+  const entry = useStore((s) =>
+    address ? s.engine.hardwareLiveByAddress?.[address] : undefined
+  )
+  if (!hwEnabled || !address || !entry) return null
+  const fresh = Date.now() - entry.t < 1000
+  // When Input Scaling is on, show scale(conditioned) — exactly the
+  // value driving the parameter. Otherwise show the raw stream.
+  const scaled = sc?.enabled === true
+  const values = scaled ? entry.cond.map((v) => scaleHardwareValue(sc, v)) : entry.raw
+  const text = values
+    .map((n) => (Number.isInteger(n) ? String(n) : n.toFixed(2)))
+    .join(' ')
+  return (
+    <span
+      className="flex items-center gap-1 shrink-0"
+      title={
+        scaled
+          ? `Live hardware input on ${address} (scaled): ${text}. Raw: ${entry.raw
+              .map((n) => (Number.isInteger(n) ? String(n) : n.toFixed(2)))
+              .join(' ')}`
+          : `Live hardware input on ${address}: ${text}`
+      }
+    >
+      <span
+        className="inline-block w-2 h-2 rounded-full"
+        style={{
+          background: 'rgb(var(--c-danger))',
+          opacity: fresh ? 1 : 0.35
+        }}
+        aria-hidden
+      />
+      <span
+        className="text-[9px] tabular-nums leading-none"
+        style={{ color: 'rgb(var(--c-danger))', opacity: fresh ? 1 : 0.5 }}
+        // A tiny "×" prefix flags that this number is the SCALED value,
+        // not the raw stream (hover for both).
+      >
+        {scaled ? '×' : ''}
+        {text}
+      </span>
+    </span>
   )
 }

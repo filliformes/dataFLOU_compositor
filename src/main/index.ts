@@ -355,6 +355,31 @@ app.whenReady().then(async () => {
   // can render before this resolves and update on resolution.
   safeHandle('app:getVersion', () => app.getVersion())
 
+  // ---------- IPC: Input Conditioning + State Triggers (v0.6) ------
+  // Scope tap: a UI surface polls getScope with the (template, address,
+  // slot) it wants at ~15 Hz; the poll registers/refreshes that watch
+  // (TTL-kept, multiple watchers supported) and returns its ring
+  // buffer. Stop polling → the watch expires → zero per-packet cost.
+  safeHandle('conditioner:getScope', (_e, watch, windowMs) =>
+    engine.getConditionerScope(
+      watch && typeof watch === 'object'
+        ? (watch as { templateId: string; address: string; slot: number })
+        : null,
+      typeof windowMs === 'number' ? windowMs : undefined
+    )
+  )
+  // State Triggers: live match scores + active flags (polled ~10 Hz
+  // while the section is expanded) and the learn-by-demonstration
+  // recording round-trip (resolves with centroid/variance or null).
+  safeHandle('stateTrigger:getLive', () => engine.getStateTriggerLive())
+  safeHandle('stateTrigger:record', (_e, templateId, stateId, durationMs) =>
+    engine.recordStateTrigger(
+      String(templateId),
+      String(stateId),
+      Number(durationMs) || 2000
+    )
+  )
+
   // ---------- IPC: MIDI ----------
   // Enumerate currently-visible MIDI output ports. Renderer calls
   // this on mount + every time it opens the MIDI section of a cell

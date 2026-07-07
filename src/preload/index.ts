@@ -92,6 +92,12 @@ const api: ExposedApi = {
   // Electron's app.getVersion()). Renderer reads this once on mount
   // to populate the window title.
   appGetVersion: () => ipcRenderer.invoke('app:getVersion'),
+  // v0.6 -- Input Conditioning live scope + State Triggers
+  conditionerGetScope: (watch, windowMs) =>
+    ipcRenderer.invoke('conditioner:getScope', watch, windowMs),
+  stateTriggerGetLive: () => ipcRenderer.invoke('stateTrigger:getLive'),
+  stateTriggerRecord: (templateId, stateId, durationMs) =>
+    ipcRenderer.invoke('stateTrigger:record', templateId, stateId, durationMs),
   onNetworkDevices: (cb) => {
     const h = (
       _e: Electron.IpcRendererEvent,

@@ -12,6 +12,7 @@ import type {
   GenerativeConfig,
   GenerativeMode,
   GenerativePoolSource,
+  InputConditionerConfig,
   InstrumentFunction,
   InstrumentTemplate,
   MetaController,
@@ -30,6 +31,7 @@ import type {
   SequencerParams,
   SequenceSlotOverride,
   Session,
+  StateTrigger,
   Track,
   TrackKind
 } from '@shared/types'
@@ -70,12 +72,14 @@ import {
   makeMetaKnob,
   makeParameterSpec,
   makeScene,
+  makeStateTrigger,
   makeTemplateSpec,
   makeTemplateTrack,
   makeTrack,
   parseValueTokens
 } from '@shared/factory'
 import { checkSessionIntegrity } from './hooks/sessionIntegrity'
+import { dumpScopePrefs, loadScopePrefs } from './scopePrefs'
 
 // ---- Clip templates: persisted in localStorage so they survive app restarts.
 
@@ -231,6 +235,13 @@ interface UiState {
   // without rescaling the Scene grid. Persisted in localStorage AND
   // mirrored into session.ui.topBarScale so it travels with the file.
   topBarScale: number
+  // (v0.6) Revision counter bumped whenever a Parameter scope's frame
+  // (time / value / height) changes. The scope prefs themselves live in
+  // a module-scope Map (scopePrefs.ts) to avoid store churn, but they
+  // must still trigger App's session-flush effect so autosave + the
+  // main-process session copy stay current — this counter is that
+  // trigger. See bumpScopePrefsRev.
+  scopePrefsRev: number
   // Shared height of the scene-notes textarea in pixels. Drives header height
   // across all scene columns + the track sidebar so rows stay aligned.
   editorNotesHeight: number
@@ -507,7 +518,11 @@ export function buildSessionForSave(
       scenePaletteWidth: state.scenePaletteWidth,
       sceneInfoPanelHeight: state.sceneInfoPanelHeight,
       tracksCollapsed: state.tracksCollapsed,
-      scenesCollapsed: state.scenesCollapsed
+      scenesCollapsed: state.scenesCollapsed,
+      // (v0.6) Persist the per-scope frames (time/value/height per
+      // Parameter). Read from the module-scope Map, not store state,
+      // so height-drags don't churn the store — see scopePrefs.ts.
+      scopePrefs: dumpScopePrefs()
     },
     // (#13) Always OVERWRITE the key with the CURRENT value (possibly
     // undefined) — spreading conditionally kept a stale file-loaded
@@ -638,6 +653,21 @@ interface Actions {
     id: string,
     patch: Partial<NonNullable<InstrumentTemplate['hardwareMode']>>
   ) => void
+  // Input Conditioning (v0.6) — patch the template's smoothing chain.
+  // Same contract as setTemplateHardwareMode: partial patch, works on
+  // builtins (conditioning is a user preference, not definitional).
+  setTemplateInputConditioner: (
+    id: string,
+    patch: Partial<InputConditionerConfig>
+  ) => void
+  // State Triggers (v0.6) — CRUD on template.stateTriggers.
+  addStateTrigger: (templateId: string) => string | null // returns new state id
+  updateStateTrigger: (
+    templateId: string,
+    stateId: string,
+    patch: Partial<StateTrigger>
+  ) => void
+  removeStateTrigger: (templateId: string, stateId: string) => void
   duplicateTemplate: (id: string) => string | null
   removeTemplate: (id: string) => void
   addFunctionToTemplate: (templateId: string) => string | null  // returns new fn id
@@ -1106,6 +1136,10 @@ interface Actions {
   // Applied on top of `uiScale` so the toolbar's effective rendering
   // is `uiScale * topBarScale`.
   setTopBarScale: (s: number) => void
+  // (v0.6) Bump the scope-prefs revision so App's session-flush effect
+  // picks up a scope frame change (the prefs are stored out-of-band in
+  // scopePrefs.ts). Cheap; called from ScopeCanvas on any frame edit.
+  bumpScopePrefsRev: () => void
 
   // ── Network discovery ───────────────────────────────────────────
   // Replace the device list + status snapshot from a main-process
@@ -1345,6 +1379,7 @@ export const useStore = create<State>((set, get) => ({
   metaKnobDisplayValues: Array.from({ length: META_KNOB_COUNT }, () => 0),
   uiScale: loadUiScale(),
   topBarScale: loadTopBarScale(),
+  scopePrefsRev: 0,
   clipTemplates: loadTemplates(),
 
   setSession: (s) => {
@@ -1406,6 +1441,9 @@ export const useStore = create<State>((set, get) => ({
     // store (i.e. the default or the previous session's value).
     const ui = next.ui ?? {}
     const cur = get()
+    // (v0.6) Restore the per-scope frames into the module-scope Map so
+    // reopening a Parameter's scope shows the saved time/value/height.
+    loadScopePrefs(ui.scopePrefs)
     const uiPatch: Partial<UiState> = {}
     if (typeof ui.uiScale === 'number' && Number.isFinite(ui.uiScale)) {
       uiPatch.uiScale = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, ui.uiScale))
@@ -1808,6 +1846,86 @@ export const useStore = create<State>((set, get) => ({
         }
       }
     }),
+  setTemplateInputConditioner: (id, patch) =>
+    set((st) => {
+      const t = st.session.pool.templates.find((tt) => tt.id === id)
+      if (!t) return st
+      const merged: InputConditionerConfig = {
+        enabled: false,
+        stages: [],
+        slotBypass: [],
+        ...t.inputConditioner,
+        ...patch
+      }
+      return {
+        session: {
+          ...st.session,
+          pool: {
+            ...st.session.pool,
+            templates: st.session.pool.templates.map((tt) =>
+              tt.id === id ? { ...tt, inputConditioner: merged } : tt
+            )
+          }
+        }
+      }
+    }),
+  addStateTrigger: (templateId) => {
+    const t = get().session.pool.templates.find((tt) => tt.id === templateId)
+    if (!t) return null
+    const trigger = makeStateTrigger(t.stateTriggers?.length ?? 0)
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? { ...tt, stateTriggers: [...(tt.stateTriggers ?? []), trigger] }
+              : tt
+          )
+        }
+      }
+    }))
+    return trigger.id
+  },
+  updateStateTrigger: (templateId, stateId, patch) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  stateTriggers: (tt.stateTriggers ?? []).map((s) =>
+                    s.id === stateId ? { ...s, ...patch } : s
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    })),
+  removeStateTrigger: (templateId, stateId) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  stateTriggers: (tt.stateTriggers ?? []).filter(
+                    (s) => s.id !== stateId
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    })),
   duplicateTemplate: (id) => {
     const src = get().session.pool.templates.find((t) => t.id === id)
     if (!src) return null
@@ -4358,6 +4476,7 @@ export const useStore = create<State>((set, get) => ({
         Math.min(TOPBAR_SCALE_MAX, s)
       )
     }),
+  bumpScopePrefsRev: () => set((s) => ({ scopePrefsRev: s.scopePrefsRev + 1 })),
 
   setNetworkSnapshot: (devices, status) =>
     set({ networkDevices: devices, networkStatus: status }),
@@ -6004,6 +6123,188 @@ function sanitizeFunction(raw: unknown, idx: number): InstrumentFunction | null 
   }
 }
 
+// Input Conditioning (v0.6) — shape-validated copy so hand-edited /
+// malformed session files can't inject a broken chain. Same rationale
+// as the hardwareMode block in sanitizeTemplate (v0.5.9 lesson: every
+// persisted Template field must round-trip through BOTH sanitizers).
+const VALID_INPUT_STAGE_TYPES = new Set([
+  'oneEuro',
+  'smooth',
+  'median',
+  'slewLimit',
+  'deadband',
+  'autoRange'
+])
+function sanitizeInputConditioner(
+  raw: unknown
+): InputConditionerConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  const stages = (Array.isArray(r.stages) ? r.stages : [])
+    .filter(
+      (s): s is Record<string, unknown> =>
+        !!s &&
+        typeof s === 'object' &&
+        typeof (s as Record<string, unknown>).type === 'string' &&
+        VALID_INPUT_STAGE_TYPES.has((s as Record<string, unknown>).type as string)
+    )
+    .map((s, i) => ({
+      id: typeof s.id === 'string' ? s.id : `istg_load_${i}`,
+      type: s.type as InputConditionerConfig['stages'][number]['type'],
+      enabled: s.enabled !== false,
+      ...(typeof s.address === 'string' && s.address ? { address: s.address } : {}),
+      ...(typeof s.minCutoffHz === 'number' ? { minCutoffHz: s.minCutoffHz } : {}),
+      ...(typeof s.beta === 'number' ? { beta: s.beta } : {}),
+      ...(typeof s.halfLifeMs === 'number' ? { halfLifeMs: s.halfLifeMs } : {}),
+      ...(typeof s.window === 'number' ? { window: s.window } : {}),
+      ...(typeof s.maxPerSec === 'number' ? { maxPerSec: s.maxPerSec } : {}),
+      ...(typeof s.epsilon === 'number' ? { epsilon: s.epsilon } : {}),
+      ...(typeof s.contractHalfLifeMs === 'number'
+        ? { contractHalfLifeMs: s.contractHalfLifeMs }
+        : {})
+    }))
+  return {
+    enabled: r.enabled === true,
+    stages,
+    slotBypass: Array.isArray(r.slotBypass)
+      ? (r.slotBypass as unknown[]).filter(
+          (x): x is number => typeof x === 'number' && Number.isInteger(x)
+        )
+      : []
+  }
+}
+
+// State Triggers (v0.6) — same shape-validated round-trip contract.
+function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: StateTrigger[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const r = item as Record<string, unknown>
+    if (typeof r.id !== 'string' || typeof r.name !== 'string') continue
+    const rules = (Array.isArray(r.rules) ? r.rules : [])
+      .filter(
+        (ru): ru is Record<string, unknown> =>
+          !!ru &&
+          typeof ru === 'object' &&
+          typeof (ru as Record<string, unknown>).address === 'string' &&
+          typeof (ru as Record<string, unknown>).a === 'number'
+      )
+      .map((ru) => ({
+        address: ru.address as string,
+        slot:
+          typeof ru.slot === 'number' && Number.isInteger(ru.slot)
+            ? (ru.slot as number)
+            : 0,
+        op: (ru.op === 'range' || ru.op === 'gt' || ru.op === 'lt'
+          ? ru.op
+          : 'eq') as StateTrigger['rules'][number]['op'],
+        a: ru.a as number,
+        ...(typeof ru.b === 'number' ? { b: ru.b } : {}),
+        ...(typeof ru.tol === 'number' ? { tol: ru.tol } : {})
+      }))
+    const learnedRaw = r.learned as Record<string, unknown> | undefined
+    let learned: StateTrigger['learned']
+    if (
+      learnedRaw &&
+      typeof learnedRaw === 'object' &&
+      Array.isArray(learnedRaw.dims) &&
+      Array.isArray(learnedRaw.centroid) &&
+      Array.isArray(learnedRaw.variance)
+    ) {
+      const dims = (learnedRaw.dims as unknown[])
+        .filter(
+          (d): d is Record<string, unknown> =>
+            !!d &&
+            typeof d === 'object' &&
+            typeof (d as Record<string, unknown>).address === 'string'
+        )
+        .map((d) => ({
+          address: d.address as string,
+          slot:
+            typeof d.slot === 'number' && Number.isInteger(d.slot)
+              ? (d.slot as number)
+              : 0
+        }))
+      const centroid = (learnedRaw.centroid as unknown[]).filter(
+        (x): x is number => typeof x === 'number' && Number.isFinite(x)
+      )
+      const variance = (learnedRaw.variance as unknown[]).filter(
+        (x): x is number => typeof x === 'number' && Number.isFinite(x)
+      )
+      // Dims / centroid / variance must be index-aligned; a truncated
+      // or hand-edited mismatch invalidates the whole model.
+      if (dims.length > 0 && dims.length === centroid.length && dims.length === variance.length) {
+        learned = {
+          dims,
+          centroid,
+          variance,
+          threshold:
+            typeof learnedRaw.threshold === 'number'
+              ? Math.max(0, Math.min(1, learnedRaw.threshold))
+              : 0.8
+        }
+      }
+    }
+    const midiRaw = (r.actions as Record<string, unknown> | undefined)?.midi as
+      | Record<string, unknown>
+      | undefined
+    out.push({
+      id: r.id,
+      name: r.name,
+      enabled: r.enabled !== false,
+      detector: r.detector === 'learned' ? 'learned' : 'rules',
+      mode:
+        r.mode === 'oneShot' || r.mode === 'continuous'
+          ? (r.mode as StateTrigger['mode'])
+          : 'enterExit',
+      hysteresisPct:
+        typeof r.hysteresisPct === 'number'
+          ? Math.max(0, Math.min(0.5, r.hysteresisPct))
+          : 0.1,
+      dwellMs:
+        typeof r.dwellMs === 'number' ? Math.max(0, r.dwellMs) : 80,
+      rules,
+      ...(learned ? { learned } : {}),
+      actions: {
+        ...(midiRaw && typeof midiRaw === 'object'
+          ? {
+              midi: {
+                enabled: midiRaw.enabled !== false,
+                portName:
+                  typeof midiRaw.portName === 'string' ? midiRaw.portName : '',
+                channel:
+                  typeof midiRaw.channel === 'number'
+                    ? Math.max(1, Math.min(16, Math.round(midiRaw.channel)))
+                    : 1,
+                kind: midiRaw.kind === 'cc' ? 'cc' : 'note',
+                ...(typeof midiRaw.note === 'number' ? { note: midiRaw.note } : {}),
+                ...(typeof midiRaw.velocity === 'number'
+                  ? { velocity: midiRaw.velocity }
+                  : {}),
+                ...(typeof midiRaw.cc === 'number' ? { cc: midiRaw.cc } : {}),
+                ...(typeof midiRaw.ccEnterValue === 'number'
+                  ? { ccEnterValue: midiRaw.ccEnterValue }
+                  : {}),
+                ...(typeof midiRaw.ccExitValue === 'number'
+                  ? { ccExitValue: midiRaw.ccExitValue }
+                  : {})
+              }
+            }
+          : {}),
+        ...(typeof (r.actions as Record<string, unknown> | undefined)
+          ?.triggerSceneId === 'string'
+          ? {
+              triggerSceneId: (r.actions as Record<string, unknown>)
+                .triggerSceneId as string
+            }
+          : {})
+      }
+    })
+  }
+  return out.length > 0 ? out : undefined
+}
+
 function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
   if (!raw || typeof raw !== 'object') return null
   const r = raw as Record<string, unknown>
@@ -6063,9 +6364,45 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
       // recognised value; absent/invalid falls back to 'catch' at use.
       ...(hwRaw.takeover === 'catch' || hwRaw.takeover === 'jump'
         ? { takeover: hwRaw.takeover }
+        : {}),
+      // (v0.6) Per-parameter HW scaling — shape-validated per entry so
+      // a malformed record can't survive into the engine.
+      ...(hwRaw.scaling && typeof hwRaw.scaling === 'object'
+        ? {
+            scaling: Object.fromEntries(
+              Object.entries(hwRaw.scaling as Record<string, unknown>)
+                .filter(
+                  (
+                    e
+                  ): e is [
+                    string,
+                    { enabled?: unknown; inMin?: unknown; inMax?: unknown; outMin?: unknown; outMax?: unknown }
+                  ] =>
+                    !!e[1] &&
+                    typeof e[1] === 'object' &&
+                    typeof (e[1] as Record<string, unknown>).inMin === 'number' &&
+                    typeof (e[1] as Record<string, unknown>).inMax === 'number' &&
+                    typeof (e[1] as Record<string, unknown>).outMin === 'number' &&
+                    typeof (e[1] as Record<string, unknown>).outMax === 'number'
+                )
+                .map(([fnId, s]) => [
+                  fnId,
+                  {
+                    enabled: s.enabled === true,
+                    inMin: s.inMin as number,
+                    inMax: s.inMax as number,
+                    outMin: s.outMin as number,
+                    outMax: s.outMax as number
+                  }
+                ])
+            )
+          }
         : {})
     }
   }
+  // v0.6 fields — same round-trip contract as hardwareMode.
+  const inputConditioner = sanitizeInputConditioner(r.inputConditioner)
+  const stateTriggers = sanitizeStateTriggers(r.stateTriggers)
   return {
     id: r.id,
     name: r.name,
@@ -6079,7 +6416,9 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
     builtin: r.builtin === true,
     draft: r.draft === true,
     functions: fns,
-    ...(hardwareMode ? { hardwareMode } : {})
+    ...(hardwareMode ? { hardwareMode } : {}),
+    ...(inputConditioner ? { inputConditioner } : {}),
+    ...(stateTriggers ? { stateTriggers } : {})
   }
 }
 
@@ -6106,8 +6445,21 @@ function sanitizePool(raw: unknown): Pool {
   const seen = new Set<string>(builtin.templates.map((t) => t.id))
   const merged: InstrumentTemplate[] = builtin.templates.map((b) => {
     const saved = savedById.get(b.id)
-    if (saved && saved.hardwareMode) {
-      return { ...b, hardwareMode: saved.hardwareMode }
+    // Graft EVERY user-overridable field (hardwareMode +
+    // inputConditioner + stateTriggers) — per-session user state that
+    // rides on top of the builtin's core definition.
+    if (
+      saved &&
+      (saved.hardwareMode || saved.inputConditioner || saved.stateTriggers)
+    ) {
+      return {
+        ...b,
+        ...(saved.hardwareMode ? { hardwareMode: saved.hardwareMode } : {}),
+        ...(saved.inputConditioner
+          ? { inputConditioner: saved.inputConditioner }
+          : {}),
+        ...(saved.stateTriggers ? { stateTriggers: saved.stateTriggers } : {})
+      }
     }
     return b
   })

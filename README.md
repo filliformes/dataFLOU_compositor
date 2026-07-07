@@ -42,6 +42,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.0](#release-notes---060)
 - [Release notes - 0.5.14](#release-notes---0514)
 - [Release notes - 0.5.13](#release-notes---0513)
 - [Release notes - 0.5.12](#release-notes---0512)
@@ -572,6 +573,52 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.0
+
+The **live-input** release. Everything here is about turning a raw physical sensor stream (an IMU, a Trill bar, any OSC-enabled instrument) into clean, musical control: smooth it, scale it, watch it, and fire events when it reaches a state. Built and tested against a 9-axis IMU (Olimex ESP32-PoE + MPU-9150) feeding scenes and samplers over OSC. All of it hangs off the existing **Hardware Mode** input path and saves with the session.
+
+### Input Conditioning - per-Instrument + per-Parameter smoothing chain
+
+A PiPo-style ordered chain of stream-processing stages applied to an Instrument's incoming Hardware-Mode OSC **before** anything else sees it (catch gates, overrides, State Triggers, the red live display, MIDI out). Six stage types:
+
+- **1 Euro Filter** - the adaptive low-pass from Casiez et al.: smooth when the signal is slow, responsive when it's fast. The go-to for gestural sensors. Two knobs (Min cutoff, Beta) with the standard two-step tuning recipe in the tooltip.
+- **Smooth** - one-pole exponential smoothing with a half-life (same math as the Slew modulator).
+- **Median** - windowed median (3/5/7/9), removes single-sample spikes that smoothing can't.
+- **Slew Limit** - hard cap on change rate (units/sec).
+- **Deadband** - ignore sub-epsilon changes; silences idle chatter from constantly-streaming sensors.
+- **Auto Range** - tracks observed min/max and rescales to 0..1, so a raw sensor becomes normalized with **no firmware changes** (leaky contraction so old extremes are forgotten).
+
+Each stage is **address-targeted**: its title is an OSC-address picker, so you can smooth `/mpu/euler/roll` one way and `/mpu/gyro/x` another (or apply a stage to all addresses). Stages reorder, enable/bypass individually, and a per-slot bypass keeps e.g. a button slot raw while the float slots are smoothed.
+
+**Edit it from either side.** The full chain lives in the Instrument inspector; each Parameter's inspector also has its own Input Conditioning editor scoped to that Parameter's address. Add a stage in one place and it shows up in the other - one source of truth, fully bidirectional, saved with the session.
+
+### Live before/after scope
+
+A raw-vs-conditioned oscilloscope (grey = raw, accent = after the chain) so tuning is a see-it job, not guesswork. Present in both the Instrument section and each Parameter inspector. It's **resizable** (drag the bottom edge), and its axes are **editable**: a **Time** window (X, up to 30 s) and **Min/Max** value range (Y) that default from the incoming data then pin so the trace neither scrolls out nor jumps, plus an **Auto** button to re-fit. Multiple scopes run at once (each keyed to its Parameter). **Every Parameter's scope frame - time, value range, height - is saved with the session**, so you set your scopes up once and they come back next time.
+
+### State Triggers - "Wekinator-lite"
+
+Named **states** of an Instrument's incoming values that fire MIDI (and/or a dataFLOU scene) when the instrument reaches them. Two detector flavors per state:
+
+- **Rules** - explicit per-address/slot conditions (`=`, `in [a,b]`, `>`, `<`), AND-combined. Deterministic and debuggable.
+- **Learned** - hold the pose, hit **Record**, and the engine memorizes it (centroid + per-dimension variance across every address the device sends). At runtime a variance-weighted distance yields a 0..1 match score - nearest-centroid classification, Wekinator distilled. A **threshold** slider + a **live match meter** on each state make tuning direct.
+
+Three trigger **modes** (selectable, Enter+Exit default): **Enter+Exit** (note-on/CC-in at enter, note-off/CC-out at exit - hold the pose, hold the effect), **One-shot** (fire once, re-arm on exit), and **Continuous** (stream the live match score as a CC 0..127 - proximity to the pose becomes an expressive controller). **Dwell** (must-match duration) and **hysteresis** (widened exit region) debounce boundary chatter. Actions: a MIDI note/CC on any port + channel, and/or trigger a dataFLOU scene at enter. Detection runs on the **conditioned** stream, so smoothing upstream gives stable triggers.
+
+### Per-Parameter Hardware input scaling
+
+Toggle-able device-range to output-range mapping per Parameter, applied **before** the catch comparison - so a controller sending 0..360 degrees can actually catch and drive a 0..1 parameter (unscaled, that catch could never succeed). Swap the Out bounds to invert. Editable both as rows in the Instrument's Hardware Mode section and as a panel directly under each Parameter's name line (shown when Hardware Mode is on). Out bounds seed from the Parameter's declared range.
+
+### Live per-Parameter hardware readout
+
+When Hardware Mode is on, every Parameter row in the grid sidebar shows a **red dot + the value the controller is currently sending** to that Parameter's OSC address - a live monitor independent of catch state. The dot fades when the stream goes quiet and disappears if the device stops. When Input Scaling is enabled for that Parameter, the readout shows the **scaled** value (prefixed `×`, raw on hover) - exactly what's driving the parameter, since scaling is applied to the conditioned value in the same shared map the engine uses.
+
+### Persistence
+
+Input Conditioning chains, State Triggers, per-Parameter scaling, and per-Parameter scope frames all round-trip through the session file (including on built-in Instruments like OCTOCOSME). Scope frames persist via all save paths - manual save, autosave, and save-on-quit.
 
 ---
 

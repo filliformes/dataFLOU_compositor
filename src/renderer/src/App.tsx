@@ -71,6 +71,10 @@ export default function App(): JSX.Element {
   const oscMonitorHeightW = useStore((s) => s.oscMonitorHeight)
   const tracksCollapsedW = useStore((s) => s.tracksCollapsed)
   const scenesCollapsedW = useStore((s) => s.scenesCollapsed)
+  // (v0.6) Scope frames persist out-of-band (scopePrefs.ts module Map);
+  // this counter changes whenever one does, so the flush below re-runs
+  // and buildSessionForSave (which reads dumpScopePrefs) reaches main.
+  const scopePrefsRevW = useStore((s) => s.scopePrefsRev)
   const sessionIpcPendingRef = useRef(false)
   useEffect(() => {
     if (sessionIpcPendingRef.current) return
@@ -95,7 +99,8 @@ export default function App(): JSX.Element {
     editorNotesHeightW,
     oscMonitorHeightW,
     tracksCollapsedW,
-    scenesCollapsedW
+    scenesCollapsedW,
+    scopePrefsRevW
   ])
 
   // v0.5.10 -- bake the package version + the current session name

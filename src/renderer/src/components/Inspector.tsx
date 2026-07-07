@@ -46,6 +46,13 @@ import { DrawCanvas } from './DrawCanvas'
 import { GestureRecorder } from './GestureRecorder'
 import { HardwareModeSection } from './InstrumentsInspectorPane'
 import {
+  InputConditioningSection,
+  ParameterConditioningReflection,
+  ParameterInputConditioning,
+  ParameterInputScaling
+} from './InputConditioningSection'
+import { StateTriggersSection } from './StateTriggersSection'
+import {
   ArpVisual,
   AttractorVisual,
   ChaosVisual,
@@ -316,6 +323,15 @@ function TrackInspector(): JSX.Element {
       ? s.session.pool.templates.find((t) => t.id === track.sourceTemplateId)
       : undefined
   )
+  // Parent template of a Parameter (child function) row — drives the
+  // read-only Hardware Input reflection (is this Parameter HW-bound +
+  // smoothed?) with its own live scope. Only resolves for function
+  // tracks that descend from a template.
+  const parentTemplateForParam = useStore((s) =>
+    track?.kind === 'function' && track.sourceTemplateId
+      ? s.session.pool.templates.find((t) => t.id === track.sourceTemplateId)
+      : undefined
+  )
 
   if (!track) return <div className="p-4 text-muted text-[12px]">Track removed.</div>
 
@@ -373,6 +389,39 @@ function TrackInspector(): JSX.Element {
         </div>
       </Section>
 
+      {/* (v0.6) Per-Parameter Input Scaling — sits directly under the
+          name line as requested, and only appears when the parent
+          Instrument's Hardware Mode is ON ("enabled by Hardware Mode").
+          Edits the same hardwareMode.scaling[fnId] blob as the
+          Instrument inspector's per-Parameter rows. */}
+      {!isTemplate &&
+        parentTemplateForParam?.hardwareMode?.enabled && (
+          <ParameterInputScaling
+            track={track}
+            template={parentTemplateForParam}
+          />
+        )}
+
+      {/* (v0.6) Per-Parameter Input Conditioning editor — just under
+          Input Scaling. Edits the same instrument conditioner chain
+          (bidirectional), scoped to this Parameter's address. */}
+      {!isTemplate &&
+        parentTemplateForParam?.hardwareMode?.enabled && (
+          <ParameterInputConditioning
+            track={track}
+            template={parentTemplateForParam}
+          />
+        )}
+
+      {/* (v0.6) Live scope + HW-bound badge for this Parameter, right
+          under its smoothing editor so you see the effect as you tune. */}
+      {!isTemplate && parentTemplateForParam && (
+        <ParameterConditioningReflection
+          track={track}
+          template={parentTemplateForParam}
+        />
+      )}
+
       {/* v0.5.10 -- Instrument-wide OSC port broadcast. Switches the
           template's destPort, every instantiated row's defaultDestPort,
           and every cell's destPort in one click. Use case: two
@@ -392,6 +441,16 @@ function TrackInspector(): JSX.Element {
           wrap in a Section (would be a redundant double-title). */}
       {isTemplate && templateForRow && (
         <HardwareModeSection template={templateForRow} />
+      )}
+
+      {/* Input Conditioning + State Triggers (v0.6) — same
+          both-surfaces contract as HardwareModeSection: this and the
+          Pool inspector edit the same template blobs. */}
+      {isTemplate && templateForRow && (
+        <InputConditioningSection template={templateForRow} />
+      )}
+      {isTemplate && templateForRow && (
+        <StateTriggersSection template={templateForRow} />
       )}
 
       {/* Parameter list — only for Template (Instrument) rows. Each
