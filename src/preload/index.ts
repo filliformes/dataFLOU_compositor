@@ -41,6 +41,11 @@ const api: ExposedApi = {
     ipcRenderer.on('engine:state', h)
     return () => ipcRenderer.off('engine:state', h)
   },
+  onMotionLoopTrigger: (cb) => {
+    const h = (): void => cb()
+    ipcRenderer.on('engine:motionLoopTrigger', h)
+    return () => ipcRenderer.off('engine:motionLoopTrigger', h)
+  },
   onOscEvents: (cb) => {
     const h = (_e: Electron.IpcRendererEvent, batch: OscEvent[]): void => cb(batch)
     ipcRenderer.on('engine:oscEvents', h)
@@ -97,6 +102,10 @@ const api: ExposedApi = {
   stateTriggerGetLive: () => ipcRenderer.invoke('stateTrigger:getLive'),
   stateTriggerRecord: (templateId, stateId, durationMs) =>
     ipcRenderer.invoke('stateTrigger:record', templateId, stateId, durationMs),
+  // v0.6.x -- Motion Loop record start/stop
+  motionLoopStartRecord: (sceneId) =>
+    ipcRenderer.invoke('motionLoop:startRecord', sceneId),
+  motionLoopStopRecord: () => ipcRenderer.invoke('motionLoop:stopRecord'),
   onNetworkDevices: (cb) => {
     const h = (
       _e: Electron.IpcRendererEvent,

@@ -26,6 +26,7 @@ import { ResizeHandle } from './ResizeHandle'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput, UncontrolledTextarea } from './UncontrolledInput'
 import { GenerativeButton } from './GenerativePopover'
+import { MotionLoopControls } from './MotionLoopControls'
 import {
   POOL_SAVED_SCENE_DRAG_MIME,
   type PoolSavedSceneDragPayload
@@ -1381,6 +1382,8 @@ export function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
           button in the Generative popover rolls fresh weights into
           every scene at once. */}
       <SceneGenerativeSection scene={scene} />
+
+      <MotionLoopControls scene={scene} />
 
       <div className="flex items-center gap-2 text-[11px] text-muted">
         <span>Tip: switch to the Edit view (Tab) to edit this scene's clips.</span>

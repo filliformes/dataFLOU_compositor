@@ -1051,6 +1051,15 @@ export class SceneEngine {
   // per-slot emit loop reads this between pitch snap and pin to
   // override the scene's computed value.
   private hardwareOverride: Map<string, number> = new Map()
+  // (v0.6.x) Motion Loop recording. Non-null while a scene is armed for
+  // capture: every matching hardware packet appends a conditioned+scaled
+  // frame per trackId. stopMotionLoopRecord() drains this and hands the
+  // buffers back to the renderer, which writes them into the cells.
+  private recordingLoop: {
+    sceneId: string
+    startMs: number
+    frames: Map<string, { t: number; v: number[] }[]>
+  } | null = null
   // Cached flag: true when at least one template in the session has
   // `hardwareMode.enabled === true`. `handleHardwareInput` consults
   // this BEFORE doing any per-packet work, so when HW Mode is off
@@ -1231,6 +1240,14 @@ export class SceneEngine {
     cb: ((sample: import('@shared/types').Mod1LiveSample | null) => void) | null
   ): void {
     this.onMod1Live = cb
+  }
+
+  // (v0.6.x) Motion Loop hands-free OSC trigger — fired on a rising edge
+  // of the configured trigger address (e.g. the antenna's /mpu/btn1).
+  private onMotionLoopTrigger: (() => void) | null = null
+  private motionLoopTriggerLast = 0
+  setOnMotionLoopTrigger(cb: (() => void) | null): void {
+    this.onMotionLoopTrigger = cb
   }
 
   /** Forward every successful OSC send to `cb`. Pass null to detach. */
@@ -1500,6 +1517,22 @@ export class SceneEngine {
     // forever false → nothing ever catches) and leak one map entry per
     // port. The ip-only key keeps a single stable baseline per device.
     const deviceKey = anyIpOnly ? ip : `${ip}:${port}`
+    // (v0.6.x) Motion Loop hands-free OSC trigger — a rising edge on the
+    // configured address (default the antenna's /mpu/btn1) toggles record.
+    // Checked on the RAW value (pre-conditioning) so a smoothing chain
+    // can't blur the button edge; one press = toggle. The renderer owns
+    // the actual start/stop (it writes cells), so we just notify it.
+    const mlTrig = this.session.motionLoopOscTrigger
+    if (mlTrig && mlTrig.enabled && mlTrig.address && address === mlTrig.address) {
+      const v =
+        numericArgs.length > 0 && Number.isFinite(numericArgs[0])
+          ? numericArgs[0]
+          : 0
+      if (v > 0.5 && this.motionLoopTriggerLast <= 0.5 && this.onMotionLoopTrigger) {
+        this.onMotionLoopTrigger()
+      }
+      this.motionLoopTriggerLast = v
+    }
     // ── Input Conditioning (v0.6) ─────────────────────────────────
     // Apply the FIRST matched template's enabled conditioner chain to
     // the raw args BEFORE movement detection, so catch gates, override
@@ -1825,6 +1858,129 @@ export class SceneEngine {
           if (Math.abs(hwVal - sceneVal) <= tol) {
             this.hardwareCaught.set(catchKey, true)
             this.hardwareOverride.set(catchKey, hwVal)
+          }
+        }
+      }
+    }
+
+    // ── Direct Output (v0.6.x) — conditioned + scaled passthrough ──
+    // Re-emit the conditioned + per-Parameter-scaled value straight to
+    // a destination on EVERY packet, with NO scene and NO catch. The
+    // "just scale my hardware and send it out" path for continuous
+    // controllers (IMU → Max/Ableton). numericArgs is already the
+    // conditioned stream at this point; we apply the same per-parameter
+    // scaling the catch loop uses, then send on the incoming address.
+    for (const tpl of matchedTemplates) {
+      const hw = tpl.hardwareMode!
+      const dout = hw.directOutput
+      if (!dout || !dout.enabled) continue
+      if (!dout.destIp || !(dout.destPort > 0)) continue
+      // Match the incoming address to one of the template's Parameters
+      // (resolving relative oscPaths against the template base, exactly
+      // as instantiation does) to find its scaling + arg types.
+      const base = tpl.oscAddressBase || ''
+      const fn = tpl.functions.find((f) => {
+        const a = f.oscPath.startsWith('/')
+          ? f.oscPath
+          : base.endsWith('/')
+            ? base + f.oscPath
+            : `${base}/${f.oscPath}`
+        return a === address
+      })
+      if (!fn) continue
+      // Yield to a playing recorded loop (Motion Loop). If the active
+      // scene has an enabled recordedLoop on a track for THIS Parameter,
+      // the loop is the source (loop replaces live) and the engine tick
+      // is already emitting it to the cell's destination. Skip the live
+      // passthrough for this address so the two don't race on the M4L.
+      // Non-looped parameters keep flowing live, automatically.
+      if (this.activeSceneId) {
+        const activeScene = this.session.scenes.find(
+          (s) => s.id === this.activeSceneId
+        )
+        if (
+          activeScene &&
+          this.session.tracks.some(
+            (t) =>
+              t.sourceTemplateId === tpl.id &&
+              (t.sourceFunctionId ?? '') === fn.id &&
+              activeScene.cells[t.id]?.recordedLoop?.enabled === true
+          )
+        ) {
+          continue
+        }
+      }
+      // Respect per-arg locks: when hw.args[fn.id] is a non-empty list,
+      // only those slots pass through (matches the catch loop). null =
+      // all slots.
+      const locked =
+        hw.args && hw.args[fn.id] && hw.args[fn.id].length > 0
+          ? hw.args[fn.id]
+          : null
+      const scale =
+        hw.scaling && hw.scaling[fn.id]?.enabled ? hw.scaling[fn.id] : null
+      const outArgs: { type: 'f' | 'i'; value: number }[] = []
+      for (let i = 0; i < numericArgs.length; i++) {
+        if (locked && !locked.includes(i)) continue
+        const v = numericArgs[i]
+        if (!Number.isFinite(v)) continue
+        const scaled = scale ? scaleHardwareValue(scale, v) : v
+        // Scaling always yields a float in the mapped range. Only emit
+        // an int token when the arg is declared int AND no scaling is
+        // active (an unscaled discrete slot — e.g. /mpu/btn1).
+        const declaredInt =
+          fn.argSpec && fn.argSpec[i] && fn.argSpec[i].type === 'int'
+        outArgs.push(
+          declaredInt && !scale
+            ? { type: 'i', value: Math.round(scaled) }
+            : { type: 'f', value: scaled }
+        )
+      }
+      if (outArgs.length > 0) {
+        this.sender.sendMany(dout.destIp, dout.destPort, address, outArgs)
+      }
+    }
+
+    // ── Motion Loop recording (v0.6.x) ────────────────────────────
+    // While a scene is armed for capture, append the conditioned +
+    // per-Parameter-scaled value of every matching Parameter to the
+    // record buffer, keyed by trackId. Same conditioned stream Direct
+    // Output uses — here it's written into cells instead of sent out.
+    const recLoop = this.recordingLoop
+    if (recLoop) {
+      const recScene = this.session.scenes.find((s) => s.id === recLoop.sceneId)
+      if (recScene) {
+        for (const tpl of matchedTemplates) {
+          const hw = tpl.hardwareMode!
+          const base = tpl.oscAddressBase || ''
+          const fn = tpl.functions.find((f) => {
+            const a = f.oscPath.startsWith('/')
+              ? f.oscPath
+              : base.endsWith('/')
+                ? base + f.oscPath
+                : `${base}/${f.oscPath}`
+            return a === address
+          })
+          if (!fn) continue
+          const scale =
+            hw.scaling && hw.scaling[fn.id]?.enabled ? hw.scaling[fn.id] : null
+          const vals = numericArgs.map((x) =>
+            Number.isFinite(x) ? (scale ? scaleHardwareValue(scale, x) : x) : 0
+          )
+          const tRel = now - recLoop.startMs
+          for (const track of this.session.tracks) {
+            if (track.sourceTemplateId !== tpl.id) continue
+            if ((track.sourceFunctionId ?? '') !== fn.id) continue
+            // NOTE: capture even when the scene has no clip yet for this
+            // parameter — stopMotionLoopRecord() auto-creates the clips on
+            // the renderer side so an empty scene records into fresh clips.
+            let arr = recLoop.frames.get(track.id)
+            if (!arr) {
+              arr = []
+              recLoop.frames.set(track.id, arr)
+            }
+            // Cap ~20 min at 50 Hz to bound memory on a runaway record.
+            if (arr.length < 60000) arr.push({ t: tRel, v: vals })
           }
         }
       }
@@ -2341,6 +2497,84 @@ export class SceneEngine {
         timer
       }
     })
+  }
+
+  // ── Motion Loop (v0.6.x) ────────────────────────────────────────
+  // Arm the given scene for hardware capture. Frames accumulate in
+  // handleHardwareInput until stopMotionLoopRecord() is called. Returns
+  // false if the scene doesn't exist.
+  startMotionLoopRecord(sceneId: string): boolean {
+    if (!this.session) return false
+    if (!this.session.scenes.some((s) => s.id === sceneId)) return false
+    this.recordingLoop = { sceneId, startMs: Date.now(), frames: new Map() }
+    return true
+  }
+
+  // Stop capture and hand the buffers back to the renderer, which writes
+  // them into the scene's cells (keeping the store authoritative). Loop
+  // length = elapsed record time (free-run). Null when nothing captured.
+  stopMotionLoopRecord(): {
+    sceneId: string
+    durationMs: number
+    byTrack: Record<string, { t: number; v: number[] }[]>
+  } | null {
+    const rec = this.recordingLoop
+    this.recordingLoop = null
+    if (!rec) return null
+    const durationMs = Date.now() - rec.startMs
+    const byTrack: Record<string, { t: number; v: number[] }[]> = {}
+    for (const [trackId, frames] of rec.frames) {
+      if (frames.length > 0) byTrack[trackId] = frames
+    }
+    if (Object.keys(byTrack).length === 0) return null
+    return { sceneId: rec.sceneId, durationMs, byTrack }
+  }
+
+  // Sample a cell's recorded Motion Loop at the current wall-clock time,
+  // returning the per-slot values (linearly interpolated between frames)
+  // or null when there's no active loop. Phase is anchored to the active
+  // scene's start so the loop restarts cleanly when the scene (re)fires.
+  private sampleRecordedLoop(cell: Cell, tNowMs: number): number[] | null {
+    const rl = cell.recordedLoop
+    if (!rl || !rl.enabled || rl.durationMs <= 0 || rl.frames.length === 0) {
+      return null
+    }
+    if (this.activeSceneStartedAt == null) return null
+    let phase = (tNowMs - this.activeSceneStartedAt) % rl.durationMs
+    if (phase < 0) phase += rl.durationMs
+    const frames = rl.frames
+    const last = frames.length - 1
+    // Locate the last frame at or before `phase` (binary search).
+    let idx = 0
+    if (phase <= frames[0].t) {
+      idx = 0
+    } else if (phase >= frames[last].t) {
+      idx = last
+    } else {
+      let lo = 0
+      let hi = last
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (frames[mid].t <= phase) {
+          idx = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+    }
+    const f0 = frames[idx]
+    const f1 = frames[Math.min(idx + 1, last)]
+    if (f1 === f0 || f1.t <= f0.t) return f0.v
+    const a = (phase - f0.t) / (f1.t - f0.t)
+    const n = Math.max(f0.v.length, f1.v.length)
+    const out: number[] = []
+    for (let i = 0; i < n; i++) {
+      const v0 = f0.v[i] ?? 0
+      const v1 = f1.v[i] ?? v0
+      out.push(v0 + (v1 - v0) * a)
+    }
+    return out
   }
 
   private finishStateRecording(): void {
@@ -5287,6 +5521,10 @@ export class SceneEngine {
       const sentValuesBefore = ts.lastSentNumeric.slice()
       const newFinalVals: number[] = []
       const trackArgSpec = track?.argSpec
+      // (v0.6.x) Motion Loop — sample this cell's recorded data loop
+      // once per emit (returns per-slot values or null). Applied per
+      // slot in the loop below, after the HW override.
+      const loopSample = this.sampleRecordedLoop(cell, t)
       for (let idx = 0; idx < perToken.length; idx++) {
         const a = perToken[idx]
         // ── Fixed argSpec slot — protocol header ──────────────────
@@ -5754,6 +5992,21 @@ export class SceneEngine {
           }
         }
 
+        // ── Recorded loop (Motion Loop) playback ──────────────────
+        // When this scene's cell holds a playing recorded data loop,
+        // the sampled value for this slot is the source (loop replaces
+        // live). After the HW override so a recorded scene isn't fought
+        // by a live catch; before the pin (the user's explicit final say).
+        let loopActiveForSlot = false
+        if (
+          loopSample &&
+          idx < loopSample.length &&
+          Number.isFinite(loopSample[idx])
+        ) {
+          out = loopSample[idx]
+          loopActiveForSlot = true
+        }
+
         // Per-arg-position persistence — cell-level pin overrides
         // track-level pin overrides nothing. Three states per slot:
         //   cell.persistentSlots[idx] === true  → pinned, use cell.persistentValues[idx]
@@ -5799,7 +6052,8 @@ export class SceneEngine {
           a.type === 'i' &&
           !cell.modulation.enabled &&
           !cell.scaleToUnit &&
-          !hwActiveForSlot
+          !hwActiveForSlot &&
+          !loopActiveForSlot
             ? 'i'
             : 'f'
         const finalVal = sendType === 'i' ? Math.round(out) : out

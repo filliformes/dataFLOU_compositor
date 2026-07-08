@@ -1967,6 +1967,82 @@ export function HardwareModeSection({
               })}
             </div>
           </Field>
+          {/* (v0.6.x) Direct Output — conditioned + scaled passthrough.
+              Emits each Parameter's conditioned+scaled value continuously
+              to destIp:destPort with NO scene / NO catch. Engine-side:
+              the directOutput block in handleHardwareInput. */}
+          <Field
+            label="Direct Output (scaled passthrough)"
+            tooltip={
+              'Continuously re-emits each Parameter’s CONDITIONED + SCALED hardware value to the destination below — with NO scene playing and NO catch required.\n\n' +
+              'Use this when you just want the controller (e.g. an IMU) to drive Ableton/Max through dataFLOU’s Input Conditioning + Per-parameter scaling, live, all the time.\n\n' +
+              'The three output paths:\n' +
+              '• OSC Forward = raw, UNSCALED byte copy.\n' +
+              '• Engine cell emit = scaled, but only while a scene plays AND the slot is caught.\n' +
+              '• Direct Output = scaled, always, no scene/catch.\n\n' +
+              'Emits on each Parameter’s incoming OSC address. Point it at your Max for Live device (127.0.0.1 + its udpreceive port). Use a port other than dataFLOU’s own listener (9000), and don’t also play a scene that targets the same address — the two would race.'
+            }
+          >
+            <div className="flex flex-col gap-1">
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={hw.directOutput?.enabled === true}
+                  onChange={(e) =>
+                    setHardwareMode(template.id, {
+                      directOutput: {
+                        destIp: '127.0.0.1',
+                        destPort: 9001,
+                        ...hw.directOutput,
+                        enabled: e.target.checked
+                      }
+                    })
+                  }
+                />
+                <span className="label">Enable scaled passthrough</span>
+              </label>
+              {hw.directOutput?.enabled && (
+                <div className="flex items-center gap-1 text-[10px] flex-wrap">
+                  <span className="label">To</span>
+                  <input
+                    className="input w-28 text-[10px]"
+                    value={hw.directOutput?.destIp ?? '127.0.0.1'}
+                    onChange={(e) =>
+                      setHardwareMode(template.id, {
+                        directOutput: {
+                          destPort: 9001,
+                          ...hw.directOutput,
+                          enabled: true,
+                          destIp: e.target.value
+                        }
+                      })
+                    }
+                    placeholder="127.0.0.1"
+                    title="Destination IP — usually 127.0.0.1 (the Max for Live device on this same Mac)"
+                  />
+                  <span className="label">:</span>
+                  <BoundedNumberInput
+                    className="input w-16 text-[10px] text-right tabular-nums"
+                    value={hw.directOutput?.destPort ?? 9001}
+                    min={1}
+                    max={65535}
+                    commitOn="blur"
+                    onChange={(v) =>
+                      setHardwareMode(template.id, {
+                        directOutput: {
+                          destIp: '127.0.0.1',
+                          ...hw.directOutput,
+                          enabled: true,
+                          destPort: Math.round(v)
+                        }
+                      })
+                    }
+                    title="Destination port — the M4L device's udpreceive port (NOT 9000, that's dataFLOU's own listener)"
+                  />
+                </div>
+              )}
+            </div>
+          </Field>
         </>
       )}
     </div>

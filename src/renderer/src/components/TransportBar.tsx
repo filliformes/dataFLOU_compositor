@@ -13,6 +13,7 @@ import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { MotionLoopRecButton } from './MotionLoopControls'
 
 export default function TransportBar(): JSX.Element {
   const session = useStore((s) => s.session)
@@ -223,6 +224,8 @@ export default function TransportBar(): JSX.Element {
           <span className="text-muted">(none)</span>
         )}
       </div>
+
+      <MotionLoopRecButton />
 
       <div className="flex-1" />
 

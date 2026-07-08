@@ -180,6 +180,13 @@ app.whenReady().then(async () => {
     sendToRenderer('engine:mod1Live', sample)
   })
 
+  // Motion Loop hands-free OSC trigger (v0.6.x) — the engine fires this on
+  // a rising edge of the configured trigger address (e.g. the antenna's
+  // /mpu/btn1); the renderer toggles record on the focused scene.
+  engine.setOnMotionLoopTrigger(() => {
+    sendToRenderer('engine:motionLoopTrigger')
+  })
+
   // OSC monitor — batch outgoing sends and flush every 50ms to the renderer.
   // Guards against IPC floods (120 Hz × many cells). A hard cap keeps us safe
   // when a burst overflows one flush window; overflow is dropped with a
@@ -407,6 +414,12 @@ app.whenReady().then(async () => {
       Number(durationMs) || 2000
     )
   )
+  // Motion Loop (v0.6.x): arm a scene for hardware capture, then drain
+  // the recorded buffers back to the renderer on stop.
+  safeHandle('motionLoop:startRecord', (_e, sceneId) =>
+    engine.startMotionLoopRecord(String(sceneId))
+  )
+  safeHandle('motionLoop:stopRecord', () => engine.stopMotionLoopRecord())
 
   // ---------- IPC: MIDI ----------
   // Enumerate currently-visible MIDI output ports. Renderer calls

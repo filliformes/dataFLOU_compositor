@@ -200,6 +200,10 @@ class MidiManager {
       } else if (target.kind === 'generativeMaxDuration') {
         if (binding.kind !== 'cc') return
         st.setGenerativeMaxDurationMidi(binding)
+      } else if (target.kind === 'motionLoopRecord') {
+        // Record toggle — accept a pad (note) or a footswitch/button (CC).
+        // Fires on press (value > 0) in the match path below.
+        st.setMotionLoopRecordMidi(binding)
       }
       st.setMidiLearnTarget(null)
       return
@@ -285,6 +289,17 @@ class MidiManager {
     // footswitch press with no cue doesn't do anything surprising.
     if (session.goMidi && matches(session.goMidi, binding)) {
       if (st.armedSceneId) st.fireArmed()
+      return
+    }
+
+    // Motion Loop record toggle (v0.6.x) — a bound pad/footswitch toggles
+    // recording on the focused scene, identical to clicking the transport
+    // ●REC. Fires on press (value > 0 gated above).
+    if (
+      session.motionLoopRecordMidi &&
+      matches(session.motionLoopRecordMidi, binding)
+    ) {
+      st.toggleMotionLoopRecordFocused()
       return
     }
 

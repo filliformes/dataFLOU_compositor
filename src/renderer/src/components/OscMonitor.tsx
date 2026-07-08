@@ -297,6 +297,7 @@ type LearnedBinding = {
     | { kind: 'generativeMaxDuration' }
     | { kind: 'generativeUseMorph' }
     | { kind: 'generativeRandomWeights' }
+    | { kind: 'motionLoopRecord' }
     | null
   onDelete: () => void
   // Apply a manually-edited binding (note/CC number and channel can
@@ -339,6 +340,7 @@ function collectLearnedBindings(
     setGenerativeMaxDurationMidi: (b: MidiBinding | undefined) => void
     setGenerativeUseMorphMidi: (b: MidiBinding | undefined) => void
     setRandomWeightsMidi: (b: MidiBinding | undefined) => void
+    setMotionLoopRecordMidi: (b: MidiBinding | null) => void
   }
 ): LearnedBinding[] {
   const out: LearnedBinding[] = []
@@ -352,6 +354,17 @@ function collectLearnedBindings(
       editTarget: { kind: 'go' },
       onDelete: () => store.setGoMidi(undefined),
       onUpdate: (next) => store.setGoMidi(next)
+    })
+  }
+  if (session.motionLoopRecordMidi) {
+    out.push({
+      id: 'transport-motionloop',
+      label: 'Motion Loop REC',
+      source: 'Transport',
+      binding: session.motionLoopRecordMidi,
+      editTarget: { kind: 'motionLoopRecord' },
+      onDelete: () => store.setMotionLoopRecordMidi(null),
+      onUpdate: (next) => store.setMotionLoopRecordMidi(next)
     })
   }
   if (session.morphTimeMidi) {
@@ -757,6 +770,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   )
   const setGenerativeUseMorphMidi = useStore((s) => s.setGenerativeUseMorphMidi)
   const setRandomWeightsMidi = useStore((s) => s.setRandomWeightsMidi)
+  const setMotionLoopRecordMidi = useStore((s) => s.setMotionLoopRecordMidi)
   const [learnedColPx, setLearnedColPxState] = useState<number>(() =>
     loadLearnedColPx()
   )
@@ -802,7 +816,8 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
       setGenerativeMinDurationMidi: (b) => setGenerativeMinDurationMidi(b),
       setGenerativeMaxDurationMidi: (b) => setGenerativeMaxDurationMidi(b),
       setGenerativeUseMorphMidi: (b) => setGenerativeUseMorphMidi(b),
-      setRandomWeightsMidi: (b) => setRandomWeightsMidi(b)
+      setRandomWeightsMidi: (b) => setRandomWeightsMidi(b),
+      setMotionLoopRecordMidi: (b) => setMotionLoopRecordMidi(b)
     })
   }, [
     session,
@@ -818,7 +833,8 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
     setGenerativeMinDurationMidi,
     setGenerativeMaxDurationMidi,
     setGenerativeUseMorphMidi,
-    setRandomWeightsMidi
+    setRandomWeightsMidi,
+    setMotionLoopRecordMidi
   ])
   // Buffers live at module scope (top of this file) so closing +
   // reopening the drawer keeps the captured history visible. We just

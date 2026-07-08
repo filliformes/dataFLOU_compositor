@@ -289,6 +289,9 @@ interface UiState {
     | { kind: 'generativeMaxDuration' }
     | { kind: 'generativeUseMorph' }
     | { kind: 'generativeRandomWeights' }
+    // (v0.6.x) Motion Loop record toggle (focused scene). Binding lives
+    // on session.motionLoopRecordMidi.
+    | { kind: 'motionLoopRecord' }
     | null
   // Theme is a UI preference, not saved in the session file.
   theme: ThemeName
@@ -305,6 +308,11 @@ interface UiState {
   // the chevron next to the GENERATIVE button. Default false so a
   // fresh app load doesn't pop the popover unprompted.
   generativePopoverOpen: boolean
+  // (v0.6.x) Motion Loop recording status (UI-only, not persisted). When
+  // a scene is armed for hardware capture, this holds its id + start
+  // wall-clock so the Scene inspector can show a live "Recording… N.Ns".
+  recordingLoopSceneId: string | null
+  recordingLoopStartedAt: number | null
   // Drawer height (px). User-resizable via the handle on top edge,
   // 120..600 (clamped). Persisted as part of the in-session UI prefs so
   // the height survives a drawer toggle.
@@ -991,8 +999,16 @@ interface Actions {
       | { kind: 'generativeMaxDuration' }
       | { kind: 'generativeUseMorph' }
       | { kind: 'generativeRandomWeights' }
+      | { kind: 'motionLoopRecord' }
       | null
   ) => void
+  // (v0.6.x) Motion Loop hands-free trigger config + focused-scene toggle.
+  setMotionLoopRecordMidi: (binding: MidiBinding | null) => void
+  setMotionLoopOscTrigger: (patch: {
+    enabled?: boolean
+    address?: string
+  }) => void
+  toggleMotionLoopRecordFocused: () => void
   // Bind / clear an Instrument-group MIDI trigger on a specific
   // (sceneId, templateRowId). Pass undefined to clear.
   setInstrumentTriggerMidi: (
@@ -1062,6 +1078,12 @@ interface Actions {
   setGenerativeUseMorph: (v: boolean) => void
   setSceneWeight: (sceneId: string, weight: number) => void
   rollRandomWeights: () => void
+  // (v0.6.x) Motion Loop — record the live hardware stream into a
+  // scene's cells (free-run), then loop it on playback.
+  startMotionLoopRecord: (sceneId: string) => void
+  stopMotionLoopRecord: () => void
+  clearMotionLoop: (sceneId: string) => void
+  setRecordedLoopEnabled: (sceneId: string, enabled: boolean) => void
   // Pick an initial scene id under generative mode for the Play
   // button's empty-timeline fallback. Walks the eligible pool
   // (poolSource + excluded[]) and returns a weight-biased random
@@ -1344,6 +1366,8 @@ export const useStore = create<State>((set, get) => ({
   showMode: false,
   oscMonitorOpen: false,
   generativePopoverOpen: false,
+  recordingLoopSceneId: null,
+  recordingLoopStartedAt: null,
   oscMonitorHeight: 220,
   poolHidden: false,
   editInspectorVisible: true,
@@ -4073,6 +4097,124 @@ export const useStore = create<State>((set, get) => ({
         }
       }
     }),
+  // (v0.6.x) Motion Loop ---------------------------------------------
+  startMotionLoopRecord: (sceneId) => {
+    const st = get()
+    if (!st.session.scenes.some((s) => s.id === sceneId)) return
+    // Flip UI state FIRST so the button responds even if the IPC bridge is
+    // stale (dev preload not reloaded). Side effect stays OUT of the set()
+    // updater — a throw there would silently abort the state change.
+    set({ recordingLoopSceneId: sceneId, recordingLoopStartedAt: Date.now() })
+    window.api.motionLoopStartRecord?.(sceneId)
+  },
+  stopMotionLoopRecord: () => {
+    set({ recordingLoopSceneId: null, recordingLoopStartedAt: null })
+    const p = window.api.motionLoopStopRecord?.()
+    if (!p) return
+    void p.then((res) => {
+      if (!res) return
+      // Auto-create a clip for every captured parameter that doesn't have
+      // one yet, so the recorded loops appear on the grid and play when the
+      // scene is triggered. ensureCell inherits the track's OSC routing and
+      // is a no-op when the cell already exists.
+      const ensure = get().ensureCell
+      for (const trackId of Object.keys(res.byTrack)) {
+        ensure(res.sceneId, trackId)
+      }
+      set((st) => ({
+        session: {
+          ...st.session,
+          scenes: st.session.scenes.map((s) => {
+            if (s.id !== res.sceneId) return s
+            const cells = { ...s.cells }
+            for (const [trackId, frames] of Object.entries(res.byTrack)) {
+              const cell = cells[trackId]
+              if (!cell) continue
+              cells[trackId] = {
+                ...cell,
+                recordedLoop: {
+                  enabled: true,
+                  durationMs: res.durationMs,
+                  frames
+                }
+              }
+            }
+            // Sync the scene's timing to the loop so it repeats seamlessly
+            // (the Scene IS the loop): duration = loop length, follow-action
+            // = Loop. Re-recording re-sets both to the new take's length.
+            return {
+              ...s,
+              cells,
+              durationSec: Math.max(0.1, res.durationMs / 1000),
+              nextMode: 'loop' as const
+            }
+          })
+        }
+      }))
+    })
+  },
+  clearMotionLoop: (sceneId) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        scenes: st.session.scenes.map((s) => {
+          if (s.id !== sceneId) return s
+          const cells = { ...s.cells }
+          for (const tid of Object.keys(cells)) {
+            if (cells[tid].recordedLoop) {
+              cells[tid] = { ...cells[tid], recordedLoop: undefined }
+            }
+          }
+          return { ...s, cells }
+        })
+      }
+    })),
+  setRecordedLoopEnabled: (sceneId, enabled) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        scenes: st.session.scenes.map((s) => {
+          if (s.id !== sceneId) return s
+          const cells = { ...s.cells }
+          for (const tid of Object.keys(cells)) {
+            const rl = cells[tid].recordedLoop
+            if (rl) {
+              cells[tid] = { ...cells[tid], recordedLoop: { ...rl, enabled } }
+            }
+          }
+          return { ...s, cells }
+        })
+      }
+    })),
+  setMotionLoopRecordMidi: (binding) =>
+    set((st) => ({
+      session: { ...st.session, motionLoopRecordMidi: binding ?? undefined }
+    })),
+  setMotionLoopOscTrigger: (patch) =>
+    set((st) => {
+      const cur = st.session.motionLoopOscTrigger ?? {
+        enabled: false,
+        address: '/mpu/btn1'
+      }
+      return {
+        session: {
+          ...st.session,
+          motionLoopOscTrigger: {
+            enabled: patch.enabled ?? cur.enabled,
+            address: patch.address !== undefined ? patch.address : cur.address
+          }
+        }
+      }
+    }),
+  toggleMotionLoopRecordFocused: () => {
+    const st = get()
+    if (st.recordingLoopSceneId != null) {
+      st.stopMotionLoopRecord()
+      return
+    }
+    const focusId = st.session.focusedSceneId
+    if (focusId) st.startMotionLoopRecord(focusId)
+  },
   rollRandomWeights: () =>
     set((st) => ({
       session: {
@@ -5457,6 +5599,11 @@ function propagateDefaults(s: Session): Session {
             // per-mode fields existed. Centralised in a helper to keep
             // adding new modes from blowing up this block.
             sequencer: migrateSequencer(c.sequencer),
+            // (v0.6.x) Motion Loop capture — shape-validated so a
+            // malformed buffer can't crash the engine sampler.
+            recordedLoop: sanitizeRecordedLoop(
+              (c as Partial<Cell>).recordedLoop
+            ),
             scaleToUnit: typeof c.scaleToUnit === 'boolean' ? c.scaleToUnit : false,
             // OSC emission — default true so legacy cells keep firing.
             oscEnabled:
@@ -5940,6 +6087,34 @@ function applyV0512Migrations(s: Session): Session {
 // + euclidean fields; this builds the full DEFAULT_SEQUENCER shape with
 // each persisted field overlaid, clamped, and validated. Centralising
 // keeps propagateDefaults from ballooning every time a new mode lands.
+function sanitizeRecordedLoop(
+  raw: unknown
+): import('@shared/types').RecordedLoop | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as Record<string, unknown>
+  if (!Array.isArray(r.frames)) return undefined
+  const durationMs =
+    typeof r.durationMs === 'number' &&
+    Number.isFinite(r.durationMs) &&
+    r.durationMs > 0
+      ? r.durationMs
+      : 0
+  if (durationMs <= 0) return undefined
+  const frames: { t: number; v: number[] }[] = []
+  for (const f of r.frames as unknown[]) {
+    if (!f || typeof f !== 'object') continue
+    const ff = f as Record<string, unknown>
+    if (typeof ff.t !== 'number' || !Number.isFinite(ff.t)) continue
+    if (!Array.isArray(ff.v)) continue
+    const v = (ff.v as unknown[]).map((x) =>
+      typeof x === 'number' && Number.isFinite(x) ? x : 0
+    )
+    frames.push({ t: ff.t, v })
+  }
+  if (frames.length === 0) return undefined
+  return { enabled: r.enabled === true, durationMs, frames }
+}
+
 function migrateSequencer(raw: unknown): SequencerParams {
   const base: SequencerParams = {
     ...DEFAULT_SEQUENCER,
@@ -6509,6 +6684,26 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
                   }
                 ])
             )
+          }
+        : {}),
+      // (v0.6.x) Direct Output — shape-validated so a malformed blob
+      // can't survive into the engine. Requires a numeric port.
+      ...(hwRaw.directOutput &&
+      typeof hwRaw.directOutput === 'object' &&
+      typeof (hwRaw.directOutput as Record<string, unknown>).destPort === 'number'
+        ? {
+            directOutput: {
+              enabled:
+                (hwRaw.directOutput as Record<string, unknown>).enabled === true,
+              destIp:
+                typeof (hwRaw.directOutput as Record<string, unknown>).destIp ===
+                'string'
+                  ? ((hwRaw.directOutput as Record<string, unknown>)
+                      .destIp as string)
+                  : '127.0.0.1',
+              destPort: (hwRaw.directOutput as Record<string, unknown>)
+                .destPort as number
+            }
           }
         : {})
     }

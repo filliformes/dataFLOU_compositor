@@ -902,6 +902,14 @@ export default function App(): JSX.Element {
   // configure their OCTOCOSME controller to send to that port the
   // Capture popup picks it up automatically.
   const defaultDestPort = useStore((s) => s.session.defaultDestPort)
+  // The EXPLICIT listen port (set via the Network tab / TopBar "Listen on")
+  // is authoritative when present. Without this, the auto-bind effect below
+  // forces the listener onto defaultDestPort (the default SEND port) every
+  // time it re-runs — e.g. when a Forward target is added/edited — which
+  // silently drags the listener off the port the user set (the "listener
+  // jumps to 9001" bug). Listen (incoming) and default-send (outgoing) are
+  // different concerns and must not be coupled.
+  const listenerPort = useStore((s) => s.session.listenerPort)
   // Persisted OSC forward targets — every received UDP packet is
   // byte-copied onward to each enabled entry. We push the whole list
   // to main once on app load so a freshly-opened session immediately
@@ -922,7 +930,12 @@ export default function App(): JSX.Element {
       // If the listener is already on (e.g. a hot-reload), don't
       // re-bind. If it's off OR bound on a different port than
       // the session's default, kick it on at the right port.
-      const wantPort = defaultDestPort > 0 ? defaultDestPort : 9000
+      const wantPort =
+        listenerPort && listenerPort > 0
+          ? listenerPort
+          : defaultDestPort > 0
+            ? defaultDestPort
+            : 9000
       if (!payload.status.enabled || payload.status.port !== wantPort) {
         window.api?.networkSetEnabled?.(true, wantPort).then((next) => {
           if (cancelled || !next) return
@@ -945,7 +958,7 @@ export default function App(): JSX.Element {
     // forwardTargets dep handles the rare case where opening a
     // different session file changes the persisted targets — the
     // store CRUD actions cover ordinary edits.
-  }, [setNetworkSnapshot, defaultDestPort, forwardTargets])
+  }, [setNetworkSnapshot, defaultDestPort, listenerPort, forwardTargets])
 
   // Saved-scene library subscription — also at app level so the
   // Pool's Scenes tab is up to date the instant the user opens it,
@@ -966,6 +979,18 @@ export default function App(): JSX.Element {
       if (off) off()
     }
   }, [setSceneLibrary])
+
+  // Motion Loop hands-free OSC trigger (v0.6.x) — the engine fires this on
+  // a rising edge of the configured trigger address (the antenna's BTN1);
+  // toggle record on the focused scene, same as clicking ●REC.
+  useEffect(() => {
+    const off = window.api?.onMotionLoopTrigger?.(() => {
+      useStore.getState().toggleMotionLoopRecordFocused()
+    })
+    return () => {
+      if (off) off()
+    }
+  }, [])
 
   // Pool library — User Instruments + Parameters persisted across
   // sessions. On mount we fetch the cache + merge any entries we

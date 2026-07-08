@@ -202,18 +202,47 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   useEffect(() => {
     setRemovedPaths(new Set())
   }, [selectedDeviceId])
-  // Seed the existing-template picker once the pool has entries —
-  // pick the FIRST non-draft entry in the Pool, which is whichever
-  // Instrument the dropdown lists first (Built-in OCTOCOSME etc.).
-  // Matches the visible order so the popup opens on the same row
-  // the user would see at the top of the select.
-  useEffect(() => {
-    if (!selectedExistingTemplateId && poolTemplates.length > 0) {
-      const firstNonDraft =
-        poolTemplates.find((t) => !t.draft) ?? poolTemplates[0]
-      setSelectedExistingTemplateId(firstNonDraft.id)
+  // (v0.6.3) Auto-detect which Pool Instrument is the one currently
+  // streaming on the network, so "New Scene for Instrument" opens on the
+  // LIVE instrument instead of just the first Pool entry. Match the
+  // freshest non-loopback device to a template by its Hardware-Mode
+  // binding (deviceIp) first, then by OSC-address overlap (the device is
+  // emitting the template's Parameter paths).
+  const detectedTemplateId = useMemo(() => {
+    const dev = networkDevices.find((d) => !d.isLoopback) ?? networkDevices[0]
+    if (!dev) return ''
+    for (const t of poolTemplates) {
+      const hw = t.hardwareMode
+      if (hw?.enabled && hw.deviceIp && hw.deviceIp === dev.ip) return t.id
     }
-  }, [poolTemplates, selectedExistingTemplateId])
+    const devAddrs = new Set(dev.addresses.map((a) => a.path))
+    for (const t of poolTemplates) {
+      const base = t.oscAddressBase || ''
+      const hit = t.functions.some((fn) => {
+        const a = fn.oscPath.startsWith('/')
+          ? fn.oscPath
+          : (base.endsWith('/') ? base.slice(0, -1) : base) + '/' + fn.oscPath
+        return devAddrs.has(a)
+      })
+      if (hit) return t.id
+    }
+    return ''
+  }, [networkDevices, poolTemplates])
+  // Seed / auto-switch the existing-template picker to the detected
+  // instrument, falling back to the first non-draft Pool entry. A manual
+  // pick locks it (userPickedTemplate) so auto-detect never yanks the
+  // user's choice out from under them.
+  const userPickedTemplate = useRef(false)
+  useEffect(() => {
+    if (userPickedTemplate.current) return
+    if (poolTemplates.length === 0) return
+    const want =
+      detectedTemplateId ||
+      (poolTemplates.find((t) => !t.draft) ?? poolTemplates[0]).id
+    if (want && want !== selectedExistingTemplateId) {
+      setSelectedExistingTemplateId(want)
+    }
+  }, [detectedTemplateId, poolTemplates, selectedExistingTemplateId])
 
   // OSC listener needs to be ON for the Network-tab cache to fill.
   // The popup auto-enables it on open (in OSC modes) and remembers
@@ -561,15 +590,46 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
             />
           )}
           {mode === 'osc-scene-for-instrument' && (
-            <SceneForInstrumentBody
-              templates={poolTemplates}
-              selectedTemplateId={selectedExistingTemplateId}
-              onSelectTemplate={setSelectedExistingTemplateId}
-              devices={networkDevices}
-              status={networkStatus}
-              addrBoxHeight={addrBoxHeight}
-              onResizeAddrBox={persistAddrBoxHeight}
-            />
+            <>
+              {detectedTemplateId && (
+                <div
+                  className="mx-3 mt-2 px-2 py-1 rounded text-[10px] flex items-center gap-1.5"
+                  style={{
+                    border: '1px solid rgb(var(--c-accent) / 0.5)',
+                    background: 'rgb(var(--c-accent) / 0.08)'
+                  }}
+                >
+                  <span style={{ color: 'rgb(var(--c-accent))' }}>●</span>
+                  <span className="text-muted">Detected on network:</span>
+                  <b>
+                    {poolTemplates.find((t) => t.id === detectedTemplateId)?.name}
+                  </b>
+                  {selectedExistingTemplateId !== detectedTemplateId && (
+                    <button
+                      className="btn text-[9px] py-0 px-1 ml-auto"
+                      onClick={() => {
+                        userPickedTemplate.current = true
+                        setSelectedExistingTemplateId(detectedTemplateId)
+                      }}
+                    >
+                      Use it
+                    </button>
+                  )}
+                </div>
+              )}
+              <SceneForInstrumentBody
+                templates={poolTemplates}
+                selectedTemplateId={selectedExistingTemplateId}
+                onSelectTemplate={(id) => {
+                  userPickedTemplate.current = true
+                  setSelectedExistingTemplateId(id)
+                }}
+                devices={networkDevices}
+                status={networkStatus}
+                addrBoxHeight={addrBoxHeight}
+                onResizeAddrBox={persistAddrBoxHeight}
+              />
+            </>
           )}
           {mode === 'midi-instrument' && (
             <MidiCaptureBody

@@ -605,6 +605,25 @@ export interface SequencerParams {
 // Sequencer rest-behaviour alias.
 export type SeqRestBehaviour = 'last' | 'hold'
 
+// (v0.6.x) One captured frame of a Motion Loop: the scaled per-arg-slot
+// values at time `t` ms from the start of the recording. `v` is parallel
+// to the cell's editable arg slots (single-value Parameters → length 1).
+export interface RecordedLoopFrame {
+  t: number
+  v: number[]
+}
+export interface RecordedLoop {
+  // Play this loop while the scene is active. Set true when a recording
+  // finishes; the user can toggle it off to silence the loop without
+  // discarding the take.
+  enabled: boolean
+  // Loop length in ms = how long the recording ran (free-run).
+  durationMs: number
+  // Time-ordered captured frames. Sampled + linearly interpolated at the
+  // current loop phase during playback.
+  frames: RecordedLoopFrame[]
+}
+
 export interface Cell {
   // Destination. If `destLinkedToDefault` is true, destIp/destPort track the session default.
   destIp: string
@@ -629,6 +648,14 @@ export interface Cell {
   // "effective Mod 1" each tick. Optional + back-compat: cells with
   // no modulation2 behave exactly as before.
   modulation2?: Modulation
+  // (v0.6.x) Motion Loop — a captured data loop for this cell. Recorded
+  // live from the Hardware-Mode conditioned+scaled stream over N seconds
+  // (free-run length), then played back LOOPING while the scene is
+  // active. When `enabled` and it has frames, the engine samples this at
+  // the current loop phase and it becomes the emitted value (loop
+  // replaces live) — see Engine.sampleRecordedLoop. Persisted in the
+  // session like the Draw sequencer's arrays. Absent on normal cells.
+  recordedLoop?: RecordedLoop
   sequencer: SequencerParams
   // If true, each numeric output (post-modulation) is clamped to [0, 1].
   // Applies to each token when `value` contains space-separated values.
@@ -1308,6 +1335,27 @@ export interface HardwareModeConfig {
   //       state flips automatically on scene start/stop without
   //       any UI action from the user.
   forwardMode?: 'suppress' | 'always' | 'whenIdle'
+  // (v0.6.x) Direct Output — "conditioned + scaled passthrough". When
+  // enabled, EVERY incoming hardware packet is conditioned (Input
+  // Conditioning chain) + per-Parameter scaled (the `scaling` map
+  // below) and re-emitted immediately to destIp:destPort — with NO
+  // scene playing and NO catch required. This is the "just scale my
+  // hardware and send it out" path for continuous controllers
+  // (IMU → Max/Ableton), which the other two paths can't do:
+  //   - raw OSC Forward is byte-copy, so it's UNSCALED;
+  //   - the engine cell-emit is scaled but GATED on a scene playing +
+  //     the slot being caught.
+  // The value emitted is the same conditioned+scaled value the catch
+  // loop computes (scaleHardwareValue on the conditioned arg). Emits on
+  // the incoming OSC address, one message per matching Parameter per
+  // packet. Independent of forwardMode (which only governs the raw
+  // relay). Leave a scene that ALSO targets destIp unplayed while using
+  // this, or the two emissions race on the same address.
+  directOutput?: {
+    enabled: boolean
+    destIp: string
+    destPort: number
+  }
   // 'reset' (default) re-arms catch on every scene change; 'persist'
   // keeps the caught state across scene transitions so a knob-turn
   // mid-show keeps overriding the new scene's value until released.
@@ -1913,6 +1961,14 @@ export interface Session {
   // optional and CC/note-bindable via the global MIDI Learn workflow.
   goMidi?: MidiBinding
   morphTimeMidi?: MidiBinding
+  // (v0.6.x) Motion Loop hands-free record trigger — toggles recording on
+  // the FOCUSED scene. `motionLoopRecordMidi` binds a MIDI note/CC via the
+  // global MIDI Learn workflow. `motionLoopOscTrigger` fires on a rising
+  // edge of an OSC address (default the antenna's own /mpu/btn1 button),
+  // so the controller arms/stops the take with no extra gear. Both
+  // optional; either or both can be active.
+  motionLoopRecordMidi?: MidiBinding
+  motionLoopOscTrigger?: { enabled: boolean; address: string }
   // Global Meta Controller bank — 8 user-assignable knobs that broadcast a
   // scaled value to up to 8 OSC destinations each. Persisted with the session.
   metaController: MetaController
@@ -2431,6 +2487,20 @@ export interface ExposedApi {
     stateId: string,
     durationMs: number
   ) => Promise<LearnedState | null>
+  // (v0.6.x) Motion Loop recording. startRecord arms capture of the
+  // Hardware-Mode conditioned+scaled stream into the given scene's cells
+  // (free-run). stopRecord ends it and resolves with the captured buffers
+  // per trackId + the loop duration (or null if nothing was captured).
+  motionLoopStartRecord: (sceneId: string) => Promise<boolean>
+  motionLoopStopRecord: () => Promise<{
+    sceneId: string
+    durationMs: number
+    byTrack: Record<string, RecordedLoopFrame[]>
+  } | null>
+  // (v0.6.x) Fired by the engine on a rising edge of the configured OSC
+  // trigger address (e.g. the antenna's /mpu/btn1) — the renderer toggles
+  // Motion Loop recording on the focused scene.
+  onMotionLoopTrigger: (cb: () => void) => () => void
   // Push channel — fired on a 250ms timer whenever the device map has
   // changed (new sender, new address, or fresh packet count). Status
   // is bundled in so port-rebinds and bind errors round-trip too.
