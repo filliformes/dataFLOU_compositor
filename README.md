@@ -42,6 +42,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.2](#release-notes---062)
 - [Release notes - 0.6.1](#release-notes---061)
 - [Release notes - 0.6.0](#release-notes---060)
 - [Release notes - 0.5.14](#release-notes---0514)
@@ -574,6 +575,14 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.2
+
+A one-fix patch for a **macOS crash on quit / window-close**.
+
+`A JavaScript error occurred in the main process — TypeError: Object has been destroyed at SceneEngine.onStateChange … emitState … tick`. When the window closed, the engine's ~20 Hz tick kept calling `webContents.send()` on the window's now-destroyed `webContents`. The `mainWindow?.` guard only caught a *null* window, not a *destroyed* one — and v0.6.1's macOS change (keeping the engine alive after the window closes, so reopening from the dock reconnects) made the tick reliably outlive the window. All main→renderer sends now go through a `sendToRenderer()` helper that checks `isDestroyed()` on both the window and its `webContents`, and `mainWindow` is nulled on the window's `closed` event. Quit and window-close are now clean on all platforms.
 
 ---
 

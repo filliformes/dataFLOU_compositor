@@ -20,6 +20,25 @@ import { SceneLibrary } from './sceneLibrary'
 import { PoolLibrary } from './poolLibrary'
 
 let mainWindow: BrowserWindow | null = null
+
+// Safe IPC push to the renderer. `mainWindow?.` only guards NULL — but
+// between the window's webContents being torn down and the 'closed'
+// event firing (and, on macOS, while the engine keeps ticking with the
+// window closed — see window-all-closed), `mainWindow` is a truthy but
+// DESTROYED reference, so `mainWindow.webContents.send()` throws
+// "Object has been destroyed" from the engine tick (emitState). Guard
+// both the window and its webContents with isDestroyed() before every
+// send. Fixes the macOS quit/close crash.
+function sendToRenderer(channel: string, ...args: unknown[]): void {
+  if (
+    mainWindow &&
+    !mainWindow.isDestroyed() &&
+    !mainWindow.webContents.isDestroyed()
+  ) {
+    mainWindow.webContents.send(channel, ...args)
+  }
+}
+
 const engine = new SceneEngine()
 // Passive OSC discovery listener. Bound lazily — stays closed until
 // the renderer's Pool drawer Network tab flips it on, so we don't fight
@@ -111,7 +130,16 @@ function createWindow(): void {
   mainWindow.on('close', (e) => {
     if (appQuitting) return
     e.preventDefault()
-    mainWindow?.webContents.send('app:before-close')
+    sendToRenderer('app:before-close')
+  })
+
+  // Null the reference once the window is gone so sendToRenderer
+  // short-circuits (and macOS 'activate' can recreate it cleanly).
+  // The isDestroyed() guard in sendToRenderer covers the brief window
+  // between webContents teardown and this event; this handler is the
+  // steady-state half of the same fix.
+  mainWindow.on('closed', () => {
+    mainWindow = null
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -140,7 +168,7 @@ app.whenReady().then(async () => {
   prevRunCrashed = autosave.startAutosave().crashed
 
   engine.setOnStateChange((s: EngineState) => {
-    mainWindow?.webContents.send('engine:state', s)
+    sendToRenderer('engine:state', s)
   })
 
   // Two-stage modulator — push the engine's per-tick effective
@@ -149,7 +177,7 @@ app.whenReady().then(async () => {
   // renderer. `null` samples (selection cleared) flow through too so
   // the Inspector knows to drop stale overlay values.
   engine.setOnMod1Live((sample) => {
-    mainWindow?.webContents.send('engine:mod1Live', sample)
+    sendToRenderer('engine:mod1Live', sample)
   })
 
   // OSC monitor — batch outgoing sends and flush every 50ms to the renderer.
@@ -185,22 +213,22 @@ app.whenReady().then(async () => {
     if (oscBuffer.length > 0) {
       const batch = oscBuffer
       oscBuffer = []
-      mainWindow?.webContents.send('engine:oscEvents', batch)
+      sendToRenderer('engine:oscEvents', batch)
     }
     if (oscErrBuffer.length > 0) {
       const errBatch = oscErrBuffer
       oscErrBuffer = []
-      mainWindow?.webContents.send('engine:oscErrors', errBatch)
+      sendToRenderer('engine:oscErrors', errBatch)
     }
     if (midiBuffer.length > 0) {
       const batch = midiBuffer
       midiBuffer = []
-      mainWindow?.webContents.send('engine:midiEvents', batch)
+      sendToRenderer('engine:midiEvents', batch)
     }
     if (midiErrBuffer.length > 0) {
       const errBatch = midiErrBuffer
       midiErrBuffer = []
-      mainWindow?.webContents.send('engine:midiErrors', errBatch)
+      sendToRenderer('engine:midiErrors', errBatch)
     }
     // Piggy-back the discovery flush on the same timer so the Network
     // tab gets fresh device updates at ~20Hz without a second loop.
@@ -211,7 +239,7 @@ app.whenReady().then(async () => {
   // Push channel — the listener calls this whenever the device map
   // changes. flush() routes through here on its 50ms cadence.
   networkListener.setOnUpdate((payload) => {
-    mainWindow?.webContents.send('network:devices', payload)
+    sendToRenderer('network:devices', payload)
   })
 
   // Hardware Mode — pipe every incoming OSC message into the engine
@@ -396,7 +424,7 @@ app.whenReady().then(async () => {
   )
   safeHandle('sceneLibrary:remove', (_e, id) => sceneLibrary.remove(id as string))
   sceneLibrary.setOnChange((scenes) => {
-    mainWindow?.webContents.send('scene-library:changed', scenes)
+    sendToRenderer('scene-library:changed', scenes)
   })
 
   // ---------- IPC: Pool library ----------
@@ -413,7 +441,7 @@ app.whenReady().then(async () => {
     )
   )
   poolLibrary.setOnChange((payload) => {
-    mainWindow?.webContents.send('pool-library:changed', payload)
+    sendToRenderer('pool-library:changed', payload)
   })
 
   // ---------- IPC: Autosave / crash recovery ----------
