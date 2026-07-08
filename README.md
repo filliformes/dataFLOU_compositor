@@ -2,6 +2,8 @@
 
 **Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of another software or another machine, **100‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
 
+Since **v0.6** dataFLOU is also a **live‑hardware performance instrument**: a physical sensor (a 9‑axis IMU, a Trill bar, any OSC controller) can be conditioned, scaled, and either streamed straight to your DAW (**Direct Output**), used to fire scenes and MIDI on gesture **States**, or **recorded as looping automation** you play back per scene (**Motion Loop**) — with hands‑free record from a footswitch or the controller's own button.
+
 ![dataFLOU_compositor - Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
 Built as a desktop app for Windows and macOS using Electron + React. Sessions are saved as plain JSON files and round‑trip cleanly between machines.
@@ -42,6 +44,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.3](#release-notes---063)
 - [Release notes - 0.6.2](#release-notes---062)
 - [Release notes - 0.6.1](#release-notes---061)
 - [Release notes - 0.6.0](#release-notes---060)
@@ -75,6 +78,10 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **One scene trigger** fires every clip in that column simultaneously.
 - **Per‑Parameter triggers** let you fire individual messages without launching the whole scene.
 - **Per‑Instrument group trigger** at each Instrument × Scene intersection fires (or stops) every child Parameter's clip on that scene as a single gesture. MIDI‑learnable.
+- **Motion Loop (v0.6.3)**: record the live hardware stream into a Scene as looping automation. Arm a scene from its inspector (or the transport **●REC**), move the controller, stop — dataFLOU **auto‑creates a clip for every hardware‑mapped Parameter**, drops the captured conditioned + scaled curve into each, and **syncs the scene's Duration + follow‑action to Loop** so it repeats seamlessly on Play. Values always emit as **float** (full resolution), and playback **replaces live input** on those Parameters. A per‑cell recorded loop is linearly interpolated at the current loop phase (anchored to scene start), saved with the session like the Draw sequencer's arrays.
+- **Hands‑free record (v0.6.3)**: the Motion Loop **●REC** in the transport bar (acts on the focused scene) is bindable two ways — a **MIDI footswitch / pad** via the standard MIDI Learn workflow (it appears in the Learned panel), OR the controller's **own button over OSC** (rising‑edge on an address such as the IMU's `/mpu/btn1`). One tap starts, the next stops — no mouse, both hands on the instrument.
+- **Direct Output (v0.6.3)**: a Hardware‑Mode toggle that continuously re‑emits each Parameter's **conditioned + scaled** value to a destination (e.g. a Max for Live device on `127.0.0.1`) with **no scene playing and no catch required** — the "just scale my controller and send it out" path. Distinct from raw OSC Forward (unscaled byte‑copy) and from the engine's scene emit (scaled but gated on scene + catch). It **auto‑yields per‑Parameter to a playing Motion Loop**, so looped Parameters play their loop while un‑looped Parameters keep flowing live.
+- **Capture auto‑detects the live Instrument (v0.6.3)**: the Capture popup's **New Scene for Instrument** mode now detects which Pool Instrument is currently streaming on the network (matched by its Hardware‑Mode binding or its Parameter addresses) and pre‑selects it with a "Detected on network" banner — so building a scene for the live instrument is one click.
 - **Hardware Mode UX hardening (v0.5.12 + v0.5.13)**: live status dot next to the "Hardware Mode" label (🟢 healthy / 🟡 enabled-but-no-packets / 🔴 dual-emission), `deviceMatch: 'ipOnly'` toggle for controllers with ephemeral source ports (Lemur, TouchOSC, ad-hoc software OSC), `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream consumers (PD, Max) only when no scene is playing (auto-flipping via `engine.activeSceneId`), **int + bool slots catch on value change** (v0.5.13 — no threshold, no idle-time window; a flip after an hour idle catches instantly, while a streaming controller's unchanged state can't steal slots back from a freshly-triggered scene), info-popup tooltips on every Hardware Mode field, right-click "Bind to template" actions on Network Discovery rows (per-template, eliminates the manual-typing-source-port trap), and a "self loopback" flag that excludes dataFLOU's own emissions from HW Mode bindings + the Capture popup's device list.
 - **Capture current state as new scene (v0.5.12)**: right-click any scene → "Capture current state as new scene" snapshots the engine's currently-emitted values for every cell on the scene (including Hardware Mode catches from a physical controller, sequencer step, modulator output, per-arg pins) into a new scene cloned from the source. Inserted directly adjacent to the source in the grid. Workflow: trigger a base scene, tweak via controller, right-click → capture. Named `<source> (capture)`.
 - **Gesture modulator (v0.5.8)**: record an X/Y stream by dragging on a square surface in the Inspector and use it as a modulator. The polyline + a crayon-style cursor render LIVE while you draw (canvas pinned-centered so it doesn't shift). On playback the engine loops the captured curve at the modulator's standard Rate (Hz or BPM-synced), and a coloured **playhead dot** animates on the canvas at ~30 Hz so you SEE the curve being traced. Three **Play modes** (Forward / Backward / Ping-Pong), a **Wiggle** knob (0–100 %, sinusoidal back-and-forth jitter on the playhead - modulatable by Modulation 2 as the third "Shape" target), and an **Output** picker: `XY` (X → slot 0, Y → slot 1) or `Merged` (radial distance √(x² + y²)/√2 broadcast to every slot). Two-channel fan-out via `gestureChannelFor`.
@@ -575,6 +582,43 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.3
+
+The **performance‑capture** release. v0.6.0 turned a raw sensor into clean, watchable control; v0.6.3 turns that control into something you *play* — send it live, or record it as a loop and re‑trigger it per scene, hands‑free. Built and tested against the same 9‑axis IMU (Olimex ESP32‑PoE + MPU‑9150) for a live show. Everything hangs off the existing **Hardware Mode** input path and saves with the session.
+
+### Motion Loop — recorded automation as Scenes
+
+A new per‑cell data source (`Cell.recordedLoop`) alongside value / sequencer / modulation: a captured time‑series recorded live from the conditioned + scaled hardware stream, played back **looping** while the scene is active.
+
+- **Record from the Scene inspector** (or the transport **●REC**): arm a scene, move the controller, stop. Free‑run length — the loop is exactly as long as you recorded.
+- **Auto‑creates the clips.** You don't pre‑build anything: on stop, dataFLOU creates a clip for every hardware‑mapped Parameter that received data (inheriting the Instrument's OSC routing) and drops the captured curve in.
+- **Scene timing syncs to the loop.** The scene's **Duration** is set to the take length and its **follow‑action to Loop**, so it repeats seamlessly on Play with no manual timing. (Re‑recording re‑sets both. Heads‑up: this overwrites the scene's prior duration / follow‑action — intended, since the scene *is* the loop.)
+- **Always float.** Recorded loops force float output at full resolution, even if the captured slot was int‑typed.
+- **Loop replaces live.** While a recorded loop plays, it's the source for those Parameters — the engine's live catch and Direct Output both step aside for them (Direct Output per‑Parameter, automatically).
+- Playback is a linear interpolation between frames at the current loop phase (anchored to scene start, re‑anchored on re‑fire). Frames are bounded (60000/track) and saved with the session like the Draw sequencer's arrays.
+
+### Hands‑free record trigger
+
+The Motion Loop **●REC** in the transport bar acts on the **focused scene** and is bindable two ways, so a performer holding an instrument never touches the mouse:
+
+- **MIDI** — a footswitch or pad via the global MIDI Learn workflow (right‑click ●REC → Learn, or the Learn button in the Motion Loop box). Shows up in the **Learned MIDI panel** with inline edit / delete.
+- **OSC / the controller's own button** — a rising‑edge (0→1) on a configurable address (default the IMU's `/mpu/btn1`). One tap starts, the next stops. (Short taps only if you're reusing a button whose long‑press means something to the firmware.)
+
+### Direct Output — conditioned + scaled passthrough
+
+A Hardware‑Mode sub‑toggle that re‑emits every incoming packet's **conditioned + per‑Parameter‑scaled** value straight to a destination (IP + port, typically a Max for Live device on `127.0.0.1`) with **no scene and no catch**. It fills the gap between the two existing output paths — raw OSC Forward (unscaled byte‑copy) and the engine's scene emit (scaled, but only while a scene plays and the slot is caught). It **auto‑yields to a playing Motion Loop** per‑Parameter, so a recorded scene and live control coexist without racing on the same OSC address.
+
+### Capture — auto‑detect the live Instrument
+
+**New Scene for Instrument** now detects which Pool Instrument is streaming on the network — matched first by its Hardware‑Mode device binding, then by OSC‑address overlap — and pre‑selects it with a "● Detected on network" banner (with a "Use it" shortcut if you'd picked another). A manual pick locks the selection so auto‑detect never yanks your choice.
+
+### Fixed
+
+- **Listen port no longer drifts.** The app auto‑bind effect was forcing the listener onto the session's default *send* port whenever it re‑ran (e.g. when a Forward target was edited), silently dragging the listener off the port you set — the "listener jumps to 9001" bug. The explicit **`listenerPort`** is now authoritative; listen (incoming) and default‑send (outgoing) are fully decoupled.
+- **Motion Loop record no longer eats the click** if the IPC bridge is momentarily stale (e.g. a dev preload not yet reloaded): the UI state flips first and the IPC fires defensively, so the button always responds.
 
 ---
 
@@ -1970,8 +2014,10 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.5.14:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.3:
 
+- ✅ **Performance capture (v0.6.3)**: **Motion Loop** (record the live hardware stream into a scene as looping automation — auto‑creates clips, forces float, syncs scene Duration + Loop), **hands‑free record** (transport ●REC bindable to a MIDI footswitch or the controller's own OSC button), **Direct Output** (conditioned + scaled passthrough to the DAW, auto‑yielding to a playing loop), and **Capture auto‑detect** of the live network Instrument. Plus the listener‑port‑drift fix (`listenerPort` now authoritative over the default send port).
+- ✅ **Live input (v0.6.0 / v0.6.1)**: per‑Instrument + per‑Parameter **Input Conditioning** chain (1€ / Smooth / Median / Slew / Deadband / Auto‑Range), **State Triggers** (rules + learn‑by‑demonstration firing MIDI / scenes), per‑Parameter Hardware scaling, live scopes + red‑dot readouts — then a 5‑agent hardening pass (malformed‑packet survival, stuck‑note fixes, MIDI port auto‑recovery, macOS engine‑alive‑on‑window‑close).
 - ✅ **Correctness + features pass (v0.5.14)**: Modulation 2 → direct value routing (new M2 column), Hardware Mode Catch/Jump takeover, Ramp "From" mode, "Update scene to current settings", Scene Inspector in Grid view, adjacent scene insert, undo depth raised to 100, plus 35 bug fixes — including `forwardMode`/`deviceMatch` no longer being stripped on session load, the Random modulator now honoring the routing matrix, and typing a duration no longer firing scene triggers.
 - ✅ **Hardware Mode discrete-slot catch on value change (v0.5.13)**: int + bool slots catch the moment their value differs from the device's previous transmission — no threshold, no idle-time window. Slow single presses catch instantly (the v0.5.12 bug), and a streaming controller's unchanged state can no longer steal slots back from a freshly-triggered scene. Fixes the OCTOCOSME instrument selector, INTERVALLE, KILL switches, GLOBAL_MODE / TOUCH_MODE — while letting scenes assert their saved switch data.
 - ✅ **Hardware Mode UX hardening (v0.5.12)**: live status dot at the configuration site, `deviceMatch: 'ipOnly'` toggle for ephemeral-port senders, `forwardMode: 'suppress' | 'always' | 'whenIdle'` policy so the controller can reach downstream only when no scene is playing (auto-flipping via `engine.activeSceneId`), int + bool slots catch instantly under HW Mode (v0.5.12 introduced the type-aware branch; v0.5.13 finished the job by moving it ahead of the movement gate), info-popup tooltips on every field, right-click "Bind to template" from Network Discovery rows, loopback flag + Capture-popup filter.
