@@ -65,7 +65,11 @@ function midi7(v: number): number {
 // 1..16. Coerce + clamp; treat undefined as channel 1 (the most
 // common single-device case).
 function midiChannel(ch: number | undefined): number {
-  const n = Math.floor(ch ?? 1) - 1
+  // Number.isFinite guard: `??` only catches null/undefined, so a NaN
+  // channel would otherwise flow through Math.floor as NaN and surface
+  // as "NaN" in the Monitor (the wire nibble silently coerces to 1).
+  const raw = Number.isFinite(ch) ? (ch as number) : 1
+  const n = Math.floor(raw) - 1
   return n < 0 ? 0 : n > 15 ? 15 : n
 }
 
@@ -107,16 +111,28 @@ export class MidiOutSender {
    *  often as the UI wants — RtMidi rescans on every read. */
   listPorts(): string[] {
     if (!midiNative) return []
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let probe: any = null
     try {
-      const probe = new midiNative.Output()
+      probe = new midiNative.Output()
       const out: string[] = []
       const n = probe.getPortCount()
       for (let i = 0; i < n; i++) out.push(probe.getPortName(i))
-      probe.destroy?.()
+      // A port that previously failed to open but is now visible again
+      // (device re-plugged) should get a fresh chance — clear it from
+      // the failed set so openOrGet retries instead of short-circuiting.
+      for (const name of out) this.failedPorts.delete(name)
       return out
     } catch (e) {
       this.lastError = (e as Error).message
       return []
+    } finally {
+      // Always free the probe, even if getPortName threw mid-loop.
+      try {
+        probe?.destroy?.()
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -285,6 +301,19 @@ export class MidiOutSender {
       const message = (e as Error).message
       rateLimitedError(`[MIDI] send to ${portName} failed:`, message)
       this.lastError = message
+      // The handle is dead (device unplugged mid-show). Close + forget
+      // it so the NEXT send re-opens lazily via openOrGet — otherwise
+      // we'd keep sending to the same dead handle forever and the port
+      // would never recover even after the device is re-plugged. We do
+      // NOT add it to failedPorts (that's for open failures); a
+      // reconnect should just re-open cleanly.
+      try {
+        port.closePort?.()
+        port.destroy?.()
+      } catch {
+        /* already dead */
+      }
+      this.ports.delete(portName)
       if (this.onError) {
         this.onError({
           timestamp: Date.now(),

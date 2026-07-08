@@ -1459,6 +1459,10 @@ export type StateTriggerMode =
 export type StateRuleOp = 'eq' | 'range' | 'gt' | 'lt'
 
 export interface StateRule {
+  // Stable id — used as the React key in the rules editor so deleting a
+  // rule can't misalign the remaining rows' input state. Optional for
+  // back-compat with sessions saved before this field.
+  id?: string
   // OSC address as seen from the device (matches Track.defaultOscAddress
   // resolution, e.g. "/mpu/euler/roll").
   address: string
@@ -2299,7 +2303,6 @@ export interface ExposedApi {
   sessionOpen: () => Promise<{ session: Session; path: string } | null>
   // Autosave / crash recovery
   autosaveCrashCheck: () => Promise<{ crashed: boolean; entries: AutosaveEntry[] }>
-  autosaveList: () => Promise<AutosaveEntry[]>
   autosaveLoad: (path: string) => Promise<Session>
   // Events from main
   onEngineState: (cb: (s: EngineState) => void) => () => void

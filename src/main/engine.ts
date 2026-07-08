@@ -59,29 +59,31 @@ interface ConditionerStageState {
 }
 interface ConditionerSlotState {
   lastT: number
+  // Ordered stage-type signature (e.g. "median,oneEuro"); re-warm when
+  // it changes so stale per-stage state can't bleed across a type swap.
+  sig: string
   stages: ConditionerStageState[]
 }
-// (v0.6) Per-parameter hardware scaling: linear map from the device's
-// native range onto the parameter's output range, clamped. Swapped out
-// bounds invert. Degenerate in-range returns outMin (no divide-by-~0).
-function applyHardwareScale(
-  cfg: import('@shared/types').HardwareScaleConfig,
-  v: number
-): number {
-  if (!Number.isFinite(v)) return v
-  const inSpan = cfg.inMax - cfg.inMin
-  if (Math.abs(inSpan) < 1e-12) return cfg.outMin
-  const t = (v - cfg.inMin) / inSpan
-  const out = cfg.outMin + t * (cfg.outMax - cfg.outMin)
-  const lo = Math.min(cfg.outMin, cfg.outMax)
-  const hi = Math.max(cfg.outMin, cfg.outMax)
-  return Math.max(lo, Math.min(hi, out))
-}
+// (v0.6) Per-parameter hardware scaling uses the SHARED `scaleHardwareValue`
+// from factory (imported below) so the engine's catch pipeline and the
+// renderer's live track readout can never drift.
 
 // Hard cap on distinct (template|device|address) conditioner keys so a
 // port-churning source can't grow the map unbounded (same rationale as
 // MAX_HW_MOVEMENT_DEVICES).
 const MAX_CONDITIONER_KEYS = 512
+// Hard cap on distinct OSC addresses tracked PER device (inner maps of
+// hardwareLastValues / hardwareLastChangeMs / stateInputLatest). Real
+// controllers use a fixed address set well under this; the cap only
+// bounds a source that encodes data in the address path. FIFO-evicts
+// the oldest address (Map preserves insertion order).
+const MAX_ADDRESSES_PER_DEVICE = 512
+function capInnerAddressMap(m: Map<string, unknown>, address: string): void {
+  if (m.size >= MAX_ADDRESSES_PER_DEVICE && !m.has(address)) {
+    const oldest = m.keys().next().value
+    if (oldest !== undefined) m.delete(oldest)
+  }
+}
 // Scope ring length: ~40 s of 50 Hz packets, so the UI can offer an
 // editable time window up to ~30 s without starving. Each poll can
 // request a windowMs to bound how much of this it actually ships.
@@ -93,6 +95,9 @@ const CONDITIONER_SCOPE_LEN = 2000
 // it's a cheap array push per matching packet). After this it's
 // pruned and its buffer freed.
 const CONDITIONER_SCOPE_TTL_MS = 5 * 60 * 1000
+// Gate length for a State Trigger note in 'oneShot' mode — there is no
+// exit event to release it, so it auto-releases after this.
+const STATE_ONESHOT_GATE_MS = 200
 
 // Generative history ring buffer length. Caps the no-repeat memory
 // and the shuffle-cycle "already played" set. ~24 entries covers a
@@ -118,6 +123,7 @@ import {
   parseValueTokens,
   polyrhythmGate,
   readNumber,
+  scaleHardwareValue,
   scaleMetaValue
 } from '@shared/factory'
 import { OscSender, type OscErrorEvent, type OscSendEvent } from './osc'
@@ -1141,6 +1147,16 @@ export class SceneEngine {
   // than pushed through emitState, keeping the 50 Hz packet path off
   // the heavyweight state-emit.
   private stateTriggerLive: Map<string, number> = new Map()
+  // Held Note-kind output per trigger key `${tplId}|${stateId}` so a
+  // note can be released on exit / disable / delete / stop / panic and
+  // never hangs. Records the EXACT (port, channel, note) sent so the
+  // Note Off matches even if the config changed since. `oneShot` notes
+  // also get a gate timer here.
+  private stateTriggerHeldNote: Map<
+    string,
+    { port: string; channel: number; note: number }
+  > = new Map()
+  private stateTriggerGateTimers: Map<string, NodeJS.Timeout> = new Map()
   // In-flight learn-by-demonstration recording session, or null.
   private stateRecording: {
     templateId: string
@@ -1159,6 +1175,15 @@ export class SceneEngine {
   stop(): void {
     this.stopTicker()
     this.sender.stop()
+    // Release held State-Trigger notes + gate timers, and abort any
+    // in-flight learn-recording (its safety timer would otherwise fire
+    // after teardown and resolve a stale promise).
+    this.releaseAllStateNotes()
+    if (this.stateRecording) {
+      clearTimeout(this.stateRecording.timer)
+      this.stateRecording.finalize(null)
+      this.stateRecording = null
+    }
     // Fire Note Off for every held MIDI note + tear down all open
     // ports before clearing tracks — without this, app shutdown
     // would leak ringing notes on every connected MIDI device.
@@ -1639,6 +1664,8 @@ export class SceneEngine {
         prevChange[i] = now
       }
     }
+    capInnerAddressMap(perDevValues, address)
+    capInnerAddressMap(perDevChange, address)
     perDevValues.set(address, prevVals)
     perDevChange.set(address, prevChange)
     // For each matching template, walk its parameters + arg locks
@@ -1732,7 +1759,7 @@ export class SceneEngine {
           //   re-catch; an actual flip catches instantly regardless
           //   of timing.
           const hwVal = hwScale
-            ? applyHardwareScale(hwScale, numericArgs[i])
+            ? scaleHardwareValue(hwScale, numericArgs[i])
             : numericArgs[i]
           const catchKey = `${track.id}|${i}`
           // (Bug 33 FIX) Already-caught refresh runs BEFORE the
@@ -1819,6 +1846,7 @@ export class SceneEngine {
         }
       }
     }
+    capInnerAddressMap(latestByAddress, address)
     latestByAddress.set(address, numericArgs.slice())
     const rec = this.stateRecording
     if (rec && matchedTemplates.some((t) => t.id === rec.templateId)) {
@@ -1872,11 +1900,16 @@ export class SceneEngine {
       if (!Number.isFinite(out[i])) continue
       if (bypass.includes(i)) continue
       let st = slots[i]
-      // Re-warm when the chain length changed (stage added/removed) —
-      // stale per-stage state from a different chain shape is garbage.
-      if (!st || st.stages.length !== cfg.stages.length) {
+      // Re-warm when the chain SHAPE changed — not just the count, but
+      // also any in-place stage TYPE swap or reorder. A stale `ring`
+      // (median) or `min/max` (autoRange) surviving into a different
+      // stage type would produce a glitch, so key the re-warm on the
+      // ordered type signature.
+      const sig = cfg.stages.map((s) => s.type).join(',')
+      if (!st || st.sig !== sig) {
         st = {
           lastT: now,
+          sig,
           stages: cfg.stages.map(() => ({}))
         }
         slots[i] = st
@@ -1996,6 +2029,11 @@ export class SceneEngine {
         if (range < 1e-9) return 0.5
         return (x - ss.min) / range
       }
+      default:
+        // Unknown stage type (session saved by a newer build, or
+        // corrupt data) — pass the value through untouched rather than
+        // returning `undefined` into the conditioned stream.
+        return x
     }
   }
 
@@ -2014,6 +2052,15 @@ export class SceneEngine {
       const key = `${tpl.id}|${trig.id}`
       if (!trig.enabled) {
         this.stateTriggerLive.delete(key)
+        // Disabled while active with a held note → release it (else it
+        // hangs) and reset the runtime so re-enabling starts clean.
+        const rtOff = this.stateTriggerRuntime.get(key)
+        if (rtOff?.active) {
+          this.releaseStateNote(key)
+          rtOff.active = false
+          rtOff.matchSince = 0
+          rtOff.lastCcSent = -1
+        }
         continue
       }
       let rt = this.stateTriggerRuntime.get(key)
@@ -2048,7 +2095,7 @@ export class SceneEngine {
           if (now - rt.matchSince >= Math.max(0, trig.dwellMs)) {
             rt.active = true
             rt.matchSince = 0
-            this.fireStateEnter(trig, canMidi)
+            this.fireStateEnter(trig, canMidi, key)
           }
         } else {
           rt.matchSince = 0
@@ -2056,7 +2103,7 @@ export class SceneEngine {
       } else if (!matchedWithHysteresis) {
         rt.active = false
         rt.matchSince = 0
-        this.fireStateExit(trig, canMidi)
+        this.fireStateExit(trig, canMidi, key)
       }
     }
   }
@@ -2161,13 +2208,36 @@ export class SceneEngine {
     }
   }
 
-  private fireStateEnter(trig: StateTrigger, canMidi: boolean): void {
+  private fireStateEnter(trig: StateTrigger, canMidi: boolean, key: string): void {
     const m = trig.actions.midi
     if (canMidi && m && trig.mode !== 'continuous') {
       if (m.kind === 'note') {
         const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
         const vel = Math.max(1, Math.min(127, Math.floor(m.velocity ?? 100)))
+        // Release any note still held for this trigger before the new
+        // one (mono per trigger) — also clears a pending gate timer.
+        this.releaseStateNote(key)
         this.midiSender.sendNoteOn(m.portName, m.channel, note, vel)
+        this.stateTriggerHeldNote.set(key, {
+          port: m.portName,
+          channel: m.channel,
+          note
+        })
+        // oneShot has no exit event to release the note, so schedule a
+        // gated Note Off — otherwise the note hangs forever.
+        if (trig.mode === 'oneShot') {
+          const port = m.portName
+          const ch = m.channel
+          const timer = setTimeout(() => {
+            this.stateTriggerGateTimers.delete(key)
+            const held = this.stateTriggerHeldNote.get(key)
+            if (held && held.note === note && held.port === port) {
+              this.midiSender.sendNoteOff(port, ch, note)
+              this.stateTriggerHeldNote.delete(key)
+            }
+          }, STATE_ONESHOT_GATE_MS)
+          this.stateTriggerGateTimers.set(key, timer)
+        }
       } else {
         const cc = Math.max(0, Math.min(127, Math.floor(m.cc ?? 20)))
         const val = Math.max(0, Math.min(127, Math.floor(m.ccEnterValue ?? 127)))
@@ -2182,18 +2252,49 @@ export class SceneEngine {
     }
   }
 
-  private fireStateExit(trig: StateTrigger, canMidi: boolean): void {
+  private fireStateExit(trig: StateTrigger, canMidi: boolean, key: string): void {
     if (trig.mode !== 'enterExit') return
     const m = trig.actions.midi
-    if (!canMidi || !m) return
+    if (!m) return
     if (m.kind === 'note') {
-      const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
-      this.midiSender.sendNoteOff(m.portName, m.channel, note)
-    } else {
+      // Always release the exact held note (even if MIDI was disabled
+      // meanwhile — the Note Off is a cleanup, harmless if the port is
+      // gone). Falls back to the configured note if nothing tracked.
+      if (!this.releaseStateNote(key) && canMidi) {
+        const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
+        this.midiSender.sendNoteOff(m.portName, m.channel, note)
+      }
+    } else if (canMidi) {
       const cc = Math.max(0, Math.min(127, Math.floor(m.cc ?? 20)))
       const val = Math.max(0, Math.min(127, Math.floor(m.ccExitValue ?? 0)))
       this.midiSender.sendCc(m.portName, m.channel, cc, val)
     }
+  }
+
+  /** Send Note Off for a trigger's held note (if any) and clear its
+   *  gate timer. Returns true if a note was actually released. Used on
+   *  exit, disable, delete, stop, and panic so state notes never hang. */
+  private releaseStateNote(key: string): boolean {
+    const timer = this.stateTriggerGateTimers.get(key)
+    if (timer) {
+      clearTimeout(timer)
+      this.stateTriggerGateTimers.delete(key)
+    }
+    const held = this.stateTriggerHeldNote.get(key)
+    if (!held) return false
+    this.stateTriggerHeldNote.delete(key)
+    this.midiSender.sendNoteOff(held.port, held.channel, held.note)
+    return true
+  }
+
+  /** Release every held State-Trigger note. Called on stop()/panic. */
+  private releaseAllStateNotes(): void {
+    for (const key of Array.from(this.stateTriggerHeldNote.keys())) {
+      this.releaseStateNote(key)
+    }
+    // Clear any orphan gate timers too.
+    for (const t of this.stateTriggerGateTimers.values()) clearTimeout(t)
+    this.stateTriggerGateTimers.clear()
   }
 
   // ── State Trigger public API (IPC surface) ────────────────────────
@@ -2533,6 +2634,18 @@ export class SceneEngine {
       }
       for (const k of Array.from(this.stateTriggerLive.keys())) {
         if (!trigKeys.has(k)) this.stateTriggerLive.delete(k)
+      }
+      // Release (and stop tracking) any held note whose trigger was
+      // deleted while active — otherwise it hangs forever.
+      for (const k of Array.from(this.stateTriggerHeldNote.keys())) {
+        if (!trigKeys.has(k)) this.releaseStateNote(k)
+      }
+      for (const k of Array.from(this.stateTriggerGateTimers.keys())) {
+        if (!trigKeys.has(k)) {
+          const t = this.stateTriggerGateTimers.get(k)
+          if (t) clearTimeout(t)
+          this.stateTriggerGateTimers.delete(k)
+        }
       }
     }
     // Prune liveValues entries for scenes or tracks that no longer exist.
@@ -3703,6 +3816,8 @@ export class SceneEngine {
     for (const [tid, ts] of this.tracks.entries()) {
       if (ts.armed || ts.delayTimer) this.beginStop(tid, undefined, /* silent */ true)
     }
+    // Release any held State-Trigger notes too — "stop everything".
+    this.releaseAllStateNotes()
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
@@ -3729,6 +3844,10 @@ export class SceneEngine {
       ts.fromCenter = []
       ts.toCenter = []
     }
+    // Release + forget any held State-Trigger notes and their gate
+    // timers (the global sweep below also silences them, but this
+    // clears our tracking so nothing fires later).
+    this.releaseAllStateNotes()
     // Global MIDI panic — All Notes Off + All Sound Off + Reset All
     // Controllers on every open port and every channel. The
     // midiSender stays alive (panic doesn't tear it down) so

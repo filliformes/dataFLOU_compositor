@@ -14,7 +14,7 @@
 // Embedded in BOTH the Pool TemplateInspector and the grid-side
 // TrackInspector, like HardwareModeSection.
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
@@ -146,6 +146,15 @@ function StateTriggerCard({
   const [expanded, setExpanded] = useState(true)
   const [recording, setRecording] = useState(false)
   const [recordMs, setRecordMs] = useState(2000)
+  // Guard setState after the up-to-30 s record await if the card
+  // unmounts meanwhile (inspector navigated away / state deleted).
+  const aliveRef = useRef(true)
+  useEffect(() => {
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+    }
+  }, [])
   const patch = (p: Partial<StateTrigger>): void =>
     updateStateTrigger(template.id, trig.id, p)
 
@@ -172,6 +181,7 @@ function StateTriggerCard({
         trig.id,
         recordMs
       )
+      if (!aliveRef.current) return
       if (result) {
         // Preserve a user-tuned threshold across re-records.
         patch({
@@ -187,7 +197,7 @@ function StateTriggerCard({
         )
       }
     } finally {
-      setRecording(false)
+      if (aliveRef.current) setRecording(false)
     }
   }
 
@@ -408,7 +418,9 @@ function RulesEditor({
   return (
     <div className="flex flex-col gap-1">
       {trig.rules.map((rule, i) => (
-        <div key={i} className="flex items-center gap-1 flex-wrap">
+        // Stable key by rule id (not array index) so deleting a rule
+        // can't carry a focused input's dirty buffer onto a sibling.
+        <div key={rule.id ?? `idx_${i}`} className="flex items-center gap-1 flex-wrap">
           <select
             className="input text-[10px] min-w-0"
             style={{ maxWidth: 130 }}
@@ -494,6 +506,7 @@ function RulesEditor({
             rules: [
               ...trig.rules,
               {
+                id: `srule_${Math.random().toString(36).slice(2, 10)}`,
                 address: addresses[0] ?? '',
                 slot: 0,
                 op: 'range',

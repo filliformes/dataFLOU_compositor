@@ -27,6 +27,20 @@ export function dumpScopePrefs(): Record<string, ScopePrefs> {
   return out
 }
 
+// Drop scope-pref entries whose `${templateId}|${address}` prefix is no
+// longer live (template or Parameter deleted). Keeps orphan frame
+// settings from accumulating in the session file across edits. Called
+// from setSession after loadScopePrefs with the current valid prefixes.
+export function pruneScopePrefs(validPrefixes: Set<string>): void {
+  for (const k of Array.from(scopePrefs.keys())) {
+    const firstPipe = k.indexOf('|')
+    const lastPipe = k.lastIndexOf('|')
+    // key = templateId|address|slot -> prefix = templateId|address
+    const prefix = firstPipe >= 0 && lastPipe > firstPipe ? k.slice(0, lastPipe) : k
+    if (!validPrefixes.has(prefix)) scopePrefs.delete(k)
+  }
+}
+
 // Replace the live Map from a loaded session (validating each entry so a
 // hand-edited file can't inject NaNs that would break the canvas math).
 export function loadScopePrefs(raw: unknown): void {

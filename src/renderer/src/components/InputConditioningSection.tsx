@@ -613,6 +613,7 @@ export function ScopeCanvas({
   // AND across sessions. Bumping scopePrefsRev flags App's session-flush
   // effect so autosave + saves capture the module-Map change.
   const bumpScopePrefsRev = useStore((s) => s.bumpScopePrefsRev)
+  const bumpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     scopePrefs.set(scopeKey, {
       windowSec,
@@ -621,8 +622,27 @@ export function ScopeCanvas({
       height,
       inited: initedRef.current
     })
-    bumpScopePrefsRev()
+    // Debounce the store rev-bump: a HEIGHT DRAG fires onChange at
+    // ~60-120 Hz, and each bump re-renders App + schedules a session
+    // flush. Coalesce them into one bump ~250 ms after the last change.
+    // The Map write above is immediate, so a manual save mid-drag still
+    // captures the current frame.
+    if (bumpTimerRef.current) clearTimeout(bumpTimerRef.current)
+    bumpTimerRef.current = setTimeout(() => {
+      bumpTimerRef.current = null
+      bumpScopePrefsRev()
+    }, 250)
   }, [scopeKey, windowSec, yMin, yMax, height, bumpScopePrefsRev])
+  // Flush a pending bump on unmount so the final tweak still reaches
+  // autosave even if the user navigates away right after changing it.
+  useEffect(() => {
+    return () => {
+      if (bumpTimerRef.current) {
+        clearTimeout(bumpTimerRef.current)
+        bumpScopePrefsRev()
+      }
+    }
+  }, [bumpScopePrefsRev])
 
   return (
     <div className="flex flex-col gap-1">

@@ -1871,7 +1871,7 @@ export function HardwareModeSection({
               native value range onto each Parameter's output range
               BEFORE the catch-tolerance comparison, so a 0..360°
               sensor can catch a 0..1 scene value. Engine-side:
-              applyHardwareScale in handleHardwareInput's slot loop. */}
+              scaleHardwareValue (shared) in handleHardwareInput's slot loop. */}
           <Field
             label="Per-parameter scaling (device → output)"
             tooltip={

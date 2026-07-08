@@ -51,6 +51,10 @@ export class OscNetworkListener {
   private port = DEFAULT_PORT
   private enabled = false
   private lastError = ''
+  // Rate-limit + count for the "malformed OSC packet ignored" log so a
+  // stream of bad datagrams doesn't spam the console.
+  private lastBadPacketLogMs = 0
+  private badPacketCount = 0
   private devices = new Map<string, DiscoveredOscDevice>()
   // Set whenever observe() mutates state; `flush()` checks it on the
   // periodic IPC timer so we only push to the renderer when something
@@ -442,6 +446,30 @@ export class OscNetworkListener {
         }
       })
       port.on('error', (err: Error) => {
+        // (HARDENING) The `osc` library funnels DECODE/parse errors
+        // through the SAME 'error' event as fatal socket errors: any
+        // truncated / non-OSC / corrupt UDP datagram (a stray LAN
+        // broadcast, a port scanner, one malformed sensor bundle)
+        // arrives here as a plain Error. Post-ready, such a packet must
+        // NOT tear the listener down — doing so killed discovery +
+        // Hardware Mode input + forwarding with no auto-recovery (one
+        // bad packet = dead live input mid-show). Genuine socket errors
+        // (EADDRINUSE, ECONNRESET, ICMP unreachable) carry a `code` or
+        // `syscall`; parse errors don't. Only tear down on the former.
+        const e = err as NodeJS.ErrnoException
+        const isSocketError =
+          typeof e.code === 'string' || typeof e.syscall === 'string'
+        if (settled && !isSocketError) {
+          this.badPacketCount++
+          const nowMs = Date.now()
+          if (nowMs - this.lastBadPacketLogMs > 5000) {
+            this.lastBadPacketLogMs = nowMs
+            console.warn(
+              `[OSC Network] ignoring malformed OSC datagram (${this.badPacketCount} total): ${err.message}`
+            )
+          }
+          return
+        }
         // EADDRINUSE / EACCES — surface to the UI via lastError, keep
         // enabled=false so the user can pick another port. We DON'T
         // reject so the renderer's `setEnabled` promise resolves with

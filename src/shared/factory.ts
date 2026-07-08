@@ -502,12 +502,6 @@ export function makeInputStage(
   }
 }
 
-export const DEFAULT_INPUT_CONDITIONER: import('./types').InputConditionerConfig = {
-  enabled: false,
-  stages: [],
-  slotBypass: []
-}
-
 // Human-readable labels + one-line hints for the stage picker UI.
 export const INPUT_STAGE_INFO: Record<
   import('./types').InputStageType,

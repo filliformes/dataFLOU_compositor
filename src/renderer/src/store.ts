@@ -23,8 +23,12 @@ import type {
   NextMode,
   OscForwardTarget,
   ParameterTemplate,
+  AttractorParams,
+  GestureParams,
   Pool,
   RampParams,
+  RandomParams,
+  SampleHoldParams,
   Scene,
   SeqMode,
   SeqSyncMode,
@@ -53,6 +57,8 @@ import {
   DEFAULT_GENERATIVE_CONFIG,
   DEFAULT_MODULATION,
   DEFAULT_RAMP,
+  DEFAULT_ATTRACTOR,
+  DEFAULT_GESTURE,
   DEFAULT_RANDOM,
   DEFAULT_SEQUENCER,
   DEFAULT_SH,
@@ -79,7 +85,7 @@ import {
   parseValueTokens
 } from '@shared/factory'
 import { checkSessionIntegrity } from './hooks/sessionIntegrity'
-import { dumpScopePrefs, loadScopePrefs } from './scopePrefs'
+import { dumpScopePrefs, loadScopePrefs, pruneScopePrefs } from './scopePrefs'
 
 // ---- Clip templates: persisted in localStorage so they survive app restarts.
 
@@ -1442,8 +1448,19 @@ export const useStore = create<State>((set, get) => ({
     const ui = next.ui ?? {}
     const cur = get()
     // (v0.6) Restore the per-scope frames into the module-scope Map so
-    // reopening a Parameter's scope shows the saved time/value/height.
+    // reopening a Parameter's scope shows the saved time/value/height,
+    // then drop any orphan frames (template/Parameter since deleted) so
+    // they don't accumulate in the file across edits.
     loadScopePrefs(ui.scopePrefs)
+    {
+      const validPrefixes = new Set<string>()
+      for (const t of next.tracks) {
+        if (t.kind === 'function' && t.sourceTemplateId && t.defaultOscAddress) {
+          validPrefixes.add(`${t.sourceTemplateId}|${t.defaultOscAddress}`)
+        }
+      }
+      pruneScopePrefs(validPrefixes)
+    }
     const uiPatch: Partial<UiState> = {}
     if (typeof ui.uiScale === 'number' && Number.isFinite(ui.uiScale)) {
       uiPatch.uiScale = Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, ui.uiScale))
@@ -5561,7 +5578,22 @@ function propagateDefaults(s: Session): Session {
                   DEFAULT_RANDOM.min,
                 max:
                   (m?.random as Partial<typeof DEFAULT_RANDOM> | undefined)?.max ??
-                  DEFAULT_RANDOM.max
+                  DEFAULT_RANDOM.max,
+                // distribution skew (Buchla 266 style) — optional; MUST
+                // round-trip or the user's edge/centre warp reverts to
+                // uniform on every load.
+                ...(typeof (m?.random as Partial<typeof DEFAULT_RANDOM> | undefined)
+                  ?.distribution === 'number' &&
+                Number.isFinite(
+                  (m!.random as RandomParams).distribution as number
+                )
+                  ? {
+                      distribution: Math.max(
+                        0,
+                        Math.min(1, (m!.random as RandomParams).distribution as number)
+                      )
+                    }
+                  : {})
               },
               // S&H / Slew / Chaos — all three brand-new; back-fill on
               // load so older session files still satisfy the type and
@@ -5577,7 +5609,20 @@ function propagateDefaults(s: Session): Session {
                         0,
                         Math.min(1, (m!.sh as typeof DEFAULT_SH).probability)
                       )
-                    : DEFAULT_SH.probability
+                    : DEFAULT_SH.probability,
+                // distribution skew — same round-trip fix as random above.
+                ...(typeof (m?.sh as Partial<typeof DEFAULT_SH> | undefined)
+                  ?.distribution === 'number' &&
+                Number.isFinite(
+                  (m!.sh as SampleHoldParams).distribution as number
+                )
+                  ? {
+                      distribution: Math.max(
+                        0,
+                        Math.min(1, (m!.sh as SampleHoldParams).distribution as number)
+                      )
+                    }
+                  : {})
               },
               slew: {
                 riseMs:
@@ -5602,6 +5647,59 @@ function propagateDefaults(s: Session): Session {
                         Math.min(4.0, (m!.chaos as typeof DEFAULT_CHAOS).r)
                       )
                     : DEFAULT_CHAOS.r
+              },
+              // Strange Attractor (v0.5.7) — this reconstruction previously
+              // omitted `attractor` entirely, so type/speed/chaos reverted
+              // to canonical Lorenz on every load. Round-trip them.
+              attractor: {
+                type:
+                  (m?.attractor as Partial<typeof DEFAULT_ATTRACTOR> | undefined)
+                    ?.type ?? DEFAULT_ATTRACTOR.type,
+                speed:
+                  typeof (m?.attractor as Partial<typeof DEFAULT_ATTRACTOR> | undefined)
+                    ?.speed === 'number' &&
+                  Number.isFinite((m!.attractor as AttractorParams).speed)
+                    ? (m!.attractor as AttractorParams).speed
+                    : DEFAULT_ATTRACTOR.speed,
+                chaos:
+                  typeof (m?.attractor as Partial<typeof DEFAULT_ATTRACTOR> | undefined)
+                    ?.chaos === 'number' &&
+                  Number.isFinite((m!.attractor as AttractorParams).chaos)
+                    ? (m!.attractor as AttractorParams).chaos
+                    : DEFAULT_ATTRACTOR.chaos
+              },
+              // Gesture (v0.5.8) — CRITICAL: the recorded polyline lived
+              // here and was being DESTROYED on every load (points -> [],
+              // so the engine emitted a dead flat 0.5). Round-trip the
+              // recording + play settings. Points are validated per-entry
+              // ({t,x,y} finite) so a hand-edited file can't inject NaN.
+              gesture: {
+                points: Array.isArray(
+                  (m?.gesture as Partial<typeof DEFAULT_GESTURE> | undefined)?.points
+                )
+                  ? ((m!.gesture as GestureParams).points as unknown[])
+                      .filter(
+                        (p): p is { t: number; x: number; y: number } =>
+                          !!p &&
+                          typeof p === 'object' &&
+                          Number.isFinite((p as { t?: unknown }).t) &&
+                          Number.isFinite((p as { x?: unknown }).x) &&
+                          Number.isFinite((p as { y?: unknown }).y)
+                      )
+                      .map((p) => ({ t: p.t, x: p.x, y: p.y }))
+                  : [...DEFAULT_GESTURE.points],
+                mode:
+                  (m?.gesture as Partial<typeof DEFAULT_GESTURE> | undefined)?.mode ??
+                  DEFAULT_GESTURE.mode,
+                wiggle:
+                  typeof (m?.gesture as Partial<typeof DEFAULT_GESTURE> | undefined)
+                    ?.wiggle === 'number' &&
+                  Number.isFinite((m!.gesture as GestureParams).wiggle)
+                    ? (m!.gesture as GestureParams).wiggle
+                    : DEFAULT_GESTURE.wiggle,
+                playMode:
+                  (m?.gesture as Partial<typeof DEFAULT_GESTURE> | undefined)
+                    ?.playMode ?? DEFAULT_GESTURE.playMode
               }
             }
           }
@@ -6000,7 +6098,17 @@ function sanitizeMidiOut(
     gateLengthMs:
       typeof r.gateLengthMs === 'number' && Number.isFinite(r.gateLengthMs)
         ? Math.max(0, Math.min(60_000, Math.floor(r.gateLengthMs)))
-        : 0
+        : 0,
+    // noteMin/noteMax define the [0..1] -> note window for Note-kind
+    // cells. Previously dropped here, so a custom note window reverted
+    // to the engine's C2..C6 default on every save/load. Round-trip
+    // them (clamped 0..127) only when present so back-compat is intact.
+    ...(typeof r.noteMin === 'number' && Number.isFinite(r.noteMin)
+      ? { noteMin: Math.max(0, Math.min(127, Math.floor(r.noteMin))) }
+      : {}),
+    ...(typeof r.noteMax === 'number' && Number.isFinite(r.noteMax)
+      ? { noteMax: Math.max(0, Math.min(127, Math.floor(r.noteMax))) }
+      : {})
   }
 }
 
@@ -6153,14 +6261,16 @@ function sanitizeInputConditioner(
       type: s.type as InputConditionerConfig['stages'][number]['type'],
       enabled: s.enabled !== false,
       ...(typeof s.address === 'string' && s.address ? { address: s.address } : {}),
-      ...(typeof s.minCutoffHz === 'number' ? { minCutoffHz: s.minCutoffHz } : {}),
-      ...(typeof s.beta === 'number' ? { beta: s.beta } : {}),
-      ...(typeof s.halfLifeMs === 'number' ? { halfLifeMs: s.halfLifeMs } : {}),
-      ...(typeof s.window === 'number' ? { window: s.window } : {}),
-      ...(typeof s.maxPerSec === 'number' ? { maxPerSec: s.maxPerSec } : {}),
-      ...(typeof s.epsilon === 'number' ? { epsilon: s.epsilon } : {}),
-      ...(typeof s.contractHalfLifeMs === 'number'
-        ? { contractHalfLifeMs: s.contractHalfLifeMs }
+      // Number.isFinite (not typeof === 'number') so a hand-edited/
+      // corrupt file can't smuggle NaN into a filter coefficient.
+      ...(Number.isFinite(s.minCutoffHz) ? { minCutoffHz: s.minCutoffHz as number } : {}),
+      ...(Number.isFinite(s.beta) ? { beta: s.beta as number } : {}),
+      ...(Number.isFinite(s.halfLifeMs) ? { halfLifeMs: s.halfLifeMs as number } : {}),
+      ...(Number.isFinite(s.window) ? { window: s.window as number } : {}),
+      ...(Number.isFinite(s.maxPerSec) ? { maxPerSec: s.maxPerSec as number } : {}),
+      ...(Number.isFinite(s.epsilon) ? { epsilon: s.epsilon as number } : {}),
+      ...(Number.isFinite(s.contractHalfLifeMs)
+        ? { contractHalfLifeMs: s.contractHalfLifeMs as number }
         : {})
     }))
   return {
@@ -6188,9 +6298,12 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
           !!ru &&
           typeof ru === 'object' &&
           typeof (ru as Record<string, unknown>).address === 'string' &&
-          typeof (ru as Record<string, unknown>).a === 'number'
+          // Number.isFinite so a NaN comparison value can't slip into
+          // the detector (would make every match test NaN-false).
+          Number.isFinite((ru as Record<string, unknown>).a)
       )
-      .map((ru) => ({
+      .map((ru, ri) => ({
+        id: typeof ru.id === 'string' ? ru.id : `srule_load_${ri}`,
         address: ru.address as string,
         slot:
           typeof ru.slot === 'number' && Number.isInteger(ru.slot)
@@ -6200,8 +6313,8 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
           ? ru.op
           : 'eq') as StateTrigger['rules'][number]['op'],
         a: ru.a as number,
-        ...(typeof ru.b === 'number' ? { b: ru.b } : {}),
-        ...(typeof ru.tol === 'number' ? { tol: ru.tol } : {})
+        ...(Number.isFinite(ru.b) ? { b: ru.b as number } : {}),
+        ...(Number.isFinite(ru.tol) ? { tol: ru.tol as number } : {})
       }))
     const learnedRaw = r.learned as Record<string, unknown> | undefined
     let learned: StateTrigger['learned']
@@ -6259,11 +6372,11 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
           ? (r.mode as StateTrigger['mode'])
           : 'enterExit',
       hysteresisPct:
-        typeof r.hysteresisPct === 'number'
-          ? Math.max(0, Math.min(0.5, r.hysteresisPct))
+        Number.isFinite(r.hysteresisPct)
+          ? Math.max(0, Math.min(0.5, r.hysteresisPct as number))
           : 0.1,
       dwellMs:
-        typeof r.dwellMs === 'number' ? Math.max(0, r.dwellMs) : 80,
+        Number.isFinite(r.dwellMs) ? Math.max(0, r.dwellMs as number) : 80,
       rules,
       ...(learned ? { learned } : {}),
       actions: {

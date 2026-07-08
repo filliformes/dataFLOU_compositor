@@ -6232,19 +6232,12 @@ function Section({
 function CollapsibleViewSection({
   title,
   rightContent,
-  headerLeft,
   forceCollapsed,
   headerEnd,
   children
 }: {
   title: string
   rightContent?: React.ReactNode
-  // Optional control rendered BEFORE the chevron / title on the
-  // header row. DEPRECATED for new sections — `headerEnd` parks
-  // the same kind of control at the far right of the row so
-  // chevrons stay column-aligned across every collapsible section
-  // in the inspector. Kept here so older callers still compile.
-  headerLeft?: React.ReactNode
   // Optional control rendered AT THE FAR RIGHT of the header row,
   // OUTSIDE the toggle button. Used by the Destination section's
   // OSC Output checkbox so it sits flush right and the chevron
@@ -6264,17 +6257,6 @@ function CollapsibleViewSection({
   return (
     <div className="flex flex-col gap-1 pt-2 border-t border-border first:border-t-0 first:pt-0">
       <div className="flex items-center gap-2 min-w-0">
-        {headerLeft && (
-          // Stop click propagation so toggling the headerLeft
-          // checkbox doesn't also flip the collapse state via the
-          // toggle button below.
-          <span
-            onClick={(e) => e.stopPropagation()}
-            className="shrink-0 flex items-center"
-          >
-            {headerLeft}
-          </span>
-        )}
         <button
           type="button"
           className={`flex flex-1 items-center gap-2 min-w-0 text-left bg-transparent border-0 p-0 select-none ${

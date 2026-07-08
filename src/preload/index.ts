@@ -34,7 +34,6 @@ const api: ExposedApi = {
   sessionOpen: () => ipcRenderer.invoke('session:open'),
 
   autosaveCrashCheck: () => ipcRenderer.invoke('autosave:crashCheck'),
-  autosaveList: () => ipcRenderer.invoke('autosave:list'),
   autosaveLoad: (path: string) => ipcRenderer.invoke('autosave:load', path),
 
   onEngineState: (cb) => {

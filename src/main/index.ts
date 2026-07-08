@@ -423,7 +423,6 @@ app.whenReady().then(async () => {
     const entries = await autosave.listAutosaves()
     return { crashed: prevRunCrashed, entries }
   })
-  safeHandle('autosave:list', () => autosave.listAutosaves())
   // Load DOES want to propagate failures (so the user sees the parse
   // error in the integrity dialog). Leave it on the raw ipcMain.handle.
   ipcMain.handle('autosave:load', async (_e, path: string) => {
@@ -443,8 +442,18 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  shutdown()
-  if (process.platform !== 'darwin') app.quit()
+  // On non-macOS, closing the last window quits the app (teardown here).
+  // On macOS, the standard pattern is to STAY resident in the dock: do
+  // NOT shut down the engine / autosave / OSC socket, so reopening from
+  // the dock ('activate' -> createWindow) reconnects to a still-live
+  // engine (its webContents.send calls read the reassigned mainWindow).
+  // Teardown for macOS happens in 'before-quit' (Cmd+Q). Previously this
+  // ran shutdown() unconditionally, leaving a reopened window wired to a
+  // dead engine (no OSC/MIDI, no autosave).
+  if (process.platform !== 'darwin') {
+    shutdown()
+    app.quit()
+  }
 })
 
 app.on('before-quit', shutdown)

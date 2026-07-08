@@ -42,6 +42,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.1](#release-notes---061)
 - [Release notes - 0.6.0](#release-notes---060)
 - [Release notes - 0.5.14](#release-notes---0514)
 - [Release notes - 0.5.13](#release-notes---0513)
@@ -573,6 +574,27 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.1
+
+A **hardening pass** from a full-app audit (5 parallel review agents over the engine, store, React, IPC/network/MIDI, and dead code, with each real finding verified against the source). No new features — just making it rock solid. Highlights, most severe first:
+
+### Fixed - show-risk
+
+- **OSC listener now survives malformed packets.** A single truncated / non-OSC / corrupt UDP datagram (a stray LAN broadcast, a port scan, one bad sensor bundle) used to tear down the entire listener — killing discovery, Hardware-Mode input, and forwarding with no auto-recovery. The `osc` library funnels parse errors through the same event as fatal socket errors; the handler now distinguishes them and only tears down on genuine socket errors, logging-and-skipping bad datagrams (rate-limited).
+- **Recorded modulator data no longer laundered on load.** `propagateDefaults` was rebuilding each cell's modulation from a hand-listed field set that silently dropped the recorded **Gesture** polyline (reloading as a dead flat 0.5), the **Strange Attractor** type/speed/chaos, and the **Random / S&H distribution** skew. All are now round-tripped. (Pre-existing since those features shipped.)
+- **State-Trigger MIDI notes never hang.** A `oneShot`+note trigger sent a Note On with no Note Off (stuck note); `enterExit` notes also hung if the state was disabled/deleted while active or the device stopped streaming. Held notes are now tracked per trigger and released on exit, disable, delete, stop, and panic; one-shots get a gated auto-release.
+- **MIDI note windows (`noteMin`/`noteMax`) no longer revert** to C2–C6 on reload — they were dropped by the MIDI sanitizer.
+
+### Fixed - robustness
+
+- **MIDI port auto-recovers.** A device unplugged mid-show left a dead port handle cached forever (only a MIDI-enable toggle revived it); a failed send now closes + forgets the port so a reconnect re-opens cleanly, and the failed-port set clears for re-appeared devices.
+- **macOS: closing the window keeps the engine alive.** `window-all-closed` ran a full shutdown on macOS, so reopening from the dock connected to a stopped engine (no OSC/MIDI, no autosave). Teardown now happens only on quit; the standard resident-in-dock pattern.
+- **Input Conditioning robustness:** unknown stage types pass through instead of injecting `undefined`; the filter chain re-warms on any stage type/reorder change (not just count) so stale state can't bleed across a swap; per-device address maps are capped; corrupt-file `NaN` values are rejected by the v0.6 sanitizers.
+- **Shared scaling helper** — the engine and the live track readout now use one `scaleHardwareValue` implementation (was duplicated, a drift risk).
+- **Misc:** stable React keys in the State-Trigger rules editor; orphan scope frames pruned from the session; dead code removed (`autosaveList` IPC, an unused default, a deprecated prop); scope height-drag no longer re-renders the app every frame.
 
 ---
 
