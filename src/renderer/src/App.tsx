@@ -12,6 +12,7 @@ import TopBar from './components/TopBar'
 import EditView from './components/EditView'
 import MetaControllerBar from './components/MetaControllerBar'
 import SequenceView from './components/SequenceView'
+import { MappingsView } from './components/MappingsView'
 import OscMonitor from './components/OscMonitor'
 import { attachOscErrorStream } from './hooks/oscHealth'
 import { IntegrityPromptHost } from './components/IntegrityPromptHost'
@@ -25,6 +26,7 @@ import { GenerativePopoverHost } from './components/GenerativePopover'
 export default function App(): JSX.Element {
   const session = useStore((s) => s.session)
   const view = useStore((s) => s.view)
+  const mappingsOpen = useStore((s) => s.mappingsOpen)
   const setView = useStore((s) => s.setView)
   const setEngineState = useStore((s) => s.setEngineState)
   const theme = useStore((s) => s.theme)
@@ -493,6 +495,14 @@ export default function App(): JSX.Element {
         if (isEditableTarget(e.target)) return
         e.preventDefault()
         useStore.getState().setCaptureOpen(true)
+        return
+      }
+      // "N" → toggle the Mappings view.
+      if ((e.key === 'n' || e.key === 'N') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        const st = useStore.getState()
+        st.setMappingsOpen(!st.mappingsOpen)
         return
       }
       // "." → Stop All; Shift+"." → Panic.
@@ -1179,7 +1189,13 @@ export default function App(): JSX.Element {
       <div className="flex flex-col flex-1 min-h-0">
         <MetaControllerBar />
         <div className="flex-1 min-h-0">
-          {view === 'edit' ? <EditView /> : <SequenceView />}
+          {mappingsOpen ? (
+            <MappingsView />
+          ) : view === 'edit' ? (
+            <EditView />
+          ) : (
+            <SequenceView />
+          )}
         </div>
         {/* Global transport bar — play/pause/stop, view toggle, selected
             scene readout, and running time counter. Sits inside the zoom

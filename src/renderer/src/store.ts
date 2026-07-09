@@ -82,8 +82,12 @@ import {
   makeTemplateSpec,
   makeTemplateTrack,
   makeTrack,
-  parseValueTokens
+  parseValueTokens,
+  TRANSFER_CURVES
 } from '@shared/factory'
+
+// (v0.6.4) Valid transfer-curve values, for the scaling sanitizer.
+const TRANSFER_CURVE_SET = new Set<string>(TRANSFER_CURVES.map((c) => c.value))
 import { checkSessionIntegrity } from './hooks/sessionIntegrity'
 import { dumpScopePrefs, loadScopePrefs, pruneScopePrefs } from './scopePrefs'
 
@@ -313,6 +317,10 @@ interface UiState {
   // wall-clock so the Scene inspector can show a live "Recording… N.Ns".
   recordingLoopSceneId: string | null
   recordingLoopStartedAt: number | null
+  // (v0.6.4) Global Mappings view — overlays the main content when true.
+  // Toggled from the transport bar. UI-only, not persisted.
+  mappingsOpen: boolean
+  setMappingsOpen: (v: boolean) => void
   // Drawer height (px). User-resizable via the handle on top edge,
   // 120..600 (clamped). Persisted as part of the in-session UI prefs so
   // the height survives a drawer toggle.
@@ -673,6 +681,11 @@ interface Actions {
   setTemplateInputConditioner: (
     id: string,
     patch: Partial<InputConditionerConfig>
+  ) => void
+  // (v0.6.4) Derived Parameters — replace the whole list on a template.
+  setTemplateDerivedParams: (
+    id: string,
+    derivedParams: import('@shared/types').DerivedParam[]
   ) => void
   // State Triggers (v0.6) — CRUD on template.stateTriggers.
   addStateTrigger: (templateId: string) => string | null // returns new state id
@@ -1368,6 +1381,8 @@ export const useStore = create<State>((set, get) => ({
   generativePopoverOpen: false,
   recordingLoopSceneId: null,
   recordingLoopStartedAt: null,
+  mappingsOpen: false,
+  setMappingsOpen: (v) => set({ mappingsOpen: v }),
   oscMonitorHeight: 220,
   poolHidden: false,
   editInspectorVisible: true,
@@ -1910,6 +1925,18 @@ export const useStore = create<State>((set, get) => ({
         }
       }
     }),
+  setTemplateDerivedParams: (id, derivedParams) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === id ? { ...tt, derivedParams } : tt
+          )
+        }
+      }
+    })),
   addStateTrigger: (templateId) => {
     const t = get().session.pool.templates.find((tt) => tt.id === templateId)
     if (!t) return null
@@ -6673,16 +6700,29 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
                     typeof (e[1] as Record<string, unknown>).outMin === 'number' &&
                     typeof (e[1] as Record<string, unknown>).outMax === 'number'
                 )
-                .map(([fnId, s]) => [
-                  fnId,
-                  {
-                    enabled: s.enabled === true,
-                    inMin: s.inMin as number,
-                    inMax: s.inMax as number,
-                    outMin: s.outMin as number,
-                    outMax: s.outMax as number
-                  }
-                ])
+                .map(([fnId, s]) => {
+                  const sr = s as Record<string, unknown>
+                  const curve = sr.curve
+                  return [
+                    fnId,
+                    {
+                      enabled: s.enabled === true,
+                      inMin: s.inMin as number,
+                      inMax: s.inMax as number,
+                      outMin: s.outMin as number,
+                      outMax: s.outMax as number,
+                      // (v0.6.4) transfer curve — optional, round-tripped.
+                      ...(typeof curve === 'string' && TRANSFER_CURVE_SET.has(curve)
+                        ? { curve: curve as import('@shared/types').TransferCurve }
+                        : {}),
+                      ...(typeof sr.curveAmount === 'number' &&
+                      Number.isFinite(sr.curveAmount)
+                        ? { curveAmount: sr.curveAmount }
+                        : {}),
+                      ...(sr.invert === true ? { invert: true } : {})
+                    }
+                  ]
+                })
             )
           }
         : {}),
@@ -6711,6 +6751,7 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
   // v0.6 fields — same round-trip contract as hardwareMode.
   const inputConditioner = sanitizeInputConditioner(r.inputConditioner)
   const stateTriggers = sanitizeStateTriggers(r.stateTriggers)
+  const derivedParams = sanitizeDerivedParams(r.derivedParams)
   return {
     id: r.id,
     name: r.name,
@@ -6726,8 +6767,48 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
     functions: fns,
     ...(hardwareMode ? { hardwareMode } : {}),
     ...(inputConditioner ? { inputConditioner } : {}),
-    ...(stateTriggers ? { stateTriggers } : {})
+    ...(stateTriggers ? { stateTriggers } : {}),
+    ...(derivedParams ? { derivedParams } : {})
   }
+}
+
+// (v0.6.4) Shape-validate Derived Parameters on load.
+function sanitizeDerivedParams(
+  raw: unknown
+): import('@shared/types').DerivedParam[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const OPS = new Set([
+    'magnitude',
+    'sum',
+    'difference',
+    'average',
+    'min',
+    'max',
+    'scaleOffset'
+  ])
+  const out: import('@shared/types').DerivedParam[] = []
+  for (const d of raw) {
+    if (!d || typeof d !== 'object') continue
+    const r = d as Record<string, unknown>
+    if (typeof r.id !== 'string' || typeof r.address !== 'string') continue
+    if (typeof r.op !== 'string' || !OPS.has(r.op)) continue
+    const sources = Array.isArray(r.sources)
+      ? (r.sources as unknown[]).filter((s): s is string => typeof s === 'string')
+      : []
+    out.push({
+      id: r.id,
+      address: r.address,
+      op: r.op as import('@shared/types').DerivedOp,
+      sources,
+      ...(typeof r.scale === 'number' && Number.isFinite(r.scale)
+        ? { scale: r.scale }
+        : {}),
+      ...(typeof r.offset === 'number' && Number.isFinite(r.offset)
+        ? { offset: r.offset }
+        : {})
+    })
+  }
+  return out.length > 0 ? out : undefined
 }
 
 function sanitizePool(raw: unknown): Pool {

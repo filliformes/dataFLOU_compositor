@@ -51,6 +51,11 @@ const api: ExposedApi = {
     ipcRenderer.on('engine:oscEvents', h)
     return () => ipcRenderer.off('engine:oscEvents', h)
   },
+  onOscInEvents: (cb) => {
+    const h = (_e: Electron.IpcRendererEvent, batch: OscEvent[]): void => cb(batch)
+    ipcRenderer.on('engine:oscInEvents', h)
+    return () => ipcRenderer.off('engine:oscInEvents', h)
+  },
   onOscErrors: (cb) => {
     const h = (_e: Electron.IpcRendererEvent, batch: OscErrorEvent[]): void =>
       cb(batch)
@@ -106,6 +111,7 @@ const api: ExposedApi = {
   motionLoopStartRecord: (sceneId) =>
     ipcRenderer.invoke('motionLoop:startRecord', sceneId),
   motionLoopStopRecord: () => ipcRenderer.invoke('motionLoop:stopRecord'),
+  derivedGetLive: () => ipcRenderer.invoke('derived:getLive'),
   onNetworkDevices: (cb) => {
     const h = (
       _e: Electron.IpcRendererEvent,

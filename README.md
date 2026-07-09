@@ -44,6 +44,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.4](#release-notes---064)
 - [Release notes - 0.6.3](#release-notes---063)
 - [Release notes - 0.6.2](#release-notes---062)
 - [Release notes - 0.6.1](#release-notes---061)
@@ -582,6 +583,31 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.4
+
+The **input observability + legibility** release — making the input side as visible and understandable as the output side already was. Three features, built and tested against the MUTEK 9-axis IMU rig.
+
+### Connection Health + incoming OSC monitor
+
+- **A live "OSC In" column** in the Monitor drawer — the Monitor is now bidirectional (OSC In · OSC Out · MIDI), so you can watch raw incoming traffic inside the app instead of reaching for an external tool.
+- **Connection Health** answers "why is nothing happening?": a full panel in Pool → Network **and** a 🟢/🟡/🔴 pill in the transport bar. It checks the listener (bound + on which port), the incoming packet rate, each source's freshness, and every destination's reachability — flagging an unreachable destination (EHOSTDOWN) in red. 🟡 means "listener's on but nothing's arriving" (the dead-air case); 🔴 means a destination is unreachable or the listener failed to bind.
+
+### Derived Parameters (cross-input math)
+
+Combine several of an Instrument's addresses into a synthetic one — e.g. **gyro magnitude** `√(x²+y²+z²)` — via a curated op (**Magnitude · Sum · Difference · Average · Min · Max · Single source**), plus a universal **Output × scale + offset** on the result. The derived value publishes on its own OSC address that behaves like any real input: it shows in the OSC In monitor, and you can Capture it as a Parameter to map / scale / drive cells. Solves the "conditioning is per-address so I can't combine axes" ceiling. Authored in the Instrument inspector; computed in the engine and injected through the full pipeline.
+
+### Unified Mapping view + transfer curves
+
+- **Transfer curves** — every input → output mapping can be shaped by a curve, the full **Penner easing set (matching Max's `ease` object)**: Sine · Quad · Cubic · Quart · Quint · Expo · Circular · Back · Elastic · Bounce, each In / Out / In-Out, plus Linear and Stepped. An **amount** knob blends linear → full ease, an **invert** toggle flips the response, and a **live plot** draws the curve with a moving dot at the current input.
+- **A Mappings view** (transport button, or press **N**) — one place showing every placed Parameter's full chain: **input address → Input Conditioning (smoothing) → curve + scale → output**. Mirrors the per-Parameter inspector (same components, same data). Modelled on the OCTOCOSME `DataScale` patch.
+
+### Fixes
+
+- Listener port no longer drifts onto the default send port (`session.listenerPort` authoritative).
+- Dev-mode: the health tracker no longer double-subscribes across hot-reloads; address-tracking maps are bounded.
 
 ---
 
@@ -2014,8 +2040,9 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.3:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.4:
 
+- ✅ **Input observability + mapping (v0.6.4)**: live **OSC In** monitor column + **Connection Health** panel/pill (why-is-nothing-happening diagnostics); **Derived Parameters** (cross-input math — gyro magnitude etc.); a unified **Mappings view** with **transfer curves** (the full Penner/Max-`ease` set) showing every Parameter's input → conditioning → curve → output chain.
 - ✅ **Performance capture (v0.6.3)**: **Motion Loop** (record the live hardware stream into a scene as looping automation — auto‑creates clips, forces float, syncs scene Duration + Loop), **hands‑free record** (transport ●REC bindable to a MIDI footswitch or the controller's own OSC button), **Direct Output** (conditioned + scaled passthrough to the DAW, auto‑yielding to a playing loop), and **Capture auto‑detect** of the live network Instrument. Plus the listener‑port‑drift fix (`listenerPort` now authoritative over the default send port).
 - ✅ **Live input (v0.6.0 / v0.6.1)**: per‑Instrument + per‑Parameter **Input Conditioning** chain (1€ / Smooth / Median / Slew / Deadband / Auto‑Range), **State Triggers** (rules + learn‑by‑demonstration firing MIDI / scenes), per‑Parameter Hardware scaling, live scopes + red‑dot readouts — then a 5‑agent hardening pass (malformed‑packet survival, stuck‑note fixes, MIDI port auto‑recovery, macOS engine‑alive‑on‑window‑close).
 - ✅ **Correctness + features pass (v0.5.14)**: Modulation 2 → direct value routing (new M2 column), Hardware Mode Catch/Jump takeover, Ramp "From" mode, "Update scene to current settings", Scene Inspector in Grid view, adjacent scene insert, undo depth raised to 100, plus 35 bug fixes — including `forwardMode`/`deviceMatch` no longer being stripped on session load, the Random modulator now honoring the routing matrix, and typing a duration no longer firing scene triggers.

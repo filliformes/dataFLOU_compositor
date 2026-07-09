@@ -52,6 +52,7 @@ import {
   ParameterInputScaling
 } from './InputConditioningSection'
 import { StateTriggersSection } from './StateTriggersSection'
+import { DerivedParamsSection } from './DerivedParamsSection'
 import {
   ArpVisual,
   AttractorVisual,
@@ -448,6 +449,9 @@ function TrackInspector(): JSX.Element {
           Pool inspector edit the same template blobs. */}
       {isTemplate && templateForRow && (
         <InputConditioningSection template={templateForRow} />
+      )}
+      {isTemplate && templateForRow && (
+        <DerivedParamsSection template={templateForRow} />
       )}
       {isTemplate && templateForRow && (
         <StateTriggersSection template={templateForRow} />

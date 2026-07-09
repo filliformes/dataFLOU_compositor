@@ -15,6 +15,7 @@ import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { InputConditioningSection } from './InputConditioningSection'
 import { StateTriggersSection } from './StateTriggersSection'
+import { DerivedParamsSection } from './DerivedParamsSection'
 import { UncontrolledTextInput, UncontrolledTextarea } from './UncontrolledInput'
 import type {
   FunctionParamNature,
@@ -142,6 +143,7 @@ function TemplateInspector({
             on the HW-Mode input stream, so they sit right under it.
             Same "user preference, editable on builtins" contract. */}
         <InputConditioningSection template={template} />
+        <DerivedParamsSection template={template} />
         <StateTriggersSection template={template} />
 
         <Field label="Description">

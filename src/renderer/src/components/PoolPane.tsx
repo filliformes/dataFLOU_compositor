@@ -15,6 +15,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useStore } from '../store'
+import { ConnectionHealthPanel } from './ConnectionHealth'
 import type {
   DiscoveredOscDevice,
   ForwardDiagEntry,
@@ -1052,6 +1053,11 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
             senders on this machine&apos;s LAN.
           </div>
         )}
+      </div>
+      {/* (v0.6.4) Connection Health — is OSC actually flowing, and is
+          every destination reachable? Same model as the transport pill. */}
+      <div className="px-2 pt-2">
+        <ConnectionHealthPanel />
       </div>
 
       {/* Device list — one row per (ip:port), expandable to show

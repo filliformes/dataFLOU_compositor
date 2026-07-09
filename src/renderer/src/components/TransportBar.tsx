@@ -14,6 +14,7 @@ import { useStore } from '../store'
 import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { MotionLoopRecButton } from './MotionLoopControls'
+import { ConnectionHealthPill } from './ConnectionHealth'
 
 export default function TransportBar(): JSX.Element {
   const session = useStore((s) => s.session)
@@ -238,10 +239,39 @@ export default function TransportBar(): JSX.Element {
         {activeSceneId && !paused && <ActiveSceneCountdown sceneId={activeSceneId} />}
       </div>
 
+      <ConnectionHealthPill />
+
       <div className="h-6 w-px bg-border" />
+
+      <MappingsToggle />
 
       <TransportTime />
     </div>
+  )
+}
+
+// (v0.6.4) Mappings view toggle — overlays the main content with the
+// global input→curve→output editor. Highlighted while open.
+function MappingsToggle(): JSX.Element {
+  const open = useStore((s) => s.mappingsOpen)
+  const setOpen = useStore((s) => s.setMappingsOpen)
+  return (
+    <button
+      className="btn text-[11px] py-0.5 px-2 shrink-0 leading-tight"
+      style={
+        open
+          ? {
+              background: 'rgb(var(--c-accent))',
+              color: '#000',
+              borderColor: 'rgb(var(--c-accent))'
+            }
+          : undefined
+      }
+      onClick={() => setOpen(!open)}
+      title="Mappings — input → transfer curve → output for every Parameter (N)"
+    >
+      Mappings
+    </button>
   )
 }
 

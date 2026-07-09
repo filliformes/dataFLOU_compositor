@@ -58,6 +58,7 @@ const MAX_ROWS = 1000
 //   - only ONE IPC listener exists across mount/unmount cycles
 // ─────────────────────────────────────────────────────────────────
 const oscBuffer: MonitorRow[] = []
+const oscInBuffer: MonitorRow[] = []
 const midiBuffer: MidiMonitorRow[] = []
 let bufferPaused = false
 // React `setState` setters from the currently-mounted Monitor
@@ -106,6 +107,13 @@ if (typeof window !== 'undefined' && window.api) {
     trimBuffer(oscBuffer)
     scheduleBump()
   })
+  // (v0.6.4) Incoming OSC — the network listener's received messages.
+  const offOscIn = window.api.onOscInEvents?.((batch) => {
+    if (bufferPaused) return
+    for (const e of batch) oscInBuffer.push({ kind: 'ok', ...e })
+    trimBuffer(oscInBuffer)
+    scheduleBump()
+  })
   const offOscErr = window.api.onOscErrors?.((batch) => {
     if (bufferPaused) return
     for (const e of batch) oscBuffer.push({ kind: 'err', ...e })
@@ -125,6 +133,7 @@ if (typeof window !== 'undefined' && window.api) {
     scheduleBump()
   })
   if (offOsc) ipcOffFns.push(offOsc)
+  if (offOscIn) ipcOffFns.push(offOscIn)
   if (offOscErr) ipcOffFns.push(offOscErr)
   if (offMidi) ipcOffFns.push(offMidi)
   if (offMidiErr) ipcOffFns.push(offMidiErr)
@@ -646,6 +655,23 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // localStorage so the user's preference survives a restart.
   const [showOsc, setShowOscState] = useState<boolean>(() => loadShowOsc())
   const [showMidi, setShowMidiState] = useState<boolean>(() => loadShowMidi())
+  // (v0.6.4) OSC In column — incoming traffic. Default ON: for an OSC
+  // playground, seeing what arrives is as important as what's sent.
+  const [showOscIn, setShowOscInState] = useState<boolean>(() => {
+    try {
+      return (localStorage.getItem('dataflou:monitor:showOscIn:v1') ?? '1') !== '0'
+    } catch {
+      return true
+    }
+  })
+  function setShowOscIn(v: boolean): void {
+    setShowOscInState(v)
+    try {
+      localStorage.setItem('dataflou:monitor:showOscIn:v1', v ? '1' : '0')
+    } catch {
+      /* ignore */
+    }
+  }
   function setShowOsc(v: boolean): void {
     setShowOscState(v)
     try {
@@ -674,6 +700,25 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
     setOscColPxState(clamped)
     try {
       localStorage.setItem('dataflou:monitor:oscColPx:v1', String(clamped))
+    } catch {
+      /* ignore */
+    }
+  }
+  // (v0.6.4) OSC In column width (px) when it isn't the last visible
+  // column — mirrors oscColPx.
+  const [oscInColPx, setOscInColPxState] = useState<number>(() => {
+    try {
+      const v = parseInt(localStorage.getItem('dataflou:monitor:oscInColPx:v1') ?? '', 10)
+      return Number.isFinite(v) && v >= 160 ? v : 320
+    } catch {
+      return 320
+    }
+  })
+  function setOscInColPx(v: number): void {
+    const clamped = Math.max(160, Math.min(1600, v))
+    setOscInColPxState(clamped)
+    try {
+      localStorage.setItem('dataflou:monitor:oscInColPx:v1', String(clamped))
     } catch {
       /* ignore */
     }
@@ -842,8 +887,10 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // `bumpListeners` registry.
   const [, setTick] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const oscInScrollRef = useRef<HTMLDivElement>(null)
   const midiScrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  const oscInStickToBottomRef = useRef(true)
   const midiStickToBottomRef = useRef(true)
 
   // Mirror the local `paused` state into the module-scope flag so
@@ -955,6 +1002,10 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
       const el = scrollRef.current
       if (el) el.scrollTop = el.scrollHeight
     }
+    if (oscInStickToBottomRef.current) {
+      const el = oscInScrollRef.current
+      if (el) el.scrollTop = el.scrollHeight
+    }
     if (midiStickToBottomRef.current) {
       const el = midiScrollRef.current
       if (el) el.scrollTop = el.scrollHeight
@@ -967,6 +1018,12 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20
     stickToBottomRef.current = atBottom
   }
+  function onOscInScroll(): void {
+    const el = oscInScrollRef.current
+    if (!el) return
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20
+    oscInStickToBottomRef.current = atBottom
+  }
   function onMidiScroll(): void {
     const el = midiScrollRef.current
     if (!el) return
@@ -976,6 +1033,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
 
   function clearLog(): void {
     oscBuffer.length = 0
+    oscInBuffer.length = 0
     midiBuffer.length = 0
     setTick((n) => n + 1)
   }
@@ -997,6 +1055,18 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
     // splice in the middle. React re-renders on the bump listener.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter, oscBuffer.length])
+  // (v0.6.4) Incoming-OSC rows — same filter + windowing as outgoing.
+  const oscInRows = useMemo(() => {
+    const view =
+      oscInBuffer.length > MAX_ROWS ? oscInBuffer.slice(-MAX_ROWS) : oscInBuffer
+    if (!filter.trim()) return view
+    const f = filter.trim().toLowerCase()
+    return view.filter(
+      (e) =>
+        e.address.toLowerCase().includes(f) || `${e.ip}:${e.port}`.includes(f)
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, oscInBuffer.length])
   // MIDI rows mirror the OSC rows. Filter matches against the port
   // name, the message kind, or "ch N" — same UX as OSC's ip:port +
   // address filter but adapted to the MIDI fields.
@@ -1078,14 +1148,28 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                 other. Persisted to localStorage. */}
             <label
               className="flex items-center gap-1 text-[10px] shrink-0 cursor-pointer select-none"
-              title="Show OSC events column"
+              title="Show incoming OSC column (what the network listener receives)"
+            >
+              <input
+                type="checkbox"
+                checked={showOscIn}
+                onChange={(e) => setShowOscIn(e.target.checked)}
+              />
+              <span>OSC In</span>
+              <span className="text-muted">
+                {oscInRows.length}/{oscInBuffer.length}
+              </span>
+            </label>
+            <label
+              className="flex items-center gap-1 text-[10px] shrink-0 cursor-pointer select-none"
+              title="Show outgoing OSC events column"
             >
               <input
                 type="checkbox"
                 checked={showOsc}
                 onChange={(e) => setShowOsc(e.target.checked)}
               />
-              <span>OSC</span>
+              <span>OSC Out</span>
               <span className="text-muted">
                 {rows.length}/{oscBuffer.length}
               </span>
@@ -1139,6 +1223,97 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
               Pane 1's boundary (which is anchored to Pool's left
               edge). */}
           <div className="flex-1 min-h-0 min-w-0 flex relative">
+            {/* (v0.6.4) OSC In column — incoming traffic. Reads left-to-right
+                as signal flow: In → Out → MIDI. Shares the oscCols field
+                widths with the Out column. */}
+            {showOscIn && (
+              <div
+                className="flex flex-col min-h-0"
+                style={{
+                  flex: showOsc || showMidi ? `0 0 ${oscInColPx}px` : '1 1 0',
+                  borderRight:
+                    showOsc || showMidi ? '1px solid rgb(var(--c-border))' : undefined
+                }}
+              >
+                <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
+                  <ColHeader
+                    label="time"
+                    width={oscCols.time}
+                    onResize={(w) => patchOscCols({ time: w })}
+                  />
+                  <span className="text-border shrink-0">|</span>
+                  <ColHeader
+                    label="src ip:port"
+                    width={oscCols.dest}
+                    onResize={(w) => patchOscCols({ dest: w })}
+                  />
+                  <ColHeader
+                    label="address"
+                    width={oscCols.address}
+                    onResize={(w) => patchOscCols({ address: w })}
+                  />
+                  <span className="flex-1 text-muted">args</span>
+                </div>
+                <div
+                  ref={oscInScrollRef}
+                  onScroll={onOscInScroll}
+                  className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
+                >
+                  {oscInRows.length === 0 ? (
+                    <div className="p-3 text-muted text-[11px]">
+                      No incoming OSC yet. Is the listener on the right port, and
+                      is your device sending to this machine? (See Pool → Network.)
+                    </div>
+                  ) : (
+                    oscInRows.map((e, i) => (
+                      <div
+                        key={i}
+                        className="flex gap-2 px-2 py-[1px] whitespace-nowrap hover:bg-panel2"
+                      >
+                        <span
+                          className="text-muted shrink-0 tabular-nums"
+                          style={{ width: oscCols.time }}
+                        >
+                          {formatTime(e.timestamp)}
+                        </span>
+                        <span className="text-muted shrink-0">|</span>
+                        <span
+                          className="shrink-0 truncate text-muted"
+                          style={{ width: oscCols.dest }}
+                          title={`${e.ip}:${e.port}`}
+                        >
+                          {e.ip}:{e.port}
+                        </span>
+                        <span
+                          className="shrink-0 truncate"
+                          style={{ width: oscCols.address, color: 'rgb(var(--c-accent2))' }}
+                          title={e.address}
+                        >
+                          {e.address || '—'}
+                        </span>
+                        <span
+                          className="truncate"
+                          title={e.kind === 'err' ? undefined : formatArgs(e.args)}
+                        >
+                          {e.kind === 'err' ? '' : formatArgs(e.args)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+            {showOscIn && (showOsc || showMidi) && (
+              <ResizeHandle
+                direction="col"
+                value={oscInColPx}
+                onChange={setOscInColPx}
+                min={160}
+                max={effectiveOscMax}
+                className="w-[4px] cursor-col-resize z-10 bg-border/40 hover:bg-accent/40"
+                title="Drag to resize the OSC In column"
+              />
+            )}
             {showOsc && (
               <div
                 className="flex flex-col min-h-0"
@@ -1352,9 +1527,9 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                 </div>
               </div>
             )}
-            {!showOsc && !showMidi && (
+            {!showOscIn && !showOsc && !showMidi && (
               <div className="flex-1 p-3 text-muted text-[11px]">
-                Both columns are hidden — toggle OSC or MIDI in the toolbar above to view traffic.
+                All columns are hidden — toggle OSC In / OSC Out / MIDI in the toolbar above to view traffic.
               </div>
             )}
             {/* "Learned" panel — far right of the MIDI Monitor. Only

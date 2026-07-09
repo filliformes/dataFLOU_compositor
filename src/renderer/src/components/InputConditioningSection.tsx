@@ -19,6 +19,7 @@ import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { ResizeHandle } from './ResizeHandle'
 import { scopePrefs } from '../scopePrefs'
+import { MappingEditor } from './MappingEditor'
 import { INPUT_STAGE_INFO, makeInputStage } from '@shared/factory'
 import type {
   InputConditionerConfig,
@@ -855,48 +856,12 @@ export function ParameterInputScaling({
           i
         </span>
       </label>
-      {enabled && sc && (
-        <div className="flex items-center gap-1 flex-wrap text-[10px]">
-          <span className="label">In</span>
-          <BoundedNumberInput
-            className="input w-14 text-[10px] text-right tabular-nums"
-            value={sc.inMin}
-            min={-1e9}
-            max={1e9}
-            commitOn="blur"
-            onChange={(v) => patchScale({ inMin: v })}
-            title="Device range low (what the controller sends)"
-          />
-          <BoundedNumberInput
-            className="input w-14 text-[10px] text-right tabular-nums"
-            value={sc.inMax}
-            min={-1e9}
-            max={1e9}
-            commitOn="blur"
-            onChange={(v) => patchScale({ inMax: v })}
-            title="Device range high"
-          />
-          <span className="text-muted">→</span>
-          <span className="label">Out</span>
-          <BoundedNumberInput
-            className="input w-14 text-[10px] text-right tabular-nums"
-            value={sc.outMin}
-            min={-1e9}
-            max={1e9}
-            commitOn="blur"
-            onChange={(v) => patchScale({ outMin: v })}
-            title="Output range low (swap with high to invert)"
-          />
-          <BoundedNumberInput
-            className="input w-14 text-[10px] text-right tabular-nums"
-            value={sc.outMax}
-            min={-1e9}
-            max={1e9}
-            commitOn="blur"
-            onChange={(v) => patchScale({ outMax: v })}
-            title="Output range high (swap with low to invert)"
-          />
-        </div>
+      {enabled && (
+        <MappingEditor
+          scale={sc}
+          onChange={patchScale}
+          address={track.defaultOscAddress ?? undefined}
+        />
       )}
     </div>
   )

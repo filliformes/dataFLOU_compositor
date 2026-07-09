@@ -19,6 +19,7 @@ import type {
   DiscoveredOscDevice,
   ForwardDiagEntry,
   NetworkListenerStatus,
+  OscEvent,
   OscForwardTarget
 } from '@shared/types'
 
@@ -630,6 +631,14 @@ export class OscNetworkListener {
     this.onMessageHook = fn
   }
 
+  // (v0.6.4) Full-message incoming observer — carries the typed args (not
+  // just numerics) so the renderer's "OSC In" monitor + live plots see
+  // the real values. Fired once per received message in observe().
+  private onIncomingHook: ((e: OscEvent) => void) | null = null
+  setOnIncoming(fn: (e: OscEvent) => void): void {
+    this.onIncomingHook = fn
+  }
+
   // Optional gate for the raw-bytes forward path. When set, the
   // listener will SKIP byte-forwarding any packet whose source
   // ip:port returns true from this predicate. Used by the engine to
@@ -711,6 +720,35 @@ export class OscNetworkListener {
             : Number.NaN
       )
       this.onMessageHook(ip, port, msg.address, nums)
+    }
+    // (v0.6.4) Full-message incoming stream for the renderer's OSC-In
+    // monitor + live plots. Normalise the raw osc.js type tags into the
+    // OscEvent arg union; unknown tags render as strings.
+    if (this.onIncomingHook) {
+      const args = msg.args.map((a) => {
+        const t =
+          a.type === 'i' ||
+          a.type === 'f' ||
+          a.type === 's' ||
+          a.type === 'T' ||
+          a.type === 'F'
+            ? a.type
+            : a.type === 'd'
+              ? 'f'
+              : 's'
+        const value =
+          typeof a.value === 'number' || typeof a.value === 'boolean'
+            ? a.value
+            : String(a.value ?? '')
+        return { type: t as 'i' | 'f' | 's' | 'T' | 'F', value }
+      })
+      this.onIncomingHook({
+        timestamp: Date.now(),
+        ip,
+        port,
+        address: msg.address,
+        args
+      })
     }
     const key = `${ip}:${port}`
     const now = Date.now()

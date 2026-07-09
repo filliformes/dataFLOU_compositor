@@ -1257,6 +1257,43 @@ export interface InstrumentTemplate {
   // State Triggers (v0.6) — "Wekinator-lite" pose/state detectors on
   // the incoming Hardware-Mode stream firing MIDI + scene actions.
   stateTriggers?: StateTrigger[]
+  // (v0.6.4) Derived Parameters — synthetic input addresses computed
+  // from several real source addresses via a curated op (magnitude,
+  // sum, …). Conditioning is per-address so cross-address math like
+  // gyro-magnitude was impossible; a derived param solves that by
+  // injecting the computed value as a first-class incoming address
+  // (flows through conditioning / scaling / catch / states / Direct
+  // Output exactly like a real one). See DerivedParam.
+  derivedParams?: DerivedParam[]
+}
+
+// (v0.6.4) Curated combiner ops for a Derived Parameter. Kept curated
+// (not a full expression parser) for legibility. `magnitude` = √(Σxᵢ²);
+// `difference` = first − Σ(rest); `scaleOffset` = source[0]·scale+offset.
+export type DerivedOp =
+  | 'magnitude'
+  | 'sum'
+  | 'difference'
+  | 'average'
+  | 'min'
+  | 'max'
+  | 'scaleOffset'
+
+export interface DerivedParam {
+  id: string
+  // The synthetic OSC address this derived value is published on, e.g.
+  // "/mpu/gyro/mag". Add a Parameter with this address (or Capture it)
+  // to map / scale / drive cells from it.
+  address: string
+  op: DerivedOp
+  // Source OSC addresses (each read at slot 0, latest RAW value).
+  sources: string[]
+  // Universal Output transform, applied to the result of EVERY op:
+  // `combined * scale + offset` (defaults 1 / 0 = no change). For the
+  // 'scaleOffset' op — which just passes source[0] through — this IS the
+  // transform.
+  scale?: number
+  offset?: number
 }
 
 // Per-Instrument Hardware Mode configuration. When enabled, dataFLOU
@@ -1411,12 +1448,58 @@ export interface HardwareModeConfig {
 //   out = outMin + (v − inMin) / (inMax − inMin) · (outMax − outMin)
 // Swapped out bounds invert the response. Degenerate in-range
 // (inMax ≈ inMin) outputs outMin.
+// (v0.6.4) Transfer-curve shape applied to the normalized 0..1 value
+// between In and Out. The Penner easing set (as in Max's `ease` object),
+// used for OCTOCOSME parameter scaling. `curveAmount` (0..1) is a
+// universal intensity — it blends linear → full ease (and = step count
+// for 'step'). See applyTransferCurve + TRANSFER_CURVES in factory.
+export type TransferCurve =
+  | 'linear'
+  | 'step'
+  | 'inSine'
+  | 'outSine'
+  | 'inOutSine'
+  | 'inQuad'
+  | 'outQuad'
+  | 'inOutQuad'
+  | 'inCubic'
+  | 'outCubic'
+  | 'inOutCubic'
+  | 'inQuart'
+  | 'outQuart'
+  | 'inOutQuart'
+  | 'inQuint'
+  | 'outQuint'
+  | 'inOutQuint'
+  | 'inExpo'
+  | 'outExpo'
+  | 'inOutExpo'
+  | 'inCirc'
+  | 'outCirc'
+  | 'inOutCirc'
+  | 'inBack'
+  | 'outBack'
+  | 'inOutBack'
+  | 'inElastic'
+  | 'outElastic'
+  | 'inOutElastic'
+  | 'inBounce'
+  | 'outBounce'
+  | 'inOutBounce'
+
 export interface HardwareScaleConfig {
   enabled: boolean
   inMin: number
   inMax: number
   outMin: number
   outMax: number
+  // (v0.6.4) Response shaping. `curve` bends the In→Out mapping;
+  // `curveAmount` (0..1) is its intensity; `invert` flips the response
+  // (input rising drives output falling). All optional — absent = a
+  // plain linear map, exactly as before.
+  curve?: TransferCurve
+  curveAmount?: number
+  invert?: boolean
 }
 
 // ── Input Conditioning (v0.6) ────────────────────────────────────────
@@ -2365,6 +2448,12 @@ export interface ExposedApi {
   // Batched outgoing OSC events (for the OSC monitor panel). Each callback
   // fire delivers a batch of messages accumulated on the main side.
   onOscEvents: (cb: (batch: OscEvent[]) => void) => () => void
+  // (v0.6.4) Incoming OSC — every message the network listener receives,
+  // batched on the same 50ms cadence as outgoing. Same OscEvent shape;
+  // ip/port are the SOURCE. Feeds the Monitor's "OSC In" column, the
+  // Connection Health packet-rate, and the live plots in Mapping /
+  // Derived Parameter editors.
+  onOscInEvents: (cb: (batch: OscEvent[]) => void) => () => void
   // Batched OSC send errors. Rendered as the health dot next to each
   // destination + as [ERR] rows in the OSC monitor drawer.
   onOscErrors: (cb: (batch: OscErrorEvent[]) => void) => () => void
@@ -2501,6 +2590,10 @@ export interface ExposedApi {
   // trigger address (e.g. the antenna's /mpu/btn1) — the renderer toggles
   // Motion Loop recording on the focused scene.
   onMotionLoopTrigger: (cb: () => void) => () => void
+  // (v0.6.4) Latest computed Derived Parameter values keyed by their
+  // synthetic address. Polled by the Instrument inspector's Derived
+  // Parameters section for the live readout.
+  derivedGetLive: () => Promise<Record<string, number>>
   // Push channel — fired on a 250ms timer whenever the device map has
   // changed (new sender, new address, or fresh packet count). Status
   // is bundled in so port-rebinds and bind errors round-trip too.

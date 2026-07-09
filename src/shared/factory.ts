@@ -469,12 +469,206 @@ export function scaleHardwareValue(
   if (!Number.isFinite(v)) return v
   const inSpan = cfg.inMax - cfg.inMin
   if (Math.abs(inSpan) < 1e-12) return cfg.outMin
-  const t = (v - cfg.inMin) / inSpan
+  let t = (v - cfg.inMin) / inSpan
+  t = t < 0 ? 0 : t > 1 ? 1 : t
+  if (cfg.invert) t = 1 - t
+  if (cfg.curve && cfg.curve !== 'linear') {
+    t = applyTransferCurve(cfg.curve, t, cfg.curveAmount ?? 0.5)
+  }
   const out = cfg.outMin + t * (cfg.outMax - cfg.outMin)
   const lo = Math.min(cfg.outMin, cfg.outMax)
   const hi = Math.max(cfg.outMin, cfg.outMax)
   return Math.max(lo, Math.min(hi, out))
 }
+
+// (v0.6.4) Transfer curve — bends a normalized 0..1 value. Shared by the
+// engine (scaleHardwareValue) and the renderer's live plot so they agree
+// exactly. The Penner easing set (as in Max's `ease` object). `amount`
+// (0..1) is a universal intensity that blends linear → full ease; for
+// 'step' it is the step count.
+export function applyTransferCurve(
+  curve: import('./types').TransferCurve,
+  t: number,
+  amount: number
+): number {
+  const a = amount < 0 ? 0 : amount > 1 ? 1 : amount
+  const x = t < 0 ? 0 : t > 1 ? 1 : t
+  if (curve === 'linear') return x
+  if (curve === 'step') {
+    const n = Math.max(2, Math.round(2 + a * 14))
+    return Math.round(x * (n - 1)) / (n - 1)
+  }
+  // Blend linear → full ease by `amount`, so any curve is dialable.
+  return x + a * (easeFn(curve, x) - x)
+}
+
+// Penner easing implementations, normalized so f(0)=0, f(1)=1 (elastic /
+// back / bounce overshoot in between, which the caller clamps at emit).
+function easeFn(curve: import('./types').TransferCurve, x: number): number {
+  const PI = Math.PI
+  switch (curve) {
+    case 'inSine':
+      return 1 - Math.cos((x * PI) / 2)
+    case 'outSine':
+      return Math.sin((x * PI) / 2)
+    case 'inOutSine':
+      return -(Math.cos(PI * x) - 1) / 2
+    case 'inQuad':
+      return x * x
+    case 'outQuad':
+      return 1 - (1 - x) * (1 - x)
+    case 'inOutQuad':
+      return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2
+    case 'inCubic':
+      return x * x * x
+    case 'outCubic':
+      return 1 - Math.pow(1 - x, 3)
+    case 'inOutCubic':
+      return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2
+    case 'inQuart':
+      return x * x * x * x
+    case 'outQuart':
+      return 1 - Math.pow(1 - x, 4)
+    case 'inOutQuart':
+      return x < 0.5 ? 8 * x * x * x * x : 1 - Math.pow(-2 * x + 2, 4) / 2
+    case 'inQuint':
+      return x * x * x * x * x
+    case 'outQuint':
+      return 1 - Math.pow(1 - x, 5)
+    case 'inOutQuint':
+      return x < 0.5 ? 16 * Math.pow(x, 5) : 1 - Math.pow(-2 * x + 2, 5) / 2
+    case 'inExpo':
+      return x === 0 ? 0 : Math.pow(2, 10 * x - 10)
+    case 'outExpo':
+      return x === 1 ? 1 : 1 - Math.pow(2, -10 * x)
+    case 'inOutExpo':
+      return x === 0
+        ? 0
+        : x === 1
+          ? 1
+          : x < 0.5
+            ? Math.pow(2, 20 * x - 10) / 2
+            : (2 - Math.pow(2, -20 * x + 10)) / 2
+    case 'inCirc':
+      return 1 - Math.sqrt(1 - x * x)
+    case 'outCirc':
+      return Math.sqrt(1 - Math.pow(x - 1, 2))
+    case 'inOutCirc':
+      return x < 0.5
+        ? (1 - Math.sqrt(1 - Math.pow(2 * x, 2))) / 2
+        : (Math.sqrt(1 - Math.pow(-2 * x + 2, 2)) + 1) / 2
+    case 'inBack': {
+      const c1 = 1.70158
+      const c3 = c1 + 1
+      return c3 * x * x * x - c1 * x * x
+    }
+    case 'outBack': {
+      const c1 = 1.70158
+      const c3 = c1 + 1
+      return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2)
+    }
+    case 'inOutBack': {
+      const c1 = 1.70158
+      const c2 = c1 * 1.525
+      return x < 0.5
+        ? (Math.pow(2 * x, 2) * ((c2 + 1) * 2 * x - c2)) / 2
+        : (Math.pow(2 * x - 2, 2) * ((c2 + 1) * (x * 2 - 2) + c2) + 2) / 2
+    }
+    case 'inElastic': {
+      const c4 = (2 * PI) / 3
+      return x === 0
+        ? 0
+        : x === 1
+          ? 1
+          : -Math.pow(2, 10 * x - 10) * Math.sin((x * 10 - 10.75) * c4)
+    }
+    case 'outElastic': {
+      const c4 = (2 * PI) / 3
+      return x === 0
+        ? 0
+        : x === 1
+          ? 1
+          : Math.pow(2, -10 * x) * Math.sin((x * 10 - 0.75) * c4) + 1
+    }
+    case 'inOutElastic': {
+      const c5 = (2 * PI) / 4.5
+      return x === 0
+        ? 0
+        : x === 1
+          ? 1
+          : x < 0.5
+            ? -(Math.pow(2, 20 * x - 10) * Math.sin((20 * x - 11.125) * c5)) / 2
+            : (Math.pow(2, -20 * x + 10) * Math.sin((20 * x - 11.125) * c5)) / 2 + 1
+    }
+    case 'inBounce':
+      return 1 - bounceOut(1 - x)
+    case 'outBounce':
+      return bounceOut(x)
+    case 'inOutBounce':
+      return x < 0.5
+        ? (1 - bounceOut(1 - 2 * x)) / 2
+        : (1 + bounceOut(2 * x - 1)) / 2
+    default:
+      return x
+  }
+}
+
+function bounceOut(x: number): number {
+  const n1 = 7.5625
+  const d1 = 2.75
+  if (x < 1 / d1) return n1 * x * x
+  if (x < 2 / d1) {
+    const x2 = x - 1.5 / d1
+    return n1 * x2 * x2 + 0.75
+  }
+  if (x < 2.5 / d1) {
+    const x2 = x - 2.25 / d1
+    return n1 * x2 * x2 + 0.9375
+  }
+  const x2 = x - 2.625 / d1
+  return n1 * x2 * x2 + 0.984375
+}
+
+// (v0.6.4) Metadata for the transfer-curve picker (label + family group),
+// shared by the UI dropdown and the session sanitizer's valid-set.
+export const TRANSFER_CURVES: {
+  value: import('./types').TransferCurve
+  label: string
+  group: string
+}[] = [
+  { value: 'linear', label: 'Linear', group: 'Basic' },
+  { value: 'step', label: 'Stepped', group: 'Basic' },
+  { value: 'inSine', label: 'In', group: 'Sine' },
+  { value: 'outSine', label: 'Out', group: 'Sine' },
+  { value: 'inOutSine', label: 'In-Out', group: 'Sine' },
+  { value: 'inQuad', label: 'In', group: 'Quad' },
+  { value: 'outQuad', label: 'Out', group: 'Quad' },
+  { value: 'inOutQuad', label: 'In-Out', group: 'Quad' },
+  { value: 'inCubic', label: 'In', group: 'Cubic' },
+  { value: 'outCubic', label: 'Out', group: 'Cubic' },
+  { value: 'inOutCubic', label: 'In-Out', group: 'Cubic' },
+  { value: 'inQuart', label: 'In', group: 'Quart' },
+  { value: 'outQuart', label: 'Out', group: 'Quart' },
+  { value: 'inOutQuart', label: 'In-Out', group: 'Quart' },
+  { value: 'inQuint', label: 'In', group: 'Quint' },
+  { value: 'outQuint', label: 'Out', group: 'Quint' },
+  { value: 'inOutQuint', label: 'In-Out', group: 'Quint' },
+  { value: 'inExpo', label: 'In', group: 'Expo' },
+  { value: 'outExpo', label: 'Out', group: 'Expo' },
+  { value: 'inOutExpo', label: 'In-Out', group: 'Expo' },
+  { value: 'inCirc', label: 'In', group: 'Circular' },
+  { value: 'outCirc', label: 'Out', group: 'Circular' },
+  { value: 'inOutCirc', label: 'In-Out', group: 'Circular' },
+  { value: 'inBack', label: 'In', group: 'Back (overshoot)' },
+  { value: 'outBack', label: 'Out', group: 'Back (overshoot)' },
+  { value: 'inOutBack', label: 'In-Out', group: 'Back (overshoot)' },
+  { value: 'inElastic', label: 'In', group: 'Elastic' },
+  { value: 'outElastic', label: 'Out', group: 'Elastic' },
+  { value: 'inOutElastic', label: 'In-Out', group: 'Elastic' },
+  { value: 'inBounce', label: 'In', group: 'Bounce' },
+  { value: 'outBounce', label: 'Out', group: 'Bounce' },
+  { value: 'inOutBounce', label: 'In-Out', group: 'Bounce' }
+]
 
 // ---------- Input Conditioning (v0.6) ----------
 

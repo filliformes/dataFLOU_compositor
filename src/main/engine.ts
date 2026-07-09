@@ -15,6 +15,7 @@
 
 import type {
   Cell,
+  DerivedOp,
   EngineState,
   GenerativeConfig,
   InputConditionerConfig,
@@ -23,6 +24,7 @@ import type {
   LearnedState,
   LfoShape,
   Modulation,
+  OscEvent,
   Scene,
   SequencerParams,
   Session,
@@ -82,6 +84,31 @@ function capInnerAddressMap(m: Map<string, unknown>, address: string): void {
   if (m.size >= MAX_ADDRESSES_PER_DEVICE && !m.has(address)) {
     const oldest = m.keys().next().value
     if (oldest !== undefined) m.delete(oldest)
+  }
+}
+// (v0.6.4) Derived Parameter combiner ops. `vals` are the latest RAW
+// source values (already finite-filtered by the caller). The universal
+// Output ×scale+offset is applied by the CALLER, so `scaleOffset` here is
+// just "pass source[0] through" — its transform IS that universal post.
+function computeDerived(op: DerivedOp, vals: number[]): number {
+  if (vals.length === 0) return Number.NaN
+  switch (op) {
+    case 'magnitude':
+      return Math.sqrt(vals.reduce((s, x) => s + x * x, 0))
+    case 'sum':
+      return vals.reduce((s, x) => s + x, 0)
+    case 'difference':
+      return vals.slice(1).reduce((s, x) => s - x, vals[0])
+    case 'average':
+      return vals.reduce((s, x) => s + x, 0) / vals.length
+    case 'min':
+      return Math.min(...vals)
+    case 'max':
+      return Math.max(...vals)
+    case 'scaleOffset':
+      return vals[0]
+    default:
+      return Number.NaN
   }
 }
 // Scope ring length: ~40 s of 50 Hz packets, so the UI can offer an
@@ -1051,6 +1078,14 @@ export class SceneEngine {
   // per-slot emit loop reads this between pitch snap and pin to
   // override the scene's computed value.
   private hardwareOverride: Map<string, number> = new Map()
+  // (v0.6.4) Derived Parameters. `derivedSourceLatest` holds the latest
+  // RAW slot-0 value per real source address (global-by-address; a single
+  // bound device per template in practice). `derivedLatest` holds the
+  // computed value per synthetic derived address, for the inspector's
+  // live readout. `hasAnyDerived` fast-paths the recompute block.
+  private derivedSourceLatest: Map<string, number> = new Map()
+  private derivedLatest: Map<string, number> = new Map()
+  private hasAnyDerived = false
   // (v0.6.x) Motion Loop recording. Non-null while a scene is armed for
   // capture: every matching hardware packet appends a conditioned+scaled
   // frame per trackId. stopMotionLoopRecord() drains this and hands the
@@ -1248,6 +1283,23 @@ export class SceneEngine {
   private motionLoopTriggerLast = 0
   setOnMotionLoopTrigger(cb: (() => void) | null): void {
     this.onMotionLoopTrigger = cb
+  }
+
+  // (v0.6.4) Fired each time a Derived Parameter is (re)computed, so the
+  // renderer can show it in the OSC In monitor. Wired to the oscInBuffer
+  // in main/index.ts.
+  private onDerived: ((e: OscEvent) => void) | null = null
+  setOnDerived(cb: ((e: OscEvent) => void) | null): void {
+    this.onDerived = cb
+  }
+  // Snapshot of the latest computed Derived Parameter values, keyed by
+  // synthetic address — polled by the Instrument inspector.
+  getDerivedLive(): Record<string, number> {
+    const out: Record<string, number> = {}
+    this.derivedLatest.forEach((v, k) => {
+      out[k] = v
+    })
+    return out
   }
 
   /** Forward every successful OSC send to `cb`. Pass null to detach. */
@@ -1482,7 +1534,12 @@ export class SceneEngine {
     ip: string,
     port: number,
     address: string,
-    numericArgs: number[]
+    numericArgs: number[],
+    // (v0.6.4) True when this call is a Derived Parameter injecting its
+    // computed value back through the pipeline. Suppresses the derived
+    // recompute block at the end so a derived can't recurse or derive
+    // from another derived.
+    fromDerived = false
   ): void {
     if (!this.session) return
     // Fast path: avoid any per-packet work when no template has HW
@@ -1541,6 +1598,23 @@ export class SceneEngine {
     // matchedTemplates[0] precedent used for movement thresholds —
     // one device is bound to one template in every real session.
     const rawArgs = numericArgs
+    // (v0.6.4) Record this real address's latest RAW slot-0 value so
+    // Derived Parameters that source it can recompute below.
+    if (!fromDerived && this.hasAnyDerived && rawArgs.length > 0) {
+      const v0 = rawArgs[0]
+      if (Number.isFinite(v0)) {
+        // Bound the map (delete oldest-inserted) so a device that sprays
+        // thousands of distinct addresses can't grow it unbounded.
+        if (
+          this.derivedSourceLatest.size >= MAX_ADDRESSES_PER_DEVICE &&
+          !this.derivedSourceLatest.has(address)
+        ) {
+          const oldest = this.derivedSourceLatest.keys().next().value
+          if (oldest !== undefined) this.derivedSourceLatest.delete(oldest)
+        }
+        this.derivedSourceLatest.set(address, v0)
+      }
+    }
     const condTpl = matchedTemplates.find(
       (t) =>
         t.inputConditioner?.enabled &&
@@ -2023,6 +2097,42 @@ export class SceneEngine {
       if (rec && rec.templateId === tpl.id) continue
       if (tpl.stateTriggers && tpl.stateTriggers.length > 0) {
         this.evaluateStateTriggers(tpl, latestByAddress, now)
+      }
+    }
+
+    // ── Derived Parameters (v0.6.4) ───────────────────────────────
+    // If this real address feeds any derived param, recompute it from
+    // the latest RAW source values and INJECT the result as a synthetic
+    // incoming packet — so the derived address flows through the whole
+    // pipeline (conditioning / catch / Direct Output / states) like a
+    // real one, and shows up in the OSC In monitor. The `fromDerived`
+    // guard blocks recursion + derived-of-derived.
+    if (!fromDerived && this.hasAnyDerived) {
+      for (const tpl of matchedTemplates) {
+        const derived = tpl.derivedParams
+        if (!derived || derived.length === 0) continue
+        for (const dp of derived) {
+          if (!dp.address || dp.sources.length === 0) continue
+          if (!dp.sources.includes(address)) continue
+          const vals = dp.sources.map((s) => this.derivedSourceLatest.get(s))
+          if (vals.some((v) => v === undefined || !Number.isFinite(v))) continue
+          const combined = computeDerived(dp.op, vals as number[])
+          if (!Number.isFinite(combined)) continue
+          // Universal Output transform — applies to every op.
+          const out = combined * (dp.scale ?? 1) + (dp.offset ?? 0)
+          if (!Number.isFinite(out)) continue
+          this.derivedLatest.set(dp.address, out)
+          if (this.onDerived) {
+            this.onDerived({
+              timestamp: now,
+              ip,
+              port,
+              address: dp.address,
+              args: [{ type: 'f', value: out }]
+            })
+          }
+          this.handleHardwareInput(ip, port, dp.address, [out], true)
+        }
       }
     }
   }
@@ -2732,6 +2842,10 @@ export class SceneEngine {
     // session-wide — which is the common case.
     this.hasAnyHardwareModeEnabled = next.pool.templates.some(
       (t) => t.hardwareMode?.enabled === true
+    )
+    // (v0.6.4) Fast-path flag for the Derived Parameter recompute block.
+    this.hasAnyDerived = next.pool.templates.some(
+      (t) => (t.derivedParams?.length ?? 0) > 0
     )
     // Restore persisted HW catch state on a fresh session load. The
     // override VALUES are not restored — they self-heal on the next

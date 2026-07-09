@@ -192,6 +192,7 @@ app.whenReady().then(async () => {
   // when a burst overflows one flush window; overflow is dropped with a
   // one-off warning per flush to keep the UI responsive.
   let oscBuffer: OscEvent[] = []
+  let oscInBuffer: OscEvent[] = []
   let oscErrBuffer: OscErrorEvent[] = []
   let midiBuffer: MidiSendEvent[] = []
   let midiErrBuffer: MidiErrorEvent[] = []
@@ -199,6 +200,16 @@ app.whenReady().then(async () => {
   const MIDI_BUFFER_MAX = 2000
   engine.setOnOscSend((e) => {
     if (oscBuffer.length < OSC_BUFFER_MAX) oscBuffer.push(e)
+  })
+  // (v0.6.4) Incoming OSC — every received message, same cap + cadence as
+  // outgoing. Feeds the Monitor "OSC In" column + Connection Health.
+  networkListener.setOnIncoming((e) => {
+    if (oscInBuffer.length < OSC_BUFFER_MAX) oscInBuffer.push(e)
+  })
+  // (v0.6.4) Derived Parameters also appear in the OSC In stream so the
+  // computed synthetic address is as visible as a real one.
+  engine.setOnDerived((e) => {
+    if (oscInBuffer.length < OSC_BUFFER_MAX) oscInBuffer.push(e)
   })
   engine.setOnOscError((e) => {
     // Much lower cap on errors — if something is pathologically wrong
@@ -221,6 +232,11 @@ app.whenReady().then(async () => {
       const batch = oscBuffer
       oscBuffer = []
       sendToRenderer('engine:oscEvents', batch)
+    }
+    if (oscInBuffer.length > 0) {
+      const batch = oscInBuffer
+      oscInBuffer = []
+      sendToRenderer('engine:oscInEvents', batch)
     }
     if (oscErrBuffer.length > 0) {
       const errBatch = oscErrBuffer
@@ -420,6 +436,8 @@ app.whenReady().then(async () => {
     engine.startMotionLoopRecord(String(sceneId))
   )
   safeHandle('motionLoop:stopRecord', () => engine.stopMotionLoopRecord())
+  // (v0.6.4) Derived Parameter live values, polled by the inspector.
+  safeHandle('derived:getLive', () => engine.getDerivedLive())
 
   // ---------- IPC: MIDI ----------
   // Enumerate currently-visible MIDI output ports. Renderer calls
