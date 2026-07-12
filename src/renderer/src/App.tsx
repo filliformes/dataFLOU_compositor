@@ -13,6 +13,7 @@ import EditView from './components/EditView'
 import MetaControllerBar from './components/MetaControllerBar'
 import SequenceView from './components/SequenceView'
 import { MappingsView } from './components/MappingsView'
+import { SignalsView } from './components/SignalsView'
 import OscMonitor from './components/OscMonitor'
 import { attachOscErrorStream } from './hooks/oscHealth'
 import { IntegrityPromptHost } from './components/IntegrityPromptHost'
@@ -27,6 +28,7 @@ export default function App(): JSX.Element {
   const session = useStore((s) => s.session)
   const view = useStore((s) => s.view)
   const mappingsOpen = useStore((s) => s.mappingsOpen)
+  const signalsOpen = useStore((s) => s.signalsOpen)
   const setView = useStore((s) => s.setView)
   const setEngineState = useStore((s) => s.setEngineState)
   const theme = useStore((s) => s.theme)
@@ -502,7 +504,10 @@ export default function App(): JSX.Element {
         if (isEditableTarget(e.target)) return
         e.preventDefault()
         const st = useStore.getState()
-        st.setMappingsOpen(!st.mappingsOpen)
+        const opening = !st.mappingsOpen
+        st.setMappingsOpen(opening)
+        // Mutually exclusive with the Signals overlay so we never stack.
+        if (opening && st.signalsOpen) st.setSignalsOpen(false)
         return
       }
       // "." → Stop All; Shift+"." → Panic.
@@ -756,14 +761,34 @@ export default function App(): JSX.Element {
         st.setEditInspectorVisible(!st.editInspectorVisible)
         return
       }
-      // S → toggle the Sequence view's focused-Scene info panel. The
-      // panel only renders when a scene is focused, so this is a
-      // no-op when nothing's focused.
+      // S → toggle the Signals view (v0.6.5) — "mission control" for every
+      // State Trigger + Pose Sequence across the session. Full-area overlay
+      // like Mappings (N).
       if (
         !e.ctrlKey &&
         !e.metaKey &&
         !e.altKey &&
         !e.shiftKey &&
+        e.key.toLowerCase() === 's'
+      ) {
+        if (isEditableTarget(e.target)) return
+        if (showMode) return
+        e.preventDefault()
+        const st = useStore.getState()
+        const opening = !st.signalsOpen
+        st.setSignalsOpen(opening)
+        // Mutually exclusive with the Mappings overlay so we never stack.
+        if (opening && st.mappingsOpen) st.setMappingsOpen(false)
+        return
+      }
+      // Shift+S → toggle the Sequence view's focused-Scene info panel
+      // (relocated from plain "S" when Signals claimed it). The panel only
+      // renders when a scene is focused, so this is a no-op otherwise.
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        e.shiftKey &&
         e.key.toLowerCase() === 's'
       ) {
         if (isEditableTarget(e.target)) return
@@ -1189,7 +1214,9 @@ export default function App(): JSX.Element {
       <div className="flex flex-col flex-1 min-h-0">
         <MetaControllerBar />
         <div className="flex-1 min-h-0">
-          {mappingsOpen ? (
+          {signalsOpen ? (
+            <SignalsView />
+          ) : mappingsOpen ? (
             <MappingsView />
           ) : view === 'edit' ? (
             <EditView />

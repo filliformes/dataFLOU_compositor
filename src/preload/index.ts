@@ -107,6 +107,12 @@ const api: ExposedApi = {
   stateTriggerGetLive: () => ipcRenderer.invoke('stateTrigger:getLive'),
   stateTriggerRecord: (templateId, stateId, durationMs) =>
     ipcRenderer.invoke('stateTrigger:record', templateId, stateId, durationMs),
+  // v0.6.5 -- Pose Sequences: rewind a sequence to waypoint 0.
+  poseSequenceReset: (templateId, seqId) =>
+    ipcRenderer.invoke('stateTrigger:resetSeq', templateId, seqId),
+  // v0.6.5 -- pause/resume a sequence's firing during companion record.
+  poseSequenceSuppress: (templateId, seqId, on) =>
+    ipcRenderer.invoke('stateTrigger:suppressSeq', templateId, seqId, on),
   // v0.6.x -- Motion Loop record start/stop
   motionLoopStartRecord: (sceneId) =>
     ipcRenderer.invoke('motionLoop:startRecord', sceneId),

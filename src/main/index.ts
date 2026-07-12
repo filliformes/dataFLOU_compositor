@@ -430,6 +430,18 @@ app.whenReady().then(async () => {
       Number(durationMs) || 2000
     )
   )
+  // Pose Sequences (v0.6.5): rewind a sequence to its first waypoint
+  // (also clears a completed non-looping phrase's parked state).
+  safeHandle('stateTrigger:resetSeq', (_e, templateId, seqId) => {
+    engine.resetPoseSequence(String(templateId), String(seqId))
+    return true
+  })
+  // Pause/resume a sequence's live firing while the companion recorder
+  // cycles through its poses (so a hands-free record stays silent).
+  safeHandle('stateTrigger:suppressSeq', (_e, templateId, seqId, on) => {
+    engine.setPoseSequenceSuppressed(String(templateId), String(seqId), on === true)
+    return true
+  })
   // Motion Loop (v0.6.x): arm a scene for hardware capture, then drain
   // the recorded buffers back to the renderer on stop.
   safeHandle('motionLoop:startRecord', (_e, sceneId) =>

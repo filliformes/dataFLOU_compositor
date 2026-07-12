@@ -1265,6 +1265,9 @@ export interface InstrumentTemplate {
   // (flows through conditioning / scaling / catch / states / Direct
   // Output exactly like a real one). See DerivedParam.
   derivedParams?: DerivedParam[]
+  // Pose Sequences (v0.6.x) — ordered "video" states: a path of pose
+  // waypoints, each firing MIDI as the playhead reaches it in order.
+  poseSequences?: PoseSequence[]
 }
 
 // (v0.6.4) Curated combiner ops for a Derived Parameter. Kept curated
@@ -1610,14 +1613,24 @@ export interface StateRule {
 
 export interface LearnedState {
   // Dimensions in centroid/variance order. Captured at Record time from
-  // every address+slot the device emitted during the window.
-  dims: { address: string; slot: number }[]
+  // every address+slot the device emitted during the window. `enabled`
+  // (default true) lets the user exclude drifty/irrelevant channels
+  // (yaw, gyro, magnetometer, buttons) from the pose match — the cure
+  // for a match that decays as those channels drift.
+  dims: { address: string; slot: number; enabled?: boolean }[]
   centroid: number[]
   // Per-dim variance from the recording (floored engine-side so a
   // perfectly-still dim doesn't produce a divide-by-zero razor edge).
   variance: number[]
   // Match threshold 0..1 — live score >= threshold = state entered.
   threshold: number
+  // (v0.6.x) Forgiveness: minimum acceptance-band width per dim as a
+  // fraction of the dim's magnitude, so a held-still recording (near-
+  // zero variance) still matches loosely. Higher = more forgiving.
+  // 0.02..1, default ~0.25. This is the knob that actually controls how
+  // loose the pose match is — threshold only sets how high the (now
+  // robust) score must reach.
+  tolerance?: number
 }
 
 export interface StateMidiAction {
@@ -1649,6 +1662,11 @@ export interface StateTrigger {
   hysteresisPct: number
   // The state must match continuously for this long before entering.
   dwellMs: number
+  // (v0.6.x) Exit hold: once ENTERED, the match must stay below the
+  // (hysteresis-widened) threshold continuously for this long before
+  // the state exits. Rides over brief dips / noise / drift excursions
+  // so a held pose doesn't drop its MIDI note. 0 = exit immediately.
+  holdMs?: number
   rules: StateRule[]
   learned?: LearnedState
   actions: {
@@ -1658,6 +1676,43 @@ export interface StateTrigger {
     // lifecycle; this is a trigger, not a gate.
     triggerSceneId?: string
   }
+}
+
+// ── Pose Sequence (v0.6.x) — the "video" state ───────────────────────
+// If a single learned State is a still image (one pose → one MIDI), a
+// Pose Sequence is a video: an ordered path of poses (waypoints). A
+// playhead advances through them in STRICT order — reach the current
+// waypoint's pose and it fires that waypoint's MIDI, then the playhead
+// arms the next one. Reach the end and it LOOPS (or stops). Off-path,
+// the playhead WAITS in place (move through the phrase at your pace).
+// A gesture becomes a melodic phrase. Reuses the learned-pose match +
+// MIDI action from State Triggers.
+export interface PoseWaypoint {
+  id: string
+  name: string
+  // The recorded pose for this waypoint (undefined until Recorded).
+  learned?: LearnedState
+  // Fired when the playhead ARRIVES at this waypoint. Note kind fires a
+  // gated note (there's no per-waypoint "exit"); CC sends its enter value.
+  midi?: StateMidiAction
+  // Optionally also trigger a dataFLOU scene on arrival.
+  triggerSceneId?: string
+}
+
+export interface PoseSequence {
+  id: string
+  name: string
+  enabled: boolean
+  // Loop back to waypoint 0 after the last (repeatable phrase) vs stop
+  // and wait for a reset. Default true.
+  loop: boolean
+  // Arrival dwell — a waypoint's pose must match this long before it
+  // fires (debounces glancing passes). Shared across the phrase.
+  dwellMs: number
+  // (v0.6.5) Hands-free "companion" recorder: how long to record EACH
+  // pose while cycling through the whole sequence. Default 2000.
+  recordHoldMs?: number
+  waypoints: PoseWaypoint[]
 }
 
 // Standalone Parameter template — a single-Function blueprint that lives
@@ -2564,18 +2619,35 @@ export interface ExposedApi {
   // v0.6 -- State Triggers: live match scores + active flags, keyed
   // `${templateId}|${stateId}`. Polled ~10 Hz while the section is
   // expanded.
+  // Also carries every Pose Sequence's live cursor: seqSteps[key] = the
+  // current waypoint index (=== waypoint count once a non-looping phrase
+  // has completed), seqScores[key] = the current waypoint's match score.
+  // Both keyed `${templateId}|${seqId}`.
   stateTriggerGetLive: () => Promise<{
     scores: Record<string, number>
     active: Record<string, boolean>
+    seqSteps: Record<string, number>
+    seqScores: Record<string, number>
   }>
   // v0.6 -- learn-by-demonstration recording. Engine collects the
   // bound device's conditioned stream for durationMs and resolves with
-  // the reduced model (or null when the device stayed silent).
+  // the reduced model (or null when the device stayed silent). Reused
+  // verbatim for Pose Sequence waypoints (pass the waypoint id as stateId).
   stateTriggerRecord: (
     templateId: string,
     stateId: string,
     durationMs: number
   ) => Promise<LearnedState | null>
+  // v0.6.5 -- Pose Sequences: rewind a sequence to its first waypoint
+  // (also clears a completed non-looping phrase). Keyed by template+seq.
+  poseSequenceReset: (templateId: string, seqId: string) => Promise<boolean>
+  // v0.6.5 -- pause/resume a sequence's live firing while the companion
+  // recorder cycles through its poses (so a hands-free record is silent).
+  poseSequenceSuppress: (
+    templateId: string,
+    seqId: string,
+    on: boolean
+  ) => Promise<boolean>
   // (v0.6.x) Motion Loop recording. startRecord arms capture of the
   // Hardware-Mode conditioned+scaled stream into the given scene's cells
   // (free-run). stopRecord ends it and resolves with the captured buffers

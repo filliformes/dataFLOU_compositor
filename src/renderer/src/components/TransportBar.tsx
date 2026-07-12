@@ -243,10 +243,46 @@ export default function TransportBar(): JSX.Element {
 
       <div className="h-6 w-px bg-border" />
 
+      <SignalsToggle />
       <MappingsToggle />
 
       <TransportTime />
     </div>
+  )
+}
+
+// (v0.6.5) Signals view toggle — overlays the main content with the
+// session-wide State Trigger + Pose Sequence "mission control". Mutually
+// exclusive with Mappings (opening one closes the other). Highlighted
+// while open. Keyboard: S.
+function SignalsToggle(): JSX.Element {
+  const open = useStore((s) => s.signalsOpen)
+  const setOpen = useStore((s) => s.setSignalsOpen)
+  const setMappings = useStore((s) => s.setMappingsOpen)
+  return (
+    <button
+      className="btn text-[11px] py-0.5 px-2 shrink-0 leading-tight inline-flex items-center gap-1"
+      style={
+        open
+          ? {
+              background: 'rgb(var(--c-accent))',
+              color: '#000',
+              borderColor: 'rgb(var(--c-accent))'
+            }
+          : undefined
+      }
+      onClick={() => {
+        const next = !open
+        setOpen(next)
+        if (next) setMappings(false)
+      }}
+      title="Signals — every State Trigger + Pose Sequence across the session, live (S)"
+    >
+      <span aria-hidden style={{ color: open ? '#000' : 'rgb(var(--c-accent))' }}>
+        ◉
+      </span>
+      Signals
+    </button>
   )
 }
 
@@ -255,6 +291,7 @@ export default function TransportBar(): JSX.Element {
 function MappingsToggle(): JSX.Element {
   const open = useStore((s) => s.mappingsOpen)
   const setOpen = useStore((s) => s.setMappingsOpen)
+  const setSignals = useStore((s) => s.setSignalsOpen)
   return (
     <button
       className="btn text-[11px] py-0.5 px-2 shrink-0 leading-tight"
@@ -267,7 +304,11 @@ function MappingsToggle(): JSX.Element {
             }
           : undefined
       }
-      onClick={() => setOpen(!open)}
+      onClick={() => {
+        const next = !open
+        setOpen(next)
+        if (next) setSignals(false)
+      }}
       title="Mappings — input → transfer curve → output for every Parameter (N)"
     >
       Mappings

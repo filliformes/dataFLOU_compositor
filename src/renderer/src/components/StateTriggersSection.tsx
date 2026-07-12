@@ -128,7 +128,7 @@ export function StateTriggersSection({
   )
 }
 
-function StateTriggerCard({
+export function StateTriggerCard({
   template,
   trig,
   score,
@@ -143,6 +143,10 @@ function StateTriggerCard({
   const removeStateTrigger = useStore((s) => s.removeStateTrigger)
   const tracks = useStore((s) => s.session.tracks)
   const scenes = useStore((s) => s.session.scenes)
+  // App-wide capture lock — the engine has a single learn-record slot,
+  // shared with Pose Sequence capture, so only one record runs at a time.
+  const poseRecordBusy = useStore((s) => s.poseRecordBusy)
+  const setPoseRecordBusy = useStore((s) => s.setPoseRecordBusy)
   const [expanded, setExpanded] = useState(true)
   const [recording, setRecording] = useState(false)
   const [recordMs, setRecordMs] = useState(2000)
@@ -174,7 +178,9 @@ function StateTriggerCard({
   }, [tracks, template.id])
 
   async function record(): Promise<void> {
+    if (poseRecordBusy) return // another capture is already running
     setRecording(true)
+    setPoseRecordBusy(true)
     try {
       const result = await window.api?.stateTriggerRecord?.(
         template.id,
@@ -197,6 +203,7 @@ function StateTriggerCard({
         )
       }
     } finally {
+      setPoseRecordBusy(false)
       if (aliveRef.current) setRecording(false)
     }
   }
@@ -329,6 +336,21 @@ function StateTriggerCard({
                 onChange={(v) => patch({ hysteresisPct: v })}
               />
             </label>
+            <label
+              className="flex items-center gap-1"
+              title="Exit hold — once ENTERED, the match must stay below threshold this long before releasing. Rides over brief dips / sensor drift so a held pose keeps its note. Raise it if the trigger flickers off while you hold."
+            >
+              <span className="label">Hold ms</span>
+              <BoundedNumberInput
+                className="input w-12 text-[10px] text-right tabular-nums"
+                value={trig.holdMs ?? 250}
+                min={0}
+                max={10000}
+                integer
+                commitOn="blur"
+                onChange={(v) => patch({ holdMs: v })}
+              />
+            </label>
           </div>
           {/* Detector editor */}
           {trig.detector === 'rules' ? (
@@ -338,7 +360,7 @@ function StateTriggerCard({
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   className="btn text-[10px]"
-                  disabled={recording}
+                  disabled={recording || (poseRecordBusy && !recording)}
                   onClick={() => void record()}
                   style={
                     recording
@@ -366,31 +388,63 @@ function StateTriggerCard({
                 </span>
               </div>
               {trig.learned && (
-                <label
-                  className="flex items-center gap-1.5"
-                  title="Match threshold — the live score must reach this to enter the state. Watch the meter while holding the pose and set the threshold comfortably below what you see."
-                >
-                  <span className="label shrink-0">Threshold</span>
-                  <input
-                    type="range"
-                    className="flex-1"
-                    min={0.05}
-                    max={0.99}
-                    step={0.01}
-                    value={trig.learned.threshold}
-                    onChange={(e) =>
-                      patch({
-                        learned: {
-                          ...trig.learned!,
-                          threshold: parseFloat(e.target.value)
-                        }
-                      })
-                    }
-                  />
-                  <span className="text-[10px] tabular-nums w-8 text-right">
-                    {(trig.learned.threshold * 100).toFixed(0)}%
-                  </span>
-                </label>
+                <>
+                  {/* Tolerance — THE forgiveness knob. Widens the
+                      acceptance band per dimension, so you don't have to
+                      reproduce the pose exactly. Turn UP if the trigger
+                      is too fussy. */}
+                  <label
+                    className="flex items-center gap-1.5"
+                    title="Forgiveness — how loose the pose match is. Higher = a wider acceptance band around the recorded pose (you don't have to be exact, and small sensor drift is tolerated). This is usually the knob to turn if it's too fussy — more effective than lowering the threshold."
+                  >
+                    <span className="label shrink-0">Tolerance</span>
+                    <input
+                      type="range"
+                      className="flex-1"
+                      min={0.02}
+                      max={1}
+                      step={0.01}
+                      value={trig.learned.tolerance ?? 0.3}
+                      onChange={(e) =>
+                        patch({
+                          learned: {
+                            ...trig.learned!,
+                            tolerance: parseFloat(e.target.value)
+                          }
+                        })
+                      }
+                    />
+                    <span className="text-[10px] tabular-nums w-8 text-right">
+                      {Math.round((trig.learned.tolerance ?? 0.3) * 100)}%
+                    </span>
+                  </label>
+                  <label
+                    className="flex items-center gap-1.5"
+                    title="Match threshold — the live score must reach this to enter. With the robust matcher, hold the pose, read the meter's peak, and set this a bit below it."
+                  >
+                    <span className="label shrink-0">Threshold</span>
+                    <input
+                      type="range"
+                      className="flex-1"
+                      min={0.05}
+                      max={0.99}
+                      step={0.01}
+                      value={trig.learned.threshold}
+                      onChange={(e) =>
+                        patch({
+                          learned: {
+                            ...trig.learned!,
+                            threshold: parseFloat(e.target.value)
+                          }
+                        })
+                      }
+                    />
+                    <span className="text-[10px] tabular-nums w-8 text-right">
+                      {(trig.learned.threshold * 100).toFixed(0)}%
+                    </span>
+                  </label>
+                  <LearnedDimsEditor trig={trig} onPatch={patch} />
+                </>
               )}
             </div>
           )}
@@ -520,6 +574,90 @@ function RulesEditor({
       >
         + Rule
       </button>
+    </div>
+  )
+}
+
+// Dimension checklist for a learned state — pick which incoming
+// channels define the pose. Untick the drifty / irrelevant ones (yaw,
+// gyro, magnetometer, buttons) so the match doesn't decay as they
+// drift. Collapsed by default; there can be a dozen+ channels.
+function LearnedDimsEditor({
+  trig,
+  onPatch
+}: {
+  trig: StateTrigger
+  onPatch: (p: Partial<StateTrigger>) => void
+}): JSX.Element | null {
+  const [open, setOpen] = useState(false)
+  const L = trig.learned
+  if (!L || L.dims.length === 0) return null
+  const enabledCount = L.dims.filter((d) => d.enabled !== false).length
+  const multiSlot = new Set(
+    L.dims
+      .filter((d, _i, arr) => arr.filter((x) => x.address === d.address).length > 1)
+      .map((d) => d.address)
+  )
+  const patchDims = (dims: typeof L.dims): void =>
+    onPatch({ learned: { ...L, dims } })
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <button
+          className="btn text-[10px]"
+          onClick={() => setOpen((o) => !o)}
+          title="Pick which inputs define this pose. Untick drifty / irrelevant channels (yaw, gyro, magnetometer, buttons) so the match doesn't decay as they drift — the main cure for a pose that dies after a few seconds."
+        >
+          {open ? '▾' : '▸'} Inputs ({enabledCount}/{L.dims.length})
+        </button>
+        {open && (
+          <>
+            <button
+              className="btn text-[9px] px-1"
+              onClick={() =>
+                patchDims(L.dims.map((d) => ({ ...d, enabled: true })))
+              }
+            >
+              all
+            </button>
+            <button
+              className="btn text-[9px] px-1"
+              onClick={() =>
+                patchDims(L.dims.map((d) => ({ ...d, enabled: false })))
+              }
+            >
+              none
+            </button>
+          </>
+        )}
+      </div>
+      {open && (
+        <div className="flex flex-col gap-0.5 max-h-40 overflow-y-auto border border-border rounded p-1">
+          {L.dims.map((d, i) => (
+            <label
+              key={`${d.address}|${d.slot}`}
+              className="flex items-center gap-1 text-[10px]"
+              title={`${d.address} slot ${d.slot}`}
+            >
+              <input
+                type="checkbox"
+                checked={d.enabled !== false}
+                onChange={(e) =>
+                  patchDims(
+                    L.dims.map((dd, j) =>
+                      j === i ? { ...dd, enabled: e.target.checked } : dd
+                    )
+                  )
+                }
+              />
+              <span className="truncate">
+                {d.address}
+                {multiSlot.has(d.address) ? ` [${d.slot}]` : ''}
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

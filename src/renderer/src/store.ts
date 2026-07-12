@@ -36,6 +36,10 @@ import type {
   SequenceSlotOverride,
   Session,
   StateTrigger,
+  StateMidiAction,
+  LearnedState,
+  PoseSequence,
+  PoseWaypoint,
   Track,
   TrackKind
 } from '@shared/types'
@@ -79,6 +83,8 @@ import {
   makeParameterSpec,
   makeScene,
   makeStateTrigger,
+  makePoseSequence,
+  makePoseWaypoint,
   makeTemplateSpec,
   makeTemplateTrack,
   makeTrack,
@@ -321,6 +327,18 @@ interface UiState {
   // Toggled from the transport bar. UI-only, not persisted.
   mappingsOpen: boolean
   setMappingsOpen: (v: boolean) => void
+  // (v0.6.5) Global Signals view — overlays the main content when true.
+  // "Mission control" for every State Trigger + Pose Sequence across the
+  // session, grouped by instrument. Toggled by the "S" key + transport
+  // bar. UI-only, not persisted.
+  signalsOpen: boolean
+  setSignalsOpen: (v: boolean) => void
+  // (v0.6.5) True while ANY pose capture is running (a single-pose
+  // Record or the whole-sequence companion recorder). The engine has a
+  // single learn-recording slot, so a second concurrent capture would
+  // corrupt the first — this gates the record buttons app-wide. UI-only.
+  poseRecordBusy: boolean
+  setPoseRecordBusy: (v: boolean) => void
   // Drawer height (px). User-resizable via the handle on top edge,
   // 120..600 (clamped). Persisted as part of the in-session UI prefs so
   // the height survives a drawer toggle.
@@ -695,6 +713,28 @@ interface Actions {
     patch: Partial<StateTrigger>
   ) => void
   removeStateTrigger: (templateId: string, stateId: string) => void
+  // Pose Sequences (v0.6.5) — ordered learned-pose phrases on a template.
+  addPoseSequence: (templateId: string) => string | null // returns new sequence id
+  updatePoseSequence: (
+    templateId: string,
+    seqId: string,
+    patch: Partial<PoseSequence>
+  ) => void
+  removePoseSequence: (templateId: string, seqId: string) => void
+  addWaypoint: (templateId: string, seqId: string) => string | null // returns new waypoint id
+  updateWaypoint: (
+    templateId: string,
+    seqId: string,
+    waypointId: string,
+    patch: Partial<PoseWaypoint>
+  ) => void
+  removeWaypoint: (templateId: string, seqId: string, waypointId: string) => void
+  moveWaypoint: (
+    templateId: string,
+    seqId: string,
+    waypointId: string,
+    dir: -1 | 1
+  ) => void
   duplicateTemplate: (id: string) => string | null
   removeTemplate: (id: string) => void
   addFunctionToTemplate: (templateId: string) => string | null  // returns new fn id
@@ -1383,6 +1423,10 @@ export const useStore = create<State>((set, get) => ({
   recordingLoopStartedAt: null,
   mappingsOpen: false,
   setMappingsOpen: (v) => set({ mappingsOpen: v }),
+  signalsOpen: false,
+  setSignalsOpen: (v) => set({ signalsOpen: v }),
+  poseRecordBusy: false,
+  setPoseRecordBusy: (v) => set({ poseRecordBusy: v }),
   oscMonitorHeight: 220,
   poolHidden: false,
   editInspectorVisible: true,
@@ -1991,6 +2035,168 @@ export const useStore = create<State>((set, get) => ({
                 }
               : tt
           )
+        }
+      }
+    })),
+  // ---- Pose Sequences (v0.6.5). Copy-on-write like State Triggers; works on
+  // builtins too — the graft in sanitizePool keeps them across reloads.
+  addPoseSequence: (templateId) => {
+    const t = get().session.pool.templates.find((tt) => tt.id === templateId)
+    if (!t) return null
+    const seq = makePoseSequence(t.poseSequences?.length ?? 0)
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? { ...tt, poseSequences: [...(tt.poseSequences ?? []), seq] }
+              : tt
+          )
+        }
+      }
+    }))
+    return seq.id
+  },
+  updatePoseSequence: (templateId, seqId, patch) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  poseSequences: (tt.poseSequences ?? []).map((s) =>
+                    s.id === seqId ? { ...s, ...patch } : s
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    })),
+  removePoseSequence: (templateId, seqId) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  poseSequences: (tt.poseSequences ?? []).filter(
+                    (s) => s.id !== seqId
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    })),
+  addWaypoint: (templateId, seqId) => {
+    const t = get().session.pool.templates.find((tt) => tt.id === templateId)
+    const seq = t?.poseSequences?.find((s) => s.id === seqId)
+    if (!t || !seq) return null
+    const wp = makePoseWaypoint(seq.waypoints.length)
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  poseSequences: (tt.poseSequences ?? []).map((s) =>
+                    s.id === seqId
+                      ? { ...s, waypoints: [...s.waypoints, wp] }
+                      : s
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    }))
+    return wp.id
+  },
+  updateWaypoint: (templateId, seqId, waypointId, patch) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  poseSequences: (tt.poseSequences ?? []).map((s) =>
+                    s.id === seqId
+                      ? {
+                          ...s,
+                          waypoints: s.waypoints.map((w) =>
+                            w.id === waypointId ? { ...w, ...patch } : w
+                          )
+                        }
+                      : s
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    })),
+  removeWaypoint: (templateId, seqId, waypointId) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) =>
+            tt.id === templateId
+              ? {
+                  ...tt,
+                  poseSequences: (tt.poseSequences ?? []).map((s) =>
+                    s.id === seqId
+                      ? {
+                          ...s,
+                          waypoints: s.waypoints.filter(
+                            (w) => w.id !== waypointId
+                          )
+                        }
+                      : s
+                  )
+                }
+              : tt
+          )
+        }
+      }
+    })),
+  moveWaypoint: (templateId, seqId, waypointId, dir) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: {
+          ...st.session.pool,
+          templates: st.session.pool.templates.map((tt) => {
+            if (tt.id !== templateId) return tt
+            return {
+              ...tt,
+              poseSequences: (tt.poseSequences ?? []).map((s) => {
+                if (s.id !== seqId) return s
+                const idx = s.waypoints.findIndex((w) => w.id === waypointId)
+                const swap = idx + dir
+                if (idx < 0 || swap < 0 || swap >= s.waypoints.length) return s
+                const wps = s.waypoints.slice()
+                ;[wps[idx], wps[swap]] = [wps[swap], wps[idx]]
+                return { ...s, waypoints: wps }
+              })
+            }
+          })
         }
       }
     })),
@@ -6539,7 +6745,10 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
           slot:
             typeof d.slot === 'number' && Number.isInteger(d.slot)
               ? (d.slot as number)
-              : 0
+              : 0,
+          // enabled defaults true; only carry an explicit false so the
+          // user's excluded-channel choices round-trip.
+          ...(d.enabled === false ? { enabled: false } : {})
         }))
       const centroid = (learnedRaw.centroid as unknown[]).filter(
         (x): x is number => typeof x === 'number' && Number.isFinite(x)
@@ -6557,7 +6766,15 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
           threshold:
             typeof learnedRaw.threshold === 'number'
               ? Math.max(0, Math.min(1, learnedRaw.threshold))
-              : 0.8
+              : 0.8,
+          ...(Number.isFinite(learnedRaw.tolerance)
+            ? {
+                tolerance: Math.max(
+                  0.01,
+                  Math.min(1, learnedRaw.tolerance as number)
+                )
+              }
+            : {})
         }
       }
     }
@@ -6579,6 +6796,9 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
           : 0.1,
       dwellMs:
         Number.isFinite(r.dwellMs) ? Math.max(0, r.dwellMs as number) : 80,
+      ...(Number.isFinite(r.holdMs)
+        ? { holdMs: Math.max(0, Math.min(10000, r.holdMs as number)) }
+        : {}),
       rules,
       ...(learned ? { learned } : {}),
       actions: {
@@ -6615,6 +6835,116 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
             }
           : {})
       }
+    })
+  }
+  return out.length > 0 ? out : undefined
+}
+
+// (v0.6.5) Shared learned-pose + MIDI-action sanitizers, reused by both
+// State Triggers and Pose Sequence waypoints.
+function sanitizeStateMidiAction(raw: unknown): StateMidiAction | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const m = raw as Record<string, unknown>
+  return {
+    enabled: m.enabled !== false,
+    portName: typeof m.portName === 'string' ? m.portName : '',
+    channel:
+      typeof m.channel === 'number' && Number.isFinite(m.channel)
+        ? Math.max(1, Math.min(16, Math.round(m.channel)))
+        : 1,
+    kind: m.kind === 'cc' ? 'cc' : 'note',
+    ...(typeof m.note === 'number' && Number.isFinite(m.note) ? { note: m.note } : {}),
+    ...(typeof m.velocity === 'number' && Number.isFinite(m.velocity)
+      ? { velocity: m.velocity }
+      : {}),
+    ...(typeof m.cc === 'number' && Number.isFinite(m.cc) ? { cc: m.cc } : {}),
+    ...(typeof m.ccEnterValue === 'number' && Number.isFinite(m.ccEnterValue)
+      ? { ccEnterValue: m.ccEnterValue }
+      : {}),
+    ...(typeof m.ccExitValue === 'number' && Number.isFinite(m.ccExitValue)
+      ? { ccExitValue: m.ccExitValue }
+      : {})
+  }
+}
+
+function sanitizeLearnedState(raw: unknown): LearnedState | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const L = raw as Record<string, unknown>
+  if (!Array.isArray(L.dims) || !Array.isArray(L.centroid) || !Array.isArray(L.variance)) {
+    return undefined
+  }
+  const dims = (L.dims as unknown[])
+    .filter(
+      (d): d is Record<string, unknown> =>
+        !!d && typeof d === 'object' && typeof (d as Record<string, unknown>).address === 'string'
+    )
+    .map((d) => ({
+      address: d.address as string,
+      slot: typeof d.slot === 'number' && Number.isInteger(d.slot) ? (d.slot as number) : 0,
+      ...(d.enabled === false ? { enabled: false as const } : {})
+    }))
+  const centroid = (L.centroid as unknown[]).map((x) =>
+    typeof x === 'number' && Number.isFinite(x) ? x : 0
+  )
+  const variance = (L.variance as unknown[]).map((x) =>
+    typeof x === 'number' && Number.isFinite(x) ? x : 0
+  )
+  if (dims.length === 0 || dims.length !== centroid.length || dims.length !== variance.length) {
+    return undefined
+  }
+  return {
+    dims,
+    centroid,
+    variance,
+    threshold:
+      typeof L.threshold === 'number' && Number.isFinite(L.threshold)
+        ? Math.max(0, Math.min(1, L.threshold))
+        : 0.6,
+    ...(typeof L.tolerance === 'number' && Number.isFinite(L.tolerance)
+      ? { tolerance: Math.max(0.01, Math.min(1, L.tolerance)) }
+      : {})
+  }
+}
+
+// (v0.6.5) Pose Sequence — an ordered list of learned poses ("waypoints"),
+// each firing MIDI as the performer passes through it. Grafted onto builtins
+// in sanitizePool (the v0.5.9 persistence law).
+function sanitizePoseSequences(raw: unknown): PoseSequence[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: PoseSequence[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const s = item as Record<string, unknown>
+    if (typeof s.id !== 'string' || typeof s.name !== 'string') continue
+    const wpsRaw = Array.isArray(s.waypoints) ? s.waypoints : []
+    const waypoints: PoseWaypoint[] = []
+    for (const w of wpsRaw) {
+      if (!w || typeof w !== 'object') continue
+      const wp = w as Record<string, unknown>
+      if (typeof wp.id !== 'string') continue
+      const learned = sanitizeLearnedState(wp.learned)
+      const midi = sanitizeStateMidiAction(wp.midi)
+      waypoints.push({
+        id: wp.id,
+        name: typeof wp.name === 'string' ? wp.name : 'Pose',
+        ...(learned ? { learned } : {}),
+        ...(midi ? { midi } : {}),
+        ...(typeof wp.triggerSceneId === 'string' ? { triggerSceneId: wp.triggerSceneId } : {})
+      })
+    }
+    out.push({
+      id: s.id,
+      name: s.name,
+      enabled: s.enabled !== false,
+      loop: s.loop !== false,
+      dwellMs:
+        typeof s.dwellMs === 'number' && Number.isFinite(s.dwellMs)
+          ? Math.max(0, s.dwellMs)
+          : 80,
+      ...(typeof s.recordHoldMs === 'number' && Number.isFinite(s.recordHoldMs)
+        ? { recordHoldMs: Math.max(250, Math.min(30000, s.recordHoldMs)) }
+        : {}),
+      waypoints
     })
   }
   return out.length > 0 ? out : undefined
@@ -6752,6 +7082,7 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
   const inputConditioner = sanitizeInputConditioner(r.inputConditioner)
   const stateTriggers = sanitizeStateTriggers(r.stateTriggers)
   const derivedParams = sanitizeDerivedParams(r.derivedParams)
+  const poseSequences = sanitizePoseSequences(r.poseSequences)
   return {
     id: r.id,
     name: r.name,
@@ -6768,7 +7099,8 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
     ...(hardwareMode ? { hardwareMode } : {}),
     ...(inputConditioner ? { inputConditioner } : {}),
     ...(stateTriggers ? { stateTriggers } : {}),
-    ...(derivedParams ? { derivedParams } : {})
+    ...(derivedParams ? { derivedParams } : {}),
+    ...(poseSequences ? { poseSequences } : {})
   }
 }
 
@@ -6835,11 +7167,16 @@ function sanitizePool(raw: unknown): Pool {
   const merged: InstrumentTemplate[] = builtin.templates.map((b) => {
     const saved = savedById.get(b.id)
     // Graft EVERY user-overridable field (hardwareMode +
-    // inputConditioner + stateTriggers) — per-session user state that
-    // rides on top of the builtin's core definition.
+    // inputConditioner + stateTriggers + derivedParams + poseSequences)
+    // — per-session user state that rides on top of the builtin's core
+    // definition.
     if (
       saved &&
-      (saved.hardwareMode || saved.inputConditioner || saved.stateTriggers)
+      (saved.hardwareMode ||
+        saved.inputConditioner ||
+        saved.stateTriggers ||
+        saved.derivedParams ||
+        saved.poseSequences)
     ) {
       return {
         ...b,
@@ -6847,7 +7184,9 @@ function sanitizePool(raw: unknown): Pool {
         ...(saved.inputConditioner
           ? { inputConditioner: saved.inputConditioner }
           : {}),
-        ...(saved.stateTriggers ? { stateTriggers: saved.stateTriggers } : {})
+        ...(saved.stateTriggers ? { stateTriggers: saved.stateTriggers } : {}),
+        ...(saved.derivedParams ? { derivedParams: saved.derivedParams } : {}),
+        ...(saved.poseSequences ? { poseSequences: saved.poseSequences } : {})
       }
     }
     return b

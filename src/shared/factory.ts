@@ -734,10 +734,14 @@ export function makeStateTrigger(index: number): import('./types').StateTrigger 
     id: uid('sttr_'),
     name: `State ${index + 1}`,
     enabled: true,
-    detector: 'rules',
+    // Learn-by-demonstration is the primary workflow (hold a pose, hit
+    // Record); Rules is the explicit/advanced fallback.
+    detector: 'learned',
     mode: 'enterExit',
-    hysteresisPct: 0.1,
+    hysteresisPct: 0.15,
     dwellMs: 80,
+    // Default 250 ms exit-hold so a held pose rides over brief dips.
+    holdMs: 250,
     rules: [],
     actions: {
       midi: {
@@ -752,6 +756,46 @@ export function makeStateTrigger(index: number): import('./types').StateTrigger 
         ccExitValue: 0
       }
     }
+  }
+}
+
+// ---------- Pose Sequences (v0.6.x) ----------
+
+// A fresh waypoint: no recording yet, a note action seeded a semitone
+// above the previous waypoint's note (so a sequence auto-builds a
+// little ascending line the user can then re-map).
+export function makePoseWaypoint(
+  index: number
+): import('./types').PoseWaypoint {
+  return {
+    id: uid('pwp_'),
+    name: `Pose ${index + 1}`,
+    midi: {
+      enabled: true,
+      portName: '',
+      channel: 1,
+      kind: 'note',
+      note: Math.max(0, Math.min(127, 60 + index)),
+      velocity: 100,
+      cc: 20,
+      ccEnterValue: 127,
+      ccExitValue: 0
+    }
+  }
+}
+
+export function makePoseSequence(
+  index: number
+): import('./types').PoseSequence {
+  return {
+    id: uid('pseq_'),
+    name: `Sequence ${index + 1}`,
+    enabled: true,
+    loop: true,
+    dwellMs: 80,
+    recordHoldMs: 2000,
+    // Start with two waypoints so the ordered idea is visible immediately.
+    waypoints: [makePoseWaypoint(0), makePoseWaypoint(1)]
   }
 }
 

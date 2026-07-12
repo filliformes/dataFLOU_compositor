@@ -2,7 +2,7 @@
 
 **Send OSC and MIDI data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC bundles + MIDI messages at once with modulation, sequencing, transitions, delays, MIDI input control, an authorable **Pool of Instruments and Parameters**, a one‑click **Capture** function that snapshots live OSC / MIDI traffic into Pool Instruments + Saved Scenes, **OSC forwarding** so the compositor can sit in front of another software or another machine, **100‑deep undo/redo**, and a **per‑session GUI layout** that re‑opens at exactly the size and shape you left it.
 
-Since **v0.6** dataFLOU is also a **live‑hardware performance instrument**: a physical sensor (a 9‑axis IMU, a Trill bar, any OSC controller) can be conditioned, scaled, and either streamed straight to your DAW (**Direct Output**), used to fire scenes and MIDI on gesture **States**, or **recorded as looping automation** you play back per scene (**Motion Loop**) — with hands‑free record from a footswitch or the controller's own button.
+Since **v0.6** dataFLOU is also a **live‑hardware performance instrument**: a physical sensor (a 9‑axis IMU, a Trill bar, any OSC controller) can be conditioned, scaled, and either streamed straight to your DAW (**Direct Output**), used to fire scenes and MIDI on gesture **States** and ordered **Pose Sequences** (move through poses A→B→C, each firing its own note), or **recorded as looping automation** you play back per scene (**Motion Loop**) — with hands‑free record from a footswitch or the controller's own button. A dedicated **Signals** view (press **S**) is mission control for every gesture trigger across the session, with a companion recorder that captures a whole pose phrase hands‑free.
 
 ![dataFLOU_compositor - Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
@@ -44,6 +44,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.5](#release-notes---065)
 - [Release notes - 0.6.4](#release-notes---064)
 - [Release notes - 0.6.3](#release-notes---063)
 - [Release notes - 0.6.2](#release-notes---062)
@@ -503,7 +504,9 @@ By default, sessions saved via the Save‑before‑quit / Save‑before‑new fl
 | **P** | Toggle the Pool inside the Monitor drawer (opens drawer if closed) |
 | **C** | Open the Capture popup |
 | **I** | Toggle the right‑side Inspector panel (Edit view) |
-| **S** | Toggle the focused‑Scene info panel (Sequence view) |
+| **S** | Toggle the **Signals** view (every State Trigger + Pose Sequence, live) |
+| **Shift + S** | Toggle the focused‑Scene info panel (Sequence view) |
+| **N** | Toggle the **Mappings** view (input → curve → output for every Parameter) |
 | **Ctrl/⌘ + Z** | Undo (3 levels) |
 | **Ctrl/⌘ + Shift + Z** *or* **Ctrl/⌘ + Y** | Redo |
 | **Ctrl + S** *(Cmd + S on macOS)* | Save the current session |
@@ -583,6 +586,49 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.5
+
+The **gesture‑phrase** release. v0.6.0 taught dataFLOU to fire on a single held pose (a **State**); v0.6.5 turns a *sequence of poses* into a playable melodic phrase, gives every gesture trigger in the session one live home (the **Signals** view), and lets you capture a whole phrase hands‑free. Built and tested against the same 9‑axis IMU rig. Everything hangs off the existing **Hardware Mode** input path and saves with the session.
+
+### Pose Sequences — the "video" state
+
+If a State Trigger is a single freeze‑frame (one pose → one MIDI event), a **Pose Sequence** is the whole video: an ordered list of poses ("waypoints") you move *through*, each firing its own MIDI note/CC (and/or a dataFLOU scene) as you reach it — pose A → note, then B → note, then C…
+
+- **Strict order** — only the next expected pose can fire; skipping ahead does nothing.
+- **Wait‑in‑place** — a stray pose never rewinds the playhead; it simply waits for you to hit the next one, so you move through the phrase at your own pace.
+- **Loop** (wrap back to the first pose after the last) or **one‑shot** (park on the last until you hit ↺ Reset), per sequence.
+- Each pose is recorded by demonstration exactly like a learned State (same centroid + variance model, same **Tolerance** / **Threshold** knobs and per‑channel **Inputs** checklist to drop drifty axes). A per‑pose gated note fires momentarily as you pass through — there's no per‑pose "exit", so notes never hang.
+- A live **playhead** (`2/4`, `✓ done`) and a per‑pose match meter show exactly where you are. Authored in the Instrument inspector (under State Triggers) **and** in the new Signals view.
+
+### Companion recorder — capture a whole phrase hands‑free
+
+Set up the poses in advance (**+ Pose**) and a **Hold ms** per pose, then hit **⏺ Rec Seq** and the app records the entire sequence for you, alone:
+
+- **Counts you in** — a get‑ready countdown so you have time to move into position.
+- **Records** that pose for the Hold time while you hold still, then **advances** to the next — all the way through.
+- The whole sequence **highlights** while it runs and the pose being recorded is **strongly highlighted** (pulsing colored badge + red glow + a countdown), so it's always obvious what's happening. A banner shows the phase, pose name, progress bar, and a **■ Stop**.
+- The sequence's own MIDI stays silent during capture (the engine pauses that sequence's firing for the whole run), and if a pose captures nothing (Hardware Mode off / device silent) it says so and stops.
+
+### Signals view — mission control for every trigger (press S)
+
+A full‑screen overlay (transport button, or press **S**) gathering **every State Trigger and Pose Sequence across the whole session**, grouped by instrument:
+
+- **Per‑instrument lanes** with a color stripe + a **HW status badge** — the gate for whether *anything* fires. It reads **● LIVE** (Hardware Mode on + a device bound), **● NO DEVICE**, or **○ HW OFF**, and clicking it toggles Hardware Mode right there.
+- A live header tally: how many states / sequences exist, how many instruments are HW‑live, and how many are **firing** right now (pulses when active).
+- Full editing inline — the exact same trigger / sequence cards as the inspector, with live match meters and playheads lit up as you perform. **+ State / + Sequence** add directly per lane.
+- A collapsible **how‑to** walkthrough (arm HW → build a sequence → companion‑record → assign notes → perform), a **card‑width** slider so you can widen the cards until a MIDI editor's Note + Vel sit on one line with MIDI + Ch, and **per‑pose colors** carried consistently across the view. Mutually exclusive with the Mappings view.
+
+### Fixes
+
+- **Companion recorder — Stop → Rec‑Seq race.** A cancelled recording run could null out a newer run's cancel token, breaking **Stop** and letting an uncontrollable recorder overwrite learned poses. Every late write is now gated on run identity.
+- **App‑wide capture lock.** The engine has a single learn‑record slot, so two concurrent captures (companion vs. single‑pose vs. a State Trigger, even across Signals cards) could corrupt each other. All record buttons now share one busy lock.
+- **Completed one‑shot un‑parks** when you add a waypoint to it or switch it to looping (previously it stayed frozen at "complete" until a manual Reset).
+- **No stale fire after a record** — a pose that was mid‑dwell when Record started can no longer fire the instant recording ends (a fresh rising edge is forced).
+- **`derivedParams` (v0.6.4) now grafts onto built‑in Instruments** on load — a Derived Parameter added to a builtin (e.g. OCTOCOSME) no longer vanishes on reload (the same "v0.5.9 law" fix now applied to Pose Sequences too).
+- Silent‑device companion path no longer leaves a progress ticker running; `S` now opens Signals (the old focused‑Scene panel toggle moved to **Shift + S**).
 
 ---
 
@@ -2040,8 +2086,9 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.4:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.5:
 
+- ✅ **Gesture phrases + Signals view (v0.6.5)**: **Pose Sequences** (an ordered path of learned poses — move through A→B→C, each firing its own MIDI, with strict‑order / wait‑in‑place / loop), a hands‑free **companion recorder** that captures a whole phrase pose‑by‑pose with a get‑ready countdown + live highlighting, and the **Signals** view (press **S**) — one live home for every State Trigger + Pose Sequence in the session, grouped by instrument with per‑instrument HW‑live badges, an inline how‑to, a card‑width control, and per‑pose colors. Plus a `derivedParams` builtin‑graft fix and an app‑wide capture lock.
 - ✅ **Input observability + mapping (v0.6.4)**: live **OSC In** monitor column + **Connection Health** panel/pill (why-is-nothing-happening diagnostics); **Derived Parameters** (cross-input math — gyro magnitude etc.); a unified **Mappings view** with **transfer curves** (the full Penner/Max-`ease` set) showing every Parameter's input → conditioning → curve → output chain.
 - ✅ **Performance capture (v0.6.3)**: **Motion Loop** (record the live hardware stream into a scene as looping automation — auto‑creates clips, forces float, syncs scene Duration + Loop), **hands‑free record** (transport ●REC bindable to a MIDI footswitch or the controller's own OSC button), **Direct Output** (conditioned + scaled passthrough to the DAW, auto‑yielding to a playing loop), and **Capture auto‑detect** of the live network Instrument. Plus the listener‑port‑drift fix (`listenerPort` now authoritative over the default send port).
 - ✅ **Live input (v0.6.0 / v0.6.1)**: per‑Instrument + per‑Parameter **Input Conditioning** chain (1€ / Smooth / Median / Slew / Deadband / Auto‑Range), **State Triggers** (rules + learn‑by‑demonstration firing MIDI / scenes), per‑Parameter Hardware scaling, live scopes + red‑dot readouts — then a 5‑agent hardening pass (malformed‑packet survival, stuck‑note fixes, MIDI port auto‑recovery, macOS engine‑alive‑on‑window‑close).

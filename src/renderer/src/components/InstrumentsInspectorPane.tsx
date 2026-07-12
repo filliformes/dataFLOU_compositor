@@ -15,6 +15,7 @@ import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { InputConditioningSection } from './InputConditioningSection'
 import { StateTriggersSection } from './StateTriggersSection'
+import { PoseSequencesSection } from './PoseSequencesSection'
 import { DerivedParamsSection } from './DerivedParamsSection'
 import { UncontrolledTextInput, UncontrolledTextarea } from './UncontrolledInput'
 import type {
@@ -145,6 +146,7 @@ function TemplateInspector({
         <InputConditioningSection template={template} />
         <DerivedParamsSection template={template} />
         <StateTriggersSection template={template} />
+        <PoseSequencesSection template={template} />
 
         <Field label="Description">
           <UncontrolledTextInput

@@ -25,6 +25,8 @@ import type {
   LfoShape,
   Modulation,
   OscEvent,
+  PoseSequence,
+  PoseWaypoint,
   Scene,
   SequencerParams,
   Session,
@@ -1184,7 +1186,14 @@ export class SceneEngine {
   // Per `${templateId}|${stateId}` detector state machine.
   private stateTriggerRuntime: Map<
     string,
-    { active: boolean; matchSince: number; lastCcSent: number }
+    {
+      active: boolean
+      matchSince: number
+      lastCcSent: number
+      // Wall-clock when the (active) match first dropped below the exit
+      // region — the exit-hold debounce measures from here. 0 = matching.
+      unmatchedSince: number
+    }
   > = new Map()
   // Live match score per `${templateId}|${stateId}` — polled by the
   // renderer's State Triggers section (10 Hz while expanded) rather
@@ -1201,6 +1210,32 @@ export class SceneEngine {
     { port: string; channel: number; note: number }
   > = new Map()
   private stateTriggerGateTimers: Map<string, NodeJS.Timeout> = new Map()
+  // ── Pose Sequences (v0.6.5) — kept in their own maps (parallel to the
+  // State-Trigger ones) so the state machine, live readout, held notes
+  // and pruning stay cleanly separate. Keyed `${templateId}|${seqId}`.
+  //   step        = index of the waypoint we're currently waiting to hit
+  //   matchSince  = wall-clock the current step's pose started matching (0=no)
+  //   ready       = must LEAVE a pose before the next can fire (rising-edge)
+  //   done        = finished a non-looping phrase; parked until reset
+  private poseSequenceRuntime: Map<
+    string,
+    { step: number; matchSince: number; ready: boolean; done: boolean }
+  > = new Map()
+  // Live {step, score} per sequence, polled by the UI alongside the
+  // State-Trigger live scores (getStateTriggerLive).
+  private poseSequenceLive: Map<string, { step: number; score: number }> =
+    new Map()
+  // Gated held Note per sequence (mono) so a waypoint's momentary note
+  // is always released — on the next waypoint, reset, stop, or panic.
+  private poseSequenceHeldNote: Map<
+    string,
+    { port: string; channel: number; note: number }
+  > = new Map()
+  private poseSequenceGateTimers: Map<string, NodeJS.Timeout> = new Map()
+  // Sequences (`${templateId}|${seqId}`) the companion recorder is
+  // currently cycling through — their live evaluation is paused so a
+  // hands-free record doesn't fire the sequence's own MIDI.
+  private suppressedSeqKeys: Set<string> = new Set()
   // In-flight learn-by-demonstration recording session, or null.
   private stateRecording: {
     templateId: string
@@ -1223,6 +1258,8 @@ export class SceneEngine {
     // in-flight learn-recording (its safety timer would otherwise fire
     // after teardown and resolve a stale promise).
     this.releaseAllStateNotes()
+    this.releaseAllSeqNotes()
+    this.suppressedSeqKeys.clear()
     if (this.stateRecording) {
       clearTimeout(this.stateRecording.timer)
       this.stateRecording.finalize(null)
@@ -2098,6 +2135,9 @@ export class SceneEngine {
       if (tpl.stateTriggers && tpl.stateTriggers.length > 0) {
         this.evaluateStateTriggers(tpl, latestByAddress, now)
       }
+      if (tpl.poseSequences && tpl.poseSequences.length > 0) {
+        this.evaluatePoseSequences(tpl, latestByAddress, now)
+      }
     }
 
     // ── Derived Parameters (v0.6.4) ───────────────────────────────
@@ -2325,13 +2365,14 @@ export class SceneEngine {
           this.releaseStateNote(key)
           rtOff.active = false
           rtOff.matchSince = 0
+          rtOff.unmatchedSince = 0
           rtOff.lastCcSent = -1
         }
         continue
       }
       let rt = this.stateTriggerRuntime.get(key)
       if (!rt) {
-        rt = { active: false, matchSince: 0, lastCcSent: -1 }
+        rt = { active: false, matchSince: 0, lastCcSent: -1, unmatchedSince: 0 }
         this.stateTriggerRuntime.set(key, rt)
       }
       const { score, matched, matchedWithHysteresis } = this.computeStateMatch(
@@ -2361,15 +2402,28 @@ export class SceneEngine {
           if (now - rt.matchSince >= Math.max(0, trig.dwellMs)) {
             rt.active = true
             rt.matchSince = 0
+            rt.unmatchedSince = 0
             this.fireStateEnter(trig, canMidi, key)
           }
         } else {
           rt.matchSince = 0
         }
-      } else if (!matchedWithHysteresis) {
-        rt.active = false
-        rt.matchSince = 0
-        this.fireStateExit(trig, canMidi, key)
+      } else {
+        // Active. Exit only after the match has stayed below the
+        // hysteresis-widened threshold continuously for holdMs — so a
+        // brief dip / noise spike / drift excursion doesn't drop the
+        // note. Any moment back inside the region resets the hold.
+        if (matchedWithHysteresis) {
+          rt.unmatchedSince = 0
+        } else {
+          if (rt.unmatchedSince === 0) rt.unmatchedSince = now
+          if (now - rt.unmatchedSince >= Math.max(0, trig.holdMs ?? 0)) {
+            rt.active = false
+            rt.matchSince = 0
+            rt.unmatchedSince = 0
+            this.fireStateExit(trig, canMidi, key)
+          }
+        }
       }
     }
   }
@@ -2388,26 +2442,7 @@ export class SceneEngine {
       if (!L || L.dims.length === 0) {
         return { score: 0, matched: false, matchedWithHysteresis: false }
       }
-      let sumZ2 = 0
-      for (let i = 0; i < L.dims.length; i++) {
-        const d = L.dims[i]
-        const args = latestByAddress.get(d.address)
-        const v = args?.[d.slot]
-        if (typeof v !== 'number' || !Number.isFinite(v)) {
-          // Unseen dimension → treat as ~3σ away rather than unknown:
-          // a pose can't match while part of it has never arrived.
-          sumZ2 += 9
-          continue
-        }
-        const c = L.centroid[i]
-        // Variance floor keeps a perfectly-still recorded dim from
-        // becoming a razor edge (divide-by-~zero).
-        const floor = Math.pow(0.015 * Math.max(Math.abs(c), 0.05), 2)
-        const varF = Math.max(L.variance[i], floor, 1e-8)
-        const dz = v - c
-        sumZ2 += (dz * dz) / varF
-      }
-      const score = Math.exp(-0.5 * (sumZ2 / L.dims.length))
+      const score = this.matchLearned(L, latestByAddress)
       const thr = Math.max(0.001, Math.min(1, L.threshold))
       return {
         score,
@@ -2472,6 +2507,237 @@ export class SceneEngine {
       // Exit only when some rule leaves the hysteresis-widened region.
       matchedWithHysteresis: allH
     }
+  }
+
+  // ── Robust, forgiving learned-pose match (v0.6.x rework) ──────────
+  // Returns a closeness score in [0, 1] for a recorded pose against the
+  // live conditioned stream. Shared by State Triggers AND Pose Sequence
+  // waypoints. Old formula was exp(-0.5·MEAN z²): one drifting dimension
+  // (large z²) collapsed the whole score, and a held-still recording
+  // gave a razor-thin acceptance band — unusable ("triggers then dies").
+  // New formula: the MEAN of per-dimension Gaussian memberships, each
+  // bounded in (0, 1], so one drifting input can only drop the score by
+  // ~1/N. Acceptance width per dim = max(recorded stddev, tolerance ·
+  // |centroid|): the Tolerance knob sets how loose the match is, recorded
+  // jitter only matters if wider. Disabled dims are skipped.
+  private matchLearned(
+    L: LearnedState,
+    latestByAddress: Map<string, number[]>
+  ): number {
+    if (!L || L.dims.length === 0) return 0
+    const tol = Math.max(0.01, Math.min(1, L.tolerance ?? 0.25))
+    const MIN_SCALE = 0.05 // floor so a zero-centred dim still has a band
+    let sum = 0
+    let count = 0
+    for (let i = 0; i < L.dims.length; i++) {
+      const d = L.dims[i]
+      if (d.enabled === false) continue // excluded channel (drifty/irrelevant)
+      count++
+      const args = latestByAddress.get(d.address)
+      const v = args?.[d.slot]
+      if (typeof v !== 'number' || !Number.isFinite(v)) continue // membership 0
+      const c = L.centroid[i]
+      const recSigma = Math.sqrt(Math.max(0, L.variance[i] ?? 0))
+      const sigma = Math.max(recSigma, tol * Math.max(Math.abs(c), MIN_SCALE))
+      const z = (v - c) / sigma
+      sum += Math.exp(-0.5 * z * z) // per-dim membership in (0, 1]
+    }
+    return count > 0 ? sum / count : 0
+  }
+
+  // ── Pose Sequences (v0.6.5) ───────────────────────────────────────
+  // A sequence is an ordered list of learned poses ("waypoints"). Strict
+  // order: only the CURRENT waypoint can fire. When it's matched (score ≥
+  // its threshold) and held for dwellMs, we fire its MIDI/scene and
+  // advance. Wait-in-place: a stray pose never resets the playhead — we
+  // simply keep waiting on the current waypoint. Loop wraps to 0; a
+  // non-looping phrase parks on the last step (`done`) until reset. The
+  // `ready` flag enforces a rising edge — you must LEAVE a pose (drop
+  // below threshold) before the next waypoint can fire, so two similar
+  // adjacent poses can't cascade in one gesture.
+  private evaluatePoseSequences(
+    tpl: InstrumentTemplate,
+    latestByAddress: Map<string, number[]>,
+    now: number
+  ): void {
+    const midiOk = this.session?.midiEnabled === true
+    for (const seq of tpl.poseSequences ?? []) {
+      const key = `${tpl.id}|${seq.id}`
+      // While the companion recorder owns this sequence, don't fire or
+      // advance the playhead in the get-ready gaps between per-pose
+      // records — a "record" operation shouldn't emit the sequence's MIDI.
+      if (this.suppressedSeqKeys.has(key)) {
+        this.releaseSeqNote(key)
+        continue
+      }
+      if (!seq.enabled || seq.waypoints.length === 0) {
+        if (this.poseSequenceRuntime.has(key)) {
+          this.releaseSeqNote(key)
+          this.poseSequenceRuntime.delete(key)
+          this.poseSequenceLive.delete(key)
+        }
+        continue
+      }
+      let rt = this.poseSequenceRuntime.get(key)
+      if (!rt) {
+        rt = { step: 0, matchSince: 0, ready: true, done: false }
+        this.poseSequenceRuntime.set(key, rt)
+      }
+      // Finished a non-looping phrase → park (show "complete") until a
+      // manual reset. step === length signals completion to the UI. But
+      // un-park automatically if the sequence was since made looping, or
+      // grew new waypoints past the parked end — the user clearly wants
+      // it to keep playing rather than stay frozen.
+      if (rt.done) {
+        if (seq.loop || rt.step < seq.waypoints.length - 1) {
+          rt.done = false
+          rt.step = seq.loop ? 0 : rt.step + 1
+          rt.matchSince = 0
+          rt.ready = true
+        } else {
+          this.poseSequenceLive.set(key, { step: seq.waypoints.length, score: 0 })
+          continue
+        }
+      }
+      // Clamp the step if waypoints were edited/shortened out from under us.
+      if (rt.step >= seq.waypoints.length) {
+        rt.step = 0
+        rt.matchSince = 0
+        rt.ready = true
+      }
+      const wp = seq.waypoints[rt.step]
+      const L = wp.learned
+      // A waypoint with no recorded pose can never match — hold here so
+      // the performer can't skip an unrecorded step (strict order).
+      const score = L && L.dims.length > 0 ? this.matchLearned(L, latestByAddress) : 0
+      this.poseSequenceLive.set(key, { step: rt.step, score })
+      const thr = L ? Math.max(0.001, Math.min(1, L.threshold)) : 1.1
+      if (score >= thr) {
+        if (rt.matchSince === 0) rt.matchSince = now
+        if (rt.ready && now - rt.matchSince >= Math.max(0, seq.dwellMs)) {
+          const m = wp.midi
+          const canMidi = midiOk && m?.enabled === true && !!m.portName
+          this.fireWaypoint(wp, canMidi, key)
+          const nextStep = rt.step + 1
+          if (nextStep >= seq.waypoints.length) {
+            if (seq.loop) {
+              rt.step = 0
+            } else {
+              rt.step = seq.waypoints.length - 1
+              rt.done = true
+            }
+          } else {
+            rt.step = nextStep
+          }
+          rt.matchSince = 0
+          rt.ready = false // must leave the (new current) pose before it fires
+        }
+      } else {
+        rt.matchSince = 0
+        rt.ready = true // left a pose → next entry is a fresh rising edge
+      }
+    }
+  }
+
+  // Fire a single waypoint's action: a momentary (gated) Note or a CC,
+  // plus an optional scene trigger. Mono per sequence — a new fire
+  // releases the previous waypoint's note first.
+  private fireWaypoint(wp: PoseWaypoint, canMidi: boolean, key: string): void {
+    const m = wp.midi
+    if (canMidi && m) {
+      if (m.kind === 'note') {
+        const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
+        const vel = Math.max(1, Math.min(127, Math.floor(m.velocity ?? 100)))
+        this.releaseSeqNote(key)
+        this.midiSender.sendNoteOn(m.portName, m.channel, note, vel)
+        this.poseSequenceHeldNote.set(key, {
+          port: m.portName,
+          channel: m.channel,
+          note
+        })
+        // Waypoints are momentary (no exit event) → schedule a gated
+        // Note Off so the note never hangs.
+        const port = m.portName
+        const ch = m.channel
+        const timer = setTimeout(() => {
+          this.poseSequenceGateTimers.delete(key)
+          const held = this.poseSequenceHeldNote.get(key)
+          if (held && held.note === note && held.port === port) {
+            this.midiSender.sendNoteOff(port, ch, note)
+            this.poseSequenceHeldNote.delete(key)
+          }
+        }, STATE_ONESHOT_GATE_MS)
+        this.poseSequenceGateTimers.set(key, timer)
+      } else {
+        const cc = Math.max(0, Math.min(127, Math.floor(m.cc ?? 20)))
+        const val = Math.max(0, Math.min(127, Math.floor(m.ccEnterValue ?? 127)))
+        this.midiSender.sendCc(m.portName, m.channel, cc, val)
+      }
+    }
+    const sceneId = wp.triggerSceneId
+    if (sceneId && this.session?.scenes.some((s) => s.id === sceneId)) {
+      this.triggerScene(sceneId)
+    }
+  }
+
+  /** Release a sequence's held note (if any) + clear its gate timer.
+   *  Returns true if a note was actually released. */
+  private releaseSeqNote(key: string): boolean {
+    const timer = this.poseSequenceGateTimers.get(key)
+    if (timer) {
+      clearTimeout(timer)
+      this.poseSequenceGateTimers.delete(key)
+    }
+    const held = this.poseSequenceHeldNote.get(key)
+    if (!held) return false
+    this.poseSequenceHeldNote.delete(key)
+    this.midiSender.sendNoteOff(held.port, held.channel, held.note)
+    return true
+  }
+
+  /** Release every held Pose-Sequence note. Called on stop()/panic. */
+  private releaseAllSeqNotes(): void {
+    for (const key of Array.from(this.poseSequenceHeldNote.keys())) {
+      this.releaseSeqNote(key)
+    }
+    for (const t of this.poseSequenceGateTimers.values()) clearTimeout(t)
+    this.poseSequenceGateTimers.clear()
+  }
+
+  /** Pause/resume a sequence's live evaluation while the companion
+   *  recorder cycles through its poses — so a hands-free record doesn't
+   *  fire the sequence's own MIDI in the get-ready gaps. Releases any
+   *  held note when paused. */
+  setPoseSequenceSuppressed(templateId: string, seqId: string, on: boolean): void {
+    const key = `${templateId}|${seqId}`
+    if (on) {
+      this.suppressedSeqKeys.add(key)
+      this.releaseSeqNote(key)
+    } else {
+      this.suppressedSeqKeys.delete(key)
+    }
+  }
+
+  /** Rewind a sequence to its first waypoint (and clear a `done` park).
+   *  Exposed over IPC for the UI's per-sequence Reset button. */
+  resetPoseSequence(templateId: string, seqId: string): void {
+    const key = `${templateId}|${seqId}`
+    this.releaseSeqNote(key)
+    const rt = this.poseSequenceRuntime.get(key)
+    if (rt) {
+      rt.step = 0
+      rt.matchSince = 0
+      rt.ready = true
+      rt.done = false
+    } else {
+      this.poseSequenceRuntime.set(key, {
+        step: 0,
+        matchSince: 0,
+        ready: true,
+        done: false
+      })
+    }
+    this.poseSequenceLive.set(key, { step: 0, score: 0 })
   }
 
   private fireStateEnter(trig: StateTrigger, canMidi: boolean, key: string): void {
@@ -2565,21 +2831,32 @@ export class SceneEngine {
 
   // ── State Trigger public API (IPC surface) ────────────────────────
 
-  /** Live match scores + active flags, polled by the renderer's State
-   *  Triggers section (~10 Hz while expanded). */
+  /** Live match scores + active flags (State Triggers) PLUS the current
+   *  step + live score of every Pose Sequence, polled by the renderer's
+   *  State Triggers / Pose Sequences sections (~10 Hz while expanded).
+   *  `seqSteps[key]` === waypoint count means a non-looping phrase has
+   *  completed (parked). Keys for both are `${templateId}|${id}`. */
   getStateTriggerLive(): {
     scores: Record<string, number>
     active: Record<string, boolean>
+    seqSteps: Record<string, number>
+    seqScores: Record<string, number>
   } {
     const scores: Record<string, number> = {}
     const active: Record<string, boolean> = {}
+    const seqSteps: Record<string, number> = {}
+    const seqScores: Record<string, number> = {}
     this.stateTriggerLive.forEach((v, k) => {
       scores[k] = v
     })
     this.stateTriggerRuntime.forEach((rt, k) => {
       if (rt.active) active[k] = true
     })
-    return { scores, active }
+    this.poseSequenceLive.forEach((v, k) => {
+      seqSteps[k] = v.step
+      seqScores[k] = v.score
+    })
+    return { scores, active, seqSteps, seqScores }
   }
 
   /** Learn-by-demonstration: collect the device's conditioned stream
@@ -2692,7 +2969,7 @@ export class SceneEngine {
     if (!rec) return
     this.stateRecording = null
     clearTimeout(rec.timer)
-    const dims: { address: string; slot: number }[] = []
+    const dims: { address: string; slot: number; enabled?: boolean }[] = []
     const centroid: number[] = []
     const variance: number[] = []
     const addresses = Array.from(rec.samples.keys()).sort()
@@ -2720,14 +2997,29 @@ export class SceneEngine {
             varSum += d * d
           }
         }
-        dims.push({ address, slot })
+        dims.push({ address, slot, enabled: true })
         centroid.push(mean)
         variance.push(varSum / n)
       }
     }
+    // Evaluation was frozen for this template while recording (the
+    // skip-during-record `continue`). Clear any stale dwell timer on its
+    // Pose Sequences so a waypoint that was mid-dwell when Record started
+    // can't fire the instant recording ends — force a fresh rising edge.
+    const prefix = `${rec.templateId}|`
+    for (const [k, rt] of this.poseSequenceRuntime) {
+      if (k.startsWith(prefix)) {
+        rt.matchSince = 0
+        rt.ready = false
+      }
+    }
     rec.finalize(
       dims.length > 0
-        ? { dims, centroid, variance, threshold: 0.8 }
+        ? // Forgiving defaults out of the box: tolerance 0.3 (wide
+          // acceptance band) + threshold 0.6 with the new robust
+          // mean-membership score. The user tunes both live via the
+          // match meter and can exclude drifty dims.
+          { dims, centroid, variance, threshold: 0.6, tolerance: 0.3 }
         : null
     )
   }
@@ -2967,9 +3259,13 @@ export class SceneEngine {
     {
       const tplIds = new Set(next.pool.templates.map((t) => t.id))
       const trigKeys = new Set<string>()
+      const seqKeys = new Set<string>()
       for (const t of next.pool.templates) {
         for (const trg of t.stateTriggers ?? []) {
           trigKeys.add(`${t.id}|${trg.id}`)
+        }
+        for (const sq of t.poseSequences ?? []) {
+          seqKeys.add(`${t.id}|${sq.id}`)
         }
       }
       for (const k of Array.from(this.conditionerState.keys())) {
@@ -2994,6 +3290,26 @@ export class SceneEngine {
           if (t) clearTimeout(t)
           this.stateTriggerGateTimers.delete(k)
         }
+      }
+      // Same discipline for Pose Sequences (v0.6.5).
+      for (const k of Array.from(this.poseSequenceRuntime.keys())) {
+        if (!seqKeys.has(k)) this.poseSequenceRuntime.delete(k)
+      }
+      for (const k of Array.from(this.poseSequenceLive.keys())) {
+        if (!seqKeys.has(k)) this.poseSequenceLive.delete(k)
+      }
+      for (const k of Array.from(this.poseSequenceHeldNote.keys())) {
+        if (!seqKeys.has(k)) this.releaseSeqNote(k)
+      }
+      for (const k of Array.from(this.poseSequenceGateTimers.keys())) {
+        if (!seqKeys.has(k)) {
+          const t = this.poseSequenceGateTimers.get(k)
+          if (t) clearTimeout(t)
+          this.poseSequenceGateTimers.delete(k)
+        }
+      }
+      for (const k of Array.from(this.suppressedSeqKeys)) {
+        if (!seqKeys.has(k)) this.suppressedSeqKeys.delete(k)
       }
     }
     // Prune liveValues entries for scenes or tracks that no longer exist.
@@ -4164,8 +4480,10 @@ export class SceneEngine {
     for (const [tid, ts] of this.tracks.entries()) {
       if (ts.armed || ts.delayTimer) this.beginStop(tid, undefined, /* silent */ true)
     }
-    // Release any held State-Trigger notes too — "stop everything".
+    // Release any held State-Trigger + Pose-Sequence notes too — "stop
+    // everything".
     this.releaseAllStateNotes()
+    this.releaseAllSeqNotes()
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
@@ -4192,10 +4510,11 @@ export class SceneEngine {
       ts.fromCenter = []
       ts.toCenter = []
     }
-    // Release + forget any held State-Trigger notes and their gate
-    // timers (the global sweep below also silences them, but this
-    // clears our tracking so nothing fires later).
+    // Release + forget any held State-Trigger + Pose-Sequence notes and
+    // their gate timers (the global sweep below also silences them, but
+    // this clears our tracking so nothing fires later).
     this.releaseAllStateNotes()
+    this.releaseAllSeqNotes()
     // Global MIDI panic — All Notes Off + All Sound Off + Reset All
     // Controllers on every open port and every channel. The
     // midiSender stays alive (panic doesn't tear it down) so

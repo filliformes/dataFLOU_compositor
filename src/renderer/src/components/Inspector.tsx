@@ -52,6 +52,7 @@ import {
   ParameterInputScaling
 } from './InputConditioningSection'
 import { StateTriggersSection } from './StateTriggersSection'
+import { PoseSequencesSection } from './PoseSequencesSection'
 import { DerivedParamsSection } from './DerivedParamsSection'
 import {
   ArpVisual,
@@ -455,6 +456,9 @@ function TrackInspector(): JSX.Element {
       )}
       {isTemplate && templateForRow && (
         <StateTriggersSection template={templateForRow} />
+      )}
+      {isTemplate && templateForRow && (
+        <PoseSequencesSection template={templateForRow} />
       )}
 
       {/* Parameter list — only for Template (Instrument) rows. Each
