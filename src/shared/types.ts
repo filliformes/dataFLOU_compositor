@@ -2394,16 +2394,16 @@ export interface DiscoveredOscDevice {
   // Set of OSC paths this device has emitted. Capped at 256 to keep
   // pathological floods (e.g. a streaming bundle per pixel) bounded.
   addresses: DiscoveredOscAddress[]
-  // (v0.5.12) True when the source IP is loopback (127.0.0.1 or ::1).
-  // Loopback sources are typically dataFLOU itself: scene cells that
-  // target 127.0.0.1:<listenerPort> as a "broadcast bus" pattern
-  // loop right back into the listener with an ephemeral source port.
-  // The UI flags these with "(self loopback)" to disambiguate them
-  // from real external devices, and Hardware Mode's device picker
-  // hard-excludes them — you should never bind HW Mode to your own
-  // loopback by accident (the v0.5.11 forward-suppression would then
-  // suppress your scene's own emissions, breaking the bus pattern).
+  // True when the source IP is loopback (127.x or ::1) — a sender on
+  // this machine. Informational only ("this machine" tag).
   isLoopback?: boolean
+  // (v0.6.6) True when the packets are dataFLOU's OWN emissions looping
+  // back (a local address + one of dataFLOU's own send-socket ports):
+  // scene cells targeting 127.0.0.1:<listenerPort> as a "broadcast bus".
+  // Hidden from Capture and the Hardware Mode device picker, shown as
+  // "self loopback" and not bindable. A real sender on this machine —
+  // the Pandore daemon on 127.0.0.1 — is loopback but NOT self.
+  isSelf?: boolean
 }
 
 // Status snapshot pushed to the renderer alongside the device list —

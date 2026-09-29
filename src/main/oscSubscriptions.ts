@@ -187,6 +187,16 @@ export class OscSubscriptionManager {
     this.onSent = cb
   }
 
+  /** Source port of the subscription socket (0 until bound). */
+  getLocalPort(): number {
+    try {
+      const sock = (this.udp as unknown as { socket?: dgram.Socket } | null)?.socket
+      return sock?.address().port ?? 0
+    } catch {
+      return 0
+    }
+  }
+
   start(): void {
     if (this.udp) return
     const port = new osc.UDPPort({

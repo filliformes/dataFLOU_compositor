@@ -436,10 +436,13 @@ export class OscNetworkListener {
               rinfo && typeof rinfo.address === 'string' ? rinfo.address : ''
             const diagPort =
               rinfo && typeof rinfo.port === 'number' ? rinfo.port : 0
+            // Our own emissions (loopback bus) are never a Hardware Mode
+            // source — always let them through to the forward targets.
             const suppressed =
               !!this.onShouldSuppressForwardHook &&
               diagIp.length > 0 &&
               diagPort > 0 &&
+              !this.isSelfSource(diagIp, diagPort) &&
               this.onShouldSuppressForwardHook(diagIp, diagPort)
             if (diagIp.length > 0 && diagPort > 0) {
               const key = `${diagIp}:${diagPort}`
@@ -695,6 +698,37 @@ export class OscNetworkListener {
     this.onMessageHook = fn
   }
 
+  // (v0.6.6) The source ports dataFLOU itself sends from (engine sender,
+  // subscription socket; the forward socket is tracked here). A packet
+  // from one of them on a local address is dataFLOU's own emission
+  // looping back — NOT a device. Keying on the port, not just the
+  // loopback IP, is what lets a real sender on this machine (the Pandore
+  // daemon on 127.0.0.1) be captured and bound like any other device.
+  private selfPortsProvider: (() => number[]) | null = null
+  private localAddrCache: { at: number; set: Set<string> } = { at: 0, set: new Set() }
+  // Per-packet check — refresh the (tiny) port list at most every 2 s.
+  private selfPortsCache: { at: number; ports: number[] } = { at: 0, ports: [] }
+  setSelfPortsProvider(fn: (() => number[]) | null): void {
+    this.selfPortsProvider = fn
+    this.selfPortsCache.at = 0
+  }
+  private isSelfSource(ip: string, port: number): boolean {
+    if (port <= 0) return false
+    const now = Date.now()
+    if (now - this.selfPortsCache.at > 2000) {
+      this.selfPortsCache = {
+        at: now,
+        ports: (this.selfPortsProvider?.() ?? []).filter((p) => p > 0)
+      }
+    }
+    const own = port === this.forwardLocalPort || this.selfPortsCache.ports.includes(port)
+    if (!own) return false
+    if (now - this.localAddrCache.at > 10000) {
+      this.localAddrCache = { at: now, set: getAllLocalAddresses() }
+    }
+    return isLocalAddress(ip, this.localAddrCache.set)
+  }
+
   // (v0.6.4) Full-message incoming observer — carries the typed args (not
   // just numerics) so the renderer's "OSC In" monitor + live plots see
   // the real values. Fired once per received message in observe().
@@ -765,11 +799,13 @@ export class OscNetworkListener {
     // mutating the device map after the user has explicitly stopped
     // listening.
     if (!this.enabled) return
+    const self = this.isSelfSource(ip, port)
     // Fire the per-message hook FIRST so Hardware Mode reacts at the
     // packet's actual arrival time, not at the 50ms device-map
     // flush cadence. Engine handler is responsible for its own
-    // filtering (per-template ip:port match + per-slot lock).
-    if (this.onMessageHook) {
+    // filtering (per-template ip:port match + per-slot lock). Our own
+    // emissions looping back are never hardware input.
+    if (this.onMessageHook && !self) {
       // Extract just numeric values into a flat array. Trill /
       // pots / faders are float; switches are int. Anything else
       // (strings like the OCTOCOSME IP prefix) becomes NaN which
@@ -832,14 +868,13 @@ export class OscNetworkListener {
         lastSeen: now,
         packetCount: 0,
         addresses: [],
-        // (v0.5.12) Flag loopback sources so the UI can de-emphasize
-        // them. dataFLOU's own scene-to-loopback-bus pattern shows
-        // up as packets from 127.0.0.1:<ephemeral>; without this
-        // flag the user sees a "discovered device" that's actually
-        // themselves.
-        // (Bug 10 FIX) Flag the whole 127.0.0.0/8 loopback block, not
-        // just the canonical 127.0.0.1 — any 127.x.y.z is loopback.
-        isLoopback: ip === '::1' || ip.startsWith('127.')
+        // Sender on this machine (the whole 127.0.0.0/8 block) — just
+        // informational ("this machine" tag).
+        isLoopback: ip === '::1' || ip.startsWith('127.'),
+        // (v0.6.6) dataFLOU's OWN emissions looping back (scene-to-
+        // loopback-bus pattern) — hidden from Capture and never
+        // bindable. A real local sender (Pandore daemon) is not self.
+        isSelf: self
       }
       this.devices.set(key, dev)
     }

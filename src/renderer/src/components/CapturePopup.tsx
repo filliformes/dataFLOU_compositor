@@ -125,10 +125,12 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   // on which source pumped a packet most recently — confusing
   // visual flicker. Hide loopback at the source: the per-row
   // chips, the dropdown options, and the auto-pick all consume
-  // this filtered list.
+  // this filtered list. (v0.6.6) Keyed on `isSelf` (dataFLOU's own
+  // send ports), not the loopback IP — a real sender on this machine,
+  // like the Pandore daemon on 127.0.0.1, must stay capturable.
   const networkDevicesRaw = useStore((s) => s.networkDevices)
   const networkDevices = useMemo(
-    () => networkDevicesRaw.filter((d) => !d.isLoopback),
+    () => networkDevicesRaw.filter((d) => !d.isSelf),
     [networkDevicesRaw]
   )
   const networkStatus = useStore((s) => s.networkStatus)
@@ -205,11 +207,11 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   // (v0.6.3) Auto-detect which Pool Instrument is the one currently
   // streaming on the network, so "New Scene for Instrument" opens on the
   // LIVE instrument instead of just the first Pool entry. Match the
-  // freshest non-loopback device to a template by its Hardware-Mode
+  // freshest device (self loopback already filtered out) to a template by its Hardware-Mode
   // binding (deviceIp) first, then by OSC-address overlap (the device is
   // emitting the template's Parameter paths).
   const detectedTemplateId = useMemo(() => {
-    const dev = networkDevices.find((d) => !d.isLoopback) ?? networkDevices[0]
+    const dev = networkDevices[0]
     if (!dev) return ''
     for (const t of poolTemplates) {
       const hw = t.hardwareMode

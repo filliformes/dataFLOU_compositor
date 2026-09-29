@@ -1601,16 +1601,16 @@ export function HardwareModeSection({
                   port picker's "(disconnected)" option above. */}
               {deviceKey &&
                 !networkDevices.some(
-                  (d) => !d.isLoopback && `${d.ip}:${d.port}` === deviceKey
+                  (d) => !d.isSelf && `${d.ip}:${d.port}` === deviceKey
                 ) && (
                   <option value={deviceKey}>{deviceKey} (not discovered)</option>
                 )}
-              {/* (v0.5.12) Hard-exclude loopback sources. Binding HW
-                  Mode to dataFLOU's own loopback would suppress the
-                  scene's emissions to its own bus, breaking the
-                  forward-to-many pattern users build. */}
+              {/* (v0.5.12) Hard-exclude dataFLOU's own loopback
+                  emissions (isSelf) — binding HW Mode to them would
+                  feed the scene back into itself. A real sender on this
+                  machine (Pandore daemon) is listed normally. */}
               {networkDevices
-                .filter((d) => !d.isLoopback)
+                .filter((d) => !d.isSelf)
                 .map((d) => (
                   <option key={d.id} value={`${d.ip}:${d.port}`}>
                     {d.ip}:{d.port} ({d.addresses.length} addr)

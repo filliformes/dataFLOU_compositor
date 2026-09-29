@@ -143,6 +143,18 @@ export class OscSender {
     this.queue.length = 0
   }
 
+  /** Ephemeral source port of the send socket (0 until bound). Packets
+   *  from this port on a local address are dataFLOU's own emissions. */
+  getLocalPort(): number {
+    try {
+      const sock = (this.udp as unknown as { socket?: { address(): { port: number } } } | null)
+        ?.socket
+      return sock?.address().port ?? 0
+    } catch {
+      return 0
+    }
+  }
+
   send(ip: string, port: number, address: string, arg: Arg): void {
     this.sendMany(ip, port, address, [arg])
   }

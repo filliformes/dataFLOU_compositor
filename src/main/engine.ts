@@ -1452,6 +1452,10 @@ export class SceneEngine {
   setOnOscSend(cb: ((e: OscSendEvent) => void) | null): void {
     this.sender.setOnSent(cb)
   }
+  /** Source port every engine OSC send leaves from (0 until bound). */
+  getOscLocalPort(): number {
+    return this.sender.getLocalPort()
+  }
   setOnMidiSend(cb: ((e: MidiSendEvent) => void) | null): void {
     this.midiSender.setOnSent(cb)
   }

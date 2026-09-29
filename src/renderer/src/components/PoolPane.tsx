@@ -1587,22 +1587,31 @@ function NetworkDeviceRow({
         </button>
         <span
           className="font-mono text-[11px] truncate"
-          style={device.isLoopback ? { opacity: 0.55, fontStyle: 'italic' } : undefined}
+          style={device.isSelf ? { opacity: 0.55, fontStyle: 'italic' } : undefined}
         >
           {device.id}
         </span>
-        {/* (v0.5.12) Loopback tag — packets from 127.0.0.1 / ::1 are
-            dataFLOU's own scene-to-listener-bus emissions, not a
-            real external device. De-emphasize visually so the user
-            doesn't pick them by mistake. */}
-        {device.isLoopback && (
+        {/* (v0.5.12) Self-loopback tag — dataFLOU's own scene-to-
+            listener-bus emissions (isSelf: a local address + one of
+            dataFLOU's send ports), not a real device. De-emphasized so
+            the user doesn't pick them by mistake. A real sender on this
+            machine (Pandore daemon) gets the plain "this machine" tag. */}
+        {device.isLoopback && !device.isSelf && (
+          <span
+            className="text-[9px] uppercase px-1 rounded-sm shrink-0 text-muted"
+            title="Sender on this machine (127.0.0.1) — a local app or daemon, e.g. the Pandore daemon. Capturable and bindable like any device."
+          >
+            this machine
+          </span>
+        )}
+        {device.isSelf && (
           <span
             className="text-[9px] uppercase px-1 rounded-sm shrink-0"
             style={{
               color: 'rgb(var(--c-muted))',
               border: '1px solid rgb(var(--c-border, 60 60 60) / 0.6)'
             }}
-            title="Source IP is loopback (127.0.0.1 or ::1). This is dataFLOU's own scene-to-listener-bus pattern echoing back. Not bindable to Hardware Mode."
+            title="dataFLOU's own emissions echoing back (a scene sending to 127.0.0.1 on the listener port). Not a device — not bindable to Hardware Mode."
           >
             self loopback
           </span>
@@ -1665,20 +1674,20 @@ function NetworkDeviceRow({
           >
             <div className="px-2 py-1 text-[10px] text-muted border-b border-border/60">
               <span className="font-mono">{device.id}</span>
-              {device.isLoopback && (
+              {device.isSelf && (
                 <span className="ml-2 italic">(self loopback — HW Mode binding disabled)</span>
               )}
             </div>
             <button
               className="block w-full text-left px-3 py-1.5 hover:bg-panel2 disabled:opacity-40 disabled:cursor-not-allowed"
-              disabled={!!device.isLoopback}
+              disabled={!!device.isSelf}
               onClick={() => {
                 onRebindAllHardwareModes()
                 setCtxMenu(null)
               }}
               title={
-                device.isLoopback
-                  ? 'Loopback sources cannot drive Hardware Mode — binding to one would suppress your scene\'s own emissions, breaking your forward-bus pattern.'
+                device.isSelf
+                  ? 'dataFLOU\'s own loopback emissions cannot drive Hardware Mode — binding to one would suppress your scene\'s own emissions, breaking your forward-bus pattern.'
                   : 'For every Pool template that has Hardware Mode configured, set its source device to this ip:port. Templates without HW Mode are untouched.'
               }
             >
@@ -1690,7 +1699,7 @@ function NetworkDeviceRow({
                 Eliminates the manual-typing-port trap that bit Vincent
                 this session — the user picks the device they SEE, no
                 guessing source ports. */}
-            {!device.isLoopback && bindableTemplates.length > 0 && (
+            {!device.isSelf && bindableTemplates.length > 0 && (
               <>
                 <div className="border-t border-border/60 mt-1 pt-1" />
                 <div className="px-2 py-0.5 text-[9px] uppercase tracking-wide text-muted">

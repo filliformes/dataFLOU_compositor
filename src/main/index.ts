@@ -372,6 +372,12 @@ app.whenReady().then(async () => {
     if (oscInBuffer.length < OSC_BUFFER_MAX) oscInBuffer.push(e)
     oscSubs.handleIncoming(e)
   })
+  // dataFLOU's own send sockets — their packets looping back through the
+  // listener are "self", not a device (see oscNetwork isSelfSource).
+  networkListener.setSelfPortsProvider(() => [
+    engine.getOscLocalPort(),
+    oscSubs.getLocalPort()
+  ])
   // Subscribe / heartbeat sends show in the Monitor's OSC Out column.
   oscSubs.setOnSent((e) => {
     if (oscBuffer.length < OSC_BUFFER_MAX) oscBuffer.push(e)

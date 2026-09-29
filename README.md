@@ -621,6 +621,7 @@ Some OSC devices send nothing until a client subscribes. dataFLOU now sends that
 - **Heartbeat**: every 5 s `/pandore/subscriptions` renews the daemon's 60 s timeout *and* returns what it has registered for us; if we're missing (daemon restarted) dataFLOU re‑subscribes. It never re‑subscribes on a timer (each re‑subscribe moves the daemon's sending port).
 - A status dot per subscription — **streaming** (with msg/s), device answers but no data yet, **unreachable**, or the device's own error — and a **Capture…** button once data flows, so the IMU goes straight into Capture.
 - **On a Pandore**, the daemon owns UDP 9000 and replies on 9001: listen on **9001** (the panel warns and offers a one‑click fix). For Hardware Mode on Pandore data, use Source match **IP only**.
+- **Senders on this machine are real devices now.** dataFLOU used to hide every `127.0.0.1` sender from Capture, the Hardware Mode picker and Network → Bind, assuming it was its own output echoing back — which hid a local Pandore daemon's IMU. It now recognises its own traffic by its own send ports: a local sender shows up normally (tagged "this machine"), and dataFLOU's own echo is still hidden and can never be mistaken for hardware input (so **IP only** matching is safe on localhost).
 
 ### Monitor drawer
 
