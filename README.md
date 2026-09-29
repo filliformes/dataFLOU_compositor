@@ -17,6 +17,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
   - [Run from source](#run-from-source)
   - [Build a Windows installer](#build-a-windows-installer)
   - [Build a macOS dmg](#build-a-macos-dmg-must-run-on-a-mac)
+  - [Build a Linux AppImage](#build-a-linux-appimage-must-run-on-linux)
 - [How it's organized](#how-its-organized)
 - [Concepts in detail](#concepts-in-detail)
   - [Instruments + Parameters (rows)](#instruments--parameters-rows)
@@ -171,6 +172,14 @@ Produces an installer under `release/<version>/dataFLOU_compositor-<version>-win
 ```bash
 npm run build:mac
 ```
+
+### Build a Linux AppImage (must run on Linux)
+
+```bash
+npm run build:linux
+```
+
+Produces a portable `release/<version>/dataFLOU_compositor-<version>-linux-x64.AppImage` — a single self-contained executable that runs on any x64 distro (e.g. the Pandore / LattePanda Mu) with no install step: `chmod +x` it and run. On a minimal system without FUSE, run it with `--appimage-extract-and-run`.
 
 ---
 

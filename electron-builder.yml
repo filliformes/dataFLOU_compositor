@@ -50,3 +50,14 @@ mac:
         - universal
   artifactName: ${productName}-${version}-mac-${arch}.${ext}
   category: public.app-category.music
+linux:
+  # AppImage: a single portable executable that runs on any x64 Linux
+  # distro with no install step — ideal for the Pandore / LattePanda Mu
+  # (Intel x86-64). `@julusian/midi` and @serialport ship linux-x64
+  # prebuilds, so npmRebuild:false is fine here too.
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  artifactName: ${productName}-${version}-linux-${arch}.${ext}
+  category: AudioVideo

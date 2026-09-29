@@ -80,3 +80,36 @@ jobs:
             release/*/*.dmg.blockmap
           if-no-files-found: error
           retention-days: 30
+
+  # Linux build — portable AppImage (x64). Runs on any x64 distro with no
+  # install step, so it can be dropped straight onto the Pandore / LattePanda.
+  linux:
+    name: Linux (AppImage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Parity with the macOS job: distutils for any node-gyp fallback.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Linux AppImage
+        run: npm run build:linux
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataFLOU_compositor-linux
+          path: |
+            release/*/*.AppImage
+          if-no-files-found: error
+          retention-days: 30
