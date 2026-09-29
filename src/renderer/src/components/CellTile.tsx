@@ -8,6 +8,7 @@ import {
 } from '@shared/factory'
 import type { ParamArgSpec } from '@shared/types'
 import { DestHealthDot } from './DestHealthDot'
+import { useEffectiveSceneDurationSec } from '../hooks/useSceneCountdown'
 
 const DRAG_MIME = 'application/x-dataflou-cell'
 
@@ -68,11 +69,10 @@ function formatCellDisplayValue(
 // How many tokens per row in the value grid. Past this count, tokens
 // wrap to a new row instead of stretching the column horizontally —
 // keeps a 12-float OCTOCOSME cell readable inside a normal-width
-// column. The "collapsed" variant uses 4 columns so 8-12 arg cells
+// column. Same 4 columns in the collapsed layout, so 8-12 arg cells
 // stack into 2–3 rows that fit the compact row height instead of
 // overflowing onto the next parameter row.
 const CELL_TOKENS_PER_ROW = 4
-const CELL_TOKENS_PER_ROW_COLLAPSED = 4
 
 // Cell value renderer. Splits the post-formatter display string back
 // into tokens and lays them out in an auto-sizing CSS grid with up
@@ -129,7 +129,7 @@ function CellValueGrid({
       </span>
     )
   }
-  const tokensPerRow = collapsed ? CELL_TOKENS_PER_ROW_COLLAPSED : CELL_TOKENS_PER_ROW
+  const tokensPerRow = CELL_TOKENS_PER_ROW
   // Few tokens AND not in collapsed mode: keep the legacy single-line
   // look (larger font, no grid) so a one-arg or vec3 cell doesn't
   // suddenly grow vertically. In collapsed mode we always use the
@@ -373,6 +373,10 @@ export default function CellTile({
     wasPlayingRef.current = isPlaying
   }, [isPlaying])
 
+  // Scene length a scene-synced Ramp spans — the engine's armed duration
+  // when this is the active scene (slot override / generative roll),
+  // else the authored Dur.
+  const sceneDurSec = useEffectiveSceneDurationSec(sceneId, scene?.durationSec ?? 0)
   const isRampCell = cell?.modulation.enabled && cell.modulation.type === 'ramp'
   // Compute an upper bound on the ramp length here (at the top of the
   // component, above the early return) so we can auto-terminate the
@@ -385,7 +389,7 @@ export default function CellTile({
     if (!r) return 0
     if (r.sync === 'free') return r.rampMs
     if (r.sync === 'freeSync') return r.totalMs
-    return (scene?.durationSec ?? 0) * 1000
+    return sceneDurSec * 1000
   })()
   const [rampNowMs, setRampNowMs] = useState<number>(() => Date.now())
   const triggerAt = triggerAtRef.current
@@ -508,7 +512,11 @@ export default function CellTile({
       <>
         <div
           className="w-full h-full flex items-center justify-center text-muted hover:bg-panel2 text-[11px] cursor-pointer"
-          onClick={() => {
+          onClick={(e) => {
+            // Same as onClickCell: keep the click off the SceneColumn
+            // root, whose setFocusedScene would clear the cell
+            // selection we're about to make.
+            e.stopPropagation()
             ensureCell(sceneId, trackId)
             selectCell(sceneId, trackId)
           }}
@@ -590,7 +598,7 @@ export default function CellTile({
         ? rampRef.rampMs
         : rampRef.sync === 'freeSync'
           ? rampRef.totalMs
-          : (scene?.durationSec ?? 0) * 1000
+          : sceneDurSec * 1000
       : 0
 
   // Timer state + trigger-at ref are hoisted to the top of the component
@@ -990,6 +998,10 @@ function ClipTemplateMenu({
       className="fixed z-50 bg-panel border border-border rounded shadow-xl py-1 min-w-[160px]"
       style={{ left: x, top: y }}
       onMouseDown={(e) => e.stopPropagation()}
+      // Portal clicks still bubble through the React tree up to the
+      // SceneColumn root (setFocusedScene → clears the cell selection
+      // the pick just made).
+      onClick={(e) => e.stopPropagation()}
     >
       <div className="px-3 py-1 text-[10px] uppercase text-muted">From template</div>
       <button
@@ -1077,6 +1089,8 @@ function FilledCellMenu({
       className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[200px]"
       style={{ left: x, top: y }}
       onMouseDown={(e) => e.stopPropagation()}
+      // See ClipTemplateMenu — keep portal clicks off the SceneColumn root.
+      onClick={(e) => e.stopPropagation()}
     >
       <div className="px-3 py-0.5 text-[10px] text-muted">
         {plural ? `${targets.length} clips selected` : 'Clip'}

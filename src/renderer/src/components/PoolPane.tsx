@@ -16,6 +16,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useStore } from '../store'
 import { ConnectionHealthPanel } from './ConnectionHealth'
+import { OscSubscriptionsPanel } from './OscSubscriptionsPanel'
 import type {
   DiscoveredOscDevice,
   ForwardDiagEntry,
@@ -163,7 +164,7 @@ export default function PoolPane({
   }
 
   // Subscribe to main-process network device pushes whenever the
-  // Pool pane is mounted. Cheap (~250ms cadence, only when devices
+  // Pool pane is mounted. Cheap (~50ms cadence, only when devices
   // change), and unsubscribes cleanly on unmount so re-mounting the
   // Pool drawer doesn't double-bind handlers.
   // Network listener subscription lives in App.tsx now — keeping it
@@ -216,15 +217,14 @@ export default function PoolPane({
           modal that's easier to scan when the library grows. */}
       <div
         {...titleBarHandlers}
-        // `flex-nowrap` + `whitespace-nowrap` on every child guarantees
-        // the title bar stays single-line at the User tab's wider
-        // trailing cluster (+ Instrument / + Parameter / ⤢ / Hide) —
-        // without it "Built-in" wrapped onto two rows. Right-side
-        // buttons use the compact `text-[9px]` + `px-1` sizing so all
-        // four can sit next to the tabs even at narrow drawer widths.
+        // Never clips: the Listening pill takes whatever width is left
+        // (zero intrinsic width, truncates), and only if the essentials
+        // themselves don't fit does the button group wrap to a second
+        // line — Capture / ⤢ / Hide stay reachable at any Pool width.
+        // Every child is `whitespace-nowrap` so labels never break.
         // `min-h-[28px]` matches the Monitor's toolbar height so the
         // two sit on the same visual line.
-        className="flex items-center gap-1.5 px-2 py-1 border-b border-border shrink-0 cursor-default select-none flex-nowrap min-h-[28px]"
+        className="flex flex-wrap items-center gap-x-1.5 gap-y-1 px-2 py-1 border-b border-border shrink-0 cursor-default select-none min-h-[28px] min-w-0"
         onDoubleClick={() => onTogglePopOut?.()}
         title={poppedOut ? 'Drag to move · Double-click to dock' : 'Double-click to pop out'}
         style={{ touchAction: titleBarHandlers ? 'none' : undefined, ...titleBarHandlers?.style }}
@@ -270,72 +270,78 @@ export default function PoolPane({
             {visibleTemplates.length}I · {visibleParameters.length}P
           </span>
         )}
-        <div className="flex-1 min-w-0" />
         {/* Listening pill — shows EXACTLY what IP:port to point an
             incoming OSC sender (OCTOCOSME, TouchOSC, etc.) at so the
             Capture popup will see its packets. Placed immediately to
             the LEFT of the Capture button so the two read as a unit:
-            "this is what we're listening to → capture from it". */}
-        <ListeningPill
-          status={networkStatus}
-          devicesCount={networkDevices.length}
-          onToggle={() => {
-            window.api
-              ?.networkSetEnabled?.(!networkStatus.enabled, networkStatus.port)
-              .then((next) => {
-                if (next) setNetworkSnapshot(networkDevices, next)
-              })
-          }}
-          onDoubleClick={() => setCaptureOpen(true)}
-        />
-        {/* Capture button — opens the modal that snapshots a live
-            OSC or MIDI device into the Pool (and optionally builds a
-            Scene from it). Visible on every tab so the user doesn't
-            have to switch tabs first. */}
-        <button
-          className="btn text-[9px] py-0 px-1.5 leading-tight shrink-0 whitespace-nowrap"
-          onClick={() => setCaptureOpen(true)}
-          title="Snapshot an incoming OSC or MIDI device — choose between New OSC Instrument, New Scene, or New MIDI Instrument"
-          style={{ borderColor: 'rgb(var(--c-accent))', color: 'rgb(var(--c-accent))' }}
-        >
-          ● Capture
-        </button>
-        {tab === 'user' && (
-          <>
-            <button
-              className="btn text-[9px] py-0 px-1 leading-tight shrink-0 whitespace-nowrap"
-              onClick={() => addTemplate()}
-              title="Create a new empty Instrument"
-            >
-              + Instr
-            </button>
-            <button
-              className="btn text-[9px] py-0 px-1 leading-tight shrink-0 whitespace-nowrap"
-              onClick={() => addParameter()}
-              title="Create a new Parameter blueprint"
-            >
-              + Param
-            </button>
-          </>
-        )}
-        {onTogglePopOut && (
+            "this is what we're listening to → capture from it". Its
+            wrapper has width 0 + grow: it contributes nothing to the
+            bar's intrinsic width (so it never forces a wrap), fills the
+            free space, and the pill truncates inside it. */}
+        <div className="flex justify-end min-w-0" style={{ flex: '1 1 auto', width: 0 }}>
+          <ListeningPill
+            status={networkStatus}
+            devicesCount={networkDevices.length}
+            onToggle={() => {
+              window.api
+                ?.networkSetEnabled?.(!networkStatus.enabled, networkStatus.port)
+                .then((next) => {
+                  if (next) setNetworkSnapshot(networkDevices, next)
+                })
+            }}
+            onDoubleClick={() => setCaptureOpen(true)}
+          />
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+          {/* Capture button — opens the modal that snapshots a live
+              OSC or MIDI device into the Pool (and optionally builds a
+              Scene from it). Visible on every tab so the user doesn't
+              have to switch tabs first. */}
           <button
-            className="btn text-[9px] py-0 px-1 leading-tight shrink-0"
-            onClick={onTogglePopOut}
-            title={poppedOut ? 'Dock back into the drawer' : 'Pop out to a centered window'}
+            className="btn text-[9px] py-0 px-1.5 leading-tight shrink-0 whitespace-nowrap"
+            onClick={() => setCaptureOpen(true)}
+            title="Snapshot an incoming OSC or MIDI device — choose between New OSC Instrument, New Scene, or New MIDI Instrument"
+            style={{ borderColor: 'rgb(var(--c-accent))', color: 'rgb(var(--c-accent))' }}
           >
-            {poppedOut ? '⤓' : '⤢'}
+            ● Capture
           </button>
-        )}
-        {onHide && (
-          <button
-            className="btn text-[9px] py-0 px-1 leading-tight shrink-0"
-            onClick={onHide}
-            title="Hide the Pool (P to toggle)"
-          >
-            Hide
-          </button>
-        )}
+          {tab === 'user' && (
+            <>
+              <button
+                className="btn text-[9px] py-0 px-1 leading-tight shrink-0 whitespace-nowrap"
+                onClick={() => addTemplate()}
+                title="Create a new empty Instrument"
+              >
+                + Instr
+              </button>
+              <button
+                className="btn text-[9px] py-0 px-1 leading-tight shrink-0 whitespace-nowrap"
+                onClick={() => addParameter()}
+                title="Create a new Parameter blueprint"
+              >
+                + Param
+              </button>
+            </>
+          )}
+          {onTogglePopOut && (
+            <button
+              className="btn text-[9px] py-0 px-1 leading-tight shrink-0"
+              onClick={onTogglePopOut}
+              title={poppedOut ? 'Dock back into the drawer' : 'Pop out to a centered window'}
+            >
+              {poppedOut ? '⤓' : '⤢'}
+            </button>
+          )}
+          {onHide && (
+            <button
+              className="btn text-[9px] py-0 px-1 leading-tight shrink-0"
+              onClick={onHide}
+              title="Hide the Pool (P to toggle)"
+            >
+              Hide
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Body — scrollable list. Built-in / User tabs render the
@@ -868,6 +874,10 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
   // Pending-rebind spinner — set true between dispatch and the next
   // status update so the user can tell the listener is restarting.
   const [busy, setBusy] = useState(false)
+  // Port applied while the listener was OFF — written through to
+  // session.listenerPort only once the user turns Listen on (see
+  // applyPort for why it can't be written immediately).
+  const pendingSessionPort = useRef<number | null>(null)
   // Track which devices are expanded (show address list). Default
   // collapsed so the list stays scannable; one click expands.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
@@ -926,6 +936,16 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
         // push (which won't fire if no devices changed).
         setNetworkSnapshot(devices, next)
         if (next.port !== portInput) setPortInput(next.port)
+        // Listener now ON with a port picked while it was off → persist
+        // it to the session. Store-only: main is already bound there,
+        // and App's listener effect sees enabled + same port → no-op.
+        if (next.enabled && pendingSessionPort.current !== null) {
+          pendingSessionPort.current = null
+          const port = next.port
+          useStore.setState((st) => ({
+            session: { ...st.session, listenerPort: port }
+          }))
+        }
       }
     } finally {
       setBusy(false)
@@ -934,6 +954,14 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
   async function applyPort(): Promise<void> {
     if (!Number.isFinite(portInput) || portInput < 1 || portInput > 65535) return
     saveNetworkPort(portInput)
+    if (!status.enabled) {
+      // Listener OFF: just remember the port — the Listen toggle binds
+      // on portInput. Writing session.listenerPort now would switch the
+      // listener ON (setListenerPort always enables, and App's listener
+      // effect auto-enables whenever that field changes).
+      pendingSessionPort.current = portInput
+      return
+    }
     // v0.5.10 -- write through to session.listenerPort so the
     // binding survives save/load AND the TopBar's "Listen on"
     // input reflects the same value. setListenerPort also pushes
@@ -943,14 +971,8 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
     setListenerPort(portInput)
     setBusy(true)
     try {
-      // Re-bind on the new port. Pass current enabled state so we
-      // stay on if already listening, or stay off if we weren't.
-      // (setListenerPort always passes enabled=true, but if the
-      // user had the listener OFF we want to preserve that here.)
-      const next = await window.api?.networkSetEnabled?.(
-        status.enabled,
-        portInput
-      )
+      // Re-bind on the new port (the listener is on — see above).
+      const next = await window.api?.networkSetEnabled?.(true, portInput)
       if (next) setNetworkSnapshot(devices, next)
     } finally {
       setBusy(false)
@@ -1059,6 +1081,10 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
       <div className="px-2 pt-2">
         <ConnectionHealthPanel />
       </div>
+      {/* (v0.6.6) Devices that only stream on request (Pandore IMU, …). */}
+      <div className="px-2 pt-2">
+        <OscSubscriptionsPanel />
+      </div>
 
       {/* Device list — one row per (ip:port), expandable to show
           observed addresses. Drag onto the Edit sidebar to materialise
@@ -1123,6 +1149,40 @@ function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Elemen
       <HwModeSuppressPanel />
     </div>
   )
+}
+
+// Diag counters for one HW-Mode template. 'ipPort' reads the exact
+// ip:port source; 'ipOnly' accepts ANY source port from the IP (as the
+// engine's source match does), so its counters sum every port seen from
+// that IP and another port is never a mismatch.
+function hwDiagFor(
+  hw: { deviceIp: string; devicePort: number; deviceMatch?: 'ipPort' | 'ipOnly' },
+  byExact: Map<string, ForwardDiagEntry>,
+  byIp: Map<string, ForwardDiagEntry[]>
+): { exact: ForwardDiagEntry | undefined; mismatches: ForwardDiagEntry[] } {
+  const sameIp = byIp.get(hw.deviceIp) ?? []
+  if ((hw.deviceMatch ?? 'ipPort') === 'ipOnly') {
+    if (sameIp.length === 0) return { exact: undefined, mismatches: [] }
+    const sum: ForwardDiagEntry = {
+      ip: hw.deviceIp,
+      port: hw.devicePort,
+      received: 0,
+      suppressed: 0,
+      forwarded: 0,
+      lastSeenAtMs: 0
+    }
+    for (const e of sameIp) {
+      sum.received += e.received
+      sum.suppressed += e.suppressed
+      sum.forwarded += e.forwarded
+      sum.lastSeenAtMs = Math.max(sum.lastSeenAtMs ?? 0, e.lastSeenAtMs ?? 0)
+    }
+    return { exact: sum, mismatches: [] }
+  }
+  return {
+    exact: byExact.get(`${hw.deviceIp}:${hw.devicePort}`),
+    mismatches: sameIp.filter((e) => e.port !== hw.devicePort)
+  }
 }
 
 // v0.5.10 -- HW Mode Suppress diagnostic panel.
@@ -1206,11 +1266,11 @@ function HwModeSuppressPanel(): JSX.Element {
     for (const t of hwTemplates) {
       const hw = t.hardwareMode
       if (!hw) continue
-      const e = byExact.get(`${hw.deviceIp}:${hw.devicePort}`)
+      const e = hwDiagFor(hw, byExact, byIp).exact
       if (e) n += e.forwarded
     }
     return n
-  }, [hwTemplates, byExact])
+  }, [hwTemplates, byExact, byIp])
   if (hwTemplates.length === 0) {
     // No HW Mode templates configured -- panel is informational only.
     // Render a tiny stub so the surface is discoverable when the
@@ -1274,12 +1334,8 @@ function HwModeSuppressPanel(): JSX.Element {
           </div>
           {hwTemplates.map((t) => {
             const hw = t.hardwareMode!
-            const exactKey = `${hw.deviceIp}:${hw.devicePort}`
-            const exact = byExact.get(exactKey)
-            const sameIp = byIp.get(hw.deviceIp) ?? []
-            const mismatches = sameIp.filter(
-              (e) => e.port !== hw.devicePort
-            )
+            const ipOnly = (hw.deviceMatch ?? 'ipPort') === 'ipOnly'
+            const { exact, mismatches } = hwDiagFor(hw, byExact, byIp)
             // Status badge selection. Priority: dual emission > port
             // mismatch (no exact match but IP seen on other port) > no
             // packets > healthy.
@@ -1329,7 +1385,7 @@ function HwModeSuppressPanel(): JSX.Element {
                 <div className="text-[9px] text-muted leading-tight">
                   Configured:{' '}
                   <span className="font-mono text-text">
-                    {hw.deviceIp}:{hw.devicePort}
+                    {hw.deviceIp}:{ipOnly ? '* (any port)' : hw.devicePort}
                   </span>
                 </div>
                 <div className="flex items-center gap-3 text-[9px] tabular-nums font-mono">
@@ -1729,7 +1785,9 @@ function ListeningPill({
   )
   return (
     <button
-      className="flex items-center gap-1 px-1.5 py-0 rounded border border-border bg-panel2 hover:bg-panel3 text-[9px] leading-tight shrink-0 whitespace-nowrap"
+      // Shrinkable: the widest item on the Pool title bar, so it
+      // truncates first and the tabs / Capture / Hide always fit.
+      className="flex items-center gap-1 px-1.5 py-0 rounded border border-border bg-panel2 hover:bg-panel3 text-[9px] leading-tight min-w-0 max-w-full shrink overflow-hidden whitespace-nowrap"
       onClick={() => {
         if (clickTimer.current !== null) window.clearTimeout(clickTimer.current)
         clickTimer.current = window.setTimeout(() => {
@@ -1750,13 +1808,15 @@ function ListeningPill({
         className="inline-block w-1.5 h-1.5 rounded-full shrink-0"
         style={{ background: dotColor }}
       />
-      <span className="text-muted">Listening</span>
-      <span className="font-mono text-text tabular-nums">
-        {ipDisplay}:{status.port}
+      <span className="truncate min-w-0">
+        <span className="text-muted">Listening </span>
+        <span className="font-mono text-text tabular-nums">
+          {ipDisplay}:{status.port}
+        </span>
       </span>
       {devicesCount > 0 && status.enabled && (
         <span
-          className="text-accent text-[9px] font-semibold"
+          className="text-accent text-[9px] font-semibold shrink-0"
           title={`${devicesCount} sender${devicesCount === 1 ? '' : 's'} discovered. Double-click to open Capture.`}
         >
           {devicesCount}D
@@ -2011,6 +2071,10 @@ function SavedSceneRow({
             className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[200px]"
             style={{ left: menu.x, top: menu.y }}
             onMouseDown={(e) => e.stopPropagation()}
+            // React bubbles portal events through the COMPONENT tree, so
+            // without this a menu click reaches the row's onClick, whose
+            // rAF blur immediately cancels the Rename input it opened.
+            onClick={(e) => e.stopPropagation()}
           >
             {/* Rename — swaps the name span into an inline input. */}
             <button

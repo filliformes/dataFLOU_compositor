@@ -30,7 +30,7 @@ function ago(ms: number): string {
 
 // The full breakdown — used inside the Network tab and inside the pill's
 // popover. `dense` tightens padding for the popover.
-export function ConnectionHealthBody({
+function ConnectionHealthBody({
   h,
   dense = false
 }: {

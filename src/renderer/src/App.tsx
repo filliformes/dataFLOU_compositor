@@ -8,7 +8,7 @@ import {
   UI_SCALE_STEP
 } from './store'
 import { midi } from './midi'
-import TopBar from './components/TopBar'
+import TopBar, { FileErrorModal } from './components/TopBar'
 import EditView from './components/EditView'
 import MetaControllerBar from './components/MetaControllerBar'
 import SequenceView from './components/SequenceView'
@@ -21,7 +21,7 @@ import CrashRecoveryPrompt from './components/CrashRecoveryPrompt'
 import CapturePopup from './components/CapturePopup'
 import { Modal } from './components/Modal'
 import { initUndo, undo, redo } from './undo'
-import TransportBar from './components/TransportBar'
+import TransportBar, { stopAllTransport } from './components/TransportBar'
 import { GenerativePopoverHost } from './components/GenerativePopover'
 
 export default function App(): JSX.Element {
@@ -73,6 +73,8 @@ export default function App(): JSX.Element {
   const trackColumnWidthW = useStore((s) => s.trackColumnWidth)
   const editorNotesHeightW = useStore((s) => s.editorNotesHeight)
   const oscMonitorHeightW = useStore((s) => s.oscMonitorHeight)
+  const scenePaletteWidthW = useStore((s) => s.scenePaletteWidth)
+  const sceneInfoPanelHeightW = useStore((s) => s.sceneInfoPanelHeight)
   const tracksCollapsedW = useStore((s) => s.tracksCollapsed)
   const scenesCollapsedW = useStore((s) => s.scenesCollapsed)
   // (v0.6) Scope frames persist out-of-band (scopePrefs.ts module Map);
@@ -102,6 +104,8 @@ export default function App(): JSX.Element {
     trackColumnWidthW,
     editorNotesHeightW,
     oscMonitorHeightW,
+    scenePaletteWidthW,
+    sceneInfoPanelHeightW,
     tracksCollapsedW,
     scenesCollapsedW,
     scopePrefsRevW
@@ -194,7 +198,8 @@ export default function App(): JSX.Element {
     attachOscErrorStream()
   }, [])
 
-  // Global Ctrl+wheel zoom for everything below the main toolbar. Scroll
+  // Global Ctrl+wheel zoom for the whole app, main toolbar included (the
+  // zoom wrapper below wraps everything). Scroll
   // down = zoom out (smaller), scroll up = zoom in (larger). Intercepts at
   // window level so the gesture works no matter where the cursor sits —
   // including over the zoom wrapper where a normal wheel would still
@@ -321,31 +326,44 @@ export default function App(): JSX.Element {
     return () => window.removeEventListener('keydown', onZoomKey)
   }, [])
 
-  // Global keyboard shortcuts.
+  // Global keyboard shortcuts. Nothing below fires while a Modal is open
+  // (except F11 and Escape) so keys can't act behind a dialog.
+  //
+  // Always (even inside text fields):
+  //   Tab / Shift+Tab → toggle Edit ↔ Sequence
+  //   Ctrl+S          → save the session (Save if path known, else Save As)
+  //   Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y → undo / redo
   //
   // Authoring (suppressed inside text fields):
-  //   Tab           → toggle Edit ↔ Sequence
-  //   Ctrl+S        → save the session (Save if path known, else Save As)
   //   Ctrl+T        → add a new Instrument (draft Template + sidebar header)
   //   Ctrl+P        → add a new Parameter to the selected Instrument
   //                   group (or to the parent of a selected Parameter row).
   //                   No-op when nothing's selected.
+  //   Ctrl+Alt+D    → duplicate the focused Scene
+  //   Ctrl+C / Ctrl+V → internal clipboard (Instruments, Parameters, clips)
   //   Alt+S         → add a Scene
+  //   C             → open the Capture popup
+  //   N             → toggle the Mappings view
+  //   L             → toggle MIDI Learn mode
+  //   G             → toggle the Generative Settings popover
   //   M             → toggle the Meta Controller bar
   //   O             → toggle the OSC Monitor drawer
   //   P             → toggle the Pool inside the OSC Monitor (also opens
   //                   the drawer if it's closed). Modifier-less so the
   //                   user can flick it on/off mid-edit.
   //   I             → toggle the right-side Inspector panel (Edit view)
-  //   S             → toggle the focused-Scene info panel (Sequence view)
+  //   S             → toggle the Signals view
+  //   Shift+S       → toggle the focused-Scene info panel (Sequence view)
   //   Delete        → Sequence view: remove focused scene (with confirm)
   //                   Edit view:     remove selected Instrument row(s)
   //
-  // Performance (always active, even in show mode):
+  // Performance (active even in show mode; suppressed inside text fields):
   //   1–9           → trigger scenes 1–9 in the sequence (sequenceLength slots)
   //   0             → trigger scene 10
-  //   Space         → trigger next non-empty slot after the currently-active
-  //                   scene (or the first non-empty slot if none is active)
+  //   Space         → GO the armed scene; otherwise trigger the next non-empty
+  //                   slot after the currently-playing slot (or the first
+  //                   non-empty slot if none is active)
+  //   A             → arm / unarm the focused scene
   //   .             → Stop All (graceful morph to 0)
   //   Shift+.       → Panic (instant kill)
   //
@@ -355,6 +373,10 @@ export default function App(): JSX.Element {
   //                   of Escape still close modals / menus etc.
   const addScene = useStore((s) => s.addScene)
   const removeScene = useStore((s) => s.removeScene)
+  // Ctrl+S failure message (shown in FileErrorModal, same as TopBar's
+  // Save / Save As / Open buttons). The setter is stable, so the
+  // keydown effect below can close over it.
+  const [fileError, setFileError] = useState<string | null>(null)
   useEffect(() => {
     function isEditableTarget(t: EventTarget | null): boolean {
       const el = t as HTMLElement | null
@@ -374,17 +396,30 @@ export default function App(): JSX.Element {
       if (idx < 0 || idx >= len) return null
       return st.session.sequence[idx] ?? null
     }
-    // Next non-empty slot after the currently-playing scene, wrapping. Used
-    // by Space bar.
-    function nextSceneId(): string | null {
+    // Next non-empty slot after the currently-playing slot, wrapping. Used
+    // by Space bar. Starts from the engine's activeSequenceSlotIdx (the
+    // slot that actually fired), not the scene's first occurrence — a
+    // scene placed twice would otherwise loop back to its first slot.
+    // Falls back to the first occurrence when the scene was fired from
+    // outside the sequence (no slot). Returns the slot index too so the
+    // trigger carries it (per-slot overrides + slot highlight key off it).
+    function nextSlot(): { id: string; slot: number } | null {
       const st = useStore.getState()
       const len = st.session.sequenceLength
       const seq = st.session.sequence.slice(0, len)
       const active = st.engine.activeSceneId
-      const start = active ? seq.findIndex((id) => id === active) : -1
+      const activeSlot = st.engine.activeSequenceSlotIdx
+      let start = -1
+      if (active) {
+        start =
+          activeSlot !== null && seq[activeSlot] === active
+            ? activeSlot
+            : seq.findIndex((id) => id === active)
+      }
       for (let i = 1; i <= seq.length; i++) {
-        const id = seq[(start + i + seq.length) % seq.length]
-        if (id) return id
+        const slot = (start + i + seq.length) % seq.length
+        const id = seq[slot]
+        if (id) return { id, slot }
       }
       return null
     }
@@ -419,6 +454,26 @@ export default function App(): JSX.Element {
         return
       }
 
+      // ------- A Modal is open (Save-before-quit, MIDI conflicts, crash
+      //             restore, …): the dialog owns the keyboard. Without this,
+      //             Space / digits / Delete / Tab acted on the app behind it.
+      //             F11 + Escape above stay live.
+      if (document.querySelector('[data-modal-open="true"]')) return
+
+      // ------- Tab → toggle view, period. We dedicate Tab to view-switch
+      //             even from inside text inputs (where the browser would
+      //             otherwise step to the next focusable element) — the user
+      //             explicitly asked for Tab to ONLY do this, so it's handled
+      //             BEFORE any isEditableTarget guard. Shift+Tab is handled
+      //             here too so the browser can't reclaim it. Modifier keys
+      //             other than Shift fall through (Ctrl+Tab is the OS-level
+      //             window/tab cycler and we shouldn't hijack that).
+      if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault()
+        setView(useStore.getState().view === 'edit' ? 'sequence' : 'edit')
+        return
+      }
+
       // ------- Ctrl/Cmd+Z = Undo, Ctrl/Cmd+Shift+Z (or Ctrl+Y) = Redo.
       //              Works inside text fields too — the snapshotting
       //              treats a typing burst as one undoable step, so
@@ -444,7 +499,8 @@ export default function App(): JSX.Element {
       // editable targets, copy captures the currently-selected cell
       // (priority) or selected track; paste drops the payload at
       // the focused destination. See store.copyToClipboard /
-      // pasteFromClipboard for the routing rules.
+      // pasteFromClipboard for the routing rules. Paste is an
+      // authoring edit, so it's also suppressed in show mode.
       if (
         (e.ctrlKey || e.metaKey) &&
         !e.altKey &&
@@ -463,15 +519,15 @@ export default function App(): JSX.Element {
         e.key.toLowerCase() === 'v'
       ) {
         if (isEditableTarget(e.target)) return
+        if (useStore.getState().showMode) return
         e.preventDefault()
         useStore.getState().pasteFromClipboard()
         return
       }
 
-      // ------- Performance hotkeys — active everywhere, including inside
-      //             text fields (musicians' typing habits notwithstanding,
-      //             these are live-fire keys). Guarded only against typing
-      //             spaces in a text field.
+      // ------- Performance hotkeys — live in show mode too (these are
+      //             live-fire keys), but never inside text fields so typing
+      //             spaces / digits / dots in a field still works.
       //
       // Space → GO. If a scene is armed, fire it (and optionally
       // auto-arm the next non-empty slot). Otherwise fall back to the
@@ -484,24 +540,26 @@ export default function App(): JSX.Element {
         if (st.armedSceneId) {
           st.fireArmed()
         } else {
-          const id = nextSceneId()
-          if (id) st.triggerSceneWithMorph(id)
+          const next = nextSlot()
+          if (next) st.triggerSceneWithMorph(next.id, next.slot)
         }
         return
       }
       // "C" → Open the Capture window (whether closed or already
       // open is fine, the modal toggles back on the same press).
       // Guarded against text-field input so typing "c" in a name
-      // field doesn't pop the modal.
+      // field doesn't pop the modal. Authoring tool → not in show mode.
       if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey && !e.altKey) {
         if (isEditableTarget(e.target)) return
+        if (useStore.getState().showMode) return
         e.preventDefault()
         useStore.getState().setCaptureOpen(true)
         return
       }
-      // "N" → toggle the Mappings view.
+      // "N" → toggle the Mappings view (authoring view → not in show mode).
       if ((e.key === 'n' || e.key === 'N') && !e.ctrlKey && !e.metaKey && !e.altKey) {
         if (isEditableTarget(e.target)) return
+        if (useStore.getState().showMode) return
         e.preventDefault()
         const st = useStore.getState()
         const opening = !st.mappingsOpen
@@ -510,12 +568,17 @@ export default function App(): JSX.Element {
         if (opening && st.signalsOpen) st.setSignalsOpen(false)
         return
       }
-      // "." → Stop All; Shift+"." → Panic.
-      if (e.key === '.' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // "." → Stop All; Shift+"." → Panic. Matched on the PHYSICAL key
+      // (e.code): Shift+. yields e.key '>' on US layouts, so a key-based
+      // match never saw the Panic chord. Numpad "." counts too, but not
+      // its NumLock-off "Delete" alias (that's the Delete shortcut).
+      // Same renderer-side transport reset as the transport ■ button.
+      const isPeriodKey =
+        e.code === 'Period' || (e.code === 'NumpadDecimal' && e.key !== 'Delete')
+      if (isPeriodKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
         if (isEditableTarget(e.target)) return
         e.preventDefault()
-        if (e.shiftKey) window.api.panic()
-        else window.api.stopAll()
+        void stopAllTransport(e.shiftKey ? 'panic' : 'stop')
         return
       }
       // 1–9 → fire scenes 1–9 in the sequence; 0 → scene 10.
@@ -542,11 +605,10 @@ export default function App(): JSX.Element {
       // Ctrl/Cmd + S → save the current session. If we have a known
       // file path, write to it directly (Save). Otherwise prompt for a
       // location (Save As) and remember the path. Suppressed in show
-      // mode and inside text fields so a performer typing into a name
-      // field doesn't accidentally save with every keystroke.
+      // mode. Works from inside text fields too — it's an explicit
+      // chord, and "type a name, hit Ctrl+S" is the natural gesture.
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
         if (showMode) return
-        if (isEditableTarget(e.target)) return
         e.preventDefault()
         const st = useStore.getState()
         // Same buildSessionForSave bundle as the manual Save button
@@ -563,17 +625,29 @@ export default function App(): JSX.Element {
           void el.offsetWidth
           el.classList.add('flash-blue')
         }
+        // Main rethrows write errors (disk full, read-only folder, …) —
+        // surface them instead of leaving an unhandled rejection and a
+        // user who thinks the show was saved.
+        const onSaveError = (err: unknown): void => {
+          setFileError(`Save failed: ${(err as Error)?.message || 'unknown error'}`)
+        }
         if (path) {
-          void window.api.sessionSave(sess, path).then((ok) => {
-            if (ok) flashSave()
-          })
+          void window.api
+            .sessionSave(sess, path)
+            .then((ok) => {
+              if (ok) flashSave()
+            })
+            .catch(onSaveError)
         } else {
-          void window.api.sessionSaveAs(sess).then((p) => {
-            if (p) {
-              useStore.getState().setCurrentFilePath(p)
-              flashSave()
-            }
-          })
+          void window.api
+            .sessionSaveAs(sess)
+            .then((p) => {
+              if (p) {
+                useStore.getState().setCurrentFilePath(p)
+                flashSave()
+              }
+            })
+            .catch(onSaveError)
         }
         return
       }
@@ -614,11 +688,12 @@ export default function App(): JSX.Element {
       // Ctrl+Alt+D → duplicate the focused scene. The right-click
       // menu also offers this; the shortcut is for hands-on-keyboard
       // workflows. No-op when no scene is focused or in show mode.
+      // Matched on e.code: with Option held, macOS reports e.key '∂'.
       if (
         (e.ctrlKey || e.metaKey) &&
         e.altKey &&
         !e.shiftKey &&
-        e.key.toLowerCase() === 'd'
+        e.code === 'KeyD'
       ) {
         if (showMode) return
         if (isEditableTarget(e.target)) return
@@ -648,8 +723,10 @@ export default function App(): JSX.Element {
         st.setArmedSceneId(st.armedSceneId === focusedId ? null : focusedId)
         return
       }
-      // Alt + S → add Scene
-      if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+      // Alt + S → add Scene. Matched on e.code: with Option held, macOS
+      // reports e.key 'ß', so a key-based match never fired there.
+      if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.code === 'KeyS') {
+        if (isEditableTarget(e.target)) return
         if (showMode) return
         e.preventDefault()
         addScene()
@@ -889,19 +966,7 @@ export default function App(): JSX.Element {
         if (confirm(label)) st.removeTracks(ids)
         return
       }
-      // Tab → toggle view, period. We dedicate Tab to view-switch
-      // even from inside text inputs (where the browser would
-      // otherwise step to the next focusable element) — the user
-      // explicitly asked for Tab to ONLY do this. Pair it with
-      // Shift+Tab → reverse direction, also handled here so the
-      // browser can't reclaim it. Modifier keys other than Shift
-      // fall through (Ctrl+Tab is the OS-level window/tab cycler
-      // and we shouldn't hijack that).
-      if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        e.preventDefault()
-        setView(useStore.getState().view === 'edit' ? 'sequence' : 'edit')
-        return
-      }
+      // (Tab is handled near the top, before any isEditableTarget guard.)
     }
     function onKeyUp(e: KeyboardEvent): void {
       if (e.key === 'Escape') {
@@ -931,69 +996,80 @@ export default function App(): JSX.Element {
   // PoolPane mount/unmount and stopped firing the moment the drawer
   // was hidden.
   const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
-  // Default destination port — used as the listener's port too.
-  // Sending and listening converge on a single "compositor OSC
-  // port" the user reads off the top toolbar, so when they
-  // configure their OCTOCOSME controller to send to that port the
-  // Capture popup picks it up automatically.
-  const defaultDestPort = useStore((s) => s.session.defaultDestPort)
-  // The EXPLICIT listen port (set via the Network tab / TopBar "Listen on")
-  // is authoritative when present. Without this, the auto-bind effect below
-  // forces the listener onto defaultDestPort (the default SEND port) every
-  // time it re-runs — e.g. when a Forward target is added/edited — which
-  // silently drags the listener off the port the user set (the "listener
-  // jumps to 9001" bug). Listen (incoming) and default-send (outgoing) are
-  // different concerns and must not be coupled.
-  const listenerPort = useStore((s) => s.session.listenerPort)
-  // Persisted OSC forward targets — every received UDP packet is
-  // byte-copied onward to each enabled entry. We push the whole list
-  // to main once on app load so a freshly-opened session immediately
-  // resumes forwarding without the user having to touch the popover.
-  // Subsequent edits route through the store's CRUD actions, which
-  // push their own updates.
-  const forwardTargets = useStore((s) => s.session.forwardTargets)
+  // Three independent effects (previously one, which re-ran — and
+  // force-enabled / re-bound the listener — on every Forward-target or
+  // default-send-port keystroke, turning a listener the user had
+  // switched off back on):
+  //   1. mount: subscribe + initial snapshot + ONE auto-enable
+  //   2. listenerPort change: re-bind (only if the listener is on)
+  //   3. forwardTargets change: replay the list to main
   useEffect(() => {
     let cancelled = false
-    // Initial fetch + AUTO-ENABLE the listener bound to the
-    // session's default OSC port. If the user has never changed
-    // it, that's the conventional 9000. Auto-enable means the
-    // Capture popup will see incoming devices without a manual
-    // toggle — the most common workflow.
+    // Initial fetch + AUTO-ENABLE the listener, once. Port: the
+    // session's EXPLICIT listen port (Network tab / TopBar "Listen
+    // on") when set, else the default send port (so an OCTOCOSME
+    // controller pointed at "the compositor port" is picked up), else
+    // the conventional 9000. Auto-enable means the Capture popup sees
+    // incoming devices without a manual toggle — the most common
+    // workflow. Later changes to the default SEND port never touch the
+    // listener: listen (incoming) and send (outgoing) are different
+    // concerns (the old "listener jumps to 9001" bug).
     window.api?.networkList?.().then((payload) => {
-      if (cancelled) return
+      // safeHandle resolves undefined when main's handler threw.
+      if (cancelled || !payload) return
       setNetworkSnapshot(payload.devices, payload.status)
-      // If the listener is already on (e.g. a hot-reload), don't
-      // re-bind. If it's off OR bound on a different port than
-      // the session's default, kick it on at the right port.
+      const sess = useStore.getState().session
       const wantPort =
-        listenerPort && listenerPort > 0
-          ? listenerPort
-          : defaultDestPort > 0
-            ? defaultDestPort
+        sess.listenerPort && sess.listenerPort > 0
+          ? sess.listenerPort
+          : sess.defaultDestPort > 0
+            ? sess.defaultDestPort
             : 9000
+      // If the listener is already on the right port (e.g. a
+      // hot-reload), don't re-bind.
       if (!payload.status.enabled || payload.status.port !== wantPort) {
         window.api?.networkSetEnabled?.(true, wantPort).then((next) => {
           if (cancelled || !next) return
           setNetworkSnapshot([], next)
         })
       }
-      // Replay persisted forward targets to main. Safe to call with
-      // [] — main treats that as "forwarding off".
-      window.api?.networkSetForwardTargets?.(forwardTargets ?? [])
     })
     const off = window.api?.onNetworkDevices?.((payload) => {
+      if (!payload) return
       setNetworkSnapshot(payload.devices, payload.status)
     })
     return () => {
       cancelled = true
       if (off) off()
     }
-    // Re-run when the session's defaultDestPort changes so the
-    // listener re-binds onto the new port automatically. The
-    // forwardTargets dep handles the rare case where opening a
-    // different session file changes the persisted targets — the
-    // store CRUD actions cover ordinary edits.
-  }, [setNetworkSnapshot, defaultDestPort, listenerPort, forwardTargets])
+  }, [setNetworkSnapshot])
+  // (2) Re-bind when the session's listen port changes after mount
+  // (session load, undo, the Listen-on / Network-tab inputs). Only while
+  // the listener is ON — a listener the user switched off stays off.
+  // setEnabled(true, samePort) is a no-op in main, so overlapping with
+  // the store actions that already push the port is harmless.
+  const listenerPort = useStore((s) => s.session.listenerPort)
+  const listenerPortMountedRef = useRef(false)
+  useEffect(() => {
+    if (!listenerPortMountedRef.current) {
+      listenerPortMountedRef.current = true
+      return // mount is covered by the auto-enable above
+    }
+    if (!listenerPort || listenerPort <= 0) return
+    if (!useStore.getState().networkStatus.enabled) return
+    void window.api?.networkSetEnabled?.(true, listenerPort).then((next) => {
+      if (next) setNetworkSnapshot(useStore.getState().networkDevices, next)
+    })
+  }, [listenerPort, setNetworkSnapshot])
+  // (3) Persisted OSC forward targets — every received UDP packet is
+  // byte-copied onward to each enabled entry. Replayed to main on mount
+  // and whenever the list changes (session load / new / undo — the
+  // store's CRUD actions also push their own edits). Safe to call with
+  // [] — main treats that as "forwarding off".
+  const forwardTargets = useStore((s) => s.session.forwardTargets)
+  useEffect(() => {
+    window.api?.networkSetForwardTargets?.(forwardTargets ?? [])
+  }, [forwardTargets])
 
   // Saved-scene library subscription — also at app level so the
   // Pool's Scenes tab is up to date the instant the user opens it,
@@ -1003,10 +1079,13 @@ export default function App(): JSX.Element {
   useEffect(() => {
     let cancelled = false
     window.api?.sceneLibraryList?.().then((scenes) => {
-      if (cancelled) return
+      // safeHandle resolves undefined when main's handler threw — keep
+      // the current list rather than handing the store `undefined`.
+      if (cancelled || !Array.isArray(scenes)) return
       setSceneLibrary(scenes)
     })
     const off = window.api?.onSceneLibrary?.((scenes) => {
+      if (!Array.isArray(scenes)) return
       setSceneLibrary(scenes)
     })
     return () => {
@@ -1081,9 +1160,7 @@ export default function App(): JSX.Element {
   // entries every time the user clicked "+ Scene". The library now
   // only grows via the explicit paths: right-click → Save Scene to
   // Pool (in the grid or the palette), and Capture (which builds a
-  // SavedScene as part of its flow). `sceneIdsFromLibrary` still
-  // exists so future re-introduction of auto-save can skip
-  // library-originated instantiations cleanly.
+  // SavedScene as part of its flow).
 
   // Save-before-quit modal. Main intercepts the window-close event
   // and pushes `app:before-close`; we show a 3-button confirm and
@@ -1160,7 +1237,9 @@ export default function App(): JSX.Element {
     setNewSessionSaveError(null)
     try {
       const st = useStore.getState()
-      const session = st.session
+      // Same bundle as every other save path (GUI layout, scope prefs,
+      // HW catch state) — the raw st.session lacked all of it.
+      const session = buildSessionForSave(st)
       const path = st.currentFilePath
       if (path) {
         await window.api?.sessionSave?.(session, path)
@@ -1255,6 +1334,9 @@ export default function App(): JSX.Element {
           hotkey can toggle it from anywhere. Renders null when
           closed. */}
       <GenerativePopoverHost />
+      {fileError && (
+        <FileErrorModal message={fileError} onClose={() => setFileError(null)} />
+      )}
       {closeConfirmOpen && (
         <Modal title="Save before quitting?" onClose={handleQuitCancel}>
           <div className="flex flex-col gap-3 text-[12px]">

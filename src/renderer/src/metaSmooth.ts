@@ -105,12 +105,18 @@ export function setKnobTarget(idx: number, target: number, smoothMs: number): vo
   if (raf == null) raf = requestAnimationFrame(tick)
 }
 
-/** Force the displayed value for a knob (e.g. session load, external reset). */
-export function setKnobDisplayImmediate(idx: number, value: number): void {
+/**
+ * Force the displayed value for a knob (e.g. session load, external reset,
+ * undo/redo). Cancels any running tween. `send` also pushes the value to
+ * the engine exactly like a knob edit does, so OSC output follows the
+ * restored position instead of staying at the pre-reset one.
+ */
+export function setKnobDisplayImmediate(idx: number, value: number, send = false): void {
   if (idx < 0 || idx >= META_KNOB_COUNT) return
   tweens.delete(idx)
   const store = useStore.getState()
   const display = [...store.metaKnobDisplayValues]
   display[idx] = value
   store.setMetaKnobDisplayValues(display)
+  if (send) window.api.sendMetaValue(idx, value).catch(warnOnce)
 }

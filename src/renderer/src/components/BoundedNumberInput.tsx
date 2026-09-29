@@ -71,6 +71,10 @@ export function BoundedNumberInput({
   // on focus + blur. Read inside the value-sync useEffect to know
   // whether to bail.
   const dirty = useRef(false)
+  // Value at focus time. In commitOn='change' mode every keystroke has
+  // already reached the parent, so Escape restores this snapshot
+  // through onChange to actually revert.
+  const focusValue = useRef(value)
   // Latest str — read inside onBlur to avoid stale-closure issues
   // (the previous version closed over the str captured at handler-
   // creation time, which intermittently caused onBlur to "restore"
@@ -175,6 +179,7 @@ export function BoundedNumberInput({
         // without typing, the on-blur commit sees dirty=false and
         // skips the commit, leaving the parent value untouched.
         dirty.current = false
+        focusValue.current = value
       }}
       onChange={(e) => {
         const v = e.target.value
@@ -225,7 +230,16 @@ export function BoundedNumberInput({
         if (e.key === 'Enter') {
           ;(e.currentTarget as HTMLInputElement).blur()
         } else if (e.key === 'Escape') {
-          setStr(formatValue(value, integer))
+          // Clear dirty BEFORE blur() — onBlur runs synchronously
+          // inside blur() and would otherwise commit the typed text.
+          const wasDirty = dirty.current
+          dirty.current = false
+          let restore = value
+          if (wasDirty && commitOn === 'change') {
+            restore = focusValue.current
+            if (restore !== value) onChange(restore)
+          }
+          setStr(formatValue(restore, integer))
           ;(e.currentTarget as HTMLInputElement).blur()
         }
       }}

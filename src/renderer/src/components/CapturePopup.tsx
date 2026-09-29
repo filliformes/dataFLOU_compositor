@@ -233,9 +233,21 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   // pick locks it (userPickedTemplate) so auto-detect never yanks the
   // user's choice out from under them.
   const userPickedTemplate = useRef(false)
+  // Once auto-detect has landed on a live instrument, stop following it:
+  // with two devices streaming, the "freshest" device alternates and the
+  // pick would flip back and forth. (Re-seeds only if that template
+  // disappears from the Pool.)
+  const autoDetectedOnce = useRef(false)
   useEffect(() => {
     if (userPickedTemplate.current) return
     if (poolTemplates.length === 0) return
+    if (
+      autoDetectedOnce.current &&
+      poolTemplates.some((t) => t.id === selectedExistingTemplateId)
+    ) {
+      return
+    }
+    if (detectedTemplateId) autoDetectedOnce.current = true
     const want =
       detectedTemplateId ||
       (poolTemplates.find((t) => !t.draft) ?? poolTemplates[0]).id
@@ -291,6 +303,11 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
   const [midiSlots, setMidiSlots] = useState<Map<string, CapturedMidiSlot>>(
     () => new Map()
   )
+  // Messages accumulate in a ref and flush to state at ~15 Hz — a knob
+  // sweep sends hundreds of CCs per second, and a Map copy + re-render
+  // per message bogged the popup down.
+  const midiSlotsRef = useRef<Map<string, CapturedMidiSlot>>(new Map())
+  const midiDirtyRef = useRef(false)
   useEffect(() => {
     if (mode !== 'midi-instrument') {
       midi.setCaptureCb(null)
@@ -302,25 +319,29 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
       // for the capture buffer; it carries no useful info beyond
       // "the user stopped holding the note."
       if (msg.kind === 'noteOff') return
-      setMidiSlots((prev) => {
-        const slotKind: 'cc' | 'note' = msg.kind === 'cc' ? 'cc' : 'note'
-        const channel = msg.channel + 1 // UI 1..16
-        const key = `${slotKind}|${channel}|${msg.number}`
-        const existing = prev.get(key)
-        const next = new Map(prev)
-        next.set(key, {
-          kind: slotKind,
-          channel,
-          number: msg.number,
-          count: (existing?.count ?? 0) + 1,
-          lastValue: msg.value,
-          lastSeen: Date.now()
-        })
-        return next
+      const slotKind: 'cc' | 'note' = msg.kind === 'cc' ? 'cc' : 'note'
+      const channel = msg.channel + 1 // UI 1..16
+      const key = `${slotKind}|${channel}|${msg.number}`
+      const slots = midiSlotsRef.current
+      const existing = slots.get(key)
+      slots.set(key, {
+        kind: slotKind,
+        channel,
+        number: msg.number,
+        count: (existing?.count ?? 0) + 1,
+        lastValue: msg.value,
+        lastSeen: Date.now()
       })
+      midiDirtyRef.current = true
     })
+    const flush = setInterval(() => {
+      if (!midiDirtyRef.current) return
+      midiDirtyRef.current = false
+      setMidiSlots(new Map(midiSlotsRef.current))
+    }, 66)
     return () => {
       midi.setCaptureCb(null)
+      clearInterval(flush)
     }
   }, [mode])
 
@@ -332,7 +353,6 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
 
   // Save handler — branches on mode.
   const setSessionStore = useStore.setState
-  const sessionRef = useStore((s) => s.session)
   function commitSave(): void {
     const trimmedName = name.trim()
     if (!trimmedName) {
@@ -371,13 +391,13 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
       // current values as a SavedScene (no new Instrument created).
       if (!selectedExistingTemplateId) return
       void saveSceneForExistingInstrument(
-        setSessionStore,
         selectedExistingTemplateId,
         networkDevices,
         trimmedName
       )
     } else if (mode === 'midi-instrument') {
-      const tpl = buildMidiTemplate(trimmedName, Array.from(midiSlots.values()))
+      // Read the ref, not state — state lags it by up to one flush.
+      const tpl = buildMidiTemplate(trimmedName, Array.from(midiSlotsRef.current.values()))
       addTemplateToPool(setSessionStore, tpl)
     }
     onClose()
@@ -420,6 +440,10 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
 
   return createPortal(
     <div
+      // Same marker as Modal.tsx — App's global hotkey router stands
+      // down (except F11 / Escape) so digits / Space / Delete typed
+      // while Capture is open can't fire scenes behind it.
+      data-modal-open="true"
       className="fixed inset-0 z-50 flex items-center justify-center"
       style={{ background: 'rgba(0,0,0,0.45)' }}
       // Only close when the mousedown ORIGINATED on the backdrop. A
@@ -634,7 +658,11 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
           {mode === 'midi-instrument' && (
             <MidiCaptureBody
               slots={Array.from(midiSlots.values())}
-              onClear={() => setMidiSlots(new Map())}
+              onClear={() => {
+                midiSlotsRef.current = new Map()
+                midiDirtyRef.current = false
+                setMidiSlots(new Map())
+              }}
             />
           )}
         </div>
@@ -688,11 +716,6 @@ function CapturePopupBody({ onClose }: { onClose: () => void }): JSX.Element {
             Save
           </button>
         </div>
-        {/* Suppress unused-warning for sessionRef — we read it to
-            keep the popup re-rendering when the session changes
-            (e.g. another window adding a Pool entry while the
-            popup is open). */}
-        {void sessionRef}
       </div>
     </div>,
     document.body
@@ -1072,19 +1095,7 @@ function SceneForInstrumentBody({
     const resolved = path.startsWith('/')
       ? path
       : (base.endsWith('/') ? base.slice(0, -1) : base) + '/' + path
-    let match: DiscoveredOscAddress | null = null
-    for (const dev of devices) {
-      const addr = dev.addresses.find(
-        (a) =>
-          a.path === resolved ||
-          a.path.endsWith(resolved) ||
-          a.path.endsWith('/' + fn.oscPath)
-      )
-      if (addr) {
-        match = addr
-        break
-      }
-    }
+    const match = findCapturedAddr(devices, resolved, path)
     return { fn, resolved, match }
   })
   return (
@@ -1323,7 +1334,7 @@ function buildOscTemplate(
       nature: 'lin',
       streamMode: 'streaming',
       min: 0,
-      max: paramType === 'bool' ? 1 : 1,
+      max: 1,
       init: seedInit,
       argSpec
     }
@@ -1566,11 +1577,7 @@ async function saveOscCaptureAsLibraryScene(
   for (let i = 0; i < tpl.functions.length; i++) {
     const fn = tpl.functions[i]
     const childRow = childRows[i]
-    const addr = dev.addresses.find((a) =>
-      a.path.endsWith(fn.oscPath) ||
-      a.path.endsWith(`/${fn.oscPath}`) ||
-      a.path === fn.oscPath
-    )
+    const addr = findCapturedAddr([dev], childRow.defaultOscAddress!, fn.oscPath ?? '')
     const cell = makeCell({
       destIp: childRow.defaultDestIp!,
       destPort: childRow.defaultDestPort!,
@@ -1639,9 +1646,6 @@ async function saveOscCaptureAsLibraryScene(
 // instantiation later, the user gets fresh tracks + cells pre-filled
 // with the values that were live at capture time.
 async function saveSceneForExistingInstrument(
-  setStore: (
-    fn: (s: ReturnType<typeof useStore.getState>) => Partial<ReturnType<typeof useStore.getState>>
-  ) => void,
   templateId: string,
   devices: DiscoveredOscDevice[],
   sceneName: string
@@ -1688,20 +1692,7 @@ async function saveSceneForExistingInstrument(
     // this function's resolved OSC path — capture mode for an
     // existing instrument is sender-agnostic (the user may have
     // multiple senders feeding the same instrument).
-    let match: DiscoveredOscAddress | null = null
-    for (const dev of devices) {
-      const addr = dev.addresses.find(
-        (a) =>
-          a.path === childRow.defaultOscAddress ||
-          a.path.endsWith(childRow.defaultOscAddress!) ||
-          a.path.endsWith('/' + fn.oscPath) ||
-          a.path === fn.oscPath
-      )
-      if (addr) {
-        match = addr
-        break
-      }
-    }
+    const match = findCapturedAddr(devices, childRow.defaultOscAddress!, fn.oscPath ?? '')
     const cell = makeCell({
       destIp: childRow.defaultDestIp!,
       destPort: childRow.defaultDestPort!,
@@ -1740,18 +1731,40 @@ async function saveSceneForExistingInstrument(
       multiplicator: 1
     }
   }
+  // No store mutation needed here — the saved scene push back arrives
+  // via IPC.
   try {
     await window.api?.sceneLibrarySave?.(saved)
   } catch (e) {
     console.error('[Capture] sceneLibrarySave failed:', (e as Error).message)
   }
-  // Suppress unused-warning in case the setStore param is dropped
-  // by a future refactor — currently we don't need to mutate the
-  // store here because the saved scene push back arrives via IPC.
-  void setStore
 }
 
 // ── Misc helpers ─────────────────────────────────────────────────
+
+// Find the captured address feeding a Parameter. EXACT match on the
+// resolved address across every device first; only when nothing matches
+// exactly, fall back to a suffix match on a '/' boundary. (A loose
+// endsWith took the first hit, so with /A/… and /B/… banks sharing
+// leaf paths a /B Parameter could read /A's value.)
+function findCapturedAddr(
+  devices: DiscoveredOscDevice[],
+  resolved: string,
+  oscPath: string
+): DiscoveredOscAddress | null {
+  for (const dev of devices) {
+    const a = dev.addresses.find((x) => x.path === resolved)
+    if (a) return a
+  }
+  const rel = oscPath.replace(/^\/+/, '')
+  const suffixes = [resolved.startsWith('/') ? resolved : '/' + resolved]
+  if (rel) suffixes.push('/' + rel)
+  for (const dev of devices) {
+    const a = dev.addresses.find((x) => suffixes.some((sfx) => x.path.endsWith(sfx)))
+    if (a) return a
+  }
+  return null
+}
 
 function pickColor(seed: string): string {
   // Tiny deterministic hash → HSL → hex.

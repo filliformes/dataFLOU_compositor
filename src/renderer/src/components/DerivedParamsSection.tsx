@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react'
 import type { DerivedOp, DerivedParam, InstrumentTemplate } from '@shared/types'
 import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { UncontrolledTextInput } from './UncontrolledInput'
 
 const OPS: { value: DerivedOp; label: string; desc: string }[] = [
   {
@@ -57,7 +58,8 @@ export function DerivedParamsSection({
     let alive = true
     const poll = (): void => {
       window.api?.derivedGetLive?.().then((v) => {
-        if (alive) setLive(v)
+        // IPC handlers resolve undefined on a main-side error.
+        if (alive && v) setLive(v)
       })
     }
     poll()
@@ -76,12 +78,17 @@ export function DerivedParamsSection({
   }
   function add(): void {
     const base = template.oscAddressBase || '/derived'
+    const prefix = `${base.endsWith('/') ? base.slice(0, -1) : base}/derived`
+    // First unused index — list.length + 1 collides after a removal.
+    const taken = new Set(list.map((d) => d.address))
+    let n = 1
+    while (taken.has(`${prefix}${n}`)) n++
     const dp: DerivedParam = {
       id:
         typeof crypto !== 'undefined' && crypto.randomUUID
           ? `dp_${crypto.randomUUID().slice(0, 8)}`
           : `dp_${Date.now().toString(36)}`,
-      address: `${base.endsWith('/') ? base.slice(0, -1) : base}/derived${list.length + 1}`,
+      address: `${prefix}${n}`,
       op: 'magnitude',
       sources: sourceOptions.slice(0, 3)
     }
@@ -95,9 +102,15 @@ export function DerivedParamsSection({
   }
   function toggleSource(d: DerivedParam, addr: string): void {
     const has = d.sources.includes(addr)
-    patch(d.id, {
-      sources: has ? d.sources.filter((s) => s !== addr) : [...d.sources, addr]
-    })
+    const next = has ? d.sources.filter((s) => s !== addr) : [...d.sources, addr]
+    // Keep sources in the visible checkbox order — order matters for
+    // Difference (a − b …) and Single source (a), and must not depend on
+    // the hidden click order. Unknown (stale) addresses stay at the end.
+    const rank = (s: string): number => {
+      const i = sourceOptions.indexOf(s)
+      return i < 0 ? sourceOptions.length : i
+    }
+    patch(d.id, { sources: next.sort((a, b) => rank(a) - rank(b)) })
   }
 
   return (
@@ -141,10 +154,24 @@ export function DerivedParamsSection({
           <div key={d.id} className="flex flex-col gap-0.5 border-t border-border/60 pt-1">
             {/* address · op · live value · remove — one tight line */}
             <div className="flex items-center gap-1 text-[10px]">
-              <input
+              {/* Commit on blur / Enter (not per keystroke) — every commit
+                  re-publishes the address engine-side. Escape reverts. */}
+              <UncontrolledTextInput
                 className="input text-[10px] flex-1 min-w-0"
                 value={d.address}
-                onChange={(e) => patch(d.id, { address: e.target.value })}
+                onChange={() => {}}
+                onBlur={(e) => {
+                  const v = e.currentTarget.value.trim()
+                  if (!v) e.currentTarget.value = d.address
+                  else if (v !== d.address) patch(d.id, { address: v })
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur()
+                  else if (e.key === 'Escape') {
+                    e.currentTarget.value = d.address
+                    e.currentTarget.blur()
+                  }
+                }}
                 title="Synthetic output address"
               />
               <select

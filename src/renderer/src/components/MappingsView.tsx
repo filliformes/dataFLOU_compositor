@@ -134,24 +134,37 @@ export function MappingsView(): JSX.Element {
                     )}
 
                     <div className="flex flex-col gap-1">
-                      <label
-                        className="flex items-center gap-1.5 cursor-pointer"
-                        title="Scale + shape the (conditioned) value into the Parameter's output range"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={enabled}
-                          onChange={(e) => patchScale({ enabled: e.target.checked })}
-                        />
-                        <span
-                          className="label"
-                          style={{
-                            color: enabled ? 'rgb(var(--c-accent))' : undefined
-                          }}
+                      <div className="flex items-center gap-1.5">
+                        <label
+                          className="flex items-center gap-1.5 cursor-pointer"
+                          title="Scale + shape the (conditioned) value into the Parameter's output range"
                         >
-                          Scale + curve
-                        </span>
-                      </label>
+                          <input
+                            type="checkbox"
+                            checked={enabled}
+                            onChange={(e) => patchScale({ enabled: e.target.checked })}
+                          />
+                          <span
+                            className="label"
+                            style={{
+                              color: enabled ? 'rgb(var(--c-accent))' : undefined
+                            }}
+                          >
+                            Scale + curve
+                          </span>
+                        </label>
+                        {/* Scaling runs in the Hardware-Mode catch path
+                            only — with HW Mode off it has no effect. */}
+                        {enabled && tpl.hardwareMode?.enabled !== true && (
+                          <span
+                            className="text-[9px] font-bold"
+                            style={{ color: 'rgb(var(--c-danger))' }}
+                            title={`Hardware Mode is OFF for the "${tpl.name}" instrument, so this mapping isn't applied. Enable it in the Instrument inspector.`}
+                          >
+                            HW Mode off — mapping inactive
+                          </span>
+                        )}
+                      </div>
                       <div
                         className={enabled ? '' : 'opacity-45'}
                         title={
@@ -162,6 +175,7 @@ export function MappingsView(): JSX.Element {
                           scale={sc}
                           onChange={patchScale}
                           address={addr}
+                          outDefault={{ min: fn.min, max: fn.max }}
                         />
                       </div>
                     </div>

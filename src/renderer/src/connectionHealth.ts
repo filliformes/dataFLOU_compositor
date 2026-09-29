@@ -131,7 +131,7 @@ if (typeof window !== 'undefined' && window.api) {
   }
 }
 
-export function getHealthSnapshot(
+function getHealthSnapshot(
   listenerOn: boolean,
   listenerPort: number,
   listenerError: string

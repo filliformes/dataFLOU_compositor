@@ -1,6 +1,7 @@
 // MIDI binding conflict detection.
 //
-// Multiple targets (scenes, clips, Meta knobs, GO, Morph time) can
+// Multiple targets (scenes, clips, Instrument group triggers, Meta
+// knobs, GO, Morph time, Motion Loop record, Generative controls) can
 // accidentally end up bound to the same MIDI message — e.g. the user
 // learns a pad for Scene 1 and later learns the same pad for GO. When
 // the MIDI arrives, midi.ts routes to the FIRST match it finds, so one
@@ -73,6 +74,15 @@ export function detectMidiConflicts(session: Session): MidiConflict[] {
         navigate: { kind: 'cell', sceneId: s.id, trackId }
       })
     }
+    // Instrument group triggers (header-row × scene). No per-cell
+    // target to jump to — focus the scene.
+    for (const [templateRowId, b] of Object.entries(s.instrumentTriggers ?? {})) {
+      const row = session.tracks.find((t) => t.id === templateRowId)
+      add(b, {
+        label: `Instrument trigger: ${s.name || '(scene)'} · ${row?.name ?? '(instrument)'}`,
+        navigate: { kind: 'scene', id: s.id }
+      })
+    }
   }
 
   // Meta knobs
@@ -92,6 +102,17 @@ export function detectMidiConflicts(session: Session): MidiConflict[] {
     label: 'Transport: Morph time',
     navigate: { kind: 'morphTime' }
   })
+  add(session.motionLoopRecordMidi, { label: 'Transport: Motion Loop record' })
+
+  // Generative controls (popover / transport — no navigation target)
+  const gen = session.generative
+  add(gen?.toggleMidi, { label: 'Generative: On/Off' })
+  add(gen?.noRepeatMidi, { label: 'Generative: No repeat' })
+  add(gen?.useMorphMidi, { label: 'Generative: Use Morph' })
+  add(gen?.randomWeightsMidi, { label: 'Generative: Random Weights' })
+  add(gen?.affinityMidi, { label: 'Generative: Affinity' })
+  add(gen?.minDurationMidi, { label: 'Generative: Min duration' })
+  add(gen?.maxDurationMidi, { label: 'Generative: Max duration' })
 
   const conflicts: MidiConflict[] = []
   for (const [key, { binding, targets }] of byKey) {

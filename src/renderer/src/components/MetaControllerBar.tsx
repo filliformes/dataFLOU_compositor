@@ -12,8 +12,6 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { META_BANK_COUNT, META_KNOBS_PER_BANK, META_MAX_DESTS } from '@shared/types'
 import type {
-  InstrumentFunction,
-  InstrumentTemplate,
   MetaCurve,
   MetaDest,
   MetaKnob as MetaKnobModel,
@@ -99,18 +97,22 @@ export default function MetaControllerBar(): JSX.Element | null {
   // missing amount. Idempotent: once content fits, overflow becomes 0 and
   // the effect stops growing.
   // Only GROWS — user can still drag smaller with the resize handle once
-  // the dependency (destCount, selectedIdx) stays constant.
+  // the dependency (destCount, selectedIdx) stays constant. `height` is
+  // read via getState() and deliberately NOT a dependency: with it, every
+  // drag-smaller step re-ran the effect, saw overflow, and grew the bar
+  // straight back.
   useLayoutEffect(() => {
     if (!visible) return
     const el = detailsRef.current
     if (!el) return
     const overflow = el.scrollHeight - el.clientHeight
     if (overflow > 0) {
+      const cur = useStore.getState().session.metaController.height
       // A couple of pixels of slop so we clear the scrollbar threshold even
       // if sub-pixel rounding trims us short.
-      setHeight(Math.min(META_MAX_HEIGHT, height + overflow + 4))
+      setHeight(Math.min(META_MAX_HEIGHT, cur + overflow + 4))
     }
-  }, [visible, destCount, selectedIdx, height, setHeight])
+  }, [visible, destCount, selectedIdx, setHeight])
 
   if (!visible) return null
 
@@ -704,10 +706,3 @@ function buildPickerIndex(tracks: Session['tracks']): {
   }
   return { instrumentTracks, orphanFnTracks, fnTracksByParent }
 }
-
-// `InstrumentTemplate` / `InstrumentFunction` aren't read at runtime
-// here, but importing them keeps the picker's intent self-documenting
-// (it walks the Pool indirectly via track.sourceTemplateId / etc.)
-// and lets a future refactor swap Track-driven enumeration for Pool-
-// driven without a fresh import dance.
-void (null as unknown as InstrumentTemplate | InstrumentFunction)

@@ -22,7 +22,10 @@ export function Modal({
   }, [onClose])
 
   return createPortal(
+    // `data-modal-open` lets App's global hotkey router stand down while
+    // any Modal is up (so Space / digits / Delete can't act behind it).
     <div
+      data-modal-open="true"
       className="fixed inset-0 z-[100] bg-black/60 flex items-center justify-center"
       onMouseDown={onClose}
     >

@@ -186,7 +186,10 @@ const MODE_ORDER: SeqMode[] = [
   'drift',
   'ratchet',
   'bounce',
-  'draw'
+  'draw',
+  // Was missing, so the rich-theme picker had no way to select Address
+  // (the plain <select> offers it) and showed nothing active for it.
+  'adresse'
 ]
 
 export function RcModeIcons({
@@ -198,12 +201,12 @@ export function RcModeIcons({
 }): JSX.Element {
   return (
     // Always a single row, right-justified. `flex-nowrap` + tight gap
-    // keep the 9 pictograms on one line regardless of which mode is
+    // keep the 10 pictograms on one line regardless of which mode is
     // selected, so the layout stays stable as the user clicks
     // through. `justify-end` aligns the cluster to the right edge so
     // it sits nicely under the "Sequencer" label that hangs off the
     // left of the inspector's grid column.
-    // `flex-wrap` allows the 9 pictograms to fold onto a second row
+    // `flex-wrap` allows the 10 pictograms to fold onto a second row
     // at narrow inspector widths / high uiScale (~168px minimum was
     // exceeding the inspector column at scale ≥ 1.5). Cluster still
     // right-justifies and groups together by line-breaking. Set

@@ -20,7 +20,26 @@ export interface SceneCountdown {
   progress: number
 }
 
-export function useSceneCountdown(sceneId: string, durationSec: number): SceneCountdown {
+/**
+ * Effective duration (seconds) of a scene for countdown / progress
+ * display. For the engine's ACTIVE scene this is the duration the
+ * engine actually armed (`engine.activeSceneDurationMs`: generative
+ * roll > per-slot override > scene Dur) — `scene.durationSec` alone
+ * ignores overrides and rolls, so countdowns ran against the wrong
+ * length. Falls back to the caller's `durationSec` for inactive scenes
+ * and when the engine doesn't publish a number (older engine, or null).
+ */
+export function useEffectiveSceneDurationSec(sceneId: string, durationSec: number): number {
+  const armedMs = useStore((s) =>
+    s.engine.activeSceneId === sceneId ? s.engine.activeSceneDurationMs : undefined
+  )
+  return typeof armedMs === 'number' && Number.isFinite(armedMs)
+    ? armedMs / 1000
+    : durationSec
+}
+
+export function useSceneCountdown(sceneId: string, fallbackDurationSec: number): SceneCountdown {
+  const durationSec = useEffectiveSceneDurationSec(sceneId, fallbackDurationSec)
   const activeSceneId = useStore((s) => s.engine.activeSceneId)
   const startedAt = useStore((s) => s.engine.activeSceneStartedAt)
   // Engine reports the wall-clock at which pause was entered, or null

@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, isRichTheme } from '../store'
-import { RcArcSlider, RcFlatBar } from './RcArcSlider'
+import { RcFlatBar } from './RcArcSlider'
 import { RcModeIcons } from './RcModeIcons'
 import type {
   ArpMode,
@@ -12,7 +12,6 @@ import type {
   LfoShape,
   LfoSync,
   MidiOut,
-  Modulation,
   ModulationTargetMode,
   ModulationTargets,
   ModType,
@@ -31,7 +30,9 @@ import {
   DEFAULT_MIDI_OUT,
   DEFAULT_MODULATION2,
   DIVISIONS,
+  buildInitialValueFromArgSpec,
   cellularInitialRow,
+  densityGate,
   euclidean,
   evolveCellular,
   generateStepValue,
@@ -44,7 +45,11 @@ import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import { DrawCanvas } from './DrawCanvas'
 import { GestureRecorder } from './GestureRecorder'
-import { HardwareModeSection } from './InstrumentsInspectorPane'
+import {
+  HardwareModeSection,
+  StringTokenInput,
+  stringSlotFallback
+} from './InstrumentsInspectorPane'
 import {
   InputConditioningSection,
   ParameterConditioningReflection,
@@ -91,10 +96,18 @@ import {
 // Called OUTSIDE the Zustand selectors so the selector can still
 // return a literal, reference-stable `null` when inactive (skips the
 // 30 Hz live re-render via default reference-equality).
+//
+// Older files can carry `null` holes (sparse arrays serialised to
+// JSON) — those are skipped like in-memory holes, so the column is
+// "fully off" when every EXPLICIT entry is false.
 function isM2toM1Active(cell: Cell): boolean {
   if (cell.modulation2?.enabled !== true) return false
-  const r = cell.routing?.modulation2
-  if (Array.isArray(r) && r.length > 0 && r.every((b) => b === false)) {
+  const r = cell.routing?.modulation2 as (boolean | null)[] | undefined
+  if (
+    Array.isArray(r) &&
+    r.some((b) => b === false) &&
+    r.every((b) => b === false || b === null || b === undefined)
+  ) {
     return false
   }
   return true
@@ -145,11 +158,13 @@ function isStepGateMuted(
     case 'polyrhythm':
       return !polyrhythmGate(idx, seq.ringALength, seq.ringBLength, seq.combine)
     case 'density':
-      // Density classic mode no longer gates (every step fires with
-      // a per-step multiplier); only generative Density gates.
-      if (!seq.generative) return false
-      return stepHash(idx, seq.seed) >= seq.density / 100
+      // Mirrors the engine's per-step gate, which applies in classic
+      // AND generative mode (classic additionally scales hit values
+      // by the density multiplier).
+      return !densityGate(idx, seq.seed, seq.density)
     case 'cellular': {
+      // Approximation: the engine gates on its live, evolving row
+      // (not exposed to the renderer); this shows the initial row.
       const row = cellularInitialRow(seq.cellSeed, s)
       return ((row >>> idx) & 1) === 0
     }
@@ -308,8 +323,11 @@ function TrackInspector(): JSX.Element {
   // currently has a clip on this track (if any).
   const focusedSceneId = useStore((s) => s.session.focusedSceneId)
   const cellOnFocused = useStore((s) => {
-    const sc = s.session.scenes.find((x) => x.id === focusedSceneId)
-    return sc?.cells[trackId]
+    if (focusedSceneId) {
+      const sc = s.session.scenes.find((x) => x.id === focusedSceneId)
+      return sc?.cells[trackId]
+    }
+    return s.session.scenes.find((x) => x.cells[trackId])?.cells[trackId]
   })
   // Children of a Template row — used only when track.kind === 'template'.
   const children = useStore((s) =>
@@ -518,7 +536,7 @@ function TrackInspector(): JSX.Element {
         <Section title="Values · pin to freeze">
           <PersistentSlotList
             argSpec={track.argSpec}
-            cellValue={cellOnFocused?.value ?? argSpecInitTokens(track.argSpec)}
+            cellValue={cellOnFocused?.value ?? buildInitialValueFromArgSpec(track.argSpec)}
             persistentSlots={track.persistentSlots ?? []}
             persistentValues={track.persistentValues ?? []}
             onToggle={(idx, persistent, capturedValue) =>
@@ -648,7 +666,7 @@ function InstrumentPortBroadcast({
           className="input w-20 text-[12px] text-center tabular-nums"
           value={port}
           onChange={(v) => setPort(v)}
-          min={0}
+          min={1}
           max={65535}
           integer
           title="Type the new port. Click Apply to broadcast to every row and clip of this Instrument."
@@ -763,6 +781,11 @@ function TrackMidiOutSection({
     let cancelled = false
     window.api?.midiListPorts?.().then((r) => {
       if (cancelled) return
+      // IPC handler returns undefined on error — treat as no ports.
+      if (!r) {
+        setPorts([])
+        return
+      }
       setPorts(r.ports)
       setAvailable(r.available)
     })
@@ -898,25 +921,6 @@ function TrackMidiOutSection({
   )
 }
 
-// Per-arg persistence toggle list. One row per editable arg in the
-// Render a space-joined string of the editable slots' init values
-// from an argSpec. Used as a fallback "cell value" for the
-// Parameter Inspector's pin-list when no clip exists on the focused
-// scene yet — gives the user a preview of the multi-arg layout
-// immediately instead of forcing them to create a clip first.
-function argSpecInitTokens(argSpec: ParamArgSpec[]): string {
-  const out: string[] = []
-  for (const a of argSpec) {
-    if (a.fixed !== undefined) continue
-    const v = a.init
-    if (typeof v === 'number') out.push(String(v))
-    else if (typeof v === 'string') out.push(v)
-    else if (typeof v === 'boolean') out.push(v ? '1' : '0')
-    else out.push('0')
-  }
-  return out.join(' ')
-}
-
 // Per-arg post-modulation Scaling editor in the Cell Inspector.
 // Renders a CollapsibleSection between Value(s) and Timing. The
 // checkbox on the header doubles as the engine-side enable flag —
@@ -941,6 +945,15 @@ function CellScalingSection({
 }): JSX.Element {
   const setCellScaling = useStore((s) => s.setCellScaling)
   const selectedCell = useStore((s) => s.selectedCell)
+  // Source Pool Parameter — its min/max seed the single-arg row's
+  // default band (multi-arg rows use their argSpec min/max).
+  const sourceFn = useStore((s) =>
+    track?.sourceTemplateId && track.sourceFunctionId
+      ? s.session.pool.templates
+          .find((t) => t.id === track.sourceTemplateId)
+          ?.functions.find((f) => f.id === track.sourceFunctionId)
+      : undefined
+  )
   if (!selectedCell) {
     // Shouldn't reach here — the inspector only renders when a cell
     // is selected — but guard so the section never crashes the pane.
@@ -962,7 +975,12 @@ function CellScalingSection({
       })
     })
   } else {
-    slots.push({ name: 'Value', idx: 0, defaultMin: 0, defaultMax: 1 })
+    slots.push({
+      name: 'Value',
+      idx: 0,
+      defaultMin: typeof sourceFn?.min === 'number' ? sourceFn.min : 0,
+      defaultMax: typeof sourceFn?.max === 'number' ? sourceFn.max : 1
+    })
   }
   const enabled = cell.scalingEnabled === true
   return (
@@ -1268,46 +1286,59 @@ function CellRoutingSection({
     | 'modulation2Direct'
     | 'modulation2Seq'
     | 'sequencer'
+  // Per-column default for a missing entry (see the *On readers above).
+  const COLUMN_DEFAULT: Record<RoutingDir, boolean> = {
+    modulator: true,
+    modulation2: true,
+    modulation2Direct: false,
+    modulation2Seq: true,
+    sequencer: true
+  }
+  // Build a DENSE column (no holes). Holes serialise to JSON `null`,
+  // which the "every slot === false → column off" checks (engine
+  // Mod 2 → Seq, isM2toM1Active) then read as not-false after a
+  // reload. Unset editable slots take the column default. Fixed
+  // (protocol-prefix) slots are never routed by the engine, so their
+  // entry only feeds those column-wide checks: false when every
+  // editable slot is off, else the column default.
+  function denseColumn(
+    src: readonly (boolean | null | undefined)[],
+    def: boolean
+  ): boolean[] {
+    const len = Math.max(src.length, ...slots.map((s) => s.idx + 1))
+    const out: boolean[] = []
+    for (let i = 0; i < len; i++) {
+      const v = src[i]
+      out.push(typeof v === 'boolean' ? v : def)
+    }
+    const allOff = slots.every((s) => out[s.idx] === false)
+    const editable = new Set(slots.map((s) => s.idx))
+    for (let i = 0; i < len; i++) {
+      if (!editable.has(i)) out[i] = allOff ? false : def
+    }
+    return out
+  }
   // Set a tick to an explicit value (used by both click and the
   // click+drag paint mode). Lazily initialises the arrays so old
   // sessions don't carry empty arrays around.
   function setTick(direction: RoutingDir, slotIdx: number, value: boolean): void {
-    const curMod = cell.routing?.modulator ? cell.routing.modulator.slice() : []
-    const curMod2 = cell.routing?.modulation2
-      ? cell.routing.modulation2.slice()
-      : []
-    const curMod2Direct = cell.routing?.modulation2Direct
-      ? cell.routing.modulation2Direct.slice()
-      : []
-    const curMod2Seq = cell.routing?.modulation2Seq
-      ? cell.routing.modulation2Seq.slice()
-      : []
-    const curSeq = cell.routing?.sequencer ? cell.routing.sequencer.slice() : []
-    const arr =
-      direction === 'modulator'
-        ? curMod
-        : direction === 'modulation2'
-          ? curMod2
-          : direction === 'modulation2Direct'
-            ? curMod2Direct
-            : direction === 'modulation2Seq'
-              ? curMod2Seq
-              : curSeq
-    arr[slotIdx] = value
+    const cur: (boolean | null | undefined)[] = (cell.routing?.[direction] ?? []).slice()
+    cur[slotIdx] = value
+    const arr = denseColumn(cur, COLUMN_DEFAULT[direction])
     onChange({
       routing: {
-        modulator: direction === 'modulator' ? curMod : cell.routing?.modulator,
+        modulator: direction === 'modulator' ? arr : cell.routing?.modulator,
         modulation2:
-          direction === 'modulation2' ? curMod2 : cell.routing?.modulation2,
+          direction === 'modulation2' ? arr : cell.routing?.modulation2,
         modulation2Direct:
           direction === 'modulation2Direct'
-            ? curMod2Direct
+            ? arr
             : cell.routing?.modulation2Direct,
         modulation2Seq:
           direction === 'modulation2Seq'
-            ? curMod2Seq
+            ? arr
             : cell.routing?.modulation2Seq,
-        sequencer: direction === 'sequencer' ? curSeq : cell.routing?.sequencer,
+        sequencer: direction === 'sequencer' ? arr : cell.routing?.sequencer,
         delays: cell.routing?.delays,
         variations: cell.routing?.variations
       }
@@ -1316,8 +1347,9 @@ function CellRoutingSection({
   // Bulk "all on / all off" per row — quick way to disable an entire
   // driver without unticking each slot.
   function setAll(direction: RoutingDir, value: boolean): void {
-    const arr: boolean[] = new Array(slots.length)
-    for (const s of slots) arr[s.idx] = value
+    const cur: boolean[] = []
+    for (const s of slots) cur[s.idx] = value
+    const arr = denseColumn(cur, COLUMN_DEFAULT[direction])
     onChange({
       routing: {
         modulator: direction === 'modulator' ? arr : cell.routing?.modulator,
@@ -1448,11 +1480,6 @@ function CellRoutingSection({
           // the rest. Left-to-right reading order is Mod 1 -> Mod 2
           // chain -> Sequencer chain -> per-slot timing controls.
           gridTemplateColumns: 'auto 24px 24px 24px 24px 24px 56px 76px'
-        }}
-        onMouseLeave={() => {
-          // If the user leaves the matrix while still painting we
-          // keep dragMode (window mouseup clears it) — they may come
-          // back. No-op here on purpose.
         }}
       >
         {/* Header row 1 — bulk-toggle row */}
@@ -1752,6 +1779,7 @@ function CellRoutingSection({
   )
 }
 
+// Per-arg persistence toggle list. One row per editable arg in the
 // track's argSpec — shows the current value (from the focused
 // scene's cell when not pinned, or the captured pinned value when
 // pinned) + a checkbox that pins/unpins the slot. Pin captures the
@@ -1770,12 +1798,9 @@ function PersistentSlotList({
   persistentSlots: boolean[]
   persistentValues: string[]
   onToggle: (idx: number, persistent: boolean, capturedValue?: string) => void
-  // Optional inline edit handler — when provided, pinned values
-  // become editable text inputs and typing fires onEditValue with
-  // the new token. The Parameter Inspector passes this; the cell
-  // inspector (which doesn't use a PersistentSlotList right now)
-  // omits it. Default-undefined keeps both call sites compatible.
-  onEditValue?: (idx: number, value: string) => void
+  // Inline edit handler — pinned values render as editable text
+  // inputs and typing fires onEditValue with the new token.
+  onEditValue: (idx: number, value: string) => void
 }): JSX.Element {
   const tokens = cellValue.trim().split(/\s+/).filter((t) => t.length > 0)
   return (
@@ -1821,8 +1846,8 @@ function PersistentSlotList({
         const pinned = persistentSlots[i] === true
         const pinnedVal = persistentValues[i] ?? ''
         // While pinned, show the captured value (what the engine is
-        // emitting). While unpinned, show the live cell token.
-        const displayVal = pinned ? pinnedVal : cellVal
+        // emitting) in an inline editor. While unpinned, show the
+        // live cell token.
         return (
           <Fragment key={i}>
             <span
@@ -1831,7 +1856,7 @@ function PersistentSlotList({
             >
               {a.name}
             </span>
-            {pinned && onEditValue ? (
+            {pinned ? (
               // Inline editor — clicking the field lets the user
               // type a new pinned value. The engine picks it up the
               // next time it emits this track (live), and "Send to
@@ -1843,7 +1868,10 @@ function PersistentSlotList({
                 title={`Pinned value — edit and click "Send to clips" to broadcast to all clips on this row`}
               >
                 <span aria-hidden>🔒</span>
-                <UncontrolledTextInput
+                {/* One space-joined token per slot: whitespace would split
+                    the pinned value and shift every later slot, and an
+                    empty token vanishes — StringTokenInput guards both. */}
+                <StringTokenInput
                   className="input font-mono text-[11px] text-right tabular-nums w-20 px-1 py-0 leading-tight"
                   value={pinnedVal}
                   onChange={(v) => onEditValue(i, v)}
@@ -1852,17 +1880,10 @@ function PersistentSlotList({
               </span>
             ) : (
               <span
-                className={`font-mono text-[11px] text-right truncate ${
-                  pinned ? 'text-accent' : ''
-                }`}
-                title={
-                  pinned
-                    ? `pinned at ${pinnedVal || '(empty)'}`
-                    : displayVal || '(empty)'
-                }
+                className="font-mono text-[11px] text-right truncate"
+                title={cellVal || '(empty)'}
               >
-                {pinned && '🔒 '}
-                {displayVal || '—'}
+                {cellVal || '—'}
               </span>
             )}
             <label
@@ -1911,18 +1932,7 @@ function CellInspector(): JSX.Element {
   // place of the classic HTML controls. Reactive: switching theme
   // flips the entire inspector instantly.
   const rich = useStore((s) => isRichTheme(s.theme))
-
-  if (!scene || !track || !cell) {
-    return <div className="p-4 text-muted text-[12px]">Cell removed.</div>
-  }
-  const c = cell
-
-  function u(patch: Partial<typeof c>): void {
-    updateCell(sel.sceneId, sel.trackId, patch)
-  }
-  function uSeq(patch: Partial<typeof c.sequencer>): void {
-    u({ sequencer: { ...c.sequencer, ...patch } })
-  }
+  const cellExists = !!(scene && track && cell)
 
   // Tell the engine which cell to stream live Modulation 1 updates
   // for. ALWAYS request the stream while the Inspector is mounted on
@@ -1932,7 +1942,10 @@ function CellInspector(): JSX.Element {
   // Engine throttles to ~30 Hz and the payload is small, so the
   // always-on stream is cheap. Clears on unmount so the engine stops
   // emitting when the user closes / navigates away from the Inspector.
+  // Declared above the "Cell removed" early return (Rules of Hooks);
+  // skips the request while the cell doesn't exist.
   useEffect(() => {
+    if (!cellExists) return
     const api = window.api as typeof window.api & {
       setSelectedCellForLive?: (
         sel: { sceneId: string; trackId: string } | null
@@ -1954,7 +1967,19 @@ function CellInspector(): JSX.Element {
       // on a different cell it starts clean.
       useStore.getState().setMod1Live(null)
     }
-  }, [sel.sceneId, sel.trackId])
+  }, [sel.sceneId, sel.trackId, cellExists])
+
+  if (!scene || !track || !cell) {
+    return <div className="p-4 text-muted text-[12px]">Cell removed.</div>
+  }
+  const c = cell
+
+  function u(patch: Partial<typeof c>): void {
+    updateCell(sel.sceneId, sel.trackId, patch)
+  }
+  function uSeq(patch: Partial<typeof c.sequencer>): void {
+    u({ sequencer: { ...c.sequencer, ...patch } })
+  }
 
   return (
     <div className="p-3 flex flex-col gap-3 text-[12px]">
@@ -2013,15 +2038,15 @@ function CellInspector(): JSX.Element {
             maxLength={15}
           />
           <span className="text-muted">:</span>
-          <UncontrolledTextInput
+          <BoundedNumberInput
             className="input w-14"
-            value={String(cell.destPort)}
+            value={cell.destPort}
             placeholder="port"
-            onChange={(v) => {
-              if (!/^\d*$/.test(v)) return
-              const n = v === '' ? 0 : parseInt(v, 10)
-              if (Number.isFinite(n) && n <= 65535) u({ destPort: n })
-            }}
+            onChange={(v) => u({ destPort: v })}
+            min={1}
+            max={65535}
+            integer
+            commitOn="blur"
           />
           {cell.destLinkedToDefault ? (
             <span className="chip text-accent2 shrink-0">~def~</span>
@@ -3601,9 +3626,12 @@ function Mod2Section({
         'It can also modulate the Sequencer (Seq Targets) and the cell\'s\n' +
         'value slots DIRECTLY (Value (direct) + the "M2" column in the\n' +
         'Routing matrix).\n\n' +
-        'Types: LFO, S&H, Slew, Chaos, Strange Attractor work as\n' +
-        "second-stage signals. Envelope, Ramp, Arp, Random are not\n" +
-        "available — they're note/time-targeted, not continuous."
+        'Types: every type in the list works as a second-stage signal\n' +
+        '(LFO, S&H, Slew, Chaos, Strange Attractor, Envelope, Random,\n' +
+        "Ramp, Arpeggiator). At this stage only the type's Rate and shape\n" +
+        "controls apply: Mod 2 always feeds a full symmetric ±1 signal (each\n" +
+        "target sets its own amount), so Depth, Mode and output-only settings\n" +
+        "(Random's Type / Min / Max, the Arpeggiator's Mult) are hidden."
       }
       enabled={m2.enabled}
       onToggle={(v) => u({ modulation2: { ...m2, enabled: v } })}
@@ -3676,7 +3704,12 @@ function Mod2Section({
         rateLabel="Rate"
         rateTooltip="Modulate Modulation 1's Rate (LFO Hz / clock division)."
         depthLabel="Depth"
-        depthTooltip="Modulate Modulation 1's Depth (0..100 %)."
+        depthTooltip={
+          cell.modulation.type === 'random'
+            ? "Modulation 1's Random Generator has no Depth (it emits raw samples in [Min, Max]) - Depth target is a no-op."
+            : "Modulate Modulation 1's Depth (0..100 %)."
+        }
+        depthUsable={cell.modulation.type !== 'random'}
         shapeLabel={shapeMeta.label}
         shapeTooltip={shapeMeta.tooltip}
         shapeUsable={shapeMeta.usable}
@@ -3817,6 +3850,7 @@ function Mod2TargetsBlock({
   rateTooltip,
   depthLabel,
   depthTooltip,
+  depthUsable = true,
   shapeLabel,
   shapeTooltip,
   shapeUsable,
@@ -3833,6 +3867,9 @@ function Mod2TargetsBlock({
   rateTooltip: string
   depthLabel: string
   depthTooltip: string
+  // Same contract as shapeUsable, for the Depth row (e.g. Mod 1 =
+  // Random, which has no Depth).
+  depthUsable?: boolean
   shapeLabel: string
   shapeTooltip: string
   // When the target's underlying parameter doesn't exist on the
@@ -3871,6 +3908,7 @@ function Mod2TargetsBlock({
         amount={depth.amount}
         onToggle={(v) => onPatchTarget('depth', { enabled: v })}
         onAmount={(v) => onPatchTarget('depth', { amount: v })}
+        disabled={!depthUsable}
       />
       <Mod2TargetRow
         label={shapeLabel}
@@ -4188,6 +4226,11 @@ function LfoEditor({
       </select>
       <span />
 
+      {/* Mod 2 feeds its targets the raw symmetric ±1 signal (the
+          engine ignores Mode / Depth there), so these rows only render
+          for Mod 1. */}
+      {!isMod2 && (
+      <>
       {/* Mode (Unipolar / Bipolar) on its own row, so it has space
           for the full label without crowding the Shape dropdown. */}
       <span className="label">Mode</span>
@@ -4238,6 +4281,8 @@ function LfoEditor({
         />
         <span className="text-muted text-[11px] w-5 shrink-0">%</span>
       </div>
+      </>
+      )}
 
       <span className="label">Rate</span>
       {m.sync === 'free' ? (
@@ -4449,21 +4494,30 @@ function ArpEditor({
       </select>
       <span />
 
-      <span className="label">Mult</span>
-      <select
-        className="input text-[11px] py-0.5 min-w-0"
-        value={arp.multMode}
-        onChange={(e) => uArp({ multMode: e.target.value as MultMode })}
-        title="Division: Value is the max; lower steps are fractions.
+      {/* Mult shapes the ladder VALUES Mod 1 emits; as Mod 2 only the
+          step position is used, so it has no effect there. */}
+      {!isMod2 && (
+        <>
+          <span className="label">Mult</span>
+          <select
+            className="input text-[11px] py-0.5 min-w-0"
+            value={arp.multMode}
+            onChange={(e) => uArp({ multMode: e.target.value as MultMode })}
+            title="Division: Value is the max; lower steps are fractions.
 Multiplication: Value is step 1; each step doubles.
 Div/Mult: Value in the middle; halvings below, doublings above."
-      >
-        <option value="div">Division</option>
-        <option value="mult">Multiplication</option>
-        <option value="divMult">Div/Mult</option>
-      </select>
-      <span />
+          >
+            <option value="div">Division</option>
+            <option value="mult">Multiplication</option>
+            <option value="divMult">Div/Mult</option>
+          </select>
+          <span />
+        </>
+      )}
 
+      {/* Mod 2 ignores Depth (raw ±1 signal) — Mod 1 only. */}
+      {!isMod2 && (
+      <>
       <span className="label">Depth</span>
       <input
         type="range"
@@ -4494,6 +4548,8 @@ Div/Mult: Value in the middle; halvings below, doublings above."
         />
         <span className="text-muted text-[11px] w-5 shrink-0">%</span>
       </div>
+      </>
+      )}
 
       <span className="label">Rate</span>
       {m.sync === 'free' ? (
@@ -4637,7 +4693,6 @@ function RandomEditor({
   const live = useStore((s) => (isMod2 || !m2toM1Active ? null : s.mod1Live))
   const liveDist = live?.randomDistribution
   const liveRateHz = live?.rateHz
-  const liveDepthPct = live?.depthPct
   const globalBpm = useStore((s) => s.session.globalBpm)
   const m = cell.modulation
   const rnd = m.random
@@ -4656,47 +4711,57 @@ function RandomEditor({
       float: { min: 0, max: 1 },
       colour: { min: 0, max: 255 }
     }
-    uRnd({ valueType: next, ...defaults[next] })
+    const prev = defaults[rnd.valueType]
+    const onPrevDefaults = !!prev && rnd.min === prev.min && rnd.max === prev.max
+    uRnd({ valueType: next, ...(onPrevDefaults ? defaults[next] : {}) })
   }
 
   const isColour = rnd.valueType === 'colour'
 
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      <span className="label">Type</span>
-      <select
-        className="input text-[11px] py-0.5 min-w-0"
-        value={rnd.valueType}
-        onChange={(e) => onValueTypeChange(e.target.value as RandomValueType)}
-        title="Int = one integer per tick. Float = one float per tick (1e-11 precision). Colour = three ints (r, g, b) per tick."
-      >
-        <option value="int">Int</option>
-        <option value="float">Float</option>
-        <option value="colour">Colour (r,g,b)</option>
-      </select>
-      <span />
+      {/* As Mod 2 only the draw itself (rate + distribution) feeds the
+          raw bipolar stage-2 signal — Type / Min / Max shape Mod 1's
+          OSC output only, and Mod 2 ignores Depth / Mode, so none of
+          them render here. */}
+      {isMod2 ? null : (
+        <>
+          <span className="label">Type</span>
+          <select
+            className="input text-[11px] py-0.5 min-w-0"
+            value={rnd.valueType}
+            onChange={(e) => onValueTypeChange(e.target.value as RandomValueType)}
+            title="Int = one integer per tick. Float = one float per tick (1e-11 precision). Colour = three ints (r, g, b) per tick."
+          >
+            <option value="int">Int</option>
+            <option value="float">Float</option>
+            <option value="colour">Colour (r,g,b)</option>
+          </select>
+          <span />
 
-      <span className="label">Min</span>
-      <BoundedNumberInput
-        className="input"
-        min={-1000000}
-        max={1000000}
-        integer={rnd.valueType !== 'float'}
-        value={rnd.min}
-        onChange={(v) => uRnd({ min: v })}
-      />
-      <span />
+          <span className="label">Min</span>
+          <BoundedNumberInput
+            className="input"
+            min={-1000000}
+            max={1000000}
+            integer={rnd.valueType !== 'float'}
+            value={rnd.min}
+            onChange={(v) => uRnd({ min: v })}
+          />
+          <span />
 
-      <span className="label">Max</span>
-      <BoundedNumberInput
-        className="input"
-        min={-1000000}
-        max={1000000}
-        integer={rnd.valueType !== 'float'}
-        value={rnd.max}
-        onChange={(v) => uRnd({ max: v })}
-      />
-      <span />
+          <span className="label">Max</span>
+          <BoundedNumberInput
+            className="input"
+            min={-1000000}
+            max={1000000}
+            integer={rnd.valueType !== 'float'}
+            value={rnd.max}
+            onChange={(v) => uRnd({ max: v })}
+          />
+          <span />
+        </>
+      )}
 
       {/* Distribution skew applied to each random draw. 0 = edge-
           weighted (cluster at min/max), 0.5 = uniform, 1 = centre-
@@ -4839,15 +4904,17 @@ function RandomEditor({
       </div>
       <span />
 
-      <div className="col-span-3 text-[10px] text-muted">
-        The clip's Value is used as the PRNG seed — the same Value produces a reproducible stream.
-        {isColour
-          ? ' Colour mode sends three integer OSC args (r, g, b), each independently drawn from [Min, Max].'
-          : rnd.valueType === 'int'
-            ? ' One int OSC arg per sample, in [Min, Max].'
-            : ' One float OSC arg per sample, in [Min, Max], rounded to 1e-11.'}
-        {' '}Scale 0.0–1.0 clamps each channel to [0, 1].
-      </div>
+      {!isMod2 && (
+        <div className="col-span-3 text-[10px] text-muted">
+          The clip's Value is used as the PRNG seed — the same Value produces a reproducible stream.
+          {isColour
+            ? ' Colour mode sends three integer OSC args (r, g, b), each independently drawn from [Min, Max].'
+            : rnd.valueType === 'int'
+              ? ' One int OSC arg per sample, in [Min, Max].'
+              : ' One float OSC arg per sample, in [Min, Max], rounded to 1e-11.'}
+          {' '}Scale 0.0–1.0 clamps each channel to [0, 1].
+        </div>
+      )}
       <div className="col-span-3">
         <RandomVisual modulation={cell.modulation} globalBpm={globalBpm} />
       </div>
@@ -5009,7 +5076,7 @@ function CompactDepthMode({
   // routing column not fully unticked). Computed by the caller
   // (isM2toM1Active).
   m2Active?: boolean
-}): JSX.Element {
+}): JSX.Element | null {
   // Suppress the orange overlay when M2→M1 isn't active (live values
   // equal base values, so no actual modulation to highlight) or when
   // this helper is rendered inside Modulation 2's section.
@@ -5019,6 +5086,10 @@ function CompactDepthMode({
   // whenever M2→M1 is inactive on the cell.
   const live = useStore((s) => (isMod2 || !m2Active ? null : s.mod1Live))
   const liveDepthPct = live?.depthPct
+  // Mod 2 feeds its targets the raw symmetric ±1 signal — the engine
+  // ignores its Depth / Mode — so render nothing there (after the hook,
+  // to keep hook order stable).
+  if (isMod2) return null
   return (
     <>
       <span className="label">Depth</span>
@@ -5807,6 +5878,9 @@ function RampEditor({
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
 
+        {/* Mod 2 ignores Depth (raw ±1 signal) — Mod 1 only. */}
+        {!isMod2 && (
+        <>
         <span className="label">Depth</span>
         <input
           type="range"
@@ -5836,6 +5910,8 @@ function RampEditor({
           />
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
+        </>
+        )}
       </div>
 
       <div className="text-[10px] text-muted italic">
@@ -5853,70 +5929,6 @@ function RampEditor({
         progress={isPlaying ? progress : undefined}
       />
     </div>
-  )
-}
-
-// Tiny SVG visualizer. Draws the chosen power curve from (0,0) → (1,1) and
-// a playhead dot at `progress ∈ [0, 1]` on that curve. Purely presentational.
-function RampVisualizer({
-  curvePct,
-  progress
-}: {
-  curvePct: number
-  progress: number
-}): JSX.Element {
-  // Mirror engine.ts's computeRampGain — rotationally-symmetric ease-in /
-  // ease-out pair so ±curve produce mirror-image shapes in the view.
-  const k = 1 + (Math.abs(curvePct) / 100) * 4
-  function gain(t: number): number {
-    if (curvePct === 0) return t
-    return curvePct > 0 ? 1 - Math.pow(1 - t, k) : Math.pow(t, k)
-  }
-  const W = 200
-  const H = 50
-  const pad = 4
-  const innerW = W - pad * 2
-  const innerH = H - pad * 2
-  const N = 40
-  const pts: string[] = []
-  for (let i = 0; i <= N; i++) {
-    const x = i / N
-    const y = gain(x)
-    pts.push(`${pad + x * innerW},${pad + (1 - y) * innerH}`)
-  }
-  const dotX = pad + progress * innerW
-  const dotY = pad + (1 - gain(progress)) * innerH
-  return (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      className="w-full border border-border rounded-sm bg-panel2"
-      style={{ height: H }}
-      aria-label="Ramp curve visualizer"
-    >
-      {/* 0/1 gridlines */}
-      <line x1={pad} y1={pad + innerH} x2={pad + innerW} y2={pad + innerH}
-        stroke="rgb(var(--c-border))" strokeWidth={0.5} />
-      <line x1={pad} y1={pad} x2={pad + innerW} y2={pad}
-        stroke="rgb(var(--c-border))" strokeWidth={0.5} strokeDasharray="2 3" />
-      <polyline
-        points={pts.join(' ')}
-        fill="none"
-        stroke="rgb(var(--c-accent2))"
-        strokeWidth={1.5}
-      />
-      {progress > 0 && (
-        <>
-          {/* Soft glow ring so the dot is easy to track against the curve. */}
-          <circle
-            cx={dotX}
-            cy={dotY}
-            r={6}
-            fill="rgb(var(--c-accent) / 0.25)"
-          />
-          <circle cx={dotX} cy={dotY} r={3.5} fill="rgb(var(--c-accent))" />
-        </>
-      )}
-    </svg>
   )
 }
 
@@ -6010,7 +6022,10 @@ function EnvelopeEditor({
   const displayMax = pctMode ? 100 : 10000
   const displayStep = pctMode ? 0.01 : 10
   const unit = pctMode ? '%' : 'ms'
-  const scaleToDisplay = (v: number): number => (pctMode ? v * 100 : v)
+  // Round the % view to 4 decimals so float noise (0.07 × 100 =
+  // 7.000000000000001) never reaches the number field.
+  const scaleToDisplay = (v: number): number =>
+    pctMode ? Math.round(v * 1e6) / 1e4 : v
   const displayToScale = (v: number): number => (pctMode ? v / 100 : v)
 
   return (
@@ -6061,6 +6076,9 @@ function EnvelopeEditor({
           </>
         )}
 
+        {/* Mod 2 ignores Depth (raw ±1 signal) — Mod 1 only. */}
+        {!isMod2 && (
+        <>
         <span className="label">Depth</span>
         <input
           type="range"
@@ -6090,6 +6108,8 @@ function EnvelopeEditor({
           />
           <span className="text-muted text-[11px] w-5 shrink-0">%</span>
         </div>
+        </>
+        )}
       </div>
 
       {(['attack', 'decay', 'sustain', 'release'] as const).map((seg) => {
@@ -6205,22 +6225,15 @@ function formatEnvelopeTime(ms: number): string {
 
 function Section({
   title,
-  children,
-  rightContent
+  children
 }: {
   title: string
   children: React.ReactNode
-  // Optional inline content rendered to the right of the title on
-  // the same row. Used by the multi-arg Value editor to show its
-  // "Auto-prefix:" badges next to the section header instead of
-  // wasting a full row on them.
-  rightContent?: React.ReactNode
 }): JSX.Element {
   return (
     <div className="flex flex-col gap-1 pt-2 border-t border-border first:border-t-0 first:pt-0">
       <div className="flex items-center gap-2 min-w-0">
         <span className="label shrink-0">{title}</span>
-        {rightContent && <span className="flex items-center gap-1 min-w-0 truncate">{rightContent}</span>}
       </div>
       {children}
     </div>
@@ -6826,9 +6839,9 @@ function RatchetPreview({
           const stepDiv = Math.max(
             2,
             Math.min(
-              8,
+              16,
               Math.round(
-                (1 - variation01) * ratchetMaxDiv + variation01 * (2 + divHash * 6)
+                (1 - variation01) * ratchetMaxDiv + variation01 * (2 + divHash * 14)
               )
             )
           )
@@ -7429,7 +7442,7 @@ function MultiArgValueEditor({
     const final = next.map((t, idx) => {
       const a = argSpec[idx]
       if (!a) return t
-      if (a.fixed !== undefined) return formatTok(a.fixed)
+      if (a.fixed !== undefined) return fixedTok(a)
       return t
     })
     onChange(final.join(' '))
@@ -7605,10 +7618,13 @@ function ArgInput({
     </div>
   )
   if (spec.type === 'string') {
+    // The cell value is ONE space-joined string, so this token can't
+    // hold whitespace (typed as '_') or be empty (reverts on blur) —
+    // either would shift every later slot.
     return (
       <label className="flex flex-col gap-0.5 min-w-0">
         {labelRow}
-        <UncontrolledTextInput
+        <StringTokenInput
           className="input text-[11px] py-0.5 font-mono"
           value={value}
           onChange={onChange}
@@ -7665,10 +7681,10 @@ function tokensFromValue(value: string): string[] {
 // the commit value after edits.
 function tokensWithDefaults(tokens: string[], spec: ParamArgSpec[]): string[] {
   return spec.map((a, i) => {
-    if (a.fixed !== undefined) return formatTok(a.fixed)
+    if (a.fixed !== undefined) return fixedTok(a)
     if (i < tokens.length && tokens[i] !== undefined) return tokens[i]
-    if (a.init !== undefined) return formatTok(a.init)
-    if (a.type === 'string') return ''
+    if (a.init !== undefined) return safeTok(formatTok(a.init), a)
+    if (a.type === 'string') return stringSlotFallback(a.name)
     return '0'
   })
 }
@@ -7676,6 +7692,19 @@ function tokensWithDefaults(tokens: string[], spec: ParamArgSpec[]): string[] {
 function formatTok(v: number | string | boolean): string {
   if (typeof v === 'boolean') return v ? '1' : '0'
   return String(v)
+}
+
+// A token as it sits in the space-joined cell value: never empty and
+// never containing whitespace (either would shift later slots).
+function safeTok(t: string, a: ParamArgSpec): string {
+  return t.trim() === '' ? stringSlotFallback(a.name) : t.replace(/\s/g, '_')
+}
+
+// Placeholder token for a fixed slot. The engine emits `fixed`
+// verbatim and only needs the token to hold the slot's POSITION, so
+// an empty / spaced fixed string is made position-safe here.
+function fixedTok(a: ParamArgSpec): string {
+  return safeTok(formatTok(a.fixed!), a)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -7717,6 +7746,11 @@ function MidiOutputSection({
     let cancelled = false
     window.api?.midiListPorts?.().then((r) => {
       if (cancelled) return
+      // IPC handler returns undefined on error — treat as no ports.
+      if (!r) {
+        setPorts([])
+        return
+      }
       setPorts(r.ports)
       setAvailable(r.available)
       setLastError(r.lastError)
@@ -7725,7 +7759,33 @@ function MidiOutputSection({
       cancelled = true
     }
   }, [m.enabled])
+  // The full Scale snap editor is Note-mode only, but the engine
+  // snaps whenever pitchSnap.enabled (+ midiScale / scaleToUnit),
+  // regardless of MIDI kind or MIDI Output being on. So whenever the
+  // editor is hidden but snap is still ON, surface a bare toggle so it
+  // can always be switched off.
+  const showSnapEditor = m.kind === 'note' && (cell.midiScale || cell.scaleToUnit)
+  const snapToggle =
+    cell.pitchSnap?.enabled && !(m.enabled && showSnapEditor) ? (
+      <label
+        className="flex items-center gap-2 text-[10px] cursor-pointer"
+        title="Scale snap is still ON for this clip (its full editor only shows with MIDI Output on in Note mode). Untick to turn it off."
+      >
+        <input
+          type="checkbox"
+          checked
+          onChange={(e) => onPitchSnapChange({ enabled: e.target.checked })}
+        />
+        <span className="label">Scale snap</span>
+        <span className="text-muted">
+          {cell.midiScale || cell.scaleToUnit
+            ? 'on — still quantising this clip (OSC too)'
+            : 'on — inactive (needs MIDI Scale or Scale 0.0–1.0)'}
+        </span>
+      </label>
+    ) : null
   return (
+    <>
     <CollapsibleSection
       title="MIDI Output"
       enabled={m.enabled}
@@ -7875,13 +7935,18 @@ function MidiOutputSection({
             <span className="text-muted shrink-0" title="MIDI velocity 0..127">
               Velocity
             </span>
-            <UncontrolledTextInput
-              className="input font-mono text-center"
-              style={{ width: 40 }}
-              value={cell.velocity ?? '100'}
-              onChange={(v) => onVelocityChange(v.trim() || '0')}
+            <BoundedNumberInput
+              className="input font-mono text-center w-10"
+              value={(() => {
+                const n = parseInt(cell.velocity ?? '100', 10)
+                return Number.isFinite(n) ? n : 100
+              })()}
+              onChange={(v) => onVelocityChange(String(v))}
               placeholder="100"
-              maxLength={3}
+              min={0}
+              max={127}
+              integer
+              commitOn="blur"
             />
             <span
               className="text-muted shrink-0"
@@ -7970,7 +8035,7 @@ function MidiOutputSection({
           Pure Data / Max patch (OSC) with the SAME melody. Gated
           on (midiScale || scaleToUnit) so the engine has a [0..1]
           domain to map. */}
-      {m.kind === 'note' && (cell.midiScale || cell.scaleToUnit) && (
+      {showSnapEditor && (
         <PitchSnapEditor
           snap={cell.pitchSnap}
           noteMin={m.noteMin ?? 36}
@@ -7978,7 +8043,12 @@ function MidiOutputSection({
           onChange={onPitchSnapChange}
         />
       )}
+      {snapToggle}
     </CollapsibleSection>
+    {/* MIDI Output off hides the section body — keep the stray snap
+        toggle reachable below the header. */}
+    {!m.enabled && snapToggle}
+    </>
   )
 }
 

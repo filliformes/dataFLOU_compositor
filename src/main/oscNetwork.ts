@@ -15,7 +15,6 @@ import * as osc from 'osc'
 import * as os from 'os'
 import * as dgram from 'dgram'
 import type {
-  DiscoveredOscAddress,
   DiscoveredOscDevice,
   ForwardDiagEntry,
   NetworkListenerStatus,
@@ -68,7 +67,17 @@ export class OscNetworkListener {
   // listener so the forwarded packet's source port is ephemeral and
   // downstream consumers can't accidentally reply into the listener.
   private forwardTargets: OscForwardTarget[] = []
+  // The renderer's full (sanitised) list, BEFORE self-loop filtering.
+  // Kept so a listener port change can re-derive `forwardTargets`.
+  private requestedForwardTargets: OscForwardTarget[] = []
+  // `${id}|${ip}:${port}` of self-loop targets already logged, so each
+  // rejected target warns once rather than on every re-apply.
+  private selfLoopLogged = new Set<string>()
   private forwardSocket: dgram.Socket | null = null
+  // Local (source) port the OS assigned the forward socket on its first
+  // send; 0 until bound. A packet arriving FROM this port on a local
+  // address is our own forward coming back — never re-forward it.
+  private forwardLocalPort = 0
   // Rate-limit forward error logging so a single bad target doesn't
   // flood the console at the upstream sender's packet rate (which can
   // be hundreds of msg/sec for control surfaces).
@@ -202,12 +211,16 @@ export class OscNetworkListener {
       const intPort = Math.floor(port)
       if (intPort !== this.port) {
         this.port = intPort
+        // A forward target that was fine on the old port may now point
+        // at our own listener (UDP loop) — re-derive the effective list.
+        this.applyForwardTargets()
         if (this.enabled) {
           // Hot re-bind. Close + open is simpler than trying to
           // mutate the bound port in place (the osc package doesn't
-          // expose that anyway).
+          // expose that anyway). `setEnabled(false, newPort)` just
+          // stores the port and closes — it must not re-open.
           await this.closeUdp()
-          await this.openUdp()
+          if (enabled) await this.openUdp()
           return this.getStatus()
         }
       }
@@ -229,7 +242,7 @@ export class OscNetworkListener {
     // the hot path doesn't have to re-validate per packet. We keep
     // disabled targets in the list (the user might re-enable them
     // mid-session) but `forwardPacket` skips them.
-    this.forwardTargets = targets
+    this.requestedForwardTargets = targets
       .filter((t) => typeof t.id === 'string' && t.id.length > 0)
       .map((t) => ({
         id: t.id,
@@ -239,6 +252,32 @@ export class OscNetworkListener {
         port: Number.isFinite(t.port) ? Math.floor(t.port) : 0
       }))
       .filter((t) => t.ip.length > 0 && t.port >= 1 && t.port <= 65535)
+    this.applyForwardTargets()
+  }
+
+  /**
+   * Derive the effective `forwardTargets` from the requested list,
+   * dropping any target that points back at this listener (its own
+   * port on a local address) — forwarding there would re-receive and
+   * re-forward every packet forever (a UDP loop that pins the CPU and
+   * floods the LAN). Re-run whenever the listener port changes.
+   */
+  private applyForwardTargets(): void {
+    let localAddrs: Set<string> | null = null
+    this.forwardTargets = this.requestedForwardTargets.filter((t) => {
+      if (t.port !== this.port) return true
+      if (!localAddrs) localAddrs = getAllLocalAddresses()
+      if (!isLocalAddress(t.ip, localAddrs)) return true
+      const key = `${t.id}|${t.ip}:${t.port}`
+      if (!this.selfLoopLogged.has(key)) {
+        this.selfLoopLogged.add(key)
+        console.warn(
+          `[OSC Forward] ignoring target ${t.label || t.id} → ${t.ip}:${t.port}: ` +
+            `it is this listener's own port (would loop forever)`
+        )
+      }
+      return false
+    })
     const anyEnabled = this.forwardTargets.some((t) => t.enabled)
     if (!anyEnabled && this.forwardSocket) {
       // No work to do — close the send socket so we're not holding
@@ -249,6 +288,7 @@ export class OscNetworkListener {
         /* ignore */
       }
       this.forwardSocket = null
+      this.forwardLocalPort = 0
     }
     // Clear the per-target error throttle on every config change so
     // a fresh "Pd at 127.0.0.1:1987" can log its first error even if
@@ -276,9 +316,20 @@ export class OscNetworkListener {
     // selection any other UDP send from this process gets.
     if (!this.forwardSocket) {
       try {
-        this.forwardSocket = dgram.createSocket('udp4')
+        const created = dgram.createSocket('udp4')
+        this.forwardSocket = created
         this.forwardSocket.on('error', (err) => {
           console.error('[OSC Forward] outbound socket error:', err.message)
+        })
+        // Implicit bind on the first send → record the ephemeral source
+        // port for the loop guard in the listener's raw 'message' hook.
+        this.forwardSocket.on('listening', () => {
+          if (this.forwardSocket !== created) return
+          try {
+            this.forwardLocalPort = created.address().port
+          } catch {
+            /* not bound after all — guard stays off */
+          }
         })
       } catch (e) {
         console.error(
@@ -438,6 +489,18 @@ export class OscNetworkListener {
             // Mode template is enabled session-wide, so this check is
             // O(1) in the common case.
             if (suppressed) return
+            // Loop guard (belt-and-braces for applyForwardTargets): a
+            // packet sent FROM our forward socket's port on a local
+            // address is our own forward coming back (e.g. a target
+            // given as a hostname that resolves to this listener).
+            // Re-forwarding it would loop forever.
+            if (
+              this.forwardLocalPort > 0 &&
+              diagPort === this.forwardLocalPort &&
+              isLocalAddress(diagIp, getAllLocalAddresses())
+            ) {
+              return
+            }
             this.forwardPacket(buf)
           })
         }
@@ -570,6 +633,7 @@ export class OscNetworkListener {
           /* ignore */
         }
         this.forwardSocket = null
+        this.forwardLocalPort = 0
       }
       const port = this.udp
       if (!port) {
@@ -811,6 +875,12 @@ export class OscNetworkListener {
       // Cap distinct addresses per device. The pathological case is a
       // sender that encodes a unique path per pixel/voxel/whatever —
       // we'd rather show the first 256 than blow the IPC payload.
+      // TTL-expired paths (already hidden by list()) don't count —
+      // drop them first so a device whose address set changes over a
+      // long session can still surface its new paths.
+      if (dev.addresses.length >= MAX_ADDRESSES_PER_DEVICE) {
+        dev.addresses = dev.addresses.filter((a) => now - a.lastSeen <= ADDRESS_TTL_MS)
+      }
       if (dev.addresses.length >= MAX_ADDRESSES_PER_DEVICE) {
         this.dirty = true
         return
@@ -855,6 +925,31 @@ function getLocalIPv4Addresses(): string[] {
     }
   }
   return out
+}
+
+/**
+ * Every address (IPv4 + IPv6, internal included) bound to this host's
+ * interfaces, plus the wildcard / loopback literals. Used by the
+ * forward-loop guard, so it must include loopback, unlike
+ * getLocalIPv4Addresses above.
+ */
+function getAllLocalAddresses(): Set<string> {
+  const out = new Set<string>(['localhost', '0.0.0.0', '::', '::1'])
+  const ifs = os.networkInterfaces()
+  for (const name in ifs) {
+    for (const ni of ifs[name] ?? []) out.add(ni.address.toLowerCase())
+  }
+  return out
+}
+
+/** True when `ip` names this machine (127.0.0.0/8, ::1, localhost,
+ *  0.0.0.0, or one of its interface addresses). */
+function isLocalAddress(ip: string, localAddrs: Set<string>): boolean {
+  let a = ip.trim().toLowerCase()
+  // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) → plain IPv4.
+  if (a.startsWith('::ffff:')) a = a.slice(7)
+  if (a.startsWith('127.')) return true
+  return localAddrs.has(a)
 }
 
 function formatArgPreview(type: string, value: unknown): string {

@@ -1,28 +1,19 @@
 // OSC sender — one UDP socket bound locally, messages sent per-destination.
 
 import * as osc from 'osc'
+import type { OscErrorEvent, OscEvent } from '@shared/types'
 
-type Arg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
+type Arg = OscEvent['args'][number]
 
-export type OscSendEvent = {
-  timestamp: number // Date.now() ms
-  ip: string
-  port: number
-  address: string
-  args: Arg[]
-}
+// One successful send, as surfaced to the OSC monitor. Same shape as the
+// shared OscEvent (re-exported under the sender-side name).
+export type OscSendEvent = OscEvent
 
 // Fired when a send fails (synchronous throw in dgram.send, async 'error'
 // on the UDP socket from ICMP unreachable on Windows, etc.). Socket-level
 // errors that can't be attributed to a specific destination use ip='*',
 // port=0, address='' — the UI treats them as system-wide warnings.
-export type OscErrorEvent = {
-  timestamp: number
-  ip: string
-  port: number
-  address: string
-  message: string
-}
+export type { OscErrorEvent }
 
 // Rate-limit stderr output so the engine can't flood the dev-server /
 // PowerShell pipe with identical "send failed" lines at tick rate. The

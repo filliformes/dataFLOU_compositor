@@ -20,11 +20,39 @@ import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import type {
   InstrumentTemplate,
+  LearnedState,
   StateRule,
   StateRuleOp,
   StateTrigger,
   StateTriggerMode
 } from '@shared/types'
+
+// Re-recording a learned pose keeps the user's tuning: threshold,
+// tolerance, and any dims they unticked that exist again in the new
+// recording (matched by address+slot). Shared with Pose Sequences.
+export function carryLearnedTuning(
+  prev: LearnedState | undefined,
+  next: LearnedState
+): LearnedState {
+  if (!prev) return next
+  const off = new Set(
+    prev.dims.filter((d) => d.enabled === false).map((d) => `${d.address}|${d.slot}`)
+  )
+  return {
+    ...next,
+    threshold: prev.threshold ?? next.threshold,
+    tolerance: prev.tolerance ?? next.tolerance,
+    dims: next.dims.map((d) =>
+      off.has(`${d.address}|${d.slot}`) ? { ...d, enabled: false } : d
+    )
+  }
+}
+
+// The engine's default '=' tolerance when rule.tol is unset — mirrors
+// engine.ts evaluateStateTriggers so the field shows what's applied.
+function defaultEqTol(a: number): number {
+  return Math.max(0.02 * Math.max(Math.abs(a), 0.5), 1e-4)
+}
 
 const MODES: { id: StateTriggerMode; label: string; hint: string }[] = [
   {
@@ -178,7 +206,9 @@ export function StateTriggerCard({
   }, [tracks, template.id])
 
   async function record(): Promise<void> {
-    if (poseRecordBusy) return // another capture is already running
+    // Read the lock fresh (not the render closure) so a double-click
+    // can't start two captures in the same frame.
+    if (useStore.getState().poseRecordBusy) return // another capture is already running
     setRecording(true)
     setPoseRecordBusy(true)
     try {
@@ -189,13 +219,11 @@ export function StateTriggerCard({
       )
       if (!aliveRef.current) return
       if (result) {
-        // Preserve a user-tuned threshold across re-records.
+        // Preserve user tuning (threshold, tolerance, unticked dims)
+        // across re-records.
         patch({
           detector: 'learned',
-          learned: {
-            ...result,
-            threshold: trig.learned?.threshold ?? result.threshold
-          }
+          learned: carryLearnedTuning(trig.learned, result)
         })
       } else {
         window.alert(
@@ -534,7 +562,7 @@ function RulesEditor({
           {rule.op === 'eq' && (
             <BoundedNumberInput
               className="input w-12 text-[10px] text-right tabular-nums"
-              value={rule.tol ?? 0.02}
+              value={rule.tol ?? defaultEqTol(rule.a)}
               min={0}
               max={1e9}
               commitOn="blur"
@@ -756,7 +784,9 @@ function StateActionsEditor({
               <option value="note">Note</option>
               <option value="cc">CC</option>
             </select>
-            {m.kind === 'note' ? (
+            {/* Continuous mode always streams the CC below, whatever the
+                kind — so it always shows the CC number field. */}
+            {m.kind === 'note' && trig.mode !== 'continuous' ? (
               <>
                 <label className="flex items-center gap-1">
                   <span className="label">Note</span>

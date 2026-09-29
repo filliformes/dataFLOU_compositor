@@ -11,7 +11,6 @@
 // local tick.
 
 import { useEffect, useState } from 'react'
-import type { OscErrorEvent } from '@shared/types'
 
 const FAIL_WINDOW_MS = 5000
 
@@ -21,8 +20,6 @@ interface FailInfo {
 }
 
 const failures = new Map<string, FailInfo>()
-// Socket-level errors (no specific destination).
-let lastSocketErrorAt: FailInfo | null = null
 const subscribers = new Set<() => void>()
 
 function destKey(ip: string, port: number): string {
@@ -41,14 +38,12 @@ export function attachOscErrorStream(): void {
   attached = true
   window.api.onOscErrors((batch) => {
     for (const e of batch) {
-      if (e.ip === '*') {
-        lastSocketErrorAt = { at: e.timestamp, message: e.message }
-      } else {
-        failures.set(destKey(e.ip, e.port), {
-          at: e.timestamp,
-          message: e.message
-        })
-      }
+      // Socket-level errors (ip '*') have no destination to flag.
+      if (e.ip === '*') continue
+      failures.set(destKey(e.ip, e.port), {
+        at: e.timestamp,
+        message: e.message
+      })
     }
     notify()
   })
@@ -62,10 +57,6 @@ export function attachOscErrorStream(): void {
         failures.delete(k)
         changed = true
       }
-    }
-    if (lastSocketErrorAt && now - lastSocketErrorAt.at > FAIL_WINDOW_MS) {
-      lastSocketErrorAt = null
-      changed = true
     }
     if (changed) notify()
   }, 1000)
@@ -91,21 +82,4 @@ export function useOscDestHealth(ip: string, port: number): {
   const age = Date.now() - info.at
   if (age > FAIL_WINDOW_MS) return { failing: false, lastMessage: null, lastAt: null }
   return { failing: true, lastMessage: info.message, lastAt: info.at }
-}
-
-/** Returns true if a socket-level OSC error fired within the window.
- *  Useful for a global "OSC not healthy" indicator. */
-export function useOscGlobalHealth(): { failing: boolean; lastMessage: string | null } {
-  const [, forceRender] = useState(0)
-  useEffect(() => {
-    const tick = (): void => forceRender((n) => n + 1)
-    subscribers.add(tick)
-    return () => {
-      subscribers.delete(tick)
-    }
-  }, [])
-  if (!lastSocketErrorAt) return { failing: false, lastMessage: null }
-  const age = Date.now() - lastSocketErrorAt.at
-  if (age > FAIL_WINDOW_MS) return { failing: false, lastMessage: null }
-  return { failing: true, lastMessage: lastSocketErrorAt.message }
 }

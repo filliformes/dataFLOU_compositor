@@ -1,7 +1,16 @@
 // Electron main entry. Creates the window, wires IPC to the engine and sessions.
-// MIDI is handled in the renderer via Web MIDI API — no native module needed.
+// MIDI INPUT (learn, triggers, Meta knobs) is Web MIDI in the renderer;
+// MIDI OUTPUT is native (@julusian/midi, see midiOut.ts) driven by the engine.
 
-import { app, BrowserWindow, ipcMain, shell, session as electronSession } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  Menu,
+  shell,
+  session as electronSession,
+  type MenuItemConstructorOptions
+} from 'electron'
 import { join } from 'path'
 import type {
   EngineState,
@@ -16,6 +25,7 @@ import { SceneEngine } from './engine'
 import * as sessionIO from './session'
 import * as autosave from './autosave'
 import { OscNetworkListener } from './oscNetwork'
+import { OscSubscriptionManager } from './oscSubscriptions'
 import { SceneLibrary } from './sceneLibrary'
 import { PoolLibrary } from './poolLibrary'
 
@@ -44,6 +54,12 @@ const engine = new SceneEngine()
 // the renderer's Pool drawer Network tab flips it on, so we don't fight
 // other apps for port 9000 unless the user actually asked for it.
 const networkListener = new OscNetworkListener()
+// (v0.6.6) Device subscriptions (Pandore IMU, …) — asks devices to stream
+// to the listener's current port, heartbeats, re-subscribes on recovery.
+const oscSubs = new OscSubscriptionManager(() => {
+  const s = networkListener.getStatus()
+  return { enabled: s.enabled, port: s.port }
+})
 // Persistent saved-scenes library — lives in
 // `<userData>/scene-library.json`, separate from any session file
 // so the user can drag scenes across sessions.
@@ -58,35 +74,86 @@ const poolLibrary = new PoolLibrary()
 // preempted (e.preventDefault()) so the renderer can show its
 // Save-before-quit modal; on user choice the renderer calls
 // proceed-close which flips this flag and re-issues window.close()
-// — the second pass falls through to the OS close.
+// — the second pass falls through to the OS close. Reset in
+// createWindow so a window reopened from the macOS dock prompts again.
 let appQuitting = false
+// Set by 'before-quit' (Cmd+Q, app.quit()), which fires BEFORE the
+// window 'close' events. Each close event consumes it into
+// `pendingCloseIsQuit`, so a quit the user cancels in the save prompt
+// can't turn a later plain window-close into a full quit.
+let quitRequested = false
+// Whether the close currently awaiting the renderer's answer was part
+// of a quit (→ app.quit() after Save/Discard) or a plain window close
+// (→ macOS keeps the app + engine resident in the dock).
+let pendingCloseIsQuit = false
+// Watchdog for the save prompt: the preload acks `app:before-close` as
+// soon as the renderer's listener has run. No ack within this window
+// (renderer hung / never mounted its listener) → close as Discard, so
+// the window can't become unclosable.
+const CLOSE_ACK_TIMEOUT_MS = 3000
+let closeAckTimer: ReturnType<typeof setTimeout> | null = null
 // Hoisted here (rather than inside whenReady()) so the module-level
-// before-quit / window-all-closed handlers can clear it alongside the
-// rest of the shutdown work. Previously there were TWO before-quit
-// handlers and the one that cleared this timer ran in isolation from
-// the one that stopped the engine + autosave — so shutdown sequencing
-// depended on registration order and ran stopAutosave twice.
+// will-quit handler can clear it alongside the rest of the shutdown
+// work. Previously there were TWO before-quit handlers and the one that
+// cleared this timer ran in isolation from the one that stopped the
+// engine + autosave — so shutdown sequencing depended on registration
+// order and ran stopAutosave twice.
 let oscFlushTimer: ReturnType<typeof setInterval> | null = null
 // Whether the previous run exited uncleanly. Detected when the autosave
 // sentinel file still exists at startup; surfaced to the renderer on demand
-// via the `session:crashCheck` IPC so it can offer a "Restore?" prompt.
+// via the `autosave:crashCheck` IPC so it can offer a "Restore?" prompt.
+// Reported for the FIRST page load only (see crashCheckAnswered).
 let prevRunCrashed = false
+// Set once the renderer has asked crashCheck. The next page load (window
+// reopened from the dock, dev reload) clears prevRunCrashed so the
+// restore prompt doesn't reappear for a crash already dealt with. Keyed
+// to page loads rather than cleared on the first call so React
+// StrictMode's double-mount in dev still sees `crashed: true`.
+let crashCheckAnswered = false
+
+// One instance only: two processes would share (and fight over) the
+// `.running` crash marker, the autosave folder and the scene / pool
+// library files. A second launch just focuses the running window.
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    } else if (app.isReady()) {
+      // macOS: app resident in the dock with its window closed.
+      createWindow()
+    }
+  })
+}
 
 /**
- * Single shutdown path. Safe to call twice (before-quit + window-all-closed
- * can both fire depending on platform / how the user exited), so every step
- * is idempotent. The old two-handler arrangement ran autosave.stopAutosave
- * twice on a normal quit — which wrote the .running sentinel-file unlink
- * twice and fired a final autosave snapshot twice.
+ * Single shutdown path, run on 'will-quit' — i.e. only once the quit is
+ * certain (every window has closed, the save prompt was answered).
+ * Running it on 'before-quit' tore the engine / OSC / autosave down and
+ * deleted the crash marker BEFORE the save prompt, so a Cancel left a
+ * live-looking app with a dead engine. Idempotent.
  */
 let shutdownComplete = false
 function shutdown(): void {
   if (shutdownComplete) return
   shutdownComplete = true
+  // A non-lock-holding second instance never started anything — and
+  // must not delete the running instance's crash marker.
+  if (!hasSingleInstanceLock) return
+  if (closeAckTimer) {
+    clearTimeout(closeAckTimer)
+    closeAckTimer = null
+  }
   if (oscFlushTimer) {
     clearInterval(oscFlushTimer)
     oscFlushTimer = null
   }
+  // Unsubscribe from devices (best effort — their TTL covers the rest).
+  oscSubs.stop()
   // Tear down the discovery listener so its UDP socket is released
   // before the process exits. Fire-and-forget — setEnabled(false)
   // returns a Promise but app shutdown can't wait on it.
@@ -97,7 +164,54 @@ function shutdown(): void {
   autosave.stopAutosave()
 }
 
+/**
+ * The renderer answered the save prompt (Save done / Discard), or can't
+ * answer at all (watchdog / renderer gone): let the window close. Quit
+ * the app for a Cmd+Q-initiated close and on Windows / Linux; on macOS a
+ * plain window close keeps the app + engine alive in the dock.
+ */
+function proceedWithClose(): void {
+  if (closeAckTimer) {
+    clearTimeout(closeAckTimer)
+    closeAckTimer = null
+  }
+  const shouldQuit = pendingCloseIsQuit || process.platform !== 'darwin'
+  pendingCloseIsQuit = false
+  appQuitting = true
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close()
+  if (shouldQuit) app.quit()
+}
+
+/**
+ * Packaged builds: the default menu's View > Reload (Ctrl/Cmd+R),
+ * Force Reload and Toggle DevTools would wipe the live renderer state
+ * mid-show. Rebuild it without those; keep the macOS app menu, the Edit
+ * roles (copy / paste / undo / select-all accelerators in text fields
+ * depend on them), zoom / full screen and the Window menu. Dev builds
+ * keep Electron's default menu.
+ */
+function installPackagedMenu(): void {
+  const template: MenuItemConstructorOptions[] = [
+    ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const }] : []),
+    { role: 'fileMenu' },
+    { role: 'editMenu' },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    { role: 'windowMenu' }
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
+
 function createWindow(): void {
+  appQuitting = false
   // v0.5.10 -- bake the package version into the window title.
   // The renderer further appends the loaded session name via
   // `document.title`, which Electron auto-syncs back to the
@@ -122,15 +236,61 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => mainWindow?.show())
 
+  const win = mainWindow
+  // Set when this window's renderer process dies — it can never answer
+  // the save prompt, so a close must go straight through.
+  let rendererGone = false
+
   // Close intercept — send the "Save before quitting?" question to
   // the renderer first; renderer responds via `app:close-proceed`
   // which sets `appQuitting=true` and re-issues close(). On the
   // second close pass we let it through. Without this guard the X
   // button would slam the window shut with no chance to save.
-  mainWindow.on('close', (e) => {
+  win.on('close', (e) => {
     if (appQuitting) return
+    // Consume the quit flag for THIS close cycle (see quitRequested).
+    pendingCloseIsQuit = quitRequested
+    quitRequested = false
+    const wc = win.webContents
+    if (rendererGone || wc.isDestroyed() || wc.isCrashed()) {
+      // Nobody can show the prompt — treat as Discard and let it close.
+      return
+    }
     e.preventDefault()
     sendToRenderer('app:before-close')
+    if (closeAckTimer) clearTimeout(closeAckTimer)
+    closeAckTimer = setTimeout(() => {
+      closeAckTimer = null
+      console.warn(
+        `[main] renderer did not acknowledge app:before-close within ${CLOSE_ACK_TIMEOUT_MS} ms — closing without saving`
+      )
+      proceedWithClose()
+    }, CLOSE_ACK_TIMEOUT_MS)
+  })
+
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.error(
+      `[main] renderer process gone (${details.reason}, exit code ${details.exitCode})`
+    )
+    rendererGone = true
+    // A save prompt it hadn't acknowledged yet will never be answered.
+    if (closeAckTimer) proceedWithClose()
+  })
+
+  // Block in-window navigation — e.g. a .json file dropped on the window
+  // would otherwise replace the app with the file's text, losing the
+  // live session. http(s) links open in the system browser instead. A
+  // same-URL navigation (dev-server full reload) is allowed.
+  win.webContents.on('will-navigate', (details) => {
+    if (details.url === win.webContents.getURL()) return
+    details.preventDefault()
+    if (/^https?:/i.test(details.url)) void shell.openExternal(details.url)
+  })
+
+  // Crash-restore prompt is offered on the first page load only: any
+  // later load of a renderer (dock reopen, reload) reports no crash.
+  win.webContents.on('did-start-loading', () => {
+    if (crashCheckAnswered) prevRunCrashed = false
   })
 
   // Null the reference once the window is gone so sendToRenderer
@@ -155,6 +315,11 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  // Second instance: already quitting (see requestSingleInstanceLock).
+  if (!hasSingleInstanceLock) return
+
+  if (app.isPackaged) installPackagedMenu()
+
   // Allow Web MIDI in the renderer.
   electronSession.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => {
     if (permission === 'midi' || permission === 'midiSysex') return cb(true)
@@ -205,7 +370,13 @@ app.whenReady().then(async () => {
   // outgoing. Feeds the Monitor "OSC In" column + Connection Health.
   networkListener.setOnIncoming((e) => {
     if (oscInBuffer.length < OSC_BUFFER_MAX) oscInBuffer.push(e)
+    oscSubs.handleIncoming(e)
   })
+  // Subscribe / heartbeat sends show in the Monitor's OSC Out column.
+  oscSubs.setOnSent((e) => {
+    if (oscBuffer.length < OSC_BUFFER_MAX) oscBuffer.push(e)
+  })
+  oscSubs.start()
   // (v0.6.4) Derived Parameters also appear in the OSC In stream so the
   // computed synthetic address is as visible as a real one.
   engine.setOnDerived((e) => {
@@ -332,6 +503,7 @@ app.whenReady().then(async () => {
     // renderer's intent. Engine call comes second.
     autosave.setCurrentSession(s as Session)
     engine.updateSession(s as Session)
+    oscSubs.update((s as Session).oscSubscriptions)
   })
   safeHandle('engine:sendMetaValue', (_e, knobIdx, v) =>
     engine.sendMetaValue(knobIdx as number, v as number)
@@ -351,19 +523,29 @@ app.whenReady().then(async () => {
   // promise rejection mechanism still forwards the error message.
   ipcMain.handle('session:saveAs', (_e, s: Session) => sessionIO.saveAs(mainWindow, s))
   ipcMain.handle('session:saveTo', (_e, s: Session, path: string) => sessionIO.saveTo(path, s))
-  // No-dialog save into `<userData>/sessions/<name>.dflou.json`.
-  // Used by the renderer's Save-before-quit flow when no file path
-  // is associated with the session yet.
+  // No-dialog save into the default Sessions folder (see
+  // session.ts sessionsFolderPath). Used by the renderer's
+  // Save-before-quit flow when no file path is associated with the
+  // session yet.
   ipcMain.handle('session:saveToDefault', (_e, s: Session) =>
     sessionIO.saveToDefault(s as Session)
   )
 
   // App close coordination — renderer calls this from its modal's
   // Yes / No buttons. Setting `appQuitting=true` makes the next
-  // window.close() bypass the preventDefault guard installed above.
+  // window.close() bypass the preventDefault guard installed above;
+  // a Cmd+Q-initiated close (or any close off macOS) then quits.
   safeHandle('app:close-proceed', () => {
-    appQuitting = true
-    mainWindow?.close()
+    proceedWithClose()
+  })
+  // Sent by the preload as soon as the renderer's app:before-close
+  // listener has run (the modal is up) — disarms the close watchdog.
+  // From then on the prompt waits for the user as long as it takes.
+  ipcMain.on('app:before-close-ack', () => {
+    if (closeAckTimer) {
+      clearTimeout(closeAckTimer)
+      closeAckTimer = null
+    }
   })
   ipcMain.handle('session:open', async () => {
     const result = await sessionIO.open(mainWindow)
@@ -400,6 +582,12 @@ app.whenReady().then(async () => {
   // entries.
   safeHandle('network:getForwardDiag', () => networkListener.getForwardDiag())
   safeHandle('network:clearForwardDiag', () => networkListener.clearForwardDiag())
+  // (v0.6.6) Device subscriptions — the list arrives with the session.
+  safeHandle('oscSubs:getStatus', () => oscSubs.getStatus())
+  safeHandle('oscSubs:probe', (_e, opts) =>
+    oscSubs.probe(opts as { network: boolean; port: number; replyPort: number })
+  )
+  safeHandle('oscSubs:resubscribe', (_e, id) => oscSubs.resubscribe(id as string))
   // v0.5.10 -- expose package version to the renderer so it can
   // include it in `document.title` (which Electron auto-syncs back
   // to the window chrome). Sync to a Promise return so the renderer
@@ -490,7 +678,10 @@ app.whenReady().then(async () => {
   // ---------- IPC: Autosave / crash recovery ----------
   // `crashCheck` — renderer calls this on mount to decide whether to show
   // the restore prompt. Returns the flag + the latest autosave entries.
+  // `crashed` is only reported to the first page load (see
+  // crashCheckAnswered + the window's did-start-loading hook).
   safeHandle('autosave:crashCheck', async () => {
+    crashCheckAnswered = true
     const entries = await autosave.listAutosaves()
     return { crashed: prevRunCrashed, entries }
   })
@@ -513,18 +704,22 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  // On non-macOS, closing the last window quits the app (teardown here).
-  // On macOS, the standard pattern is to STAY resident in the dock: do
-  // NOT shut down the engine / autosave / OSC socket, so reopening from
-  // the dock ('activate' -> createWindow) reconnects to a still-live
-  // engine (its webContents.send calls read the reassigned mainWindow).
-  // Teardown for macOS happens in 'before-quit' (Cmd+Q). Previously this
-  // ran shutdown() unconditionally, leaving a reopened window wired to a
-  // dead engine (no OSC/MIDI, no autosave).
-  if (process.platform !== 'darwin') {
-    shutdown()
-    app.quit()
-  }
+  // On non-macOS, closing the last window quits the app (teardown runs
+  // on will-quit). On macOS, the standard pattern is to STAY resident in
+  // the dock: do NOT shut down the engine / autosave / OSC socket, so
+  // reopening from the dock ('activate' -> createWindow) reconnects to a
+  // still-live engine (its webContents.send calls read the reassigned
+  // mainWindow). Previously this ran shutdown() unconditionally, leaving
+  // a reopened window wired to a dead engine (no OSC/MIDI, no autosave).
+  if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', shutdown)
+// 'before-quit' fires BEFORE the windows are asked to close — i.e. before
+// the save prompt, which can still cancel the quit. Only record intent.
+app.on('before-quit', () => {
+  quitRequested = true
+})
+
+// 'will-quit' fires once every window has closed and the quit is
+// certain — the one safe place to tear the engine / OSC / autosave down.
+app.on('will-quit', shutdown)

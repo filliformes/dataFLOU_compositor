@@ -20,6 +20,7 @@ import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useStore } from '../store'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
+import { carryLearnedTuning } from './StateTriggersSection'
 import type {
   InstrumentTemplate,
   PoseSequence,
@@ -183,10 +184,13 @@ export function PoseSequenceCard({
       aliveRef.current = false
       if (cancelRef.current) {
         cancelRef.current.cancelled = true
+        cancelRef.current = null
         // We owned an in-flight companion run → release its engine-side
-        // suppression + busy flag so nothing stays paused after unmount.
+        // suppression so nothing stays paused after unmount. The busy
+        // lock is NOT released here: the run's own epilogue releases it
+        // once its in-flight stateTriggerRecord settles (the engine has
+        // a single record slot — a new capture must wait for it).
         void window.api?.poseSequenceSuppress?.(tid, sid, false)
-        setPoseRecordBusy(false)
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -201,11 +205,12 @@ export function PoseSequenceCard({
 
   function stopCompanion(): void {
     if (cancelRef.current) cancelRef.current.cancelled = true
-    // Un-suppress + release the app-wide record lock immediately; the
-    // loop epilogue also does this, but a long record-await could delay
-    // it, and the user just asked to stop.
+    cancelRef.current = null
+    // Un-suppress immediately (the user just asked to stop). The app-wide
+    // record lock stays held until the run's in-flight record-await
+    // settles — its epilogue releases it — so no new capture can start
+    // while the engine's single record slot is still busy.
     void window.api?.poseSequenceSuppress?.(template.id, seq.id, false)
-    setPoseRecordBusy(false)
     setRec(null)
     setRecMsLeft(0)
   }
@@ -213,69 +218,77 @@ export function PoseSequenceCard({
   async function runCompanion(): Promise<void> {
     // Bail if THIS card is running, or ANY capture is in flight anywhere
     // (single engine record slot — a second would corrupt the first).
-    if (rec || total === 0 || poseRecordBusy) return
+    if (rec || total === 0 || useStore.getState().poseRecordBusy) return
     setExpanded(true)
     const token = { cancelled: false }
     cancelRef.current = token
     setPoseRecordBusy(true)
+    // Per-run lock ownership: released exactly once, by this run, after
+    // its last await has settled (even when Stop / unmount cancelled it).
+    let lockHeld = true
     // Pause this sequence's live firing for the whole run, and rewind the
     // playhead so performing right after a record is clean.
     void window.api?.poseSequenceSuppress?.(template.id, seq.id, true)
     void window.api?.poseSequenceReset?.(template.id, seq.id)
-    for (let k = 0; k < seq.waypoints.length; k++) {
-      if (token.cancelled || !aliveRef.current) break
-      const wp = seq.waypoints[k]
-      // Only the loop that still owns cancelRef may write shared state —
-      // otherwise a cancelled loop whose await is still settling could
-      // clobber a newer run started after Stop → Rec-Seq.
-      const tick = (l: number): void => {
-        if (aliveRef.current && cancelRef.current === token) setRecMsLeft(l)
-      }
-      // 1) Get-ready countdown — move into the pose.
-      setRec({ phase: 'ready', step: k })
-      await waitTicks(READY_MS, token, tick)
-      if (token.cancelled || !aliveRef.current) break
-      // 2) Record — the engine collects the conditioned stream for holdMs.
-      //    Animate the bar alongside the (slightly longer) await.
-      setRec({ phase: 'rec', step: k })
-      void waitTicks(holdMs, token, tick)
-      const result = await window.api?.stateTriggerRecord?.(
-        template.id,
-        wp.id,
-        holdMs
-      )
-      if (token.cancelled || !aliveRef.current) break
-      if (result) {
-        updateWaypoint(template.id, seq.id, wp.id, {
-          learned: {
-            ...result,
-            threshold: wp.learned?.threshold ?? result.threshold
-          }
-        })
-      } else {
-        // Silent device → stop here. Mark the token cancelled so the
-        // fire-and-forget record-bar ticker stops immediately instead of
-        // running out the full hold window.
-        token.cancelled = true
-        if (aliveRef.current) {
-          window.alert(
-            `No data captured for "${wp.name}". Turn Hardware Mode ON for this instrument, make sure the device is streaming, then try again.`
-          )
+    try {
+      for (let k = 0; k < seq.waypoints.length; k++) {
+        if (token.cancelled || !aliveRef.current) break
+        const wp = seq.waypoints[k]
+        // Only the loop that still owns cancelRef may write shared state —
+        // otherwise a cancelled loop whose await is still settling could
+        // clobber a newer run started after Stop → Rec-Seq.
+        const tick = (l: number): void => {
+          if (aliveRef.current && cancelRef.current === token) setRecMsLeft(l)
         }
-        break
+        // 1) Get-ready countdown — move into the pose.
+        setRec({ phase: 'ready', step: k })
+        await waitTicks(READY_MS, token, tick)
+        if (token.cancelled || !aliveRef.current) break
+        // 2) Record — the engine collects the conditioned stream for holdMs.
+        //    Animate the bar alongside the (slightly longer) await.
+        setRec({ phase: 'rec', step: k })
+        void waitTicks(holdMs, token, tick)
+        const result = await window.api?.stateTriggerRecord?.(
+          template.id,
+          wp.id,
+          holdMs
+        )
+        if (token.cancelled || !aliveRef.current) break
+        if (result) {
+          updateWaypoint(template.id, seq.id, wp.id, {
+            learned: carryLearnedTuning(wp.learned, result)
+          })
+        } else {
+          // Silent device → stop here. Mark the token cancelled so the
+          // fire-and-forget record-bar ticker stops immediately instead of
+          // running out the full hold window.
+          token.cancelled = true
+          if (aliveRef.current) {
+            window.alert(
+              `No data captured for "${wp.name}". Turn Hardware Mode ON for this instrument, make sure the device is streaming, then try again.`
+            )
+          }
+          break
+        }
       }
-    }
-    // Tear down ONLY if we still own the run — a newer run may have
-    // replaced us (Stop → Rec-Seq) while our final await was settling.
-    if (cancelRef.current === token) {
-      void window.api?.poseSequenceSuppress?.(template.id, seq.id, false)
-      void window.api?.poseSequenceReset?.(template.id, seq.id)
-      setPoseRecordBusy(false)
-      if (aliveRef.current) {
-        setRec(null)
-        setRecMsLeft(0)
+    } finally {
+      // Tear down UI/engine state ONLY if we still own the run — Stop /
+      // unmount already un-suppressed and cleared cancelRef.
+      if (cancelRef.current === token) {
+        void window.api?.poseSequenceSuppress?.(template.id, seq.id, false)
+        void window.api?.poseSequenceReset?.(template.id, seq.id)
+        if (aliveRef.current) {
+          setRec(null)
+          setRecMsLeft(0)
+        }
+        cancelRef.current = null
       }
-      cancelRef.current = null
+      // The lock is always ours to release: nothing else can acquire it
+      // while we hold it, so no newer capture can be clobbered.
+      if (lockHeld) {
+        lockHeld = false
+        setPoseRecordBusy(false)
+      }
     }
   }
 
@@ -504,7 +517,6 @@ export function PoseSequenceCard({
                 liveScore={currentStep === i ? liveScore : 0}
                 recState={rowRecState(i)}
                 recMsLeft={rec && rec.step === i ? recMsLeft : 0}
-                recPhaseTotal={phaseTotal}
                 busy={rec !== null}
               />
             ))}
@@ -532,7 +544,6 @@ function WaypointRow({
   liveScore,
   recState,
   recMsLeft,
-  recPhaseTotal,
   busy
 }: {
   template: InstrumentTemplate
@@ -543,7 +554,6 @@ function WaypointRow({
   liveScore: number
   recState: RecState
   recMsLeft: number
-  recPhaseTotal: number
   busy: boolean
 }): JSX.Element {
   const updateWaypoint = useStore((s) => s.updateWaypoint)
@@ -567,7 +577,9 @@ function WaypointRow({
     updateWaypoint(template.id, seq.id, wp.id, p)
 
   async function record(): Promise<void> {
-    if (poseRecordBusy) return // another capture is already running
+    // Read the lock fresh (not the render closure) so a double-click
+    // can't start two captures in the same frame.
+    if (useStore.getState().poseRecordBusy) return // another capture is already running
     setRecording(true)
     setPoseRecordBusy(true)
     try {
@@ -580,13 +592,9 @@ function WaypointRow({
       )
       if (!aliveRef.current) return
       if (result) {
-        patch({
-          learned: {
-            ...result,
-            // Preserve a user-tuned threshold across re-records.
-            threshold: wp.learned?.threshold ?? result.threshold
-          }
-        })
+        // Preserve user tuning (threshold, tolerance, unticked dims)
+        // across re-records.
+        patch({ learned: carryLearnedTuning(wp.learned, result) })
       } else {
         window.alert(
           'Nothing recorded — the bound Hardware-Mode device sent no packets during the window. Check that HW Mode is enabled and the device is streaming.'
@@ -605,7 +613,7 @@ function WaypointRow({
   const isDone = recState === 'done'
   // Companion recording dominates the row visual; otherwise the live
   // perform playhead (isCurrent) provides the subtle highlight.
-  const rowStyle: React.CSSProperties = isRec
+  const rowStyle: CSSProperties = isRec
     ? {
         outline: '2px solid rgb(var(--c-danger))',
         background: 'rgb(var(--c-danger) / 0.14)',

@@ -48,6 +48,12 @@ function rateLimitedError(...args: unknown[]): void {
   }
 }
 
+// After a failed open, wait this long before the next attempt on the same
+// port name. Long enough that tick-rate sends to a missing device don't
+// churn native handles / flood errors; short enough that a re-plugged
+// device comes back mid-show without a restart.
+const OPEN_RETRY_MS = 2000
+
 // MIDI status nibbles for the three event types we currently emit.
 const STATUS_NOTE_OFF = 0x80
 const STATUS_NOTE_ON = 0x90
@@ -77,9 +83,10 @@ export class MidiOutSender {
   /** Map keyed by port name → open RtMidi Output instance. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private ports = new Map<string, any>()
-  /** Tracks "we tried to open this and it failed" so we don't
-   *  re-attempt the open on every send (which would log a flood). */
-  private failedPorts = new Set<string>()
+  /** Port name → earliest time (ms) of the next open attempt after a
+   *  failure, so we don't re-attempt the open on every send (which
+   *  would log a flood) but still recover when the device reappears. */
+  private retryAfter = new Map<string, number>()
   /** Global on/off — when false every send is a no-op and any open
    *  ports are closed. Matches `session.midiEnabled`. */
   private enabled = true
@@ -119,9 +126,10 @@ export class MidiOutSender {
       const n = probe.getPortCount()
       for (let i = 0; i < n; i++) out.push(probe.getPortName(i))
       // A port that previously failed to open but is now visible again
-      // (device re-plugged) should get a fresh chance — clear it from
-      // the failed set so openOrGet retries instead of short-circuiting.
-      for (const name of out) this.failedPorts.delete(name)
+      // (device re-plugged) should get a fresh chance — clear its retry
+      // back-off so the next send retries immediately. (A failed open
+      // destroys its handle, so this can't accumulate native handles.)
+      for (const name of out) this.retryAfter.delete(name)
       return out
     } catch (e) {
       this.lastError = (e as Error).message
@@ -147,7 +155,7 @@ export class MidiOutSender {
 
   /** Send a CC. Opens the port lazily on first use. Drops silently
    *  if globally disabled, native module missing, or the port name
-   *  has previously failed to open. */
+   *  failed to open within the last OPEN_RETRY_MS. */
   sendCc(portName: string, channel: number, cc: number, value: number): void {
     if (!this.enabled || !midiNative) return
     if (!portName) return
@@ -232,7 +240,7 @@ export class MidiOutSender {
       void name
     })
     this.ports.clear()
-    this.failedPorts.clear()
+    this.retryAfter.clear()
   }
 
   /** Engine shutdown — same as closeAll. */
@@ -243,21 +251,35 @@ export class MidiOutSender {
   // ── Internals ──────────────────────────────────────────────────
 
   /** Lazy open. Returns the RtMidi Output for `portName` or null if
-   *  the port doesn't exist (we record the failure so subsequent
-   *  sends to the same name short-circuit without re-trying). */
+   *  the port doesn't exist / can't be opened (we record a retry-after
+   *  time so subsequent sends short-circuit for OPEN_RETRY_MS). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private openOrGet(portName: string): any | null {
     if (!midiNative) return null
     const existing = this.ports.get(portName)
     if (existing) return existing
-    if (this.failedPorts.has(portName)) return null
+    const retryAt = this.retryAfter.get(portName)
+    if (retryAt !== undefined && Date.now() < retryAt) return null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let out: any = null
     try {
-      const out = new midiNative.Output()
+      out = new midiNative.Output()
+      // openPortByName returns undefined WITHOUT throwing when no port
+      // has that name — an unopened Output's sends are silent no-ops,
+      // so verify before caching it.
       out.openPortByName(portName)
+      if (!out.isPortOpen()) throw new Error('port not found')
       this.ports.set(portName, out)
+      this.retryAfter.delete(portName)
       return out
     } catch (e) {
-      this.failedPorts.add(portName)
+      // Free the native handle — never cache a half-open Output.
+      try {
+        out?.destroy?.()
+      } catch {
+        /* ignore */
+      }
+      this.retryAfter.set(portName, Date.now() + OPEN_RETRY_MS)
       const message = `Could not open MIDI port "${portName}": ${(e as Error).message}`
       rateLimitedError('[MIDI]', message)
       this.lastError = message
@@ -305,7 +327,7 @@ export class MidiOutSender {
       // it so the NEXT send re-opens lazily via openOrGet — otherwise
       // we'd keep sending to the same dead handle forever and the port
       // would never recover even after the device is re-plugged. We do
-      // NOT add it to failedPorts (that's for open failures); a
+      // NOT set a retryAfter back-off (that's for open failures); a
       // reconnect should just re-open cleanly.
       try {
         port.closePort?.()

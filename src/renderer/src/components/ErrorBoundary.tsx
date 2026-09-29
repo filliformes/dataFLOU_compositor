@@ -30,9 +30,39 @@ export class ErrorBoundary extends Component<Props, State> {
     // eslint-disable-next-line no-console
     console.error('[ErrorBoundary]', error, info)
     this.setState({ error, info })
+    this.armCloseFallback()
   }
 
-  reset = (): void => this.setState({ error: null, info: null })
+  componentWillUnmount(): void {
+    this.disarmCloseFallback()
+  }
+
+  // Close-handshake fallback. Main preventDefault()s every window close
+  // and waits for the renderer to answer `app:before-close` (App's
+  // Save-before-quit modal → appCloseProceed). While this fallback UI is
+  // showing, App is unmounted and its listener is gone, so the window
+  // could never be closed. Answer on App's behalf by letting the close
+  // proceed — no save attempt: the store may be the thing that crashed,
+  // and overwriting the user's file with it would be worse. Autosave
+  // still holds the last session main received.
+  private offBeforeClose: (() => void) | null = null
+  private armCloseFallback(): void {
+    if (this.offBeforeClose) return
+    this.offBeforeClose =
+      window.api?.onAppBeforeClose?.(() => {
+        void window.api?.appCloseProceed?.()
+      }) ?? null
+  }
+  private disarmCloseFallback(): void {
+    if (this.offBeforeClose) this.offBeforeClose()
+    this.offBeforeClose = null
+  }
+
+  reset = (): void => {
+    // App remounts and registers its own listener again.
+    this.disarmCloseFallback()
+    this.setState({ error: null, info: null })
+  }
 
   render(): ReactNode {
     if (!this.state.error) return this.props.children

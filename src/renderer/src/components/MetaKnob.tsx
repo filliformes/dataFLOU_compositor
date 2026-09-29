@@ -13,7 +13,7 @@
 // Drag sensitivity: 200 px of vertical travel = full 0..1 range. Shift = 4×
 // slower. Double-click resets to 0.
 
-import { memo, useRef } from 'react'
+import { memo, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { scaleMetaValue } from '@shared/factory'
 import type { MetaKnob as MetaKnobModel } from '@shared/types'
@@ -75,7 +75,17 @@ function MetaKnobImpl({
     startValue: number
     pointerId: number
     lastTarget: number
+    // Shift (fine mode) state the current anchor was taken with.
+    fine: boolean
   } | null>(null)
+
+  // Unmount mid-drag (bank switch via MIDI, bar hidden, …): no pointerup
+  // will ever reach us, so give the cursor back.
+  useEffect(() => {
+    return () => {
+      if (dragRef.current) document.body.style.cursor = ''
+    }
+  }, [])
 
   const display = displayValue
   const scaled = scaleMetaValue(display, knob.min, knob.max, knob.curve)
@@ -96,14 +106,18 @@ function MetaKnobImpl({
       setSelected(index)
       return
     }
-    ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
+    // Capture on the knob container (currentTarget), NOT e.target: the
+    // press often lands on the value-arc <path>, which unmounts when the
+    // value drops to 0 — taking the capture (and the pointerup) with it.
+    e.currentTarget.setPointerCapture(e.pointerId)
     dragRef.current = {
       startY: e.clientY,
       // Start the drag from the currently-displayed value so the knob
       // doesn't jump if a tween was mid-flight.
       startValue: displayValue,
       pointerId: e.pointerId,
-      lastTarget: displayValue
+      lastTarget: displayValue,
+      fine: e.shiftKey
     }
     // Hide the cursor while dragging — matches Ableton / hardware DAW
     // convention where the pointer "lives inside" the knob during edit.
@@ -115,8 +129,17 @@ function MetaKnobImpl({
   function onPointerMove(e: React.PointerEvent<HTMLDivElement>): void {
     const d = dragRef.current
     if (!d || e.pointerId !== d.pointerId) return
+    // Shift pressed / released mid-drag: re-anchor at the current
+    // position + value so only FUTURE travel uses the new sensitivity.
+    // Otherwise the whole drag distance so far was rescaled and the
+    // knob jumped.
+    if (e.shiftKey !== d.fine) {
+      d.startY = e.clientY
+      d.startValue = d.lastTarget
+      d.fine = e.shiftKey
+    }
     const dy = d.startY - e.clientY // drag up = increase
-    const sensitivity = e.shiftKey ? 4 : 1
+    const sensitivity = d.fine ? 4 : 1
     const delta = dy / (DRAG_PIXELS_FOR_FULL_RANGE * sensitivity)
     const next = Math.max(0, Math.min(1, d.startValue + delta))
     d.lastTarget = next
@@ -126,14 +149,13 @@ function MetaKnobImpl({
     setKnobTarget(index, next, knob.smoothMs)
   }
 
-  function onPointerUp(e: React.PointerEvent<HTMLDivElement>): void {
+  // Ends the drag. Reached from pointerup / pointercancel AND from
+  // lostpointercapture (capture yanked without an up — the old code then
+  // left the cursor hidden and the drag armed). Idempotent: whichever
+  // fires first commits, the rest no-op.
+  function endDrag(pointerId: number): void {
     const d = dragRef.current
-    if (!d || e.pointerId !== d.pointerId) return
-    try {
-      ;(e.target as HTMLElement).releasePointerCapture(e.pointerId)
-    } catch {
-      /* ignore */
-    }
+    if (!d || pointerId !== d.pointerId) return
     // Commit the final target to the session so it persists. The smoother
     // may still be finishing the last tween — that's fine, display will
     // settle on the same value.
@@ -141,6 +163,17 @@ function MetaKnobImpl({
     dragRef.current = null
     // Restore the cursor (we hid it on pointerdown).
     document.body.style.cursor = ''
+  }
+
+  function onPointerUp(e: React.PointerEvent<HTMLDivElement>): void {
+    const d = dragRef.current
+    if (!d || e.pointerId !== d.pointerId) return
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    endDrag(e.pointerId)
   }
 
   function onDoubleClick(): void {
@@ -177,6 +210,7 @@ function MetaKnobImpl({
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
+        onLostPointerCapture={(e) => endDrag(e.pointerId)}
         onDoubleClick={onDoubleClick}
       >
         {learnOverlayClass && (

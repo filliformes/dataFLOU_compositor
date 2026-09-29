@@ -11,10 +11,7 @@ import type {
   EnvelopeParams,
   LfoShape,
   Modulation,
-  RampParams,
-  RandomParams,
-  SampleHoldParams,
-  SlewParams
+  RampParams
 } from '@shared/types'
 
 // ─────────────────────────────────────────────────────────────────

@@ -97,6 +97,10 @@ const api: ExposedApi = {
   networkGetForwardDiag: () => ipcRenderer.invoke('network:getForwardDiag'),
   networkClearForwardDiag: () =>
     ipcRenderer.invoke('network:clearForwardDiag'),
+  // v0.6.6 -- Device subscriptions (Pandore IMU, …)
+  oscSubsGetStatus: () => ipcRenderer.invoke('oscSubs:getStatus'),
+  oscSubsProbe: (opts) => ipcRenderer.invoke('oscSubs:probe', opts),
+  oscSubsResubscribe: (id) => ipcRenderer.invoke('oscSubs:resubscribe', id),
   // v0.5.10 -- package version (sourced from package.json via
   // Electron's app.getVersion()). Renderer reads this once on mount
   // to populate the window title.
@@ -152,7 +156,8 @@ const api: ExposedApi = {
 
   // ── App lifecycle ────────────────────────────────────────────────
   // Save without prompting — writes to the app's Sessions folder.
-  // Returns the absolute path the file landed on (or null on error).
+  // Resolves with the absolute path the file landed on; REJECTS on a
+  // write error (so the quit / new-session flows can show it).
   sessionSaveToDefault: (s) => ipcRenderer.invoke('session:saveToDefault', s),
   // Renderer signals main: "ok to close the window, I'm done with
   // the Save-before-quit modal." Main sets its appQuitting flag
@@ -160,8 +165,15 @@ const api: ExposedApi = {
   appCloseProceed: () => ipcRenderer.invoke('app:close-proceed'),
   // Main asks renderer to show the save-before-quit modal. The
   // renderer's listener replies by calling `appCloseProceed`.
+  // Once the listener has run we ack, which disarms main's close
+  // watchdog — without an ack (renderer hung, listener never
+  // registered) main closes as Discard after a few seconds so the
+  // window can't become unclosable.
   onAppBeforeClose: (cb) => {
-    const h = (): void => cb()
+    const h = (): void => {
+      cb()
+      ipcRenderer.send('app:before-close-ack')
+    }
     ipcRenderer.on('app:before-close', h)
     return () => ipcRenderer.off('app:before-close', h)
   }

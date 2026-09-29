@@ -17,7 +17,6 @@ import type {
   Cell,
   DerivedOp,
   EngineState,
-  GenerativeConfig,
   InputConditionerConfig,
   InputStage,
   InstrumentTemplate,
@@ -25,13 +24,11 @@ import type {
   LfoShape,
   Modulation,
   OscEvent,
-  PoseSequence,
   PoseWaypoint,
   Scene,
   SequencerParams,
   Session,
-  StateTrigger,
-  Track
+  StateTrigger
 } from '@shared/types'
 import {
   META_KNOB_COUNT,
@@ -60,11 +57,16 @@ interface ConditionerStageState {
   // autoRange — leaky min/max envelope
   min?: number
   max?: number
+  // autoRange — widest (max − min) span ever observed; floors how far
+  // contraction may shrink the range (see applyStage).
+  peakSpan?: number
 }
 interface ConditionerSlotState {
   lastT: number
-  // Ordered stage-type signature (e.g. "median,oneEuro"); re-warm when
-  // it changes so stale per-stage state can't bleed across a type swap.
+  // Ordered stage signature — type + enabled flag + address scope per
+  // stage (e.g. "median:1:,oneEuro:0:/mpu/roll"); re-warm when it
+  // changes so stale per-stage state can't bleed across a type swap,
+  // an enable toggle, or a re-scope.
   sig: string
   stages: ConditionerStageState[]
 }
@@ -124,9 +126,35 @@ const CONDITIONER_SCOPE_LEN = 2000
 // it's a cheap array push per matching packet). After this it's
 // pruned and its buffer freed.
 const CONDITIONER_SCOPE_TTL_MS = 5 * 60 * 1000
+// autoRange contraction floor (see applyStage 'autoRange'): the tracked
+// range never shrinks below max(ABS, FRAC × widest span observed).
+const AUTORANGE_MIN_SPAN_ABS = 1e-6
+const AUTORANGE_MIN_SPAN_FRAC = 0.05
 // Gate length for a State Trigger note in 'oneShot' mode — there is no
 // exit event to release it, so it auto-releases after this.
 const STATE_ONESHOT_GATE_MS = 200
+// Exit-hold fallback for State Triggers saved without `holdMs` — matches
+// the factory default (makeStateTrigger) and the UI's displayed default.
+const STATE_HOLD_MS_DEFAULT = 250
+// Learned-pose tolerance fallback — matches finishStateRecording's
+// default and the UI's displayed default.
+const LEARNED_TOLERANCE_DEFAULT = 0.3
+
+// Bound on absolute-time catch-up loops (`while (t - lastAt >= period)`).
+// After a long stall (sleep/wake, debugger pause) or a stale anchor (a
+// modulator type switched to mid-play, whose clock was last set at
+// trigger), the backlog could be thousands of periods — one tick would
+// burn through all of them. Past this many periods we snap the anchor so
+// the loop advances exactly once and resumes from `t`. The ms floor
+// keeps normal operation untouched: a regular backlog is one tick
+// interval (≤ 100 ms at the 10 Hz minimum tick rate), which a 1 ms
+// sequencer step would otherwise exceed 64× on every tick.
+const MAX_CATCHUP_PERIODS = 64
+const MIN_CATCHUP_WINDOW_MS = 250
+function snapStaleClock(lastAt: number, t: number, period: number): number {
+  const limit = Math.max(period * MAX_CATCHUP_PERIODS, MIN_CATCHUP_WINDOW_MS)
+  return t - lastAt > limit ? t - period : lastAt
+}
 
 // Generative history ring buffer length. Caps the no-repeat memory
 // and the shuffle-cycle "already played" set. ~24 entries covers a
@@ -225,7 +253,6 @@ function snapToScale(floatNote: number, intervals: number[], root: number): numb
 // ─────────────────────────────────────────────────────────────────
 interface Mod2State {
   phase: number
-  rndStepLastTick: number
   rndStepValue: number
   rndSmoothPrev: number
   rndSmoothNext: number
@@ -269,7 +296,6 @@ interface Mod2State {
 function makeMod2State(): Mod2State {
   return {
     phase: 0,
-    rndStepLastTick: -1,
     rndStepValue: 0,
     rndSmoothPrev: 0,
     rndSmoothNext: 0,
@@ -305,6 +331,16 @@ interface TrackState {
   phase: number
   // hrtime ms when the current clip was last triggered (for envelope time math).
   triggerTime: number
+  // Motion Loop playback phase anchor (hrtime ms, same clock as the
+  // tick's `t`): the triggerTime of the (re)trigger that started this
+  // clip, so a recorded loop restarts from frame 0 on every (re)trigger
+  // and keeps its phase through pause/resume and the stop fade. Kept
+  // apart from triggerTime because a Ramp mode flip rewrites
+  // triggerTime mid-play and must not restart the loop.
+  // `loopAnchorTrig` = the triggerTime value the anchor was synced
+  // from; a mismatch means a fresh (re)trigger happened since.
+  loopAnchorAt: number
+  loopAnchorTrig: number
   // Center morph — arrays so a multi-value cell morphs each slot independently.
   // Lengths may differ between triggers; padding with zeros for missing slots.
   fromCenter: number[]
@@ -312,7 +348,6 @@ interface TrackState {
   morphStart: number // hrtime ms
   morphMs: number
   // Stepped-random helpers
-  rndStepLastTick: number
   rndStepValue: number
   rndSmoothPrev: number
   rndSmoothNext: number
@@ -444,6 +479,10 @@ interface TrackState {
   stopping: boolean
   armed: boolean
   delayTimer: NodeJS.Timeout | null
+  // Scene whose cell is waiting on `delayTimer` (the track isn't armed
+  // yet, so stopScene / stopCell / an orphan-stop can't find it through
+  // `activeSceneId`). Null when no delay is pending.
+  pendingSceneId: string | null
   // ── MIDI Note tracking ───────────────────────────────────────────
   // Last (note, channel, port) of a Note On still hanging (no Note
   // Off sent yet). Null when no note is currently held. The engine
@@ -464,14 +503,25 @@ interface TrackState {
   // doesn't leave a stale timer firing the Note Off after the new
   // note has already started.
   midiGateTimer: NodeJS.Timeout | null
+  // Last note NUMBER fired on this track. Unlike `midiHeldNote` it
+  // survives the gate timer's Note Off, so the note-number-change edge
+  // compares against what was last PLAYED — a gated static note fires
+  // once instead of re-striking every gate period.
+  midiLastNoteNum: number | null
+  // A fresh (re)trigger owes a Note On. Set in triggerCell's start(),
+  // consumed by the first note emit — deferred to the end of the
+  // cell's transition / scene morph so a glide lands one note on its
+  // target instead of re-striking the old note or playing a chromatic
+  // run through every intermediate value.
+  midiTriggerEdge: boolean
   // For non-numeric values we only send on change. The "source" key tracks
   // scene/step so we know when to re-send.
   lastSentString: string | null
   lastStringAtSceneId: string | null
   lastStringAtStep: number
-  // Last numeric value sent per arg position. Persistence reads from
-  // here on every tick to freeze pinned slots at their last value.
-  // Grows on demand to match the sent-out array length.
+  // Last numeric value computed per arg position (written every tick,
+  // even when Hold suppresses the send). Hardware Mode's catch test
+  // compares the knob against it; the Hold dedup snapshots it.
   lastSentNumeric: number[]
   // Last velocity actually pushed out on a noteOn — including any
   // humanize jitter the engine added. The renderer reads this so the
@@ -493,11 +543,12 @@ function makeTrackState(): TrackState {
   return {
     phase: 0,
     triggerTime: 0,
+    loopAnchorAt: 0,
+    loopAnchorTrig: -1,
     fromCenter: [],
     toCenter: [],
     morphStart: 0,
     morphMs: 0,
-    rndStepLastTick: -1,
     rndStepValue: 0,
     rndSmoothPrev: 0,
     rndSmoothNext: 0,
@@ -554,11 +605,14 @@ function makeTrackState(): TrackState {
     stopping: false,
     armed: false,
     delayTimer: null,
+    pendingSceneId: null,
     midiHeldNote: null,
     midiHeldChannel: 0,
     midiHeldPort: '',
     midiLastCc: new Map(),
     midiGateTimer: null,
+    midiLastNoteNum: null,
+    midiTriggerEdge: false,
     lastSentString: null,
     lastSentNumeric: [],
     lastStringAtSceneId: null,
@@ -771,6 +825,25 @@ function formatFixedAsOscArg(spec: import('@shared/types').ParamArgSpec): {
     : { type: 'f', value: n }
 }
 
+// Every Parameter of `tpl` whose resolved OSC address equals `address`
+// (relative oscPaths resolve against the template base, exactly as
+// instantiation does). Used by the hardware Direct Output + Motion Loop
+// paths, which work per Parameter rather than per placed Track.
+function templateFunctionsAt(
+  tpl: InstrumentTemplate,
+  address: string
+): InstrumentTemplate['functions'] {
+  const base = tpl.oscAddressBase || ''
+  return tpl.functions.filter((f) => {
+    const a = f.oscPath.startsWith('/')
+      ? f.oscPath
+      : base.endsWith('/')
+        ? base + f.oscPath
+        : `${base}/${f.oscPath}`
+    return a === address
+  })
+}
+
 function predictModRange(m: Modulation, center: number): { min: number; max: number } {
   if (!m.enabled) return { min: center, max: center }
   const depth01 = Math.max(0, Math.min(1, m.depthPct / 100))
@@ -929,27 +1002,32 @@ function computeCycleRanges(
     max: -Infinity
   }))
   const stepCount = effectiveSteps(cell)
-  // For Ratchet, sample (step × subIdx ∈ [0, maxDiv)) so the scatter's
-  // sub-pulse range counts toward the cycle min/max. Other modes
-  // collapse subIdx=0, subdiv=1. Cap matches the runtime cap in
-  // `ratchetStepParams` (16) — earlier this was 8 and Ratchet bursts
-  // with maxDiv ∈ (8, 16] were under-sampled, causing scaleToUnit
-  // auto-range to clip the loudest sub-pulses.
-  const maxDiv =
-    cell.sequencer.mode === 'ratchet'
-      ? Math.max(2, Math.min(16, Math.floor(cell.sequencer.ratchetMaxDiv)))
-      : 1
+  const isRatchet = cell.sequencer.mode === 'ratchet'
+  const sample = (i: number, sub: number, subdiv: number): void => {
+    const raw = resolveStepBaseRaw(cell, ts, i, sub, subdiv)
+    const toks = parseValueTokens(raw)
+    toks.forEach((tok, idx) => {
+      if (idx >= ranges.length) return
+      const n = parseFloat(tok)
+      if (!Number.isFinite(n)) return
+      if (n < ranges[idx].min) ranges[idx].min = n
+      if (n > ranges[idx].max) ranges[idx].max = n
+    })
+  }
   for (let i = 0; i < stepCount; i++) {
-    for (let sub = 0; sub < maxDiv; sub++) {
-      const raw = resolveStepBaseRaw(cell, ts, i, sub, maxDiv)
-      const toks = parseValueTokens(raw)
-      toks.forEach((tok, idx) => {
-        if (idx >= ranges.length) return
-        const n = parseFloat(tok)
-        if (!Number.isFinite(n)) return
-        if (n < ranges[idx].min) ranges[idx].min = n
-        if (n > ranges[idx].max) ranges[idx].max = n
-      })
+    // Un-burst step (subdiv 1) — every mode, and Ratchet steps whose
+    // probability roll doesn't fire.
+    sample(i, 0, 1)
+    if (!isRatchet) continue
+    // Ratchet — the tick rolls subdiv ∈ [2, maxDiv] per step, and the
+    // sub-pulse shaping depends on the subdiv actually rolled (e.g.
+    // 'octaves' emits value / subdiv), so sample EVERY reachable burst
+    // size, not just maxDiv (which under-covered the range and made
+    // scaleToUnit auto-range clip). maxDiv is per-step (Variation) and
+    // resolved exactly as the tick does, via ratchetStepParams.
+    const maxDiv = ratchetStepParams(cell.sequencer, i).maxDiv
+    for (let subdiv = 2; subdiv <= maxDiv; subdiv++) {
+      for (let sub = 0; sub < subdiv; sub++) sample(i, sub, subdiv)
     }
   }
   // Replace Infinity with sentinel zeros when no numeric token at
@@ -967,8 +1045,7 @@ function lfo(
   // structurally so both TrackState (Mod 1) and Mod2State (Mod 2)
   // can be passed without a refactor — they each carry these three
   // fields, even though their broader shapes differ.
-  state: { rndStepValue: number; rndSmoothPrev: number; rndSmoothNext: number },
-  tickIdx: number
+  state: { rndStepValue: number; rndSmoothPrev: number; rndSmoothNext: number }
 ): number {
   // phase in [0,1). Returns [-1, 1]
   const p = phase - Math.floor(phase)
@@ -1041,6 +1118,11 @@ export class SceneEngine {
   // forward by the pause duration so the elapsed time picks up where it
   // left off rather than jumping ahead.
   private pauseStartedAt: number | null = null
+  // Effective duration (ms) armed for the active scene by
+  // armSceneAdvance — generative roll > slot override > scene Dur.
+  // Published as EngineState.activeSceneDurationMs; null when no scene
+  // is active.
+  private activeSceneDurationMs: number | null = null
   private sceneAdvanceTimer: NodeJS.Timeout | null = null
   private onStateChange: ((s: EngineState) => void) | null = null
   // ── Two-stage modulator: live Mod 1 preview ─────────────────────
@@ -1080,14 +1162,34 @@ export class SceneEngine {
   // per-slot emit loop reads this between pitch snap and pin to
   // override the scene's computed value.
   private hardwareOverride: Map<string, number> = new Map()
+  // Tracks whose reset-mode catches were just cleared by a scene change.
+  // Until the tick emits a fresh value for the track, its
+  // `lastSentNumeric` still holds the knob value the override was
+  // sending — a moving knob would "catch" against itself and re-take
+  // the new scene instantly. Float soft-takeover is skipped for these
+  // tracks until their next numeric emit clears the entry.
+  private hwCatchAwaitingEmit: Set<string> = new Set()
   // (v0.6.4) Derived Parameters. `derivedSourceLatest` holds the latest
   // RAW slot-0 value per real source address (global-by-address; a single
   // bound device per template in practice). `derivedLatest` holds the
   // computed value per synthetic derived address, for the inspector's
-  // live readout. `hasAnyDerived` fast-paths the recompute block.
+  // live readout. `hasAnyDerived` fast-paths the recompute block;
+  // `derivedSourceAddrs` is the set of addresses any derived param
+  // sources (only those are cached). Both refreshed in updateSession.
   private derivedSourceLatest: Map<string, number> = new Map()
   private derivedLatest: Map<string, number> = new Map()
   private hasAnyDerived = false
+  private derivedSourceAddrs: Set<string> = new Set()
+  // Derived params awaiting recompute, keyed
+  // `${ip}|${port}|${templateId}|${derivedAddress}`. A source message
+  // only marks its derived params dirty; one microtask flush per
+  // incoming datagram recomputes each ONCE, after every message of the
+  // bundle has refreshed its source (see flushDerived).
+  private derivedPending: Map<
+    string,
+    { ip: string; port: number; templateId: string; address: string }
+  > = new Map()
+  private derivedFlushScheduled = false
   // (v0.6.x) Motion Loop recording. Non-null while a scene is armed for
   // capture: every matching hardware packet appends a conditioned+scaled
   // frame per trackId. stopMotionLoopRecord() drains this and hands the
@@ -1118,6 +1220,11 @@ export class SceneEngine {
   // "every scene once before any repeats" guarantee. Capped at
   // GENERATIVE_HISTORY_LEN entries.
   private generativeHistory: string[] = []
+  // Shuffle Cycle bookkeeping: scenes played since the current cycle
+  // began. Kept separately from generativeHistory because the ring is
+  // capped (a pool larger than GENERATIVE_HISTORY_LEN could never
+  // complete a cycle) and can't tell where one cycle ended.
+  private shuffleCyclePlayed = new Set<string>()
   // Per-scene most-recent generative auto-roll, in ms. Mirrored
   // into EngineState so the Scene Inspector can overlay the rolled
   // duration on the Dur input for ANY focused scene that's been
@@ -1150,9 +1257,10 @@ export class SceneEngine {
   // `${templateId}|${address}|${slot}` so MULTIPLE surfaces can watch
   // at once (the Instrument section's scope AND a Parameter
   // inspector's scope). TTL model: polling a watch refreshes its
-  // lastPollMs; handleHardwareInput prunes watches not polled in
-  // ~1.5s, so a closed/unmounted scope stops costing anything without
-  // any explicit teardown. Empty map = zero per-packet cost.
+  // lastPollMs; handleHardwareInput prunes watches not polled within
+  // CONDITIONER_SCOPE_TTL_MS (5 min), so a closed/unmounted scope stops
+  // costing anything without any explicit teardown. Empty map = zero
+  // per-packet cost.
   private conditionerScopes: Map<
     string,
     {
@@ -1239,7 +1347,6 @@ export class SceneEngine {
   // In-flight learn-by-demonstration recording session, or null.
   private stateRecording: {
     templateId: string
-    stateId: string
     until: number
     samples: Map<string, number[][]>
     finalize: (result: LearnedState | null) => void
@@ -1282,7 +1389,6 @@ export class SceneEngine {
     this.liveValues = {}
     this.lastTickAt = 0
     this.lastValueEmitAt = 0
-    this.tickIdx = 0
     this.activeSceneId = null
     this.activeSceneStartedAt = null
     this.activeSequenceSlotIdx = null
@@ -1455,6 +1561,7 @@ export class SceneEngine {
       activeSceneStartedAt: this.activeSceneStartedAt,
       activeSequenceSlotIdx: this.activeSequenceSlotIdx,
       pausedAt: this.pauseStartedAt,
+      activeSceneDurationMs: this.activeSceneId ? this.activeSceneDurationMs : null,
       tickRateHz: this.session.tickRateHz,
       hardwareCaughtByTrack,
       lastEmittedVelocityByCell: lastVel,
@@ -1483,13 +1590,15 @@ export class SceneEngine {
    * typically have <10 templates so a Map index isn't worth the
    * coherency overhead vs. updateSession.
    */
-  /** (Bug 7) True while any track is still fading out ('stopping'
-   *  morph-out in progress). Used by the 'whenIdle' forward policy so
-   *  the controller stays suppressed until the fade actually finishes,
-   *  not just until activeSceneId is nulled. */
-  private isAnyTrackStopping(): boolean {
+  /** (Bug 7) True while any track is playing (armed) or still fading
+   *  out ('stopping' morph-out in progress). Used by the 'whenIdle'
+   *  forward policy so the controller stays suppressed until the fade
+   *  actually finishes, not just until activeSceneId is nulled — and
+   *  while a cell triggered on its own (no scene, so activeSceneId is
+   *  null) is playing. */
+  private isAnyTrackActive(): boolean {
     for (const ts of this.tracks.values()) {
-      if (ts.stopping) return true
+      if (ts.armed || ts.stopping) return true
     }
     return false
   }
@@ -1531,11 +1640,12 @@ export class SceneEngine {
       // seconds). If we un-suppressed during that fade, the controller
       // would byte-forward downstream WHILE the engine is still emitting
       // the fading cell values → dual emission. Idle = no active scene
-      // AND no track currently stopping.
+      // AND no track playing or stopping (a cell triggered on its own
+      // plays with activeSceneId null — still not idle).
       if (
         fwdMode === 'whenIdle' &&
         this.activeSceneId === null &&
-        !this.isAnyTrackStopping()
+        !this.isAnyTrackActive()
       ) {
         continue
       }
@@ -1636,8 +1746,14 @@ export class SceneEngine {
     // one device is bound to one template in every real session.
     const rawArgs = numericArgs
     // (v0.6.4) Record this real address's latest RAW slot-0 value so
-    // Derived Parameters that source it can recompute below.
-    if (!fromDerived && this.hasAnyDerived && rawArgs.length > 0) {
+    // Derived Parameters that source it can recompute below. Only
+    // addresses some derived param actually sources are cached.
+    if (
+      !fromDerived &&
+      this.hasAnyDerived &&
+      rawArgs.length > 0 &&
+      this.derivedSourceAddrs.has(address)
+    ) {
       const v0 = rawArgs[0]
       if (Number.isFinite(v0)) {
         // Bound the map (delete oldest-inserted) so a device that sprays
@@ -1736,6 +1852,10 @@ export class SceneEngine {
     }
     const prevVals = perDevValues.get(address) ?? []
     const prevChange = perDevChange.get(address) ?? []
+    // The device's previous distinct value per slot, BEFORE this packet
+    // updates the baseline — the float catch below uses it to detect the
+    // knob sweeping across the scene value between two packets.
+    const prevValsBefore = prevVals.slice()
     // Pre-compute per-slot "is moving?" flags so each template can
     // check movement independently of which template's parameters
     // it's working with. Movement is a property of the hardware
@@ -1830,11 +1950,11 @@ export class SceneEngine {
       // cell.oscAddress (which inherits the function's default if
       // not overridden).
       for (const track of tracks) {
-        if (!this.activeSceneId) continue
-        const scene = this.session.scenes.find(
-          (s) => s.id === this.activeSceneId
-        )
-        const cell = scene?.cells[track.id]
+        // Resolve the cell this TRACK is actually playing (its own
+        // activeSceneId), not the global active scene — a cell
+        // triggered on its own, or one still playing from a scene the
+        // global pointer has moved past, is just as HW-controllable.
+        const cell = this.getActiveCell(track.id)
         if (!cell) continue
         if (cell.oscAddress !== address) continue
         // Resolve which arg slots the HW is locked to. Default =
@@ -1956,17 +2076,40 @@ export class SceneEngine {
           // Float-typed slot (or unknown — fall back to existing
           // tolerance check). Pull the most recent ts.lastSentNumeric
           // for this track. If nothing's been emitted yet, skip until
-          // the scene actually produces a value.
+          // the scene actually produces a value. Also skip right after
+          // a reset-mode scene change: until the new scene emits,
+          // lastSentNumeric is still the knob's own override value.
+          if (this.hwCatchAwaitingEmit.has(track.id)) continue
           const ts = this.tracks.get(track.id)
           const sceneVal = ts?.lastSentNumeric?.[i]
-          if (typeof sceneVal !== 'number') continue
-          // Catch tolerance is a fraction of the param's RANGE. For
-          // scaled-to-unit params the range is [0,1]; otherwise we
-          // fall back to a generous absolute tolerance derived from
-          // the value's magnitude.
-          const range = cell.scaleToUnit ? 1 : Math.max(1, Math.abs(sceneVal) * 2)
+          if (typeof sceneVal !== 'number' || !Number.isFinite(hwVal)) continue
+          // Catch tolerance is a fraction of the param's RANGE. With
+          // hardware scaling configured, the range is the parameter's
+          // mapped output span |outMax − outMin|; for scaled-to-unit
+          // params it's [0,1]; otherwise we fall back to a generous
+          // absolute tolerance derived from the value's magnitude.
+          const scaledSpan = hwScale ? Math.abs(hwScale.outMax - hwScale.outMin) : 0
+          const range =
+            hwScale && Number.isFinite(scaledSpan) && scaledSpan > 0
+              ? scaledSpan
+              : cell.scaleToUnit
+                ? 1
+                : Math.max(1, Math.abs(sceneVal) * 2)
           const tol = hw.catchTolerance * range
-          if (Math.abs(hwVal - sceneVal) <= tol) {
+          // Crossing detection — a fast sweep can jump straight over the
+          // tolerance window between two packets (one sample per packet),
+          // so also catch when the knob's previous and current positions
+          // lie on opposite sides of (or on) the scene value.
+          const prevRaw = prevValsBefore[i]
+          const prevHw = Number.isFinite(prevRaw)
+            ? hwScale
+              ? scaleHardwareValue(hwScale, prevRaw)
+              : prevRaw
+            : Number.NaN
+          const crossed =
+            Number.isFinite(prevHw) &&
+            (prevHw - sceneVal) * (hwVal - sceneVal) <= 0
+          if (crossed || Math.abs(hwVal - sceneVal) <= tol) {
             this.hardwareCaught.set(catchKey, true)
             this.hardwareOverride.set(catchKey, hwVal)
           }
@@ -1986,69 +2129,71 @@ export class SceneEngine {
       const dout = hw.directOutput
       if (!dout || !dout.enabled) continue
       if (!dout.destIp || !(dout.destPort > 0)) continue
-      // Match the incoming address to one of the template's Parameters
-      // (resolving relative oscPaths against the template base, exactly
-      // as instantiation does) to find its scaling + arg types.
-      const base = tpl.oscAddressBase || ''
-      const fn = tpl.functions.find((f) => {
-        const a = f.oscPath.startsWith('/')
-          ? f.oscPath
-          : base.endsWith('/')
-            ? base + f.oscPath
-            : `${base}/${f.oscPath}`
-        return a === address
-      })
-      if (!fn) continue
-      // Yield to a playing recorded loop (Motion Loop). If the active
-      // scene has an enabled recordedLoop on a track for THIS Parameter,
-      // the loop is the source (loop replaces live) and the engine tick
-      // is already emitting it to the cell's destination. Skip the live
-      // passthrough for this address so the two don't race on the M4L.
-      // Non-looped parameters keep flowing live, automatically.
-      if (this.activeSceneId) {
-        const activeScene = this.session.scenes.find(
-          (s) => s.id === this.activeSceneId
-        )
+      // Match the incoming address to the template's Parameters to find
+      // their scaling + arg types. EVERY matching Parameter emits (two
+      // Parameters may share an address with different scaling).
+      for (const fn of templateFunctionsAt(tpl, address)) {
+        // Yield to a playing recorded loop (Motion Loop). If a track for
+        // THIS Parameter is playing a cell with an enabled recordedLoop
+        // (resolved per track, like the catch loop — a cell can play
+        // outside the global active scene), the loop is the source (loop
+        // replaces live) and the engine tick is already emitting it to
+        // the cell's destination. Skip the live passthrough for this
+        // address so the two don't race on the M4L. Non-looped
+        // parameters keep flowing live, automatically.
         if (
-          activeScene &&
           this.session.tracks.some(
             (t) =>
               t.sourceTemplateId === tpl.id &&
               (t.sourceFunctionId ?? '') === fn.id &&
-              activeScene.cells[t.id]?.recordedLoop?.enabled === true
+              this.getActiveCell(t.id)?.recordedLoop?.enabled === true
           )
         ) {
           continue
         }
-      }
-      // Respect per-arg locks: when hw.args[fn.id] is a non-empty list,
-      // only those slots pass through (matches the catch loop). null =
-      // all slots.
-      const locked =
-        hw.args && hw.args[fn.id] && hw.args[fn.id].length > 0
-          ? hw.args[fn.id]
-          : null
-      const scale =
-        hw.scaling && hw.scaling[fn.id]?.enabled ? hw.scaling[fn.id] : null
-      const outArgs: { type: 'f' | 'i'; value: number }[] = []
-      for (let i = 0; i < numericArgs.length; i++) {
-        if (locked && !locked.includes(i)) continue
-        const v = numericArgs[i]
-        if (!Number.isFinite(v)) continue
-        const scaled = scale ? scaleHardwareValue(scale, v) : v
-        // Scaling always yields a float in the mapped range. Only emit
-        // an int token when the arg is declared int AND no scaling is
-        // active (an unscaled discrete slot — e.g. /mpu/btn1).
-        const declaredInt =
-          fn.argSpec && fn.argSpec[i] && fn.argSpec[i].type === 'int'
-        outArgs.push(
-          declaredInt && !scale
-            ? { type: 'i', value: Math.round(scaled) }
-            : { type: 'f', value: scaled }
-        )
-      }
-      if (outArgs.length > 0) {
-        this.sender.sendMany(dout.destIp, dout.destPort, address, outArgs)
+        // Per-arg locks: when hw.args[fn.id] is a non-empty list, only
+        // those slots are HW-mapped (scaled). The message stays FULL
+        // WIDTH so every arg keeps its position for the receiver —
+        // unlocked slots pass through as conditioned-but-unscaled.
+        // null = all slots mapped.
+        const locked =
+          hw.args && hw.args[fn.id] && hw.args[fn.id].length > 0
+            ? hw.args[fn.id]
+            : null
+        const scale =
+          hw.scaling && hw.scaling[fn.id]?.enabled ? hw.scaling[fn.id] : null
+        const outArgs: OscArg[] = []
+        for (let i = 0; i < numericArgs.length; i++) {
+          const spec = fn.argSpec?.[i]
+          const v = numericArgs[i]
+          // Declared fixed slot (protocol header, e.g. a string) — always
+          // its declared value, never scaled. This is also the only way
+          // to re-emit a string arg: the network layer only hands us
+          // numbers (strings arrive as NaN).
+          if (spec?.fixed !== undefined) {
+            outArgs.push(formatFixedAsOscArg(spec))
+            continue
+          }
+          if (!Number.isFinite(v)) {
+            // Other non-numeric arg — a neutral 0 keeps later args in
+            // position.
+            outArgs.push({ type: 'f', value: 0 })
+            continue
+          }
+          const slotScale = scale && (!locked || locked.includes(i)) ? scale : null
+          const out = slotScale ? scaleHardwareValue(slotScale, v) : v
+          // Scaling always yields a float in the mapped range. Only emit
+          // an int token when the arg is declared int AND the slot is
+          // unscaled (an unscaled discrete slot — e.g. /mpu/btn1).
+          outArgs.push(
+            spec?.type === 'int' && !slotScale
+              ? { type: 'i', value: Math.round(out) }
+              : { type: 'f', value: out }
+          )
+        }
+        if (outArgs.length > 0) {
+          this.sender.sendMany(dout.destIp, dout.destPort, address, outArgs)
+        }
       }
     }
 
@@ -2061,37 +2206,51 @@ export class SceneEngine {
     if (recLoop) {
       const recScene = this.session.scenes.find((s) => s.id === recLoop.sceneId)
       if (recScene) {
+        const tRel = now - recLoop.startMs
         for (const tpl of matchedTemplates) {
           const hw = tpl.hardwareMode!
-          const base = tpl.oscAddressBase || ''
-          const fn = tpl.functions.find((f) => {
-            const a = f.oscPath.startsWith('/')
-              ? f.oscPath
-              : base.endsWith('/')
-                ? base + f.oscPath
-                : `${base}/${f.oscPath}`
-            return a === address
-          })
-          if (!fn) continue
-          const scale =
-            hw.scaling && hw.scaling[fn.id]?.enabled ? hw.scaling[fn.id] : null
-          const vals = numericArgs.map((x) =>
-            Number.isFinite(x) ? (scale ? scaleHardwareValue(scale, x) : x) : 0
-          )
-          const tRel = now - recLoop.startMs
-          for (const track of this.session.tracks) {
-            if (track.sourceTemplateId !== tpl.id) continue
-            if ((track.sourceFunctionId ?? '') !== fn.id) continue
-            // NOTE: capture even when the scene has no clip yet for this
-            // parameter — stopMotionLoopRecord() auto-creates the clips on
-            // the renderer side so an empty scene records into fresh clips.
-            let arr = recLoop.frames.get(track.id)
-            if (!arr) {
-              arr = []
-              recLoop.frames.set(track.id, arr)
+          for (const fn of templateFunctionsAt(tpl, address)) {
+            const scale =
+              hw.scaling && hw.scaling[fn.id]?.enabled ? hw.scaling[fn.id] : null
+            // Honour the per-arg locks exactly like the catch loop: only
+            // HW-controlled slots are recorded. Slots outside the lock
+            // list (and non-numeric args) store NaN, which playback
+            // skips — so the loop never overrides a slot the hardware
+            // doesn't drive, and args keep their positions.
+            const locked =
+              hw.args && hw.args[fn.id] && hw.args[fn.id].length > 0
+                ? hw.args[fn.id]
+                : null
+            const vals = numericArgs.map((x, i) =>
+              Number.isFinite(x) && (!locked || locked.includes(i))
+                ? scale
+                  ? scaleHardwareValue(scale, x)
+                  : x
+                : Number.NaN
+            )
+            for (const track of this.session.tracks) {
+              if (track.sourceTemplateId !== tpl.id) continue
+              if ((track.sourceFunctionId ?? '') !== fn.id) continue
+              // Same instance narrowing as the catch loop — a copy the
+              // HW Mode doesn't apply to isn't recorded either.
+              if (
+                hw.appliesToTrackIds &&
+                hw.appliesToTrackIds.length > 0 &&
+                !hw.appliesToTrackIds.includes(track.id)
+              ) {
+                continue
+              }
+              // NOTE: capture even when the scene has no clip yet for this
+              // parameter — stopMotionLoopRecord() auto-creates the clips on
+              // the renderer side so an empty scene records into fresh clips.
+              let arr = recLoop.frames.get(track.id)
+              if (!arr) {
+                arr = []
+                recLoop.frames.set(track.id, arr)
+              }
+              // Cap ~20 min at 50 Hz to bound memory on a runaway record.
+              if (arr.length < 60000) arr.push({ t: tRel, v: vals })
             }
-            // Cap ~20 min at 50 Hz to bound memory on a runaway record.
-            if (arr.length < 60000) arr.push({ t: tRel, v: vals })
           }
         }
       }
@@ -2141,39 +2300,76 @@ export class SceneEngine {
     }
 
     // ── Derived Parameters (v0.6.4) ───────────────────────────────
-    // If this real address feeds any derived param, recompute it from
-    // the latest RAW source values and INJECT the result as a synthetic
-    // incoming packet — so the derived address flows through the whole
-    // pipeline (conditioning / catch / Direct Output / states) like a
-    // real one, and shows up in the OSC In monitor. The `fromDerived`
+    // If this real address feeds any derived param, mark it for
+    // recompute. The actual recompute + injection happens once per
+    // incoming datagram in flushDerived() — a bundle carrying several
+    // of a derived param's sources must yield ONE injection computed
+    // from all-fresh sources, not one per source message with a mix of
+    // this bundle's and the previous bundle's values. The `fromDerived`
     // guard blocks recursion + derived-of-derived.
-    if (!fromDerived && this.hasAnyDerived) {
+    if (!fromDerived && this.hasAnyDerived && this.derivedSourceAddrs.has(address)) {
       for (const tpl of matchedTemplates) {
         const derived = tpl.derivedParams
         if (!derived || derived.length === 0) continue
         for (const dp of derived) {
           if (!dp.address || dp.sources.length === 0) continue
           if (!dp.sources.includes(address)) continue
-          const vals = dp.sources.map((s) => this.derivedSourceLatest.get(s))
-          if (vals.some((v) => v === undefined || !Number.isFinite(v))) continue
-          const combined = computeDerived(dp.op, vals as number[])
-          if (!Number.isFinite(combined)) continue
-          // Universal Output transform — applies to every op.
-          const out = combined * (dp.scale ?? 1) + (dp.offset ?? 0)
-          if (!Number.isFinite(out)) continue
-          this.derivedLatest.set(dp.address, out)
-          if (this.onDerived) {
-            this.onDerived({
-              timestamp: now,
+          const pendingKey = `${ip}|${port}|${tpl.id}|${dp.address}`
+          if (!this.derivedPending.has(pendingKey)) {
+            this.derivedPending.set(pendingKey, {
               ip,
               port,
-              address: dp.address,
-              args: [{ type: 'f', value: out }]
+              templateId: tpl.id,
+              address: dp.address
             })
           }
-          this.handleHardwareInput(ip, port, dp.address, [out], true)
         }
       }
+      if (this.derivedPending.size > 0 && !this.derivedFlushScheduled) {
+        this.derivedFlushScheduled = true
+        // Microtask: runs after the listener has dispatched every message
+        // of the current datagram (osc.js fans a bundle out synchronously),
+        // before the next datagram is handled.
+        queueMicrotask(() => this.flushDerived())
+      }
+    }
+  }
+
+  // Recompute every dirty Derived Parameter from the latest RAW source
+  // values and INJECT the result as a synthetic incoming packet — so the
+  // derived address flows through the whole pipeline (conditioning /
+  // catch / Direct Output / states) like a real one, and shows up in the
+  // OSC In monitor. Resolves templates from the CURRENT session so an
+  // edit landing between mark and flush can't inject a stale config.
+  private flushDerived(): void {
+    this.derivedFlushScheduled = false
+    if (this.derivedPending.size === 0) return
+    const pending = Array.from(this.derivedPending.values())
+    this.derivedPending.clear()
+    if (!this.session || !this.hasAnyDerived) return
+    const nowMs = Date.now()
+    for (const p of pending) {
+      const tpl = this.session.pool.templates.find((t) => t.id === p.templateId)
+      const dp = tpl?.derivedParams?.find((d) => d.address === p.address)
+      if (!dp || dp.sources.length === 0) continue
+      const vals = dp.sources.map((s) => this.derivedSourceLatest.get(s))
+      if (vals.some((v) => v === undefined || !Number.isFinite(v))) continue
+      const combined = computeDerived(dp.op, vals as number[])
+      if (!Number.isFinite(combined)) continue
+      // Universal Output transform — applies to every op.
+      const out = combined * (dp.scale ?? 1) + (dp.offset ?? 0)
+      if (!Number.isFinite(out)) continue
+      this.derivedLatest.set(dp.address, out)
+      if (this.onDerived) {
+        this.onDerived({
+          timestamp: nowMs,
+          ip: p.ip,
+          port: p.port,
+          address: dp.address,
+          args: [{ type: 'f', value: out }]
+        })
+      }
+      this.handleHardwareInput(p.ip, p.port, dp.address, [out], true)
     }
   }
 
@@ -2181,7 +2377,8 @@ export class SceneEngine {
   // Runs the template's enabled stages over every arg slot. Filter
   // state is keyed (templateId | deviceKey | address); slot states are
   // index-parallel to the chain so edits re-warm from scratch when the
-  // stage count changes.
+  // chain signature (stage types / enabled flags / address scopes)
+  // changes.
   private applyInputConditioning(
     tpl: InstrumentTemplate,
     deviceKey: string,
@@ -2202,16 +2399,20 @@ export class SceneEngine {
     }
     const bypass = cfg.slotBypass ?? []
     const out = args.slice()
+    // Re-warm when the chain SHAPE changed — not just the count, but
+    // also any in-place stage TYPE swap or reorder, an enable toggle, or
+    // an address re-scope. A stale `ring` (median) or `min/max`
+    // (autoRange) surviving into a different stage type — or a stage
+    // resuming with state frozen from before it was disabled / scoped
+    // away from this address — would produce a glitch, so key the
+    // re-warm on the ordered type + enabled + address signature.
+    const sig = cfg.stages
+      .map((s) => `${s.type}:${s.enabled ? 1 : 0}:${s.address ?? ''}`)
+      .join(',')
     for (let i = 0; i < out.length; i++) {
       if (!Number.isFinite(out[i])) continue
       if (bypass.includes(i)) continue
       let st = slots[i]
-      // Re-warm when the chain SHAPE changed — not just the count, but
-      // also any in-place stage TYPE swap or reorder. A stale `ring`
-      // (median) or `min/max` (autoRange) surviving into a different
-      // stage type would produce a glitch, so key the re-warm on the
-      // ordered type signature.
-      const sig = cfg.stages.map((s) => s.type).join(',')
       if (!st || st.sig !== sig) {
         st = {
           lastT: now,
@@ -2220,8 +2421,9 @@ export class SceneEngine {
         }
         slots[i] = st
       }
-      // dt in seconds, clamped: a long gap (sensor unplugged) re-warms
-      // rather than producing one giant integration step.
+      // dt in seconds, clamped to [1 ms, 2 s]: a long gap (sensor
+      // unplugged) integrates as at most one 2 s step rather than one
+      // giant step (stage state itself is kept, not re-warmed).
       const dtSec = Math.min(2, Math.max(0.001, (now - st.lastT) / 1000))
       let v = out[i]
       for (let s = 0; s < cfg.stages.length; s++) {
@@ -2320,6 +2522,7 @@ export class SceneEngine {
         if (ss.max === undefined || !Number.isFinite(ss.max)) ss.max = x
         if (x < ss.min) ss.min = x
         if (x > ss.max) ss.max = x
+        ss.peakSpan = Math.max(ss.peakSpan ?? 0, ss.max - ss.min)
         const hl = stage.contractHalfLifeMs ?? 0
         if (hl > 0) {
           const k = 1 - Math.pow(2, (-dtSec * 1000) / Math.max(1, hl))
@@ -2328,6 +2531,25 @@ export class SceneEngine {
           if (ss.min > ss.max) {
             ss.min = x
             ss.max = x
+          }
+          // Minimum-span floor. Left alone, contraction on a held-still
+          // input collapses min/max onto the sensor's noise, and the
+          // 0..1 rescale then blows that noise up to full scale. The
+          // range may never shrink below max(AUTORANGE_MIN_SPAN_ABS,
+          // AUTORANGE_MIN_SPAN_FRAC × widest span ever observed) — the
+          // fraction keeps the floor unit-free (degrees vs 0..1), small
+          // enough that a one-off spike (≤ 1/FRAC × the real range) is
+          // still mostly forgotten. Widened symmetrically around the
+          // current range's midpoint; x stays inside (min ≤ x ≤ max).
+          const minSpan = Math.max(
+            AUTORANGE_MIN_SPAN_ABS,
+            AUTORANGE_MIN_SPAN_FRAC * ss.peakSpan
+          )
+          const span = ss.max - ss.min
+          if (span < minSpan && ss.peakSpan > 0) {
+            const mid = (ss.min + ss.max) / 2
+            ss.min = mid - minSpan / 2
+            ss.max = mid + minSpan / 2
           }
         }
         const range = ss.max - ss.min
@@ -2383,8 +2605,10 @@ export class SceneEngine {
       const m = trig.actions.midi
       const canMidi = midiOk && m?.enabled === true && !!m.portName
       // Continuous mode: stream the live score as a CC, change-gated so
-      // a static pose doesn't spam identical bytes at packet rate.
-      if (trig.mode === 'continuous' && canMidi && m!.kind === 'cc') {
+      // a static pose doesn't spam identical bytes at packet rate. A
+      // score stream is always a CC — regardless of the action's kind
+      // (which defaults to 'note' and only governs enter/exit modes).
+      if (trig.mode === 'continuous' && canMidi) {
         const ccVal = Math.max(0, Math.min(127, Math.round(score * 127)))
         if (ccVal !== rt.lastCcSent) {
           rt.lastCcSent = ccVal
@@ -2417,7 +2641,10 @@ export class SceneEngine {
           rt.unmatchedSince = 0
         } else {
           if (rt.unmatchedSince === 0) rt.unmatchedSince = now
-          if (now - rt.unmatchedSince >= Math.max(0, trig.holdMs ?? 0)) {
+          if (
+            now - rt.unmatchedSince >=
+            Math.max(0, trig.holdMs ?? STATE_HOLD_MS_DEFAULT)
+          ) {
             rt.active = false
             rt.matchSince = 0
             rt.unmatchedSince = 0
@@ -2525,7 +2752,7 @@ export class SceneEngine {
     latestByAddress: Map<string, number[]>
   ): number {
     if (!L || L.dims.length === 0) return 0
-    const tol = Math.max(0.01, Math.min(1, L.tolerance ?? 0.25))
+    const tol = Math.max(0.01, Math.min(1, L.tolerance ?? LEARNED_TOLERANCE_DEFAULT))
     const MIN_SCALE = 0.05 // floor so a zero-centred dim still has a band
     let sum = 0
     let count = 0
@@ -2785,14 +3012,20 @@ export class SceneEngine {
   }
 
   private fireStateExit(trig: StateTrigger, canMidi: boolean, key: string): void {
+    // Release the exact held note FIRST, whatever the CURRENT mode /
+    // kind / MIDI switch say — the note may have been struck under an
+    // earlier config (enterExit → continuous/oneShot, note → cc, MIDI
+    // disabled meanwhile) and nothing else would ever release it. The
+    // Note Off is a cleanup, harmless if the port is gone. A oneShot
+    // note still inside its gate is left to (and owned by) its timer.
+    const released =
+      this.stateTriggerGateTimers.has(key) || this.releaseStateNote(key)
     if (trig.mode !== 'enterExit') return
     const m = trig.actions.midi
     if (!m) return
     if (m.kind === 'note') {
-      // Always release the exact held note (even if MIDI was disabled
-      // meanwhile — the Note Off is a cleanup, harmless if the port is
-      // gone). Falls back to the configured note if nothing tracked.
-      if (!this.releaseStateNote(key) && canMidi) {
+      // Falls back to the configured note if nothing was tracked.
+      if (!released && canMidi) {
         const note = Math.max(0, Math.min(127, Math.floor(m.note ?? 60)))
         this.midiSender.sendNoteOff(m.portName, m.channel, note)
       }
@@ -2817,6 +3050,44 @@ export class SceneEngine {
     this.stateTriggerHeldNote.delete(key)
     this.midiSender.sendNoteOff(held.port, held.channel, held.note)
     return true
+  }
+
+  /** Stop-evaluation cleanup for one template's State Triggers + Pose
+   *  Sequences (its HW Mode went off / was re-bound, so no packet will
+   *  ever drive their exit): release held notes, forget the runtimes so
+   *  a later re-enable starts clean, and drop the live readouts. */
+  private resetTemplateStateEval(templateId: string): void {
+    const prefix = `${templateId}|`
+    for (const k of Array.from(this.stateTriggerHeldNote.keys())) {
+      if (k.startsWith(prefix)) this.releaseStateNote(k)
+    }
+    for (const [k, t] of Array.from(this.stateTriggerGateTimers)) {
+      if (k.startsWith(prefix)) {
+        clearTimeout(t)
+        this.stateTriggerGateTimers.delete(k)
+      }
+    }
+    for (const k of Array.from(this.stateTriggerRuntime.keys())) {
+      if (k.startsWith(prefix)) this.stateTriggerRuntime.delete(k)
+    }
+    for (const k of Array.from(this.stateTriggerLive.keys())) {
+      if (k.startsWith(prefix)) this.stateTriggerLive.delete(k)
+    }
+    for (const k of Array.from(this.poseSequenceHeldNote.keys())) {
+      if (k.startsWith(prefix)) this.releaseSeqNote(k)
+    }
+    for (const [k, t] of Array.from(this.poseSequenceGateTimers)) {
+      if (k.startsWith(prefix)) {
+        clearTimeout(t)
+        this.poseSequenceGateTimers.delete(k)
+      }
+    }
+    for (const k of Array.from(this.poseSequenceRuntime.keys())) {
+      if (k.startsWith(prefix)) this.poseSequenceRuntime.delete(k)
+    }
+    for (const k of Array.from(this.poseSequenceLive.keys())) {
+      if (k.startsWith(prefix)) this.poseSequenceLive.delete(k)
+    }
   }
 
   /** Release every held State-Trigger note. Called on stop()/panic. */
@@ -2866,7 +3137,9 @@ export class SceneEngine {
    *  finalizes the previous one immediately. */
   recordStateTrigger(
     templateId: string,
-    stateId: string,
+    // Identifies the target state for the IPC caller only — the engine
+    // records the whole device stream; the renderer writes the result.
+    _stateId: string,
     durationMs: number
   ): Promise<LearnedState | null> {
     if (this.stateRecording) this.finishStateRecording()
@@ -2877,7 +3150,6 @@ export class SceneEngine {
       const timer = setTimeout(() => this.finishStateRecording(), ms + 400)
       this.stateRecording = {
         templateId,
-        stateId,
         until: Date.now() + ms,
         samples: new Map(),
         finalize: resolve,
@@ -2917,17 +3189,24 @@ export class SceneEngine {
     return { sceneId: rec.sceneId, durationMs, byTrack }
   }
 
-  // Sample a cell's recorded Motion Loop at the current wall-clock time,
-  // returning the per-slot values (linearly interpolated between frames)
-  // or null when there's no active loop. Phase is anchored to the active
-  // scene's start so the loop restarts cleanly when the scene (re)fires.
-  private sampleRecordedLoop(cell: Cell, tNowMs: number): number[] | null {
+  // Sample a cell's recorded Motion Loop at tick time `tNowMs` (hrtime
+  // ms), returning the per-slot values (linearly interpolated between
+  // frames) or null when there's no active loop. Phase is anchored to
+  // the TRACK's own (re)trigger time (ts.loopAnchorAt, same hrtime
+  // clock) so the loop starts at frame 0 on every (re)trigger and runs
+  // on unbroken through pause/resume and the stop fade. Slots that
+  // weren't recorded (outside the HW lock list) come back non-finite —
+  // the caller leaves those slots to the live pipeline.
+  private sampleRecordedLoop(
+    cell: Cell,
+    ts: TrackState,
+    tNowMs: number
+  ): number[] | null {
     const rl = cell.recordedLoop
     if (!rl || !rl.enabled || rl.durationMs <= 0 || rl.frames.length === 0) {
       return null
     }
-    if (this.activeSceneStartedAt == null) return null
-    let phase = (tNowMs - this.activeSceneStartedAt) % rl.durationMs
+    let phase = (tNowMs - ts.loopAnchorAt) % rl.durationMs
     if (phase < 0) phase += rl.durationMs
     const frames = rl.frames
     const last = frames.length - 1
@@ -2952,13 +3231,21 @@ export class SceneEngine {
     }
     const f0 = frames[idx]
     const f1 = frames[Math.min(idx + 1, last)]
-    if (f1 === f0 || f1.t <= f0.t) return f0.v
-    const a = (phase - f0.t) / (f1.t - f0.t)
+    // Before the first captured frame (recording starts a few ms in)
+    // hold frame 0 rather than extrapolating backwards off the f0→f1
+    // slope, which could shoot far outside the recorded range.
+    if (phase <= f0.t || f1 === f0 || f1.t <= f0.t) return f0.v
+    const a = Math.max(0, Math.min(1, (phase - f0.t) / (f1.t - f0.t)))
     const n = Math.max(f0.v.length, f1.v.length)
     const out: number[] = []
     for (let i = 0; i < n; i++) {
-      const v0 = f0.v[i] ?? 0
-      const v1 = f1.v[i] ?? v0
+      // Non-numeric entries (NaN = slot not recorded; null once a NaN
+      // has round-tripped through JSON) stay non-finite so the caller
+      // skips the slot; a missing next value holds the current one.
+      const r0 = f0.v[i]
+      const r1 = f1.v[i]
+      const v0 = typeof r0 === 'number' ? r0 : Number.NaN
+      const v1 = typeof r1 === 'number' && Number.isFinite(r1) ? r1 : v0
       out.push(v0 + (v1 - v0) * a)
     }
     return out
@@ -3011,6 +3298,15 @@ export class SceneEngine {
       if (k.startsWith(prefix)) {
         rt.matchSince = 0
         rt.ready = false
+      }
+    }
+    // Same for the template's State Triggers: a stale enter-dwell
+    // (matchSince) or exit-hold (unmatchedSince) timer from before the
+    // freeze would otherwise enter / exit the instant recording ends.
+    for (const [k, rt] of this.stateTriggerRuntime) {
+      if (k.startsWith(prefix)) {
+        rt.matchSince = 0
+        rt.unmatchedSince = 0
       }
     }
     rec.finalize(
@@ -3095,7 +3391,12 @@ export class SceneEngine {
     for (const k of Array.from(this.hardwareCaught.keys())) {
       const pipe = k.indexOf('|')
       const trackId = pipe > 0 ? k.slice(0, pipe) : k
-      if (resetTrackIds.has(trackId)) this.hardwareCaught.delete(k)
+      if (resetTrackIds.has(trackId)) {
+        this.hardwareCaught.delete(k)
+        // Block float re-catch until the track emits a fresh value —
+        // lastSentNumeric still holds the knob's own override value.
+        this.hwCatchAwaitingEmit.add(trackId)
+      }
     }
     for (const k of Array.from(this.hardwareOverride.keys())) {
       const pipe = k.indexOf('|')
@@ -3118,6 +3419,7 @@ export class SceneEngine {
   }
 
   updateSession(next: Session): void {
+    const prevSession = this.session
     const prevTickRate = this.session?.tickRateHz
     const prevMidiEnabled = this.session?.midiEnabled
     // (Bug 5 FIX) Restore HW catch state from `next.hardwareState` only
@@ -3139,6 +3441,28 @@ export class SceneEngine {
     this.hasAnyDerived = next.pool.templates.some(
       (t) => (t.derivedParams?.length ?? 0) > 0
     )
+    // Refresh the derived source-address set, and prune the derived
+    // caches of addresses no longer in use — a renamed / deleted
+    // derived param (or every intermediate "/d", "/de", … of an address
+    // committed while typing) would otherwise linger in derivedLatest
+    // (and the inspector readout) forever.
+    {
+      const derivedAddrs = new Set<string>()
+      const sourceAddrs = new Set<string>()
+      for (const tpl of next.pool.templates) {
+        for (const dp of tpl.derivedParams ?? []) {
+          if (dp.address) derivedAddrs.add(dp.address)
+          for (const s of dp.sources) sourceAddrs.add(s)
+        }
+      }
+      this.derivedSourceAddrs = sourceAddrs
+      for (const k of Array.from(this.derivedLatest.keys())) {
+        if (!derivedAddrs.has(k)) this.derivedLatest.delete(k)
+      }
+      for (const k of Array.from(this.derivedSourceLatest.keys())) {
+        if (!sourceAddrs.has(k)) this.derivedSourceLatest.delete(k)
+      }
+    }
     // Restore persisted HW catch state on a fresh session load. The
     // override VALUES are not restored — they self-heal on the next
     // OSC packet from the bound device (handleHardwareInput refreshes
@@ -3165,32 +3489,83 @@ export class SceneEngine {
     // clearHardwareCatchIfReset only runs on scene change when an
     // ENABLED reset template still exists. Recomputed cheaply on every
     // session update so a HW-Mode-off toggle releases its slots at once.
+    // Also drops catches the HW Mode no longer SCOPES: tracks narrowed
+    // out via appliesToTrackIds and slots outside a (newly narrowed)
+    // hw.args lock list — same resolution as the catch loop.
     {
-      const hwEnabledTemplateIds = new Set<string>()
+      // trackId → locked slot list (null = every slot) for each track an
+      // ENABLED Hardware Mode currently applies to.
+      const hwScope = new Map<string, number[] | null>()
       for (const tpl of next.pool.templates) {
-        if (tpl.hardwareMode?.enabled === true) hwEnabledTemplateIds.add(tpl.id)
-      }
-      const hwActiveTrackIds = new Set<string>()
-      for (const t of next.tracks) {
-        if (t.sourceTemplateId && hwEnabledTemplateIds.has(t.sourceTemplateId)) {
-          hwActiveTrackIds.add(t.id)
+        const hw = tpl.hardwareMode
+        if (hw?.enabled !== true) continue
+        const narrowed =
+          hw.appliesToTrackIds && hw.appliesToTrackIds.length > 0
+            ? hw.appliesToTrackIds
+            : null
+        for (const t of next.tracks) {
+          if (t.sourceTemplateId !== tpl.id) continue
+          if (narrowed && !narrowed.includes(t.id)) continue
+          const fnId = t.sourceFunctionId ?? t.id
+          hwScope.set(
+            t.id,
+            hw.args && hw.args[fnId] && hw.args[fnId].length > 0
+              ? hw.args[fnId]
+              : null
+          )
         }
       }
-      for (const k of Array.from(this.hardwareCaught.keys())) {
+      const inScope = (k: string): boolean => {
         const pipe = k.indexOf('|')
         const trackId = pipe > 0 ? k.slice(0, pipe) : k
-        if (!hwActiveTrackIds.has(trackId)) this.hardwareCaught.delete(k)
+        if (!hwScope.has(trackId)) return false
+        const locked = hwScope.get(trackId)
+        return !locked || locked.includes(Number(k.slice(pipe + 1)))
+      }
+      for (const k of Array.from(this.hardwareCaught.keys())) {
+        if (!inScope(k)) this.hardwareCaught.delete(k)
       }
       for (const k of Array.from(this.hardwareOverride.keys())) {
-        const pipe = k.indexOf('|')
-        const trackId = pipe > 0 ? k.slice(0, pipe) : k
-        if (!hwActiveTrackIds.has(trackId)) this.hardwareOverride.delete(k)
+        if (!inScope(k)) this.hardwareOverride.delete(k)
+      }
+    }
+    // State Triggers + Pose Sequences only evaluate while their
+    // template's Hardware Mode is on and bound to the sending device.
+    // When HW Mode goes off (or is re-bound to another device) the
+    // evaluation simply stops arriving — so a state that was active
+    // would never exit and its held note would hang. Release those
+    // notes, reset the runtimes (re-enabling starts clean), and drop
+    // the live readouts.
+    {
+      const prevTpls = new Map(
+        (prevSession?.pool.templates ?? []).map((t) => [t.id, t])
+      )
+      for (const tpl of next.pool.templates) {
+        const hw = tpl.hardwareMode
+        const prevHw = prevTpls.get(tpl.id)?.hardwareMode
+        const off = hw?.enabled !== true
+        const rebound =
+          !off &&
+          prevHw?.enabled === true &&
+          (prevHw.deviceIp !== hw!.deviceIp ||
+            prevHw.devicePort !== hw!.devicePort ||
+            (prevHw.deviceMatch ?? 'ipPort') !== (hw!.deviceMatch ?? 'ipPort'))
+        if (off || rebound) this.resetTemplateStateEval(tpl.id)
       }
     }
     // Propagate the global MIDI on/off to the sender. Flipping off
     // closes every open port (zero CPU); flipping on lets the next
     // emit lazy-open ports as needed.
     if (prevMidiEnabled !== next.midiEnabled) {
+      if (!next.midiEnabled) {
+        // Release every held note FIRST — once disabled the sender drops
+        // all messages (and closes its ports), so a Note Off sent later
+        // would be lost and the note would hang on the synth with no way
+        // for Panic to reach it.
+        for (const ts of this.tracks.values()) this.sendMidiNoteOff(ts)
+        this.releaseAllStateNotes()
+        this.releaseAllSeqNotes()
+      }
       this.midiSender.setEnabled(!!next.midiEnabled)
     }
     // Invalidate the generative similarity matrix on every session
@@ -3212,6 +3587,9 @@ export class SceneEngine {
       this.generativeHistory = this.generativeHistory.filter((id) =>
         sceneIdSet.has(id)
       )
+      for (const sid of Array.from(this.shuffleCyclePlayed)) {
+        if (!sceneIdSet.has(sid)) this.shuffleCyclePlayed.delete(sid)
+      }
       for (const sid of Array.from(this.generativeRolledBySceneId.keys())) {
         if (!sceneIdSet.has(sid)) this.generativeRolledBySceneId.delete(sid)
       }
@@ -3246,12 +3624,16 @@ export class SceneEngine {
       const trackId = pipe > 0 ? k.slice(0, pipe) : k
       if (!keep.has(trackId)) this.hardwareOverride.delete(k)
     }
+    for (const trackId of Array.from(this.hwCatchAwaitingEmit)) {
+      if (!keep.has(trackId)) this.hwCatchAwaitingEmit.delete(trackId)
+    }
     // `hardwareLastValues` and `hardwareLastChangeMs` are keyed by
-    // device (`${ip}:${port}`), NOT trackId — they cache per-device
-    // movement-detection state and are independent of tracks. They
-    // only grow when new devices appear; safe to leave across track
-    // changes. (Cleared explicitly on session load via stop()/start()
-    // if needed.)
+    // device (`${ip}:${port}`, or ip alone for ipOnly), NOT trackId —
+    // they cache per-device movement-detection state and are
+    // independent of tracks, so they're left across track changes.
+    // Nothing clears them (not even stop()); growth is bounded by
+    // MAX_HW_MOVEMENT_DEVICES devices × MAX_ADDRESSES_PER_DEVICE
+    // addresses with FIFO eviction in handleHardwareInput.
     // (v0.6) Prune Input Conditioning + State Trigger runtime for
     // templates/triggers that no longer exist — same leak discipline
     // as the hardware maps above. conditionerState keys are
@@ -3401,12 +3783,28 @@ export class SceneEngine {
     // (their own enabled flag may still be true; parent overrides).
     if (this.isTrackEffectivelyDisabled(trackId)) return
 
-    if (ts.delayTimer) {
-      clearTimeout(ts.delayTimer)
-      ts.delayTimer = null
-    }
+    this.cancelPendingDelay(ts)
 
     const start = (): void => {
+      ts.pendingSceneId = null
+      // Note hand-off: the previous cell's held note ends here UNLESS
+      // the new cell will re-strike on the same port + channel — its
+      // first Note On sends that Note Off itself (gap-free). An
+      // OSC-only / CC / other-port cell would otherwise leave the old
+      // note ringing through the whole new scene.
+      const nm = cell.midiOut
+      const reStrikesSameOut =
+        !!nm &&
+        nm.enabled &&
+        nm.kind === 'note' &&
+        nm.portName === ts.midiHeldPort &&
+        nm.channel === ts.midiHeldChannel
+      if (ts.midiHeldNote !== null && !reStrikesSameOut) this.sendMidiNoteOff(ts)
+      // Every (re)trigger owes a Note On — including a re-trigger of the
+      // same note (loop follow-action, multiplicator repeat, re-click).
+      ts.midiTriggerEdge = true
+      // The velocity badge belongs to the cell that fired it.
+      ts.lastEmittedVelocity = null
       const curOut = this.computeCurrentOutputs(trackId)
       // Reset sequencer to step 0 + per-mode state on trigger. Done
       // BEFORE the baseRaw lookup below so generative mode's seeded
@@ -3490,7 +3888,6 @@ export class SceneEngine {
       // modulator trajectories — the rest of the modulator state
       // tries to be reproducible and Math.random() defeated that.
       const seedRng = ts.seqRng ?? Math.random
-      ts.rndStepLastTick = -1
       ts.rndStepValue = seedRng() * 2 - 1
       ts.rndSmoothPrev = 0
       ts.rndSmoothNext = seedRng() * 2 - 1
@@ -3612,7 +4009,6 @@ export class SceneEngine {
         m2.rng = mulberry32(hashSeedString(cell.value + '_m2'))
         const rngM2 = m2.rng
         m2.phase = 0
-        m2.rndStepLastTick = -1
         m2.rndStepValue = rngM2() * 2 - 1
         m2.rndSmoothPrev = 0
         m2.rndSmoothNext = rngM2() * 2 - 1
@@ -3714,8 +4110,10 @@ export class SceneEngine {
     // bypass). When true the stored value applies as before.
     const effectiveDelay = cell.timingEnabled === false ? 0 : cell.delayMs
     if (effectiveDelay > 0) {
+      ts.pendingSceneId = sceneId
       ts.delayTimer = setTimeout(() => {
         ts.delayTimer = null
+        ts.pendingSceneId = null
         start()
       }, effectiveDelay)
     } else {
@@ -3723,9 +4121,21 @@ export class SceneEngine {
     }
   }
 
+  /** Cancel a track's pending delayed trigger (if any). */
+  private cancelPendingDelay(ts: TrackState): void {
+    if (ts.delayTimer) {
+      clearTimeout(ts.delayTimer)
+      ts.delayTimer = null
+    }
+    ts.pendingSceneId = null
+  }
+
   stopCell(sceneId: string, trackId: string): void {
     const ts = this.tracks.get(trackId)
     if (!ts || !this.session) return
+    // A delayed trigger of THIS cell that hasn't started yet is cancelled
+    // too — the track isn't armed for it, so the check below can't see it.
+    if (ts.pendingSceneId === sceneId) this.cancelPendingDelay(ts)
     // Only stop if this cell is actually the active one for the track.
     if (ts.activeSceneId !== sceneId) return
     this.beginStop(trackId)
@@ -3742,21 +4152,22 @@ export class SceneEngine {
   ): void {
     const ts = this.tracks.get(trackId)
     if (!ts || !this.session) return
-    if (ts.delayTimer) {
-      clearTimeout(ts.delayTimer)
-      ts.delayTimer = null
-    }
+    this.cancelPendingDelay(ts)
     const cell = this.getActiveCell(trackId)
     const curOut = this.computeCurrentOutputs(trackId)
     ts.fromCenter = [...curOut]
     ts.toCenter = curOut.map(() => 0)
     ts.morphStart = now()
     // Morph override lets the scene-to-scene Morph feature fade orphan
-    // tracks out over the same duration the new tracks fade in.
+    // tracks out over the same duration the new tracks fade in. A cell
+    // with its Timing section off ignores its stored transition — same
+    // rule triggerCell applies on the way in.
     ts.morphMs =
       typeof morphMsOverride === 'number' && morphMsOverride >= 0
         ? morphMsOverride
-        : cell?.transitionMs ?? 0
+        : cell?.timingEnabled === false
+          ? 0
+          : cell?.transitionMs ?? 0
     ts.stopping = true
     if (!silent) this.emitState()
   }
@@ -3764,8 +4175,11 @@ export class SceneEngine {
   stopScene(sceneId: string): void {
     if (!this.session) return
     // Stop any track whose active cell is currently in this scene — silent
-    // per-track, single emit at the end.
+    // per-track, single emit at the end. Delayed cells of this scene that
+    // haven't started yet are cancelled too (their track isn't armed, so
+    // the activeSceneId test can't see them — they'd fire after the stop).
     for (const [tid, ts] of this.tracks.entries()) {
+      if (ts.pendingSceneId === sceneId) this.cancelPendingDelay(ts)
       if (ts.armed && ts.activeSceneId === sceneId) {
         this.beginStop(tid, undefined, /* silent */ true)
       }
@@ -3774,6 +4188,8 @@ export class SceneEngine {
       this.activeSceneId = null
       this.activeSceneStartedAt = null
       this.activeSequenceSlotIdx = null
+      this.activeSceneDurationMs = null
+      this.pauseStartedAt = null
       this.clearSceneAdvance()
     }
     this.emitState()
@@ -3797,20 +4213,27 @@ export class SceneEngine {
   resumeSequence(): void {
     if (!this.session) return
     // Apply the pause-shift: activeSceneStartedAt += (now - pauseStartedAt)
-    // so elapsed picks up exactly where it left off.
+    // so elapsed picks up exactly where it left off. Resume re-arms only
+    // the time that was LEFT of the armed duration when we paused —
+    // re-arming the full duration made every resume restart the scene's
+    // clock while the countdown (which honours the shift) hit 0 early.
+    let remainingMs: number | undefined
     if (this.pauseStartedAt !== null && this.activeSceneStartedAt !== null) {
+      if (this.activeSceneDurationMs !== null) {
+        const elapsedAtPause = this.pauseStartedAt - this.activeSceneStartedAt
+        remainingMs = Math.max(0, this.activeSceneDurationMs - elapsedAtPause)
+      }
       const pauseDur = Date.now() - this.pauseStartedAt
       this.activeSceneStartedAt += pauseDur
     }
     this.pauseStartedAt = null
-    // Re-arm from the current active scene's full duration (simple approach).
     const id = this.activeSceneId
     if (!id) {
       this.emitState()
       return
     }
     const scene = this.session.scenes.find((s) => s.id === id)
-    if (scene) this.armSceneAdvance(scene)
+    if (scene) this.armSceneAdvance(scene, undefined, remainingMs)
     this.emitState()
   }
 
@@ -3856,7 +4279,11 @@ export class SceneEngine {
     {
       const newTrackIds = new Set(Object.keys(scene.cells))
       for (const [trackId, ts] of this.tracks.entries()) {
-        if (ts.armed && !newTrackIds.has(trackId)) {
+        if (newTrackIds.has(trackId)) continue
+        // A delayed cell of the previous scene that hasn't started yet
+        // must not fire into this one.
+        if (ts.delayTimer) this.cancelPendingDelay(ts)
+        if (ts.armed) {
           this.beginStop(
             trackId,
             useMorph ? morphMs : undefined,
@@ -3904,6 +4331,7 @@ export class SceneEngine {
       while (this.generativeHistory.length > GENERATIVE_HISTORY_LEN) {
         this.generativeHistory.shift()
       }
+      this.shuffleCyclePlayed.add(sceneId)
     }
     // Auto-roll a min/max duration under generative mode (v0.5.10).
     // When the caller doesn't pass an explicit generativeDurationSec
@@ -3938,10 +4366,26 @@ export class SceneEngine {
       )
     }
     this.armSceneAdvance(scene, effectiveGenerativeDurationSec)
+    // Triggered while the transport is paused: the scene plays, but its
+    // auto-advance stays paused — countdown frozen at its full duration
+    // until Resume (which then re-arms the remaining time). Re-stamping
+    // the pause at the new start keeps elapsed = 0 instead of a stale
+    // pre-trigger timestamp that would read as negative elapsed time.
+    if (this.pauseStartedAt !== null) {
+      this.clearSceneAdvance()
+      this.pauseStartedAt = this.activeSceneStartedAt
+    }
     this.emitState()
   }
 
-  private armSceneAdvance(scene: Scene, generativeDurationSec?: number): void {
+  // `remainingMs` (resume from pause): arm the timer for what was left of
+  // the already-armed duration instead of recomputing it — keeps the
+  // published activeSceneDurationMs (incl. a generative roll) intact.
+  private armSceneAdvance(
+    scene: Scene,
+    generativeDurationSec?: number,
+    remainingMs?: number
+  ): void {
     this.clearSceneAdvance()
     // Capture the scene's id, NOT the scene object itself, so that edits
     // made while the duration timer is ticking (user changes nextMode,
@@ -3974,6 +4418,12 @@ export class SceneEngine {
             Number.isFinite(slotOverride.durationSec)
           ? slotOverride.durationSec
           : scene.durationSec
+    // Publish what was actually armed — renderer countdowns and 'synced'
+    // envelopes / ramps read this instead of scene.durationSec, which
+    // ignores slot overrides and generative rolls.
+    if (remainingMs === undefined) {
+      this.activeSceneDurationMs = Math.max(10, Math.round(effectiveDuration * 1000))
+    }
     this.sceneAdvanceTimer = setTimeout(() => {
       // Re-fetch the current version of this scene off the live session.
       const cur =
@@ -4012,6 +4462,13 @@ export class SceneEngine {
       // Loop is still respected when set per-slot (slot override
       // wins) so the user can pin one slot to loop under generative.
       const generativeOn = this.session?.generative?.enabled === true
+      // Per-slot Loop override beats generative (as promised above):
+      // advanceScene's generative branch would otherwise pick a random
+      // next scene regardless of the slot's own follow action.
+      if (generativeOn && liveOverride?.nextMode === 'loop') {
+        this.triggerScene(cur.id, { sourceSlotIdx: slotIdx })
+        return
+      }
       if (effectiveNextMode === 'stop' && !generativeOn) {
         // Stop now *actually* stops everything. Previously the engine kept
         // the scene "alive" as long as any cell had modulation or sequencer
@@ -4022,18 +4479,12 @@ export class SceneEngine {
       } else {
         this.advanceScene(cur, effectiveNextMode)
       }
-    }, Math.max(10, effectiveDuration * 1000))
+    }, Math.max(10, remainingMs ?? effectiveDuration * 1000))
   }
 
-  private sceneHasOngoingActivity(sceneId: string): boolean {
-    if (!this.session) return false
-    const scene = this.session.scenes.find((s) => s.id === sceneId)
-    if (!scene) return false
-    for (const [trackId, ts] of this.tracks.entries()) {
-      if (ts.armed && ts.activeSceneId === sceneId) {
-        const cell = scene.cells[trackId]
-        if (cell?.modulation.enabled || cell?.sequencer.enabled) return true
-      }
+  private sceneHasPlayingTracks(sceneId: string): boolean {
+    for (const ts of this.tracks.values()) {
+      if ((ts.armed || ts.stopping) && ts.activeSceneId === sceneId) return true
     }
     return false
   }
@@ -4168,30 +4619,24 @@ export class SceneEngine {
       if (filtered.length > 0) candidates = filtered
     }
     // Shuffle Cycle: every scene in the eligible pool must play once
-    // before any repeat. Track the "already played this cycle" set
-    // by scanning generativeHistory back until we hit an entry NOT
-    // in the eligible pool (that's the marker of a previous cycle's
-    // end) OR we've covered the whole pool. Reset is automatic:
-    // when all eligible scenes are in the recent history, drop them
-    // all and start fresh.
+    // before any repeat. shuffleCyclePlayed holds this cycle's plays
+    // (the current scene included). Once it covers the whole pool the
+    // cycle is complete: start a new one, and keep the scene that just
+    // closed the old cycle out of the new cycle's first pick so the
+    // boundary can't produce an immediate repeat.
     if (cfg.shuffleCycle) {
-      const eligibleSet = new Set(candidates.map((s) => s.id))
-      const playedThisCycle = new Set<string>()
-      for (let i = this.generativeHistory.length - 1; i >= 0; i--) {
-        const id = this.generativeHistory[i]
-        if (!eligibleSet.has(id)) break
-        playedThisCycle.add(id)
-        // Stop once we've covered every eligible scene -- earlier
-        // history is from prior cycles and shouldn't constrain
-        // current picks.
-        if (playedThisCycle.size >= eligibleSet.size) break
+      const poolIds = new Set(pool.map((s) => s.id))
+      for (const id of Array.from(this.shuffleCyclePlayed)) {
+        if (!poolIds.has(id)) this.shuffleCyclePlayed.delete(id)
       }
-      if (playedThisCycle.size >= eligibleSet.size) {
-        // Cycle complete -- reset (allow every scene again).
+      let remaining: Scene[]
+      if (this.shuffleCyclePlayed.size >= poolIds.size) {
+        this.shuffleCyclePlayed.clear()
+        remaining = candidates.filter((s) => s.id !== currentSceneId)
       } else {
-        const remaining = candidates.filter((s) => !playedThisCycle.has(s.id))
-        if (remaining.length > 0) candidates = remaining
+        remaining = candidates.filter((s) => !this.shuffleCyclePlayed.has(s.id))
       }
+      if (remaining.length > 0) candidates = remaining
     }
     if (candidates.length === 0) return null
     if (candidates.length === 1) return candidates[0].id
@@ -4478,7 +4923,12 @@ export class SceneEngine {
 
   stopAll(): void {
     for (const [tid, ts] of this.tracks.entries()) {
-      if (ts.armed || ts.delayTimer) this.beginStop(tid, undefined, /* silent */ true)
+      // A delay-only track (not armed yet) just loses its pending
+      // trigger. Sending it through beginStop set `stopping` on a track
+      // with no cell to fade, which then never resolved — pinning
+      // isAnyTrackActive() and 'whenIdle' forwarding forever.
+      this.cancelPendingDelay(ts)
+      if (ts.armed) this.beginStop(tid, undefined, /* silent */ true)
     }
     // Release any held State-Trigger + Pose-Sequence notes too — "stop
     // everything".
@@ -4489,15 +4939,16 @@ export class SceneEngine {
     this.activeSceneStartedAt = null
     this.activeSequenceSlotIdx = null
     this.activeSceneRepeatCount = 0
+    this.activeSceneDurationMs = null
+    // Stop ends a pause too — otherwise the stale pause stamp survived
+    // into the next Play (countdown frozen, next Pause ignored).
+    this.pauseStartedAt = null
     this.emitState()
   }
 
   panic(): void {
     for (const ts of this.tracks.values()) {
-      if (ts.delayTimer) {
-        clearTimeout(ts.delayTimer)
-        ts.delayTimer = null
-      }
+      this.cancelPendingDelay(ts)
       // Send Note Off for any held note + clear the gate scheduler
       // BEFORE the global midi panic sweep. Both layers fire All
       // Notes Off + All Sound Off — belt-and-braces so no note can
@@ -4525,6 +4976,8 @@ export class SceneEngine {
     this.activeSceneStartedAt = null
     this.activeSequenceSlotIdx = null
     this.activeSceneRepeatCount = 0
+    this.activeSceneDurationMs = null
+    this.pauseStartedAt = null
     this.emitState()
   }
 
@@ -4556,8 +5009,6 @@ export class SceneEngine {
     this.startTicker()
   }
 
-  private tickIdx = 0
-
   private tick(): void {
     if (!this.session) return
     const t = now()
@@ -4570,12 +5021,21 @@ export class SceneEngine {
     const rawDt = this.lastTickAt === 0 ? 0 : (t - this.lastTickAt) / 1000
     const dt = Math.min(0.05, rawDt)
     this.lastTickAt = t
-    this.tickIdx++
+    // Set when a sequencer step advanced this tick: the step highlight
+    // should update now, not at the next throttle window — but once per
+    // tick, not once per advancing track.
+    let stepAdvanced = false
 
     for (const [trackId, ts] of this.tracks.entries()) {
       if (!ts.armed && !ts.stopping) continue
       let cell = this.getActiveCell(trackId)
-      if (!cell) continue
+      if (!cell) {
+        // The playing clip (or its scene) was deleted: nothing left to
+        // emit or fade. Disarm so its held note is released and a
+        // pending stop can't leave `stopping` set forever.
+        this.disarm(ts)
+        continue
+      }
       // Resolve the session-side Track entry for engine-aware flags
       // (enabled, persistentSlots, oscEnabled) read further down the
       // loop.
@@ -4604,11 +5064,22 @@ export class SceneEngine {
       // here — template tracks could theoretically host a MIDI
       // group-trigger pattern in a future revision; the bug is
       // OSC-specific.
+      // A child Parameter row also honours its Instrument header's OSC
+      // toggle ("Disable OSC output for every cell on this instrument").
+      const parentTrack = track?.parentTrackId
+        ? this.session.tracks.find((tt) => tt.id === track.parentTrackId)
+        : undefined
       const oscEmitAllowed =
         track?.kind !== 'template' &&
         (cell.oscEnabled ?? true) &&
-        (track?.oscEnabled ?? true)
-      if (this.isTrackEffectivelyDisabled(trackId)) continue
+        (track?.oscEnabled ?? true) &&
+        (parentTrack?.oscEnabled ?? true)
+      if (this.isTrackEffectivelyDisabled(trackId)) {
+        // Row (or its Instrument) disabled mid-play: release + disarm
+        // rather than skipping it forever with a note still held.
+        this.disarm(ts)
+        continue
+      }
 
       // Live-recompute `seqGenRanges` when the user toggles
       // `scaleToUnit` mid-play. Without this, the auto-range path
@@ -4629,6 +5100,13 @@ export class SceneEngine {
         }
       }
       ts.prevScaleToUnit = cell.scaleToUnit
+      // Motion Loop phase anchor — re-sync on a fresh (re)trigger (the
+      // Ramp mode-flip reset below keeps loopAnchorTrig in step so it
+      // doesn't count as one). See TrackState.loopAnchorAt.
+      if (ts.loopAnchorTrig !== ts.triggerTime) {
+        ts.loopAnchorAt = ts.triggerTime
+        ts.loopAnchorTrig = ts.triggerTime
+      }
 
       // ── Two-stage modulator — Mod 2 advance + apply ──────────────
       // Mod 2 runs every tick when enabled. We advance its parallel
@@ -4649,6 +5127,10 @@ export class SceneEngine {
       // read it later in this iteration — Mod 2 drives the playhead
       // instead of Mod 1 in that sub-mode. Stays 0 when Mod 2 is off.
       let mod2NormBipolar = 0
+      // Mod 2 as a 0..1 playhead position for Adresse `stage2` — read
+      // from the RAW signal, independent of Mod 2's Depth / Mode, exactly
+      // like Mod 1's own address reading.
+      let mod2AddrUnit = 0.5
       if (cell.modulation2?.enabled) {
         mod1OriginalForSlots = cell.modulation
         advanceMod2State(
@@ -4656,50 +5138,68 @@ export class SceneEngine {
           ts.m2,
           dt,
           t,
-          this.session.globalBpm,
-          this.tickIdx
+          this.session.globalBpm
         )
-        // Scene duration (seconds) for envelope-as-Mod2. Best-effort
-        // — falls back to 1 s if we can't resolve it cheaply (the
-        // duration is mainly used by Envelope which is a rare Mod 2
-        // pick anyway).
-        const sceneDurSec = 1
-        mod2NormBipolar = evalMod2Bipolar(
+        // Scene duration (seconds) for a 'synced' Envelope / Ramp as
+        // Mod 2 — the effective duration the engine armed (generative
+        // roll / slot override / scene Dur), same as Mod 1 uses. Was a
+        // hard-coded 1 s, so a synced Mod 2 envelope always ran 1 s.
+        const sceneDurSec = this.currentSceneDurationSec(ts.activeSceneId)
+        const mod2Raw = evalMod2Bipolar(
           cell.modulation2,
           ts.m2,
           ts.triggerTime,
           t,
           this.session.globalBpm,
-          this.tickIdx,
           sceneDurSec
         )
+        // Mod 2 feeds its targets the RAW symmetric ±1 signal — Depth and
+        // Mode are deliberately NOT applied (each target has its own
+        // amount; forcing bipolar keeps a symmetric swing around Mod 1's
+        // base). Applying Depth now would silently cut every existing
+        // session's Mod 2 to its stored default of 10 %, so the
+        // Inspector hides Depth / Mode for Mod 2 instead.
+        mod2NormBipolar = mod2Raw
+        mod2AddrUnit = (mod2Raw + 1) / 2
         const effMod1 = applyMod2ToMod1(
           cell.modulation,
           cell.modulation2,
-          mod2NormBipolar
+          mod2NormBipolar,
+          this.session.globalBpm
         )
         // Compute effective Sequencer too -- Mod 2 -> Seq routes
         // through `targetsSeq` (parallel to `targets` for Mod 1).
         // Same skip-when-no-target fast path keeps cells that don't
         // use this feature at zero cost. The cell-level routing gate
         // (`cell.routing.modulation2Seq`) is honoured too: if EVERY
-        // slot in the array is explicitly false, skip the seq patch
+        // editable slot is explicitly false, skip the seq patch
         // (visual cue: user has turned off Mod 2 -> Seq for every
-        // slot in the routing matrix). Any true entry => apply
+        // slot in the routing matrix). Any slot on => apply
         // cell-wide; the seq state (step idx, timing) is global per
-        // cell so true per-slot gating isn't meaningful here.
+        // cell so true per-slot gating isn't meaningful here. Fixed
+        // (argSpec) slots are never routed, so older sessions' holes
+        // at those indices don't count; a hole elsewhere is the
+        // column default (on).
         let effSeq = cell.sequencer
         if (cell.sequencer?.enabled) {
           const m2SeqRouting = cell.routing?.modulation2Seq
-          const allSlotsOff =
-            Array.isArray(m2SeqRouting) &&
-            m2SeqRouting.length > 0 &&
-            m2SeqRouting.every((b) => b === false)
+          let allSlotsOff = Array.isArray(m2SeqRouting) && m2SeqRouting.length > 0
+          if (allSlotsOff) {
+            const nSlots = Math.max(1, parseValueTokens(cell.value).length)
+            for (let i = 0; i < nSlots; i++) {
+              if (track?.argSpec?.[i]?.fixed !== undefined) continue
+              if (m2SeqRouting?.[i] !== false) {
+                allSlotsOff = false
+                break
+              }
+            }
+          }
           if (!allSlotsOff) {
             effSeq = applyMod2ToSeq(
               cell.sequencer,
               cell.modulation2,
-              mod2NormBipolar
+              mod2NormBipolar,
+              this.session.globalBpm
             )
           }
         }
@@ -4741,7 +5241,6 @@ export class SceneEngine {
             ts.rndSmoothNext = rng() * 2 - 1
             ts.rndStepValue = spastic ? (rng() < 0.5 ? -1 : 1) : rng() * 2 - 1
           }
-          ts.rndStepLastTick = this.tickIdx
         }
       }
 
@@ -4763,6 +5262,7 @@ export class SceneEngine {
             const warped = warpDistribution(rng(), dist) // [0, 1]
             return warped * 2 - 1
           }
+          ts.shLastAdvanceAt = snapStaleClock(ts.shLastAdvanceAt, t, period)
           while (t - ts.shLastAdvanceAt >= period) {
             ts.shLastAdvanceAt += period
             if (rng() < Math.max(0, Math.min(1, cell.modulation.sh.probability))) {
@@ -4781,6 +5281,7 @@ export class SceneEngine {
         if (effHz > 0) {
           const rng = ts.seqRng ?? Math.random
           const period = 1000 / effHz
+          ts.slewLastAdvanceAt = snapStaleClock(ts.slewLastAdvanceAt, t, period)
           while (t - ts.slewLastAdvanceAt >= period) {
             ts.slewLastAdvanceAt += period
             if (cell.modulation.slew.randomTarget) {
@@ -4812,6 +5313,7 @@ export class SceneEngine {
           const period = 1000 / effHz
           const r = Math.max(3.4, Math.min(4.0, cell.modulation.chaos.r))
           const rng = ts.seqRng ?? Math.random
+          ts.chaosLastAdvanceAt = snapStaleClock(ts.chaosLastAdvanceAt, t, period)
           while (t - ts.chaosLastAdvanceAt >= period) {
             ts.chaosLastAdvanceAt += period
             let x = ts.chaosX
@@ -5149,6 +5651,7 @@ export class SceneEngine {
           const rawTokens = parseValueTokens(cell.value)
           const tokenCount = Math.max(1, rawTokens.length)
           let advanced = false
+          ts.randLastAdvanceAt = snapStaleClock(ts.randLastAdvanceAt, t, period)
           while (t - ts.randLastAdvanceAt >= period) {
             ts.randLastAdvanceAt += period
             ts.randCurrent = sampleRandom(
@@ -5158,7 +5661,10 @@ export class SceneEngine {
             )
             advanced = true
           }
-          if (advanced) {
+          // The trigger already drew the first sample (triggerCell) —
+          // send it on the first tick instead of waiting a full period.
+          const firstEmitAfterTrigger = !ts.hasEmittedNumeric
+          if (advanced || firstEmitAfterTrigger) {
             const rnd = cell.modulation.random
             // Pre-compute the configured output span so scaleToUnit
             // can NORMALISE int / colour samples (which live in
@@ -5320,6 +5826,37 @@ export class SceneEngine {
             if (oscEmitAllowed) {
               this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, args)
             }
+            ts.hasEmittedNumeric = true
+            // MIDI parallel emit — same source-slot rule as the main
+            // path (first non-fixed numeric slot). Each new random
+            // sample is a note edge: the generator's rate is its note
+            // rate, like a sequencer step.
+            if (
+              this.session.midiEnabled &&
+              cell.midiOut?.enabled &&
+              cell.midiOut.portName &&
+              track?.kind !== 'template'
+            ) {
+              const srcIdx = args.findIndex(
+                (a, i) =>
+                  argSpecRnd?.[i]?.fixed === undefined && typeof a.value === 'number'
+              )
+              if (srcIdx >= 0) {
+                const tokenIdx =
+                  rnd.valueType === 'colour' ? Math.floor(srcIdx / 3) : srcIdx
+                const seed = readNumber(rawTokens[tokenIdx] ?? '') ?? 0
+                this.emitMidiForCell(
+                  ts,
+                  cell,
+                  args[srcIdx].value as number,
+                  cell.scaleToUnit ? normalise(seed) : seed,
+                  true,
+                  false,
+                  true,
+                  firstEmitAfterTrigger
+                )
+              }
+            }
             this.recordLiveValue(
               ts.activeSceneId ?? '',
               trackId,
@@ -5333,7 +5870,6 @@ export class SceneEngine {
             )
           }
         }
-        if (ts.stopping) this.disarm(ts)
         continue
       }
 
@@ -5347,7 +5883,8 @@ export class SceneEngine {
         if (effHz > 0) {
           const period = 1000 / effHz
           // While-loop catches up if we missed multiple step boundaries
-          // (e.g., a tick took unusually long).
+          // (e.g., a tick took unusually long) — bounded by snapStaleClock.
+          ts.arpLastAdvanceAt = snapStaleClock(ts.arpLastAdvanceAt, t, period)
           while (t - ts.arpLastAdvanceAt >= period) {
             ts.arpLastAdvanceAt += period
             advanceArpStep(ts, cell.modulation.arpeggiator)
@@ -5466,23 +6003,22 @@ export class SceneEngine {
         //   'stage2'            — Modulation 2 drives the playhead
         //                         while Modulation 1 modulates the
         //                         addressed step's value as normal.
-        //                         Falls back to Mod 1 if Mod 2 is off
-        //                         so the dropdown is never a silent
-        //                         no-op.
+        //                         With Mod 2 off it falls back to
+        //                         'hijack' (Mod 1 addresses, no value
+        //                         modulation — see the slot loop) so
+        //                         the dropdown is never a silent no-op.
         const stepsA = effectiveSteps(cell)
         const subMode = cell.sequencer.adresseMode ?? 'hijack'
         const useMod2ForAddress =
           subMode === 'stage2' && cell.modulation2?.enabled === true
         let modAddrUnit = 0.5
         if (useMod2ForAddress) {
-          // mod2NormBipolar was computed above (hoisted). Map [-1,+1]
-          // → [0,1].
-          modAddrUnit = (mod2NormBipolar + 1) / 2
+          // Raw Mod 2 mapped [-1,+1] → [0,1], computed above (hoisted).
+          modAddrUnit = mod2AddrUnit
         } else if (cell.modulation.enabled) {
           const norm = computeModNorm(
             cell.modulation,
             ts,
-            this.tickIdx,
             (t - ts.triggerTime) / 1000,
             this.currentSceneDurationSec(ts.activeSceneId),
             this.session.globalBpm
@@ -5526,6 +6062,14 @@ export class SceneEngine {
                 idx
               )
             : stepDurMs
+        // Bound the catch-up (snapStaleClock) — e.g. a sync-mode flip to a
+        // much shorter step, or a stall, mustn't replay thousands of
+        // steps (each with drift / cellular / ratchet rolls) in one tick.
+        ts.seqStepStart = snapStaleClock(
+          ts.seqStepStart,
+          t,
+          Math.max(1, currentStepDur(ts.seqStepIdx))
+        )
         while (t - ts.seqStepStart >= currentStepDur(ts.seqStepIdx)) {
           ts.seqStepStart += currentStepDur(ts.seqStepIdx)
           ts.seqLastStepIdx = ts.seqStepIdx
@@ -5635,7 +6179,7 @@ export class SceneEngine {
             ratchetForceRetrigger = true
           }
         }
-        if (stepChanged) this.emitState()
+        if (stepChanged) stepAdvanced = true
       }
 
       // Per-mode gate evaluation. Some modes (steps, drift, ratchet)
@@ -5859,6 +6403,8 @@ export class SceneEngine {
             ts.prevRampMode !== currentMode
           ) {
             ts.triggerTime = t
+            // Not a (re)trigger — keep the Motion Loop phase running.
+            ts.loopAnchorTrig = t
           }
           ts.prevRampMode = currentMode
           rampGain = computeRampGain(
@@ -5874,7 +6420,6 @@ export class SceneEngine {
           modNorm = computeModNorm(
             cell.modulation,
             ts,
-            this.tickIdx,
             (t - ts.triggerTime) / 1000,
             this.currentSceneDurationSec(ts.activeSceneId),
             this.session.globalBpm
@@ -5911,7 +6456,6 @@ export class SceneEngine {
           modNormOriginal = computeModNorm(
             mod1OriginalForSlots,
             ts,
-            this.tickIdx,
             (t - ts.triggerTime) / 1000,
             this.currentSceneDurationSec(ts.activeSceneId),
             this.session.globalBpm
@@ -5953,11 +6497,36 @@ export class SceneEngine {
       // redundant traffic, no re-triggering).
       const sentValuesBefore = ts.lastSentNumeric.slice()
       const newFinalVals: number[] = []
+      // Per-slot view of this tick's numeric output. The Hold dedup
+      // compares it against `sentValuesBefore` SLOT BY SLOT — comparing
+      // the compact newFinalVals against the per-slot cache misaligned
+      // as soon as a fixed / string slot preceded a numeric one, so a
+      // static fixed-header cell re-sent at full tick rate.
+      const newFinalBySlot: (number | undefined)[] = []
+      // MIDI source = the first NON-fixed numeric slot (a fixed protocol
+      // header must never drive the note / CC), plus its unmodulated
+      // base token from the cell Value for the Note pin.
+      let midiSrcVal: number | undefined
+      let midiBaseVal: number | undefined
+      // First emit since this cell (re)triggered — captured before the
+      // send below flips hasEmittedNumeric.
+      const firstEmitAfterTrigger = !ts.hasEmittedNumeric
       const trackArgSpec = track?.argSpec
       // (v0.6.x) Motion Loop — sample this cell's recorded data loop
       // once per emit (returns per-slot values or null). Applied per
       // slot in the loop below, after the HW override.
-      const loopSample = this.sampleRecordedLoop(cell, t)
+      const loopSample = this.sampleRecordedLoop(cell, ts, t)
+      // Adresse `hijack` — the Mod 1 signal is CONSUMED entirely as the
+      // playhead position, so the addressed step emits as-is with NO Mod
+      // 1 value modulation (whatever Mod 1's type). `stage2` with Mod 2
+      // off falls back to Mod 1 addressing, i.e. behaves as hijack.
+      // `parallel` (and `stage2` with Mod 2 on) modulate on top.
+      const adresseSubMode = cell.sequencer.adresseMode ?? 'hijack'
+      const adresseHijack =
+        cell.sequencer.enabled &&
+        cell.sequencer.mode === 'adresse' &&
+        (adresseSubMode === 'hijack' ||
+          (adresseSubMode === 'stage2' && cell.modulation2?.enabled !== true))
       for (let idx = 0; idx < perToken.length; idx++) {
         const a = perToken[idx]
         // ── Fixed argSpec slot — protocol header ──────────────────
@@ -5982,12 +6551,17 @@ export class SceneEngine {
             outs.push({ type: 'i', value: n })
             liveParts.push(String(n))
             newFinalVals.push(n)
+            newFinalBySlot[idx] = n
+            ts.lastSentNumeric[idx] = n
           } else {
             const n = Number(fv)
             const isInt = Number.isInteger(n) || specEntry.type === 'int'
-            outs.push({ type: isInt ? 'i' : 'f', value: isInt ? Math.round(n) : n })
-            liveParts.push(isInt ? String(Math.round(n)) : n.toFixed(3))
-            newFinalVals.push(isInt ? Math.round(n) : n)
+            const v = isInt ? Math.round(n) : n
+            outs.push({ type: isInt ? 'i' : 'f', value: v })
+            liveParts.push(isInt ? String(v) : n.toFixed(3))
+            newFinalVals.push(v)
+            newFinalBySlot[idx] = v
+            ts.lastSentNumeric[idx] = v
           }
           continue
         }
@@ -6039,10 +6613,11 @@ export class SceneEngine {
         const target = seqDrivesSlot ? stepTargets[idx] ?? 0 : seedVal
         // Center: with sequencer driving this slot, center jumps to
         // step value (still honoring the initial morph-in after
-        // trigger). Otherwise center follows the morph between the
-        // cell.value seed endpoints.
+        // trigger). Otherwise — or while stopping, so a sequenced slot
+        // fades out like every other slot instead of gliding toward
+        // the current step — center follows fromCenter → toCenter.
         let center: number
-        if (seqDrivesSlot) {
+        if (seqDrivesSlot && !ts.stopping) {
           const from = ts.fromCenter[idx] ?? 0
           center = morphP < 1 ? from + (target - from) * morphP : target
         } else {
@@ -6105,8 +6680,14 @@ export class SceneEngine {
         // seed / step value). We still enter the block so the
         // sequencer's step-change side effects (e.g. liveDisplay)
         // fire normally elsewhere; just the contribution to `out`
-        // is suppressed.
-        if (cell.modulation.enabled && !ts.stopping && routingModOn) {
+        // is suppressed. Adresse hijack (hoisted above the slot loop)
+        // suppresses it for every Mod 1 type the same way.
+        if (
+          cell.modulation.enabled &&
+          !ts.stopping &&
+          routingModOn &&
+          !adresseHijack
+        ) {
           if (cell.modulation.type === 'envelope') {
             // Multiplicative envelope, depth-mixed. depth=0% → no effect
             // (output = center); depth=100% → full VCA shape (out = center * env).
@@ -6215,24 +6796,16 @@ export class SceneEngine {
                       cell.modulation.gesture?.mode ?? 'xy'
                     )
                   : modNormForSlot
-            // Adresse mode `hijack` (default) — the modulator is
-            // CONSUMED entirely as the playhead position; the step
-            // value emits as-is, NO additional modulation. `parallel`
-            // adds the modulator on top of the addressed step.
-            const adresseMode = cell.sequencer.adresseMode ?? 'hijack'
-            const adresseHijack =
-              cell.sequencer.enabled &&
-              cell.sequencer.mode === 'adresse' &&
-              adresseMode === 'hijack'
             // Routing gates the modulator contribution out for this
             // slot when the user unticked the Modulator row in the
             // Routing matrix. Combined with the sequencer-routing
             // toggle above, the user can dial individual slots
-            // independent of either driver.
+            // independent of either driver. (Adresse hijack is gated
+            // at the enclosing block.)
             // Per-slot Variation multiplier scales the contribution
             // so multi-arg cells get "similar but slightly different"
             // motion across slots.
-            if (adresseHijack || !routingModOn) {
+            if (!routingModOn) {
               out = center
             } else {
               out = center + slotModNorm * magnitude * variationFactor
@@ -6335,7 +6908,15 @@ export class SceneEngine {
         if (cell.scaleToUnit) {
           const seqAutoRanged =
             cell.sequencer.enabled && ts.seqGenRanges[idx]
-          if (!seqAutoRanged && cell.modulation.enabled && !ts.stopping) {
+          // Arpeggiator is excluded: its branch above already normalised
+          // the ladder into [0, 1] under scaleToUnit, so remapping by the
+          // predicted range again would squash it (~halve it).
+          if (
+            !seqAutoRanged &&
+            cell.modulation.enabled &&
+            cell.modulation.type !== 'arpeggiator' &&
+            !ts.stopping
+          ) {
             const r = predictModRange(cell.modulation, center)
             const span = r.max - r.min
             if (span > 1e-9) {
@@ -6490,15 +7071,24 @@ export class SceneEngine {
             ? 'i'
             : 'f'
         const finalVal = sendType === 'i' ? Math.round(out) : out
-        // Cache the value we just decided to send — non-persistent
-        // slots update freely. (Pinned slots are sourced from the
-        // track's stored persistentValues, not from this cache, so
-        // we don't need to keep the cache in sync for them.)
-        if (!persistThis) ts.lastSentNumeric[idx] = finalVal
+        // Cache what we emit for EVERY numeric slot, pinned included:
+        // the per-slot Hold dedup and the HW catch both compare against
+        // what the slot actually sent. (Pinned values are sourced from
+        // persistentValues, never from this cache, so writing it is safe.)
+        ts.lastSentNumeric[idx] = finalVal
         newFinalVals.push(finalVal)
+        newFinalBySlot[idx] = finalVal
+        if (midiSrcVal === undefined) {
+          midiSrcVal = finalVal
+          const baseTok = parseFloat(parseValueTokens(cell.value)[idx] ?? '')
+          midiBaseVal = Number.isFinite(baseTok) ? baseTok : finalVal
+        }
         outs.push({ type: sendType, value: finalVal })
         liveParts.push(sendType === 'i' ? String(finalVal) : finalVal.toFixed(3))
       }
+      // lastSentNumeric now holds a value this track's cell computed
+      // (not a stale knob override) — soft-takeover may resume.
+      if (this.hwCatchAwaitingEmit.size > 0) this.hwCatchAwaitingEmit.delete(trackId)
 
       // Hold rest-behaviour gate: when restBehaviour='hold', skip
       // the OSC send if every numeric token matches what we sent
@@ -6511,8 +7101,9 @@ export class SceneEngine {
       if (newFinalVals.length === 0) {
         valuesChanged = true // pure string/bool — fall through to send
       } else {
-        for (let i = 0; i < newFinalVals.length; i++) {
-          if (sentValuesBefore[i] !== newFinalVals[i]) {
+        for (let i = 0; i < newFinalBySlot.length; i++) {
+          const v = newFinalBySlot[i]
+          if (v !== undefined && sentValuesBefore[i] !== v) {
             valuesChanged = true
             break
           }
@@ -6543,23 +7134,39 @@ export class SceneEngine {
       // Fires after OSC so the wall-clock order in the Monitor
       // matches "what the user expects" (OSC first, then MIDI).
       // `isNoteEdge` captures the three Note On trigger moments:
-      //   1. First numeric emit after a fresh cell trigger
-      //      (`!sentValuesBefore.length` would be the strict test;
-      //       we use `!hadEmittedAtTickStart` so a Hold-mode
-      //       re-trigger still fires a note).
+      //   1. A fresh (re)trigger (`ts.midiTriggerEdge`, set in
+      //      triggerCell's start()) — re-triggering the SAME note
+      //      (loop follow-action, repeat, re-click) re-strikes it.
       //   2. Sequencer step advance this tick (`stepChanged` was
       //      set by the advance loop above).
       //   3. Ratchet sub-pulse boundary (`ratchetForceRetrigger`).
+      // While the value GLIDES (cell transition / scene morph) or fades
+      // out on stop, it sweeps through intermediate numbers — the
+      // trigger's Note On waits for the glide to land and note-number
+      // changes don't fire, so a morph plays one note on its target
+      // instead of a chromatic run.
       // For CC kind, every shouldSend emits — same cadence as OSC.
+      // Instrument header rows are group-trigger containers: like OSC
+      // (see oscEmitAllowed), they never emit MIDI.
       if (
         this.session?.midiEnabled &&
         cell.midiOut?.enabled &&
-        cell.midiOut.portName
+        cell.midiOut.portName &&
+        track?.kind !== 'template'
       ) {
-        const hadEmittedAtTickStart = sentValuesBefore.length > 0
+        const gliding = ts.stopping || (ts.morphMs > 0 && morphP < 1)
         const isNoteEdge =
-          !hadEmittedAtTickStart || stepChanged || ratchetForceRetrigger
-        this.emitMidiForCell(ts, cell, newFinalVals, isNoteEdge, shouldSend)
+          (ts.midiTriggerEdge && !gliding) || stepChanged || ratchetForceRetrigger
+        this.emitMidiForCell(
+          ts,
+          cell,
+          midiSrcVal,
+          midiBaseVal,
+          isNoteEdge,
+          gliding,
+          shouldSend,
+          firstEmitAfterTrigger
+        )
       }
       // Always record liveValue for the UI — even if we suppressed
       // the OSC send for Hold, the cell tile + step previews should
@@ -6570,7 +7177,7 @@ export class SceneEngine {
     }
 
     // Throttle live-value emits to ~20Hz to keep IPC cheap.
-    if (t - this.lastValueEmitAt >= 50) {
+    if (stepAdvanced || t - this.lastValueEmitAt >= 50) {
       this.lastValueEmitAt = t
       this.emitState()
     }
@@ -6591,32 +7198,37 @@ export class SceneEngine {
    * of, if the user only enabled MIDI on this cell). Two paths:
    *
    *   - CC kind: continuous send, gated by Hold rest-behaviour the
-   *     same way OSC is. Maps the cell's first final numeric value
-   *     into 0..127.
+   *     same way OSC is. Maps `srcVal` (the first NON-fixed numeric
+   *     slot) into 0..127.
    *   - Note kind: edge-triggered. `isNoteEdge` is true at fresh
-   *     cell triggers, sequencer step advances, and ratchet sub-pulse
-   *     boundaries. On each edge we send Note Off for the previously
-   *     held note (if any), then Note On with the current note number
-   *     (= newFinalVals[0] clamped) and velocity (= cell.velocity
-   *     parsed, with `velocityPersistent` overriding modulator). An
-   *     optional `gateLengthMs` schedules an explicit Note Off after
-   *     N ms; otherwise the next edge or `sendMidiNoteOff()` fires it.
+   *     (re)triggers, sequencer step advances, and ratchet sub-pulse
+   *     boundaries; a note-number change also fires unless `gliding`.
+   *     On each edge we send Note Off for the previously held note (if
+   *     any), then Note On with the note number (from `srcVal`, or the
+   *     cell's base Value `baseVal` when the Note pin is on) and
+   *     velocity (the Velocity field — or, with the Note pin on and
+   *     velocity unpinned, the modulated output). An optional
+   *     `gateLengthMs` schedules an explicit Note Off after N ms;
+   *     otherwise the next edge or `sendMidiNoteOff()` fires it.
    *
    * Returns early if MIDI is globally disabled, the cell doesn't
-   * opt in, or the port name is empty.
+   * opt in, the port name is empty, or there's no numeric source slot.
    */
   private emitMidiForCell(
     ts: TrackState,
     cell: Cell,
-    newFinalVals: number[],
+    srcVal: number | undefined,
+    baseVal: number | undefined,
     isNoteEdge: boolean,
-    oscSentThisTick: boolean
+    gliding: boolean,
+    oscSentThisTick: boolean,
+    firstEmitAfterTrigger: boolean
   ): void {
     const m = cell.midiOut
     if (!m || !m.enabled || !m.portName) return
     if (!this.session?.midiEnabled) return
-    if (newFinalVals.length === 0) return
-    const noteOrCcSourceVal = newFinalVals[0] ?? 0
+    if (srcVal === undefined) return
+    const noteOrCcSourceVal = srcVal
     if (m.kind === 'cc') {
       const ccNum = Math.max(0, Math.min(127, Math.floor(m.cc ?? 0)))
       // Re-clamp to [0, 127]. `midiScale` (MIDI-specific 0..1 → 0..127
@@ -6637,8 +7249,14 @@ export class SceneEngine {
       const cacheKey = `${m.portName}|${m.channel}|${ccNum}`
       const last = ts.midiLastCc.get(cacheKey)
       const hold = cell.sequencer.restBehaviour === 'hold'
-      if (hold && last === value && oscSentThisTick === false) return
-      if (hold && last === value && ts.hasEmittedNumeric) return
+      // The first emit after a (re)trigger always sends — the cache
+      // survives re-triggers, so a cell re-fired while playing (loop
+      // follow-action, repeat) was otherwise silently deduped.
+      if (!firstEmitAfterTrigger) {
+        if (hold && last === value && oscSentThisTick === false) return
+        if (hold && last === value && ts.hasEmittedNumeric) return
+      }
+      ts.midiTriggerEdge = false
       ts.midiLastCc.set(cacheKey, value)
       this.midiSender.sendCc(m.portName, m.channel, ccNum, value)
       return
@@ -6661,26 +7279,42 @@ export class SceneEngine {
     // Tolerate swapped min/max — pick the lower as lo, the higher as hi.
     const lo = Math.max(0, Math.min(127, Math.min(rawLo, rawHi)))
     const hi = Math.max(0, Math.min(127, Math.max(rawLo, rawHi)))
+    // Note pin: the pitch freezes at the cell's base Value (sequencer /
+    // modulator stop moving it) and the modulated output drives
+    // velocity instead — unless velocity is pinned too.
+    const pinNote = cell.notePersistent === true
+    const pitchSrc = pinNote
+      ? cell.scaleToUnit
+        ? clamp01(baseVal ?? noteOrCcSourceVal)
+        : baseVal ?? noteOrCcSourceVal
+      : noteOrCcSourceVal
     const rawNote = wantNoteMap
-      ? Math.round(lo + noteOrCcSourceVal * (hi - lo))
-      : Math.round(noteOrCcSourceVal)
+      ? Math.round(lo + pitchSrc * (hi - lo))
+      : Math.round(pitchSrc)
     const noteNum = Math.max(0, Math.min(127, rawNote))
     // Effective edge: caller-supplied (trigger / sequencer step /
-    // ratchet) OR note-number change from the last held note.
-    // `midiHeldNote === null` is treated as "different" so the cell
-    // re-triggers after a gate-timer noteOff (otherwise modulator-
-    // only cells with a non-zero gate would go silent forever once
-    // their gate elapsed — no edge would ever fire again).
-    const noteNumberChanged = ts.midiHeldNote !== noteNum
+    // ratchet) OR a note-number change against the last note PLAYED.
+    // Comparing against the HELD note (nulled by the gate timer)
+    // re-struck a gated static note every gate period. No note-number
+    // edges while gliding (transition / morph / stop fade): the sweep
+    // would otherwise play every intermediate note.
+    const noteNumberChanged =
+      !gliding && ts.midiLastNoteNum !== null && ts.midiLastNoteNum !== noteNum
     if (!isNoteEdge && !noteNumberChanged) return
-    // Resolve velocity. Pinned velocity always reads from the cell's
-    // velocity field; unpinned velocity also reads from the field
-    // (full per-velocity modulation is a v0.6 feature — for v0.5
-    // the velocity slot is a static or hand-edited value).
-    const velRaw = parseFloat(cell.velocity ?? '100')
-    let velocity = Number.isFinite(velRaw)
-      ? Math.max(0, Math.min(127, Math.round(velRaw)))
-      : 100
+    // This edge answers any pending (re)trigger.
+    ts.midiTriggerEdge = false
+    // Velocity: the Velocity field — or, with the Note pin on and
+    // velocity unpinned, the modulated output mapped like a CC value.
+    let velocity: number
+    if (pinNote && cell.velocityPersistent !== true) {
+      const velSrc = wantNoteMap ? noteOrCcSourceVal * 127 : noteOrCcSourceVal
+      velocity = Math.max(0, Math.min(127, Math.round(velSrc)))
+    } else {
+      const velRaw = parseFloat(cell.velocity ?? '100')
+      velocity = Number.isFinite(velRaw)
+        ? Math.max(0, Math.min(127, Math.round(velRaw)))
+        : 100
+    }
     // Humanization — adds random jitter around the user's velocity
     // value. 0..100% maps to ±(humanize / 100) × 127 / 2 of variation.
     // Each Note On rolls a fresh random offset so repeated triggers
@@ -6714,6 +7348,7 @@ export class SceneEngine {
       return
     }
     this.midiSender.sendNoteOn(m.portName, m.channel, noteNum, velocity)
+    ts.midiLastNoteNum = noteNum
     // Cache the jittered velocity ONLY after the noteOn actually hit
     // the wire — so the renderer's badge mirrors what was sent (and
     // stays at the last real value during gaps, instead of getting
@@ -6775,23 +7410,31 @@ export class SceneEngine {
     ts.armed = false
     ts.stopping = false
     ts.activeSceneId = null
-    // If a scene was "held open" (duration expired but modulation kept it alive),
-    // clear activeSceneId now that the last active cell has stopped.
+    // No advance timer pending (paused) and this was the scene's last
+    // playing cell: the scene has ended, so clear it like stopScene.
     if (
       wasScene &&
       this.activeSceneId === wasScene &&
       this.sceneAdvanceTimer === null &&
-      !this.sceneHasOngoingActivity(wasScene)
+      !this.sceneHasPlayingTracks(wasScene)
     ) {
       this.activeSceneId = null
       this.activeSceneStartedAt = null
       this.activeSequenceSlotIdx = null
+      this.activeSceneDurationMs = null
+      this.pauseStartedAt = null
     }
     this.emitState()
   }
 
   private currentSceneDurationSec(sceneId: string | null): number {
     if (!this.session || !sceneId) return 5
+    // The active scene plays for its EFFECTIVE armed duration (generative
+    // roll / per-slot override), not its authored Dur — 'synced'
+    // envelopes / ramps must span what actually plays.
+    if (sceneId === this.activeSceneId && this.activeSceneDurationMs !== null) {
+      return this.activeSceneDurationMs / 1000
+    }
     const sc = this.session.scenes.find((s) => s.id === sceneId)
     return sc?.durationSec ?? 5
   }
@@ -6863,7 +7506,6 @@ export class SceneEngine {
         modNorm = computeModNorm(
           cell.modulation,
           ts,
-          this.tickIdx,
           (t - ts.triggerTime) / 1000,
           this.currentSceneDurationSec(ts.activeSceneId),
           this.session.globalBpm
@@ -6875,7 +7517,7 @@ export class SceneEngine {
     const outs: number[] = []
     for (let i = 0; i < targets.length; i++) {
       let center: number
-      if (cell.sequencer.enabled) {
+      if (cell.sequencer.enabled && !ts.stopping) {
         const from = ts.fromCenter[i] ?? 0
         center = morphP < 1 ? from + (targets[i] - from) * morphP : targets[i]
       } else {
@@ -7064,7 +7706,6 @@ function advanceArpStep(
 function computeModNorm(
   m: Modulation,
   ts: TrackState,
-  tickIdx: number,
   elapsedSec: number,
   sceneDurSec: number,
   _bpm: number
@@ -7113,10 +7754,39 @@ function computeModNorm(
     return ts.chaosX // already 0..1
   }
   if (m.type === 'attractor') {
-    // Default channel = X. Multi-arg cells get per-slot channels via
-    // `attractorChannelFor(ts, slotIdx, mode)` in the per-slot emit
-    // loop; single-arg / single-channel readers use this fallback.
-    return attractorChannelFor(ts, 1, m.mode)
+    // Default channel = X (slot 0). Multi-arg cells get per-slot
+    // channels via `attractorChannelFor(ts, slotIdx, mode)` in the
+    // per-slot emit loop; single-arg / single-channel readers use this
+    // fallback.
+    return attractorChannelFor(ts, 0, m.mode)
+  }
+  if (m.type === 'ramp') {
+    // Ramp gain is naturally unipolar 0..1 (same mapping as envelope).
+    // Without this branch Adresse + Ramp fell through to the LFO path
+    // on a phase that never advances → playhead frozen.
+    const g = computeRampGain(m.ramp, elapsedSec, sceneDurSec)
+    return m.mode === 'bipolar' ? 2 * g - 1 : g
+  }
+  if (m.type === 'arpeggiator') {
+    // Current step's normalised position on the ladder (0 = first
+    // step, 1 = last) — the same reading Mod 2's arpeggiator uses. A
+    // single-step ladder sits at the centre.
+    const N = Math.max(1, Math.min(8, m.arpeggiator.steps))
+    const k = Math.max(0, Math.min(N - 1, ts.arpStepIdx))
+    const u = N <= 1 ? 0.5 : k / (N - 1)
+    return m.mode === 'bipolar' ? 2 * u - 1 : u
+  }
+  if (m.type === 'random') {
+    // Current random sample (first entry), normalised into the
+    // generator's [min, max] span.
+    const lo = Math.min(m.random.min, m.random.max)
+    const span = Math.max(m.random.min, m.random.max) - lo
+    const v = ts.randCurrent[0]
+    const u =
+      typeof v === 'number' && Number.isFinite(v) && span > 1e-9
+        ? Math.max(0, Math.min(1, (v - lo) / span))
+        : 0.5
+    return m.mode === 'bipolar' ? 2 * u - 1 : u
   }
   if (m.type === 'gesture') {
     // Default channel = X (slot 0 in xy mode). Multi-arg cells get
@@ -7127,17 +7797,17 @@ function computeModNorm(
     return gestureChannelFor(ts, 0, m.mode, gMode)
   }
   // LFO (default fallthrough)
-  const raw = lfo(m.shape, ts.phase, ts, tickIdx) // -1..1
+  const raw = lfo(m.shape, ts.phase, ts) // -1..1
   if (m.mode === 'bipolar') return raw
   return (raw + 1) / 2 // 0..1
 }
 
 // Resolve which attractor channel feeds a given arg slot.
-//   slotIdx 0 → W (4D) or X (3D, since W=speed sits at slot 3)
-//   slotIdx 1 → X
-//   slotIdx 2 → Y
-//   slotIdx 3 → Z
-//   slotIdx 4+ → Z (graceful degrade — keeps the last channel mod
+//   slotIdx 0 → X
+//   slotIdx 1 → Y
+//   slotIdx 2 → Z
+//   slotIdx 3 → W (native W for 4D types; trajectory speed for 3D)
+//   slotIdx 4+ → Z (graceful degrade — keeps a motion channel mod
 //                  active rather than zeroing)
 // For 3D attractors the user-facing mental model is X/Y/Z fan-out to
 // the first three slots + a "speed breath" on slot 3. For 4D the
@@ -7353,11 +8023,10 @@ function computeRampGain(
 // Rate / Depth / context-aware Shape per the user's targets +
 // targetMode.
 //
-// Supported Mod 2 types (subset of full ModType): LFO, S&H, Slew,
-// Chaos, Strange Attractor. The remaining types (Envelope, Ramp,
-// Arpeggiator, Random) are time/note/multi-channel constructs that
-// don't map cleanly to "continuous bipolar modulator signal", and
-// are treated as no-op when assigned to Mod 2 (eval returns 0).
+// Every ModType can drive Mod 2: continuous types (LFO, S&H, Slew,
+// Chaos, Attractor, Random) return their signal directly; the one-shot
+// / stepped types (Envelope, Ramp, Arpeggiator) are mapped onto
+// [-1, +1] — see evalMod2Bipolar.
 // ─────────────────────────────────────────────────────────────────
 
 function advanceMod2State(
@@ -7365,8 +8034,7 @@ function advanceMod2State(
   m2: Mod2State,
   dt: number,
   t: number,
-  bpm: number,
-  tickIdx: number
+  bpm: number
 ): void {
   if (!m.enabled) return
   // LFO — same phase advance + stepped/smooth shape resampling as
@@ -7384,7 +8052,6 @@ function advanceMod2State(
         m2.rndSmoothNext = rng() * 2 - 1
         m2.rndStepValue = spastic ? (rng() < 0.5 ? -1 : 1) : rng() * 2 - 1
       }
-      m2.rndStepLastTick = tickIdx
     }
     return
   }
@@ -7400,6 +8067,7 @@ function advanceMod2State(
         const warped = warpDistribution(rng(), dist)
         return warped * 2 - 1
       }
+      m2.shLastAdvanceAt = snapStaleClock(m2.shLastAdvanceAt, t, period)
       while (t - m2.shLastAdvanceAt >= period) {
         m2.shLastAdvanceAt += period
         if (rng() < Math.max(0, Math.min(1, m.sh.probability))) {
@@ -7416,6 +8084,7 @@ function advanceMod2State(
     if (effHz > 0) {
       const rng = m2.rng ?? Math.random
       const period = 1000 / effHz
+      m2.slewLastAdvanceAt = snapStaleClock(m2.slewLastAdvanceAt, t, period)
       while (t - m2.slewLastAdvanceAt >= period) {
         m2.slewLastAdvanceAt += period
         if (m.slew.randomTarget) {
@@ -7438,6 +8107,7 @@ function advanceMod2State(
       const period = 1000 / effHz
       const r = Math.max(3.4, Math.min(4.0, m.chaos.r))
       const rng = m2.rng ?? Math.random
+      m2.chaosLastAdvanceAt = snapStaleClock(m2.chaosLastAdvanceAt, t, period)
       while (t - m2.chaosLastAdvanceAt >= period) {
         m2.chaosLastAdvanceAt += period
         let x = m2.chaosX
@@ -7608,6 +8278,7 @@ function advanceMod2State(
     const effHz = effectiveLfoHz(m, bpm)
     if (effHz > 0) {
       const period = 1000 / effHz
+      m2.arpLastAdvanceAt = snapStaleClock(m2.arpLastAdvanceAt, t, period)
       while (t - m2.arpLastAdvanceAt >= period) {
         m2.arpLastAdvanceAt += period
         advanceArpStep(m2, m.arpeggiator)
@@ -7626,6 +8297,7 @@ function advanceMod2State(
       const period = 1000 / effHz
       const dist = m.random.distribution
       const rng = m2.rng
+      m2.randLastAdvanceAt = snapStaleClock(m2.randLastAdvanceAt, t, period)
       while (t - m2.randLastAdvanceAt >= period) {
         m2.randLastAdvanceAt += period
         const draw = rng()
@@ -7643,13 +8315,14 @@ function advanceMod2State(
   // already does on the shared triggerTime).
 }
 
+// Mod 2 signal in [-1, +1]. Consumed raw by every Mod 2 target — Depth
+// and Mode are intentionally not applied (see the call site in tick).
 function evalMod2Bipolar(
   m: import('@shared/types').Modulation,
   m2: Mod2State,
   triggerTimeMs: number,
   nowMs: number,
   bpm: number,
-  tickIdx: number,
   sceneDurSec: number
 ): number {
   if (!m.enabled) return 0
@@ -7687,7 +8360,7 @@ function evalMod2Bipolar(
       // per-slot output, but at this stage we just need ONE number.)
       return m2.attractorX * 2 - 1
     case 'lfo': {
-      const raw = lfo(m.shape, m2.phase, m2, tickIdx)
+      const raw = lfo(m.shape, m2.phase, m2)
       return raw
     }
     case 'random':
@@ -7729,7 +8402,9 @@ function evalMod2Bipolar(
 function applyMod2ToMod1(
   m1: import('@shared/types').Modulation,
   m2cfg: import('@shared/types').Modulation,
-  mod2NormBipolar: number
+  mod2NormBipolar: number,
+  // Session BPM — resolves a BPM-synced Mod 1's effective rate.
+  bpm: number
 ): import('@shared/types').Modulation {
   const targets = m2cfg.targets
   if (!targets) return m1
@@ -7759,21 +8434,34 @@ function applyMod2ToMod1(
   if (targets.rate?.enabled) {
     const amt = (targets.rate.amount ?? 0) / 100
     // LFO-family rate (rateHz) — used by LFO, S&H, Slew, Chaos,
-    // Random, Arpeggiator. Clamp to the engine's 0.01..20 Hz band.
-    const baseRate = m1.rateHz
+    // Random, Arpeggiator, Gesture. Clamp to the Rate slider's
+    // 0.01..100 Hz range (sliderToRateHz).
+    //
+    // BPM-synced Mod 1 ignores rateHz — effectiveLfoHz derives the
+    // rate from the note division + session BPM — so patching rateHz
+    // alone was a silent no-op. For sync 'bpm' we resolve the synced
+    // Hz, apply Mod 2 to THAT (a tempo scale factor on the division),
+    // and hand the tick a free-running clone at the result. The stored
+    // Mod 1 keeps its sync settings; only this per-tick clone is free.
+    const synced = m1.sync === 'bpm'
+    const baseRate = synced ? effectiveLfoHz(m1, bpm) : m1.rateHz
     let nextRate: number
     if (mode === 'additive') {
-      // Bipolar swing ±(20 Hz × amount) around the base, clamped to
-      // a sane LFO band. 20 Hz is the engine's upper LFO limit; the
-      // additive math feels right when the swing is a fixed slice of
-      // the legal range.
+      // Bipolar swing ±(20 Hz × amount) around the base — a fixed
+      // slice of the legal range, which is where the additive math
+      // feels right (and matches the lower, fine-grained half of the
+      // Rate slider).
       nextRate = baseRate + mod2NormBipolar * 20 * amt
     } else {
       // multiplicative + mix
       nextRate = baseRate * (1 + mod2NormBipolar * amt)
     }
-    nextRate = Math.max(0.01, Math.min(20, nextRate))
-    out = { ...out, rateHz: nextRate }
+    // A fast synced division can legitimately exceed 100 Hz; don't let
+    // the clamp alone pull it below its own base rate.
+    nextRate = Math.max(0.01, Math.min(Math.max(100, baseRate), nextRate))
+    out = synced
+      ? { ...out, sync: 'free', rateHz: nextRate }
+      : { ...out, rateHz: nextRate }
     // Strange Attractor — patch `attractor.speed` too. The engine
     // ignores rateHz for attractor and reads `attractor.speed`
     // exclusively; without this branch the Rate knob would be a
@@ -8064,9 +8752,10 @@ function applyMod2ToMod1(
 // Same model as applyMod2ToMod1 (Rate / Shape / Depth) but the actual
 // fields patched depend on the sequencer mode:
 //
-//   Rate  -> bpm (when syncMode='bpm' or 'tempo') OR stepMs (free).
-//            Both are patched so the user can flip syncMode without
-//            losing the Mod 2 effect. Engine clamps to legal ranges.
+//   Rate  -> bpm (syncMode 'tempo') OR stepMs (free). Both are
+//            patched so the user can flip syncMode without losing the
+//            Mod 2 effect. syncMode 'bpm' scales the SESSION tempo and
+//            the clone runs as 'tempo'. Engine clamps to legal ranges.
 //   Shape -> per-mode "musical personality" knob:
 //              euclidean   -> rotation        (0..steps-1)
 //              density     -> seed            (0..255)
@@ -8121,7 +8810,9 @@ function cellSimilarityFromTokens(
 function applyMod2ToSeq(
   seq: import('@shared/types').SequencerParams,
   m2cfg: import('@shared/types').Modulation,
-  mod2NormBipolar: number
+  mod2NormBipolar: number,
+  // Session BPM — the tempo a syncMode 'bpm' sequencer actually runs at.
+  globalBpm: number
 ): import('@shared/types').SequencerParams {
   const targets = m2cfg.targetsSeq
   if (!targets) return seq
@@ -8140,7 +8831,11 @@ function applyMod2ToSeq(
     // BPM: 10..500. Multiplicative is musical (LFO ±100% halves /
     // doubles the tempo). Additive ±240 BPM × amount lets the user
     // pull base tempo all the way to the edges of the legal range.
-    const baseBpm = seq.bpm
+    // syncMode 'bpm' steps at the SESSION tempo and ignores seq.bpm, so
+    // scale the session tempo instead and hand the tick a 'tempo'-mode
+    // clone running at the result (the stored sequencer is untouched).
+    const bpmSynced = seq.syncMode === 'bpm'
+    const baseBpm = bpmSynced ? globalBpm : seq.bpm
     let nextBpm: number
     if (mode === 'additive') {
       nextBpm = baseBpm + mod2NormBipolar * 240 * amt
@@ -8160,7 +8855,9 @@ function applyMod2ToSeq(
       nextStepMs = baseStepMs * (1 - mod2NormBipolar * amt)
     }
     nextStepMs = Math.max(1, Math.min(60000, nextStepMs))
-    out = { ...out, bpm: nextBpm, stepMs: nextStepMs }
+    out = bpmSynced
+      ? { ...out, syncMode: 'tempo', bpm: nextBpm, stepMs: nextStepMs }
+      : { ...out, bpm: nextBpm, stepMs: nextStepMs }
   }
   // ── Shape -> per-mode musical personality knob ──────────────────
   if (targets.shape?.enabled) {

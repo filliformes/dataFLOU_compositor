@@ -6,7 +6,7 @@ Since **v0.6** dataFLOU is also a **live‑hardware performance instrument**: a 
 
 ![dataFLOU_compositor - Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
-Built as a desktop app for Windows and macOS using Electron + React. Sessions are saved as plain JSON files and round‑trip cleanly between machines.
+Built as a desktop app for Windows, macOS and Linux using Electron + React. Sessions are saved as plain JSON files and round‑trip cleanly between machines.
 
 ---
 
@@ -45,6 +45,7 @@ Built as a desktop app for Windows and macOS using Electron + React. Sessions ar
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.6](#release-notes---066)
 - [Release notes - 0.6.5](#release-notes---065)
 - [Release notes - 0.6.4](#release-notes---064)
 - [Release notes - 0.6.3](#release-notes---063)
@@ -139,7 +140,7 @@ You build a grid of **Instruments** (rows - each Instrument is a typed group of 
 - **Multi‑select clips**: Ctrl+click adds clips to a disjoint selection.
 - **Multi‑select sequence slots**: Shift+click in the Scene Steps grid OR the Timeline extends a contiguous slot range. Right‑click → Clear Scene from N slots / Set Follow Action on every covered scene at once.
 - **Global MIDI Learn**: one button. Click a scene, clip trigger, **Instrument group trigger**, or Meta knob, wiggle a MIDI control. Blue overlays show learnables, green = bound.
-- **UI zoom**: Ctrl+wheel rescales everything below the main toolbar (0.5×–2×), including the Pool drawer + OSC monitor.
+- **UI zoom**: Ctrl+wheel (or Ctrl + = / − / 0) rescales the whole app, main toolbar included (0.5×–2×), including the Pool drawer + OSC monitor. The toolbar has its own extra zoom in the prefs panel.
 - **17 themes**: including two **rich themes** (Nature, Cream) that swap classic HTML controls for bespoke Rainbow‑Circuit‑flavoured arc sliders, mode icon rows, console‑style readouts, and card‑wrapped inspector sections.
 
 OSC is sent over UDP. The engine runs in the Electron main process at a configurable tick rate (10–300 Hz) so timing stays stable even if the UI is busy.
@@ -197,7 +198,7 @@ The window is split into three regions:
 
 **Tab** toggles Edit ↔ Sequence - even from inside text inputs, dedicated to view‑switch only.
 
-**Ctrl+wheel** zooms the whole app (except the main toolbar). **Left‑click** on either Collapse toggle flips just that axis; **right‑click** flips both.
+**Ctrl+wheel** zooms the whole app (main toolbar included). **Left‑click** on either Collapse toggle flips just that axis; **right‑click** flips both.
 
 ---
 
@@ -417,13 +418,14 @@ This means you can sequence one channel of a multi‑value parameter while leavi
 
 ### OSC monitor
 
-A bottom drawer that streams outgoing OSC traffic for debugging.
+A bottom drawer that streams OSC (incoming + outgoing) and MIDI traffic for debugging.
 
 - Toggle with **O** or right‑click the Instruments column → **Show Pool**.
 - **Resizable**: drag the top edge. Max height now adapts to UI zoom so the drawer can't eat the workspace at 2× scale.
-- Single‑line title bar - `× close · OSC Monitor · Log N/M · filter input · Live · Clear`.
+- **OSC In** is stacked above **OSC Out** in one column (equal halves), **MIDI** sits to their right (OSC and MIDI split 50/50 by default, drag the divider to change it), then the **Learned** MIDI bindings panel.
+- Title bar - `× close · Monitor · OSC In / OSC Out / MIDI toggles + counts · filter · Live · Clear`. It never clips: when the drawer is too narrow, Live / Clear drop to a second line.
 - Filter by substring, pause, clear.
-- Pool pane sits beside the log; each can be hidden independently.
+- Pool pane sits beside the log; each can be hidden independently. The Pool can also float in its own window (⤢ or double‑click its title bar) — drag it by the title bar, resize it from the bottom‑right corner.
 - **Scales with Ctrl+wheel zoom**: Pool tabs, device rows, and OSC log all scale alongside the rest of the app.
 
 ### Autosave + crash recovery
@@ -498,32 +500,40 @@ By default, sessions saved via the Save‑before‑quit / Save‑before‑new fl
 
 ## Keyboard shortcuts
 
+Single‑key shortcuts (and Space, Delete, Alt + S, Ctrl + C / V, Ctrl + T / P, Ctrl + Alt + D, Ctrl + = / − / 0) are ignored while the focus is in a text field, so typing works normally; **Tab**, **Ctrl + S**, **Ctrl + Z / Y**, **F11** and **Esc** work there too. While a dialog is open, the shortcuts stand down except **F11**, **Esc** and zoom. In **Show mode** only the performance keys stay live (Tab, Space, A, 1 – 9 / 0, . / Shift + ., Ctrl + Z / Y, Ctrl + C, zoom, F11, Esc‑hold).
+
 | Shortcut | Action |
 | --- | --- |
-| **Tab** | Toggle Edit ↔ Sequence (works even inside text inputs) |
-| **Space** | GO - fire the armed scene; if none, trigger the next non‑empty slot |
+| **Tab** / **Shift + Tab** | Toggle Edit ↔ Sequence (works even inside text inputs) |
+| **Space** | GO - fire the armed scene; if none, trigger the next non‑empty slot after the one playing |
 | **A** | Arm / unarm the focused scene as the next cue |
 | **1 – 9 / 0** | Trigger scenes 1–10 in the sequence directly |
 | **Enter** (in a clip's Value field) | Commit the new value AND re‑trigger the clip |
-| **. / Shift + .** | Stop All (graceful) / Panic (instant) |
+| **. / Shift + .** | Stop All (graceful) / Panic (instant). Physical "." key (numpad "." too), so Shift + . works on every layout |
 | **F11** | Toggle Show / Kiosk mode |
 | **Esc** (hold ≥ 800 ms) | Exit Show mode |
 | **M** | Toggle the Meta Controller bar |
 | **O** | Toggle the Monitor drawer |
 | **P** | Toggle the Pool inside the Monitor drawer (opens drawer if closed) |
 | **C** | Open the Capture popup |
+| **L** | Toggle MIDI Learn mode |
+| **G** | Toggle the Generative Settings popover |
 | **I** | Toggle the right‑side Inspector panel (Edit view) |
 | **S** | Toggle the **Signals** view (every State Trigger + Pose Sequence, live) |
 | **Shift + S** | Toggle the focused‑Scene info panel (Sequence view) |
 | **N** | Toggle the **Mappings** view (input → curve → output for every Parameter) |
 | **Ctrl/⌘ + Z** | Undo (3 levels) |
 | **Ctrl/⌘ + Shift + Z** *or* **Ctrl/⌘ + Y** | Redo |
-| **Ctrl + S** *(Cmd + S on macOS)* | Save the current session |
+| **Ctrl/⌘ + C** / **Ctrl/⌘ + V** | Copy / paste the selected clip or Instrument / Parameter (internal clipboard) |
+| **Ctrl + S** *(Cmd + S on macOS)* | Save the current session (works inside text fields too) |
 | **Ctrl + T** *(Cmd + T on macOS)* | Add a new Instrument |
 | **Ctrl + P** *(Cmd + P on macOS)* | Add a Parameter to the selected Instrument's group |
-| **Alt + S** | Add a Scene |
+| **Ctrl + Alt + D** *(Cmd + Option + D on macOS)* | Duplicate the focused Scene |
+| **Alt + S** *(Option + S on macOS)* | Add a Scene |
 | **Delete** | Multi‑selected Scenes → bulk delete; otherwise focused scene / selected Instrument(s) |
-| **Ctrl + wheel** | Zoom the whole app (except the main toolbar), 0.5×–2× |
+| **Ctrl/⌘ + =** / **Ctrl/⌘ + −** / **Ctrl/⌘ + 0** | Zoom the whole app in / out / reset to 100 % |
+| **Ctrl + wheel** | Zoom the whole app (main toolbar included), 0.5×–2× |
+| **Shift + wheel** | Scroll the view under the cursor horizontally |
 | **Ctrl + drag** *(Cmd + drag on macOS)* a clip onto an empty cell | Duplicate that clip |
 | **Ctrl + click** a clip | Add / remove it from the disjoint multi‑selection |
 | **Shift + click** a scene | Extend range selection from the anchor |
@@ -595,6 +605,47 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.6
+
+The **device subscriptions + full audit** release. dataFLOU can now ask OSC hardware that only streams on request — the **Pandore** daemon's built‑in IMU, encoder and pins — to send to it, on session load, and keep that link alive. Plus a full‑app audit (engine, persistence, app lifecycle, UI), a Monitor drawer that no longer spills off the screen, and a **Linux AppImage** built with every release.
+
+### Device Subscriptions (Pool → Network)
+
+Some OSC devices send nothing until a client subscribes. dataFLOU now sends that handshake itself:
+
+- **Find on this machine / Network** asks Pandore daemons (`/pandore/describe`) what they expose — IMU, encoder, input pins, `aio/*` / `dio/*` wildcards — and lists them with a one‑click **Subscribe**. `+ Pandore` adds one by hand; `+ Custom` covers any other device (your own subscribe address, arguments with `{rate} {host} {port}` placeholders, optional unsubscribe address, re‑sent every 30 s).
+- Subscriptions are **saved with the session and sent on load** (`/pandore/{endpoint}/subscribe i rate s host i port`; rate in Hz, 0 = on‑change, IMU defaults to 50 Hz), pointed at the listener's current port — and re‑sent if the listener moves.
+- **Heartbeat**: every 5 s `/pandore/subscriptions` renews the daemon's 60 s timeout *and* returns what it has registered for us; if we're missing (daemon restarted) dataFLOU re‑subscribes. It never re‑subscribes on a timer (each re‑subscribe moves the daemon's sending port).
+- A status dot per subscription — **streaming** (with msg/s), device answers but no data yet, **unreachable**, or the device's own error — and a **Capture…** button once data flows, so the IMU goes straight into Capture.
+- **On a Pandore**, the daemon owns UDP 9000 and replies on 9001: listen on **9001** (the panel warns and offers a one‑click fix). For Hardware Mode on Pandore data, use Source match **IP only**.
+
+### Monitor drawer
+
+- **OSC In stacked above OSC Out** in one column, MIDI to their right; OSC and MIDI load at equal widths (split kept as a proportion, the divider tracks the cursor exactly at any zoom).
+- The Monitor and Pool title bars **never clip**: the Listening pill truncates first, and Capture / ⤢ / Hide (or Live / Clear) drop to a second line only when even they don't fit.
+- **Fixed**: at Ctrl+wheel zoom above 1 the drawer measured its width in zoomed pixels, so the Pool could be pushed past the window's right edge.
+- The floating Pool window is now **resizable** (bottom‑right grip) like Capture, and keeps its size when moved.
+
+### Engine fixes (MIDI + transport)
+
+- **Notes**: re‑triggering a playing cell re‑strikes its note; a gated static note fires once (not every gate period); held notes are released on scene change, track disable, clip deletion and when MIDI is switched off; a morph / transition / stop fade lands **one** note on its target instead of a chromatic run; the MIDI source skips fixed protocol‑prefix slots; Instrument header rows never emit MIDI and their OSC toggle cascades to child rows; the **Note pin** now works (pitch frozen at the base Value, the modulated output drives velocity).
+- **Transport**: pause keeps the scene's remaining time on resume; triggering while paused stays paused; stopping a scene cancels its not‑yet‑fired delayed cells; stale pause state is cleared on stop; countdowns and scene‑synced envelopes / ramps use the duration actually armed (slot override / generative roll); stopping one cell of a paused scene no longer ends the scene.
+- **Generative Shuffle Cycle** really plays every scene once per cycle (it did nothing with No‑Repeat on, and never completed a cycle for pools over 24 scenes).
+- **Random modulator** sends its first value at trigger and drives MIDI; a stopping sequenced cell fades out like every other slot; Hold no longer re‑sends every tick on cells with fixed argSpec slots.
+- **Modulation 2** Depth / Mode controls are hidden — they were never applied (Mod 2 feeds its raw signal to each target's own amount); sound is unchanged.
+
+### Persistence, app lifecycle, UI
+
+- Pool Parameter blueprints keep their argSpec + MIDI output, the Address sequencer mode survives reload, New Session no longer shadows (and erases) library entries, Hardware Mode state and destination overrides graft onto built‑ins, session files are written atomically, autosave does a final flush on quit, and a corrupt library file is backed up instead of lost.
+- Quit / close: the save prompt can't make the window unclosable (watchdog), Cancel keeps a live engine, only one instance runs, and packaged builds drop View › Reload (it wiped the live state mid‑show).
+- Dozens of UI fixes: string tokens with spaces, Escape reverts number fields, modals block scene hotkeys, keyboard shortcuts work on non‑QWERTY layouts, Capture matches exact addresses, and more. Dead code removed across the engine and renderer.
+
+### Linux
+
+Every release now ships `dataFLOU_compositor-<version>-linux-x86_64.AppImage` alongside the Windows and macOS builds (CI job on Ubuntu).
 
 ---
 
@@ -2095,8 +2146,9 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.5:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.6:
 
+- ✅ **Device subscriptions + full audit (v0.6.6)**: subscribe‑on‑load with heartbeat for OSC hardware that streams on request (Pandore IMU / encoder / pins, or any custom device), a Monitor drawer that never spills off screen (OSC In over Out, MIDI beside), a floating Pool you can resize, a full engine / persistence / lifecycle / UI audit, and a Linux AppImage with every release.
 - ✅ **Gesture phrases + Signals view (v0.6.5)**: **Pose Sequences** (an ordered path of learned poses — move through A→B→C, each firing its own MIDI, with strict‑order / wait‑in‑place / loop), a hands‑free **companion recorder** that captures a whole phrase pose‑by‑pose with a get‑ready countdown + live highlighting, and the **Signals** view (press **S**) — one live home for every State Trigger + Pose Sequence in the session, grouped by instrument with per‑instrument HW‑live badges, an inline how‑to, a card‑width control, and per‑pose colors. Plus a `derivedParams` builtin‑graft fix and an app‑wide capture lock.
 - ✅ **Input observability + mapping (v0.6.4)**: live **OSC In** monitor column + **Connection Health** panel/pill (why-is-nothing-happening diagnostics); **Derived Parameters** (cross-input math — gyro magnitude etc.); a unified **Mappings view** with **transfer curves** (the full Penner/Max-`ease` set) showing every Parameter's input → conditioning → curve → output chain.
 - ✅ **Performance capture (v0.6.3)**: **Motion Loop** (record the live hardware stream into a scene as looping automation — auto‑creates clips, forces float, syncs scene Duration + Loop), **hands‑free record** (transport ●REC bindable to a MIDI footswitch or the controller's own OSC button), **Direct Output** (conditioned + scaled passthrough to the DAW, auto‑yielding to a playing loop), and **Capture auto‑detect** of the live network Instrument. Plus the listener‑port‑drift fix (`listenerPort` now authoritative over the default send port).

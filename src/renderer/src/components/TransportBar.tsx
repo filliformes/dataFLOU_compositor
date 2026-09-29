@@ -16,6 +16,24 @@ import { BoundedNumberInput } from './BoundedNumberInput'
 import { MotionLoopRecButton } from './MotionLoopControls'
 import { ConnectionHealthPill } from './ConnectionHealth'
 
+// Shared Stop / Panic entry point — the transport ■ button, TopBar's
+// Stop All / Panic buttons and the "." / Shift+"." hotkeys all go
+// through here. Only the engine call differs; the renderer-side
+// transport reset must not (the hotkeys used to call the engine
+// directly, leaving the UI "paused" with a running clock and a stale
+// start slot).
+export async function stopAllTransport(mode: 'stop' | 'panic' = 'stop'): Promise<void> {
+  if (mode === 'panic') await window.api.panic()
+  else await window.api.stopAll()
+  const st = useStore.getState()
+  st.setSequencePaused(false)
+  st.transportStop()
+  // Drop the slot selection on Stop so the next Play starts from the
+  // beginning, matching the user's "transport reset" mental model.
+  // The focused scene (inspector) is left alone.
+  st.setSelectedSequenceSlot(null)
+}
+
 export default function TransportBar(): JSX.Element {
   const session = useStore((s) => s.session)
   const focusedSceneId = session.focusedSceneId
@@ -26,7 +44,6 @@ export default function TransportBar(): JSX.Element {
 
   const transportPlay = useStore((s) => s.transportPlay)
   const transportPause = useStore((s) => s.transportPause)
-  const transportStop = useStore((s) => s.transportStop)
 
   const trackCountInFocused = focusedScene
     ? Object.keys(focusedScene.cells).length
@@ -112,13 +129,7 @@ export default function TransportBar(): JSX.Element {
   }
 
   async function onStop(): Promise<void> {
-    await window.api.stopAll()
-    setPaused(false)
-    transportStop()
-    // Drop the slot selection on Stop so the next Play starts from
-    // the beginning, matching the user's "transport reset" mental
-    // model. The focused scene (inspector) is left alone.
-    useStore.getState().setSelectedSequenceSlot(null)
+    await stopAllTransport('stop')
   }
 
   return (

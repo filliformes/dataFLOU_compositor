@@ -352,8 +352,9 @@ export interface Modulation {
   // comment on that field).
   //
   // `valueAmount` is the DEDICATED intensity for this route (0..1,
-  // default 0.5). Deliberately NOT the Depth knob — Depth keeps
-  // shaping Mod 2's own signal as before.
+  // default 0.5). Mod 2's own Depth / Mode are NOT applied anywhere —
+  // every Mod 2 target consumes the raw symmetric ±1 signal and scales
+  // it by its own amount (the Inspector hides Depth / Mode for Mod 2).
   //
   // `valueMath` picks how the M2-direct contribution combines with
   // the Mod 1-modulated value on slots where BOTH routes are active
@@ -716,9 +717,11 @@ export interface Cell {
   // enough to keep a synth from sounding mechanical, not enough
   // to lose the user's intended dynamic.
   velocityHumanize?: number
-  // Pin for the value slot when in MIDI Note mode — lets the
-  // user freeze the note number while sequencer/modulator drives
-  // velocity (or vice versa via `velocityPersistent`).
+  // Pin for the value slot when in MIDI Note mode — freezes the
+  // note number at the cell's base Value (sequencer / modulator no
+  // longer move the pitch); the modulated output drives velocity
+  // instead, unless `velocityPersistent` pins velocity to the typed
+  // Velocity field.
   notePersistent?: boolean
   // ── Per-arg pin/freeze, CELL-level ────────────────────────────
   // Mirrors `Track.persistentSlots` / `Track.persistentValues` but
@@ -1021,12 +1024,12 @@ export interface MidiOut {
   kind: 'cc' | 'note'
   // CC number 0..127 when `kind === 'cc'`. Ignored for `note`.
   cc?: number
-  // For `kind === 'note'` only — picks whether the modulated /
-  // sequenced output drives the note NUMBER (pitch) or the
-  // velocity. `velocity` is the natural fit when the value field
-  // holds a fixed pitch (e.g. drum trigger on note 36); `pitch`
-  // when the value field holds a melodic line and a separate
-  // Velocity slot drives loudness.
+  // RESERVED — not read by the engine yet and has no UI. The engine
+  // always drives the note NUMBER from the (modulated / sequenced)
+  // value; to freeze the pitch and let the output drive velocity
+  // instead, use the cell's Note pin (`Cell.notePersistent`).
+  // Implementing this field would silently change every existing
+  // note cell (the stored default is 'velocity'), so it stays inert.
   noteMode?: 'velocity' | 'pitch'
   // Note-Off gate length in ms. 0 = "until next trigger" (the
   // engine schedules Note Off on the next Note On / cell stop /
@@ -1047,10 +1050,6 @@ export interface MidiOut {
   noteMin?: number
   noteMax?: number
 }
-
-/** Range / bound check for MIDI channel — 1..16 inclusive. */
-export const MIDI_CHANNEL_MIN = 1
-export const MIDI_CHANNEL_MAX = 16
 
 /** Max number of space-separated values allowed in a single Value box. */
 export const MAX_VALUE_TOKENS = 16
@@ -1627,7 +1626,7 @@ export interface LearnedState {
   // (v0.6.x) Forgiveness: minimum acceptance-band width per dim as a
   // fraction of the dim's magnitude, so a held-still recording (near-
   // zero variance) still matches loosely. Higher = more forgiving.
-  // 0.02..1, default ~0.25. This is the knob that actually controls how
+  // 0.02..1, default 0.3. This is the knob that actually controls how
   // loose the pose match is — threshold only sets how high the (now
   // robust) score must reach.
   tolerance?: number
@@ -2117,6 +2116,8 @@ export interface Session {
   // can only target one port and we still need multiple consumers.
   // Optional + defaults to `[]` for back-compat with v0.4 sessions.
   forwardTargets?: OscForwardTarget[]
+  // (v0.6.6) Device subscriptions sent on load (Pandore IMU, …).
+  oscSubscriptions?: OscSubscription[]
   // Persisted GUI layout — captures Ctrl+wheel zoom, row height,
   // column widths, drawer heights, and collapse flags so a saved
   // session re-opens at exactly the size + shape the user left it.
@@ -2208,6 +2209,12 @@ export interface EngineState {
   // calculation at this timestamp instead of Date.now() so the
   // visual display also pauses.
   pausedAt: number | null
+  // (v0.6.6) Effective duration (ms) the engine actually armed for the
+  // active scene — generative roll > per-slot override > scene
+  // durationSec. Null when no scene is active or it has no auto-advance.
+  // Renderer countdowns must use this instead of scene.durationSec, which
+  // ignores overrides and rolls.
+  activeSceneDurationMs?: number | null
   tickRateHz: number
   // Per-track Hardware Mode catch state. Keyed by trackId, value is
   // the sorted array of arg-slot indices currently overridden by
@@ -2453,8 +2460,84 @@ export interface OscForwardTarget {
   port: number
 }
 
+// (v0.6.6) Device subscriptions — the "subscribe" handshake some OSC
+// hardware needs before it streams anything. Sent by the main process on
+// session load / enable, kept alive with a heartbeat, re-sent when the
+// device comes back. Data then arrives at the listener like any sender.
+//   pandore — Pandore daemon: `/pandore/{endpoint}/subscribe i rate
+//             s host i port`, events on `/pandore/{endpoint}`, heartbeat
+//             `/pandore/subscriptions` (renews the daemon's 60 s TTL and
+//             lists what it has registered for us).
+//   custom  — any device: `endpoint` is the full subscribe address,
+//             `customArgs` its arguments, re-sent every 30 s.
+export interface OscSubscription {
+  id: string
+  enabled: boolean
+  kind: 'pandore' | 'custom'
+  // Device IP ('127.0.0.1' = this machine) and OSC listen port
+  // (Pandore daemon default 9000).
+  host: string
+  port: number
+  // pandore: endpoint name ('imu', 'encoder', 'aio/2', 'aio/*').
+  // custom: full subscribe address ('/sensor/subscribe').
+  endpoint: string
+  // Hz; 0 = on-change (pandore). custom: fills the {rate} placeholder.
+  rateHz: number
+  // pandore: the port the daemon sends its replies to (pong, describe,
+  // subscriptions list) — its --osc-reply, default 9001. Heartbeat
+  // replies are only seen when the listener is on this port.
+  replyPort?: number
+  // custom: space-separated args. {rate} {port} → int, {host} → string,
+  // plain integers → int, decimals → float, anything else → string.
+  customArgs?: string
+  // custom: address sent (with the same args) when disabled / removed.
+  customUnsubscribe?: string
+}
+
+export type OscSubscriptionState =
+  | 'off'
+  | 'waiting' // sent, no answer yet
+  | 'connected' // device answers, no data flowing (idle on-change endpoint, MCU offline…)
+  | 'streaming' // data arriving
+  | 'unreachable' // no answer and no data
+  | 'error' // device rejected the subscription / listener off
+
+export interface OscSubscriptionStatus {
+  id: string
+  state: OscSubscriptionState
+  // Where the device was asked to send (host:port) — '' until sent.
+  target: string
+  // Registered in the device's own list (pandore heartbeat reply).
+  confirmed: boolean
+  lastReplyAt: number | null
+  lastDataAt: number | null
+  dataRateHz: number
+  message: string
+}
+
+export interface OscSubsProbeEndpoint {
+  name: string
+  kind: 'pin' | 'device'
+  mcu: string
+  online: boolean
+  mode?: string
+}
+
+export interface OscSubsProbeResult {
+  devices: {
+    host: string
+    port: number
+    endpoints: OscSubsProbeEndpoint[]
+    mcus: Record<string, boolean>
+  }[]
+  // Set when the probe couldn't listen for replies at all.
+  error?: string
+}
+
 // Window.api signature — consumed by renderer.
-// MIDI is handled via Web MIDI in the renderer (not through IPC).
+// MIDI INPUT (learn, triggers, Meta knobs) is Web MIDI in the renderer;
+// MIDI OUTPUT is native (@julusian/midi) in main, reached through the
+// midi:* channels below.
 export interface ExposedApi {
   // Engine
   triggerCell: (sceneId: string, trackId: string) => Promise<void>
@@ -2601,6 +2684,17 @@ export interface ExposedApi {
   // device list. Lets the user measure a fresh window after
   // flipping a HW Mode toggle to verify the fix took.
   networkClearForwardDiag: () => Promise<void>
+  // (v0.6.6) Device subscriptions. The list itself travels with the
+  // session (engine:updateSession); these read status / discover / retry.
+  oscSubsGetStatus: () => Promise<OscSubscriptionStatus[]>
+  // Ask Pandore daemons for their endpoints: this machine, plus the LAN
+  // (subnet broadcast) when `network` is true.
+  oscSubsProbe: (opts: {
+    network: boolean
+    port: number
+    replyPort: number
+  }) => Promise<OscSubsProbeResult>
+  oscSubsResubscribe: (id: string) => Promise<void>
   // v0.5.10 -- package version string (e.g. "0.5.10"). Resolves
   // to the value Electron's `app.getVersion()` returns, which is
   // sourced from package.json at app start. Renderer reads this
@@ -2666,7 +2760,7 @@ export interface ExposedApi {
   // synthetic address. Polled by the Instrument inspector's Derived
   // Parameters section for the live readout.
   derivedGetLive: () => Promise<Record<string, number>>
-  // Push channel — fired on a 250ms timer whenever the device map has
+  // Push channel — fired on a 50ms timer whenever the device map has
   // changed (new sender, new address, or fresh packet count). Status
   // is bundled in so port-rebinds and bind errors round-trip too.
   onNetworkDevices: (

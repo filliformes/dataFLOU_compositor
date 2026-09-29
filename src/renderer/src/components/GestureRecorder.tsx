@@ -1,10 +1,12 @@
 // GestureRecorder — XY surface for the Gesture modulator.
 //
-// The user clicks RECORD, then drags on the square SVG canvas. Every
+// The user drags on the square SVG canvas — pressing starts a new
+// recording (no separate RECORD button). Every
 // pointermove during the recording is captured as a GesturePoint
 // (relative ms timestamp + x/y in [0, 1] inside the canvas). When the
 // user releases the pointer, recording stops and the captured path
-// becomes the gesture.
+// becomes the gesture. A bare click (no movement) is ignored so a stray
+// click can't wipe a gesture down to a single point.
 //
 // Live drawing — the in-progress polyline AND a small "crayon" dot
 // at the current pointer position render as the user drags, so the
@@ -132,7 +134,10 @@ export function GestureRecorder({ points, onChange, livePlayhead }: Props): JSX.
     // pointermove's setState. Slice to clone before handing to
     // onChange so downstream mutations don't poison our local ref.
     const finalPts = drawingRef.current ? drawingRef.current.slice() : []
-    onChange(finalPts)
+    // A click without a drag yields one point — not a gesture. Keep the
+    // committed one instead of replacing it (the render falls back to
+    // `points` once drawingRef is cleared below).
+    if (finalPts.length >= 2) onChange(finalPts)
     captureRef.current = null
     drawingRef.current = null
     setDrawingTick((n) => n + 1)
@@ -191,10 +196,13 @@ export function GestureRecorder({ points, onChange, livePlayhead }: Props): JSX.
             }
             clearRecording()
           }}
+          disabled={!recording && visiblePts.length === 0}
           title={
             recording
-              ? 'Recording in progress — release the pointer on the canvas to commit. Click to cancel.'
-              : 'Clear the current recording. Then drag on the canvas to record a new gesture.'
+              ? 'Recording — release the pointer to commit the gesture.'
+              : visiblePts.length > 0
+                ? 'Clear the recorded gesture. Dragging on the canvas records a new one (replacing this one) — no need to clear first.'
+                : 'Drag inside the square to record a gesture.'
           }
         >
           {recording ? '● Recording' : visiblePts.length > 0 ? 'Clear' : 'Draw to record'}

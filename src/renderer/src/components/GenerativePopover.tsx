@@ -329,7 +329,7 @@ export function GenerativePopoverHost(): JSX.Element | null {
         </div>
       </div>
       <div className="p-3 flex flex-col gap-2.5 overflow-y-auto">
-        <GenerativePopoverBody onClose={() => setOpen(false)} />
+        <GenerativePopoverBody />
       </div>
     </div>,
     document.body
@@ -337,12 +337,10 @@ export function GenerativePopoverHost(): JSX.Element | null {
 }
 
 // Popover contents extracted as a sub-component so the parent can
-// stay focused on positioning logic.
-function GenerativePopoverBody({
-  onClose
-}: {
-  onClose: () => void
-}): JSX.Element {
+// stay focused on positioning logic. No close prop: the draggable title
+// bar owns the ✕ button (plus Escape / G) — picking a value here never
+// closes the popover.
+function GenerativePopoverBody(): JSX.Element {
   const gen = useStore(
     (s) => s.session.generative ?? DEFAULT_GENERATIVE_CONFIG
   )
@@ -366,11 +364,6 @@ function GenerativePopoverBody({
   const useMorphLearn = useArmLearn('generativeUseMorph')
   const randomWeightsLearn = useArmLearn('generativeRandomWeights')
 
-  // Reference to keep the `onClose` prop satisfied even though the
-  // new draggable title bar owns the close button. Calling onClose
-  // when the user picks a value from the keyboard would be wrong --
-  // we only close on the explicit X click or Escape.
-  void onClose
   return (
     <>
       {/* ── Pool Source ───────────────────────────────────────────── */}

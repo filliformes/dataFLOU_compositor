@@ -1634,25 +1634,13 @@ function SlotOverridePanel({
       <div className="flex items-center gap-3">
         <div className="flex items-center gap-1.5">
           <span className="label">Dur</span>
-          <input
-            className="input w-16 text-[12px] py-0.5"
-            type="text"
-            inputMode="numeric"
+          <SlotDurOverrideInput
+            // Re-key per slot so an in-progress draft never leaks onto
+            // another slot's override.
+            key={selectedSlot}
+            value={current?.durationSec}
             placeholder={String(scene.durationSec)}
-            value={current?.durationSec !== undefined ? String(current.durationSec) : ''}
-            onChange={(e) => {
-              const raw = e.target.value.trim()
-              if (raw === '') {
-                setOverride(selectedSlot, { durationSec: undefined })
-                return
-              }
-              const n = Number(raw)
-              if (!Number.isFinite(n)) return
-              setOverride(selectedSlot, {
-                durationSec: Math.max(0.5, Math.min(300, n))
-              })
-            }}
-            title="Per-slot duration override. Empty = use the scene's default."
+            onCommit={(v) => setOverride(selectedSlot, { durationSec: v })}
           />
           <span className="text-muted text-[11px]">s</span>
         </div>
@@ -1680,6 +1668,51 @@ function SlotOverridePanel({
         </div>
       </div>
     </div>
+  )
+}
+
+// Per-slot Dur override field. Keeps a local draft while typing and
+// commits on blur / Enter (Escape drops the draft). The old per-
+// keystroke Number(raw) + clamp round-trip snapped "0" → 0.5 and ate a
+// trailing "." ("2." → 2), so values like 2.5 or 0.8 couldn't be typed.
+// Empty commits `undefined` = fall back to the scene's own duration.
+function SlotDurOverrideInput({
+  value,
+  placeholder,
+  onCommit
+}: {
+  value: number | undefined
+  placeholder: string
+  onCommit: (v: number | undefined) => void
+}): JSX.Element {
+  const [draft, setDraft] = useState<string | null>(null)
+  function commit(): void {
+    if (draft === null) return
+    const raw = draft.trim()
+    setDraft(null)
+    if (raw === '') {
+      onCommit(undefined)
+      return
+    }
+    const n = Number(raw)
+    if (!Number.isFinite(n)) return // invalid → revert to the stored value
+    onCommit(Math.max(0.5, Math.min(300, n)))
+  }
+  return (
+    <input
+      className="input w-16 text-[12px] py-0.5"
+      type="text"
+      inputMode="decimal"
+      placeholder={placeholder}
+      value={draft ?? (value !== undefined ? String(value) : '')}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur()
+        else if (e.key === 'Escape') setDraft(null)
+      }}
+      title="Per-slot duration override (0.5–300 s). Commits on Enter / blur; Esc reverts. Empty = use the scene's default."
+    />
   )
 }
 

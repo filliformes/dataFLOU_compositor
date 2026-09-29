@@ -41,7 +41,7 @@ function looksLikeIp(s: string): boolean {
 }
 
 function looksLikeOscAddress(s: string): boolean {
-  return s.startsWith('/') && s.length >= 2
+  return typeof s === 'string' && s.startsWith('/') && s.length >= 2
 }
 
 function checkCell(
@@ -63,7 +63,7 @@ function checkCell(
       suggested: 'Reset to 127.0.0.1',
       fix: (draft) => {
         const sc = draft.scenes.find((s) => s.id === sceneId)
-        const c = sc?.cells[trackId]
+        const c = sc?.cells?.[trackId]
         if (c) c.destIp = '127.0.0.1'
       }
     })
@@ -82,7 +82,7 @@ function checkCell(
       suggested: 'Reset to 9000',
       fix: (draft) => {
         const sc = draft.scenes.find((s) => s.id === sceneId)
-        const c = sc?.cells[trackId]
+        const c = sc?.cells?.[trackId]
         if (c) c.destPort = 9000
       }
     })
@@ -97,8 +97,8 @@ function checkCell(
       suggested: `Prepend "/"`,
       fix: (draft) => {
         const sc = draft.scenes.find((s) => s.id === sceneId)
-        const c = sc?.cells[trackId]
-        if (c) c.oscAddress = '/' + c.oscAddress.replace(/^\/+/, '')
+        const c = sc?.cells?.[trackId]
+        if (c) c.oscAddress = '/' + String(c.oscAddress ?? '').replace(/^\/+/, '')
       }
     })
   }
@@ -112,7 +112,7 @@ function checkCell(
       suggested: 'Clamp to range',
       fix: (draft) => {
         const sc = draft.scenes.find((s) => s.id === sceneId)
-        const c = sc?.cells[trackId]
+        const c = sc?.cells?.[trackId]
         if (c) c.delayMs = Math.max(0, Math.min(60000, c.delayMs))
       }
     })
@@ -126,14 +126,16 @@ function checkCell(
       suggested: 'Clamp to range',
       fix: (draft) => {
         const sc = draft.scenes.find((s) => s.id === sceneId)
-        const c = sc?.cells[trackId]
+        const c = sc?.cells?.[trackId]
         if (c) c.transitionMs = Math.max(0, Math.min(60000, c.transitionMs))
       }
     })
   }
-  // Modulation depth sanity
+  // Modulation depth sanity. Optional chaining: this runs on the RAW
+  // file (before propagateDefaults back-fills `modulation`), so a legacy
+  // cell may not have one.
   if (
-    cell.modulation.enabled &&
+    cell.modulation?.enabled &&
     (cell.modulation.depthPct < 0 || cell.modulation.depthPct > 100)
   ) {
     issues.push({
@@ -144,8 +146,10 @@ function checkCell(
       suggested: 'Clamp to [0, 100]',
       fix: (draft) => {
         const sc = draft.scenes.find((s) => s.id === sceneId)
-        const c = sc?.cells[trackId]
-        if (c) c.modulation.depthPct = Math.max(0, Math.min(100, c.modulation.depthPct))
+        const c = sc?.cells?.[trackId]
+        if (c?.modulation) {
+          c.modulation.depthPct = Math.max(0, Math.min(100, c.modulation.depthPct))
+        }
       }
     })
   }
@@ -226,12 +230,17 @@ export function checkSessionIntegrity(session: Session): IntegrityIssue[] {
       }
     })
   }
-  // Scene-level + cell-level
-  for (const scene of session.scenes) {
+  // Scene-level + cell-level. Runs on the RAW file (before
+  // propagateDefaults), so a legacy / hand-edited file may lack arrays or
+  // hold null entries — guard every structural deref instead of throwing
+  // out of Open.
+  const tracks = Array.isArray(session.tracks) ? session.tracks : []
+  for (const scene of Array.isArray(session.scenes) ? session.scenes : []) {
+    if (!scene || typeof scene !== 'object') continue
     checkScene(scene, issues)
-    const tracks = session.tracks
-    for (const [trackId, cell] of Object.entries(scene.cells)) {
-      const track = tracks.find((t) => t.id === trackId)
+    for (const [trackId, cell] of Object.entries(scene.cells ?? {})) {
+      if (!cell || typeof cell !== 'object') continue
+      const track = tracks.find((t) => t?.id === trackId)
       checkCell(scene.id, scene.name, track?.name ?? '', trackId, cell, issues)
     }
   }

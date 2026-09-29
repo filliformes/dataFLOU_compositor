@@ -4,6 +4,7 @@ import { buildSessionForSave, useStore, type ThemeName } from '../store'
 import { midi, type MidiDevice } from '../midi'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { Modal } from './Modal'
+import { stopAllTransport } from './TransportBar'
 import { detectMidiConflicts } from '../hooks/midiConflicts'
 import type { OscForwardTarget } from '@shared/types'
 import { undo, redo } from '../undo'
@@ -41,7 +42,6 @@ export default function TopBar(): JSX.Element {
   // setDefaults moved into the DefaultOscGroup helper (the only place
   // the OSC default inputs live now that the group is collapsible).
   const setMidiInputName = useStore((s) => s.setMidiInputName)
-  const setSession = useStore((s) => s.setSession)
   const setCurrentFilePath = useStore((s) => s.setCurrentFilePath)
   // newSession is invoked from the App-level new-session-confirm
   // modal instead of directly here.
@@ -66,8 +66,22 @@ export default function TopBar(): JSX.Element {
     setMidiInputName(name)
   }
 
+  // Open / Save / Save As failures (unparseable file, disk full,
+  // read-only folder, …). Main rethrows so the UI can say so — before,
+  // the rejection went unhandled and the click silently did nothing.
+  const [fileError, setFileError] = useState<string | null>(null)
+  function errText(e: unknown): string {
+    return (e as Error)?.message || 'unknown error'
+  }
+
   async function onOpen(): Promise<void> {
-    const res = await window.api.sessionOpen()
+    let res: Awaited<ReturnType<typeof window.api.sessionOpen>>
+    try {
+      res = await window.api.sessionOpen()
+    } catch (e) {
+      setFileError(`Open failed: ${errText(e)}`)
+      return
+    }
     if (!res) return
     // Route through requestSessionLoad so an integrity check can
     // interpose an "Auto-fix?" modal for malformed sessions. Clean
@@ -80,9 +94,13 @@ export default function TopBar(): JSX.Element {
       // the file captures the user's chosen zoom + sizes + collapse
       // state. `setSession` on next load re-applies these via the
       // ui sub-field.
-      const sess = buildSessionForSave(useStore.getState())
-      const ok = await window.api.sessionSave(sess, currentFilePath)
-      if (ok) flash(saveRef.current, 'flash-blue')
+      try {
+        const sess = buildSessionForSave(useStore.getState())
+        const ok = await window.api.sessionSave(sess, currentFilePath)
+        if (ok) flash(saveRef.current, 'flash-blue')
+      } catch (e) {
+        setFileError(`Save failed: ${errText(e)}`)
+      }
     } else {
       const p = await onSaveAs()
       // First-time save promotes Save As → Save; flash Save when that succeeds too.
@@ -90,10 +108,15 @@ export default function TopBar(): JSX.Element {
     }
   }
   async function onSaveAs(): Promise<string | null> {
-    const sess = buildSessionForSave(useStore.getState())
-    const p = await window.api.sessionSaveAs(sess)
-    if (p) setCurrentFilePath(p)
-    return p
+    try {
+      const sess = buildSessionForSave(useStore.getState())
+      const p = await window.api.sessionSaveAs(sess)
+      if (p) setCurrentFilePath(p)
+      return p
+    } catch (e) {
+      setFileError(`Save failed: ${errText(e)}`)
+      return null
+    }
   }
 
   // One-shot flash helpers — restart animation on each click via class re-add.
@@ -254,7 +277,9 @@ export default function TopBar(): JSX.Element {
         className="btn"
         onClick={() => {
           flash(stopAllRef.current)
-          window.api.stopAll()
+          // Same path as the transport ■ and the "." hotkey — resets the
+          // pause flag, transport clock and start slot too.
+          void stopAllTransport('stop')
         }}
         title="Stop all (with morph)"
       >
@@ -269,13 +294,17 @@ export default function TopBar(): JSX.Element {
         }}
         onClick={() => {
           flash(panicRef.current)
-          window.api.panic()
+          void stopAllTransport('panic')
         }}
         title="Panic (instant stop)"
       >
         Panic
       </button>
     </div>
+
+    {fileError && (
+      <FileErrorModal message={fileError} onClose={() => setFileError(null)} />
+    )}
 
     {/* Preferences sub-toolbar — toggled by clicking the dataFLOU brand
         label. Sits immediately below the main toolbar and pushes the rest
@@ -371,6 +400,38 @@ export default function TopBar(): JSX.Element {
       </div>
     )}
     </>
+  )
+}
+
+// Open / Save failure dialog — shared by the toolbar's Open / Save /
+// Save As buttons and App's Ctrl+S. Same danger-bordered message box as
+// the Save-before-quit modal's error line.
+export function FileErrorModal({
+  message,
+  onClose
+}: {
+  message: string
+  onClose: () => void
+}): JSX.Element {
+  return (
+    <Modal title="Session file error" onClose={onClose}>
+      <div className="flex flex-col gap-3 text-[12px]">
+        <p
+          className="text-[11px] px-2 py-1 rounded border whitespace-pre-wrap break-words"
+          style={{
+            borderColor: 'rgb(var(--c-danger))',
+            color: 'rgb(var(--c-danger))'
+          }}
+        >
+          {message}
+        </p>
+        <div className="flex items-center justify-end pt-1">
+          <button className="btn text-[11px]" onClick={onClose}>
+            OK
+          </button>
+        </div>
+      </div>
+    </Modal>
   )
 }
 

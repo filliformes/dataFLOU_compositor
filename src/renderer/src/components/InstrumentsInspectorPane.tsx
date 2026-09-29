@@ -408,6 +408,42 @@ const ARG_TYPES: { id: ParamArgSpec['type']; label: string }[] = [
   { id: 'string', label: 'String' },
   { id: 'bool', label: 'Bool' }
 ]
+
+// String arg slots live inside ONE space-joined cell value, so a
+// string token can never contain whitespace nor be empty — either
+// would shift every later slot on the next parse. Typed whitespace
+// becomes '_'; an empty token falls back to the slot's name (or
+// 'value' when unnamed).
+export function stringSlotFallback(name: string | undefined): string {
+  return (name ?? '').trim().replace(/\s+/g, '_') || 'value'
+}
+
+// Text input for a string arg token. Same UncontrolledTextInput
+// contract, but whitespace is committed as '_' and an empty field is
+// never committed — blur re-syncs the DOM to the last committed token
+// (reverting a cleared field, showing '_' for typed spaces).
+export function StringTokenInput({
+  value,
+  onChange,
+  ...rest
+}: Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'defaultValue' | 'onBlur'> & {
+  value: string
+  onChange: (v: string) => void
+}): JSX.Element {
+  return (
+    <UncontrolledTextInput
+      {...rest}
+      value={value}
+      onChange={(v) => {
+        const tok = v.replace(/\s/g, '_')
+        if (tok.length > 0) onChange(tok)
+      }}
+      onBlur={(e) => {
+        if (e.currentTarget.value !== value) e.currentTarget.value = value
+      }}
+    />
+  )
+}
 function ParameterArgSpecSection({
   fn,
   onChange,
@@ -440,18 +476,50 @@ function ParameterArgSpecSection({
   function patchSlot(i: number, p: Partial<ParamArgSpec>): void {
     setSpec(spec.map((s, idx) => (idx === i ? { ...s, ...p } : s)))
   }
+  // Changing a slot's Type coerces its fixed / init value to the new
+  // type so no stale token of the old type lingers (e.g. a string
+  // fixed prefix left on an Int slot). min/max only mean something
+  // for numeric slots, so they're dropped for string / bool.
+  function changeSlotType(i: number, type: ParamArgSpec['type']): void {
+    const s = spec[i]
+    if (!s) return
+    const coerce = (
+      v: number | string | boolean | undefined
+    ): number | string | boolean | undefined => {
+      if (v === undefined) return undefined
+      if (type === 'string') {
+        const str = typeof v === 'boolean' ? (v ? '1' : '0') : String(v)
+        return str.trim() === '' ? stringSlotFallback(s.name) : str.replace(/\s/g, '_')
+      }
+      if (type === 'bool') {
+        return typeof v === 'boolean' ? v : typeof v === 'number' ? v !== 0 : false
+      }
+      const n = typeof v === 'boolean' ? (v ? 1 : 0) : Number(v)
+      if (!Number.isFinite(n)) return 0
+      return type === 'int' ? Math.round(n) : n
+    }
+    const numeric = type === 'float' || type === 'int'
+    patchSlot(i, {
+      type,
+      fixed: coerce(s.fixed),
+      init: coerce(s.init),
+      ...(numeric ? {} : { min: undefined, max: undefined })
+    })
+  }
   function togglePinned(i: number, pinned: boolean): void {
     const s = spec[i]
     if (!s) return
     if (pinned) {
       // Convert editable → pinned. Capture the current init as the
       // fixed value so the in-flight bundle keeps emitting the same
-      // token the user has been seeing live.
+      // token the user has been seeing live. A string slot with no
+      // (or an empty) init falls back to the slot's name — an empty
+      // fixed token would vanish from the space-joined cell value.
       const defaultFixed: number | string | boolean =
         s.type === 'string'
-          ? typeof s.init === 'string'
-            ? s.init
-            : ''
+          ? typeof s.init === 'string' && s.init.trim() !== ''
+            ? s.init.replace(/\s/g, '_')
+            : stringSlotFallback(s.name)
           : s.type === 'bool'
             ? !!s.init
             : typeof s.init === 'number'
@@ -533,7 +601,7 @@ function ParameterArgSpecSection({
                       className="input text-[10px] py-0.5 w-full"
                       value={s.type}
                       onChange={(e) =>
-                        patchSlot(i, { type: e.target.value as ParamArgSpec['type'] })
+                        changeSlotType(i, e.target.value as ParamArgSpec['type'])
                       }
                       disabled={readonly}
                     >
@@ -638,7 +706,7 @@ function ArgFixedInput({
   }
   if (type === 'string') {
     return (
-      <UncontrolledTextInput
+      <StringTokenInput
         className="input text-[10px] py-0.5 w-full font-mono"
         value={typeof value === 'string' ? value : String(value)}
         onChange={(v) => onChange(v)}
@@ -685,7 +753,7 @@ function ArgEditableInput({
   }
   if (type === 'string') {
     return (
-      <UncontrolledTextInput
+      <StringTokenInput
         className="input text-[10px] py-0.5 w-full font-mono"
         value={typeof value === 'string' ? value : ''}
         onChange={(v) => onChange(v)}
@@ -743,6 +811,11 @@ function ParameterMidiSection({
     let cancelled = false
     window.api?.midiListPorts?.().then((r) => {
       if (cancelled) return
+      // IPC handler returns undefined on error — treat as no ports.
+      if (!r) {
+        setPorts([])
+        return
+      }
       setPorts(r.ports)
       setAvailable(r.available)
     })
@@ -1423,13 +1496,26 @@ export function HardwareModeSection({
     movementWindowMs: 300
   }
   const deviceKey = hw.deviceIp ? `${hw.deviceIp}:${hw.devicePort}` : ''
-  // Which Track instances are spawned from this template — the
-  // "applies to" selector listing.
+  // Which Instrument instances are spawned from this template — the
+  // "applies to" selector listing. Only the Instrument HEADER rows
+  // count as instances (child Parameter rows share the template id).
   const trackInstances = tracks.filter(
-    (t) => t.sourceTemplateId === template.id
+    (t) => t.kind === 'template' && t.sourceTemplateId === template.id
   )
+  // The engine matches appliesToTrackIds against the Parameter rows
+  // that emit (their own track ids), so ticking an instance stores
+  // the header id plus every child Parameter row id under it.
+  const instanceRowIds = (headerId: string): string[] => [
+    headerId,
+    ...tracks.filter((t) => t.parentTrackId === headerId).map((t) => t.id)
+  ]
   const appliesToAll =
     !hw.appliesToTrackIds || hw.appliesToTrackIds.length === 0
+  const instanceChecked = (headerId: string): boolean =>
+    instanceRowIds(headerId).some((id) => hw.appliesToTrackIds?.includes(id))
+  const checkedInstanceCount = trackInstances.filter((t) =>
+    instanceChecked(t.id)
+  ).length
   return (
     <div className="border border-border rounded p-1.5 flex flex-col gap-1.5 bg-panel2/30">
       <label
@@ -1743,7 +1829,9 @@ export function HardwareModeSection({
           </div>
           {/* Multi-instance selector — empty list = all instances of
               this template are HW-controllable. Listing specific
-              track IDs narrows the scope. */}
+              track IDs narrows the scope. There is no "none" state:
+              an empty list means "all", so the last ticked instance
+              can't be unticked. */}
           {trackInstances.length > 1 && (
             <Field label="Apply to">
               <div className="flex flex-col gap-0.5">
@@ -1753,35 +1841,49 @@ export function HardwareModeSection({
                     checked={appliesToAll}
                     onChange={(e) => {
                       setHardwareMode(template.id, {
-                        appliesToTrackIds: e.target.checked ? [] : trackInstances.map((t) => t.id)
+                        appliesToTrackIds: e.target.checked
+                          ? []
+                          : trackInstances.flatMap((t) => instanceRowIds(t.id))
                       })
                     }}
                   />
                   <span>All instances ({trackInstances.length})</span>
                 </label>
                 {!appliesToAll &&
-                  trackInstances.map((t) => (
-                    <label
-                      key={t.id}
-                      className="flex items-center gap-1 text-[10px] pl-3"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={hw.appliesToTrackIds!.includes(t.id)}
-                        onChange={(e) => {
-                          const next = e.target.checked
-                            ? [...(hw.appliesToTrackIds ?? []), t.id]
-                            : (hw.appliesToTrackIds ?? []).filter(
-                                (id) => id !== t.id
-                              )
-                          setHardwareMode(template.id, {
-                            appliesToTrackIds: next
-                          })
-                        }}
-                      />
-                      <span>{t.name}</span>
-                    </label>
-                  ))}
+                  trackInstances.map((t) => {
+                    const checked = instanceChecked(t.id)
+                    const isLast = checked && checkedInstanceCount <= 1
+                    return (
+                      <label
+                        key={t.id}
+                        className="flex items-center gap-1 text-[10px] pl-3"
+                        title={
+                          isLast
+                            ? 'At least one instance must stay selected — tick "All instances" to widen the scope instead.'
+                            : undefined
+                        }
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          disabled={isLast}
+                          onChange={(e) => {
+                            const rowIds = instanceRowIds(t.id)
+                            const cur = hw.appliesToTrackIds ?? []
+                            const next = e.target.checked
+                              ? [...cur, ...rowIds.filter((id) => !cur.includes(id))]
+                              : cur.filter((id) => !rowIds.includes(id))
+                            // Never store [] from here — it means "all".
+                            if (next.length === 0) return
+                            setHardwareMode(template.id, {
+                              appliesToTrackIds: next
+                            })
+                          }}
+                        />
+                        <span>{t.name}</span>
+                      </label>
+                    )
+                  })}
               </div>
             </Field>
           )}

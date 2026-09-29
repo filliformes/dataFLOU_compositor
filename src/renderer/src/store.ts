@@ -1,8 +1,8 @@
 import { create } from 'zustand'
 // Imported lazily-used (only referenced inside action bodies) so the
 // undo.ts ↔ store.ts circular import resolves cleanly under ESM —
-// no top-level reads of `resetUndoHistory` before it's bound.
-import { resetUndoHistory } from './undo'
+// no top-level reads of either import before it's bound.
+import { resetUndoHistory, withoutUndoSnapshot } from './undo'
 import type {
   Cell,
   EngineState,
@@ -22,6 +22,7 @@ import type {
   MidiBinding,
   NextMode,
   OscForwardTarget,
+  OscSubscription,
   ParameterTemplate,
   AttractorParams,
   GestureParams,
@@ -148,7 +149,6 @@ function saveUiScale(v: number): void {
 const TOPBAR_SCALE_KEY = 'dataflou:topBarScale:v1'
 export const TOPBAR_SCALE_MIN = 0.5
 export const TOPBAR_SCALE_MAX = 2.5
-export const TOPBAR_SCALE_STEP = 0.05
 const TOPBAR_SCALE_DEFAULT = 1.0
 function loadTopBarScale(): number {
   try {
@@ -340,7 +340,7 @@ interface UiState {
   poseRecordBusy: boolean
   setPoseRecordBusy: (v: boolean) => void
   // Drawer height (px). User-resizable via the handle on top edge,
-  // 120..600 (clamped). Persisted as part of the in-session UI prefs so
+  // 120..800 (clamped). Persisted as part of the in-session UI prefs so
   // the height survives a drawer toggle.
   oscMonitorHeight: number
   // Hide the Pool pane within the OSC drawer. When true, the OSC log
@@ -573,19 +573,6 @@ export function buildSessionForSave(
   }
 }
 
-// Module-scope set of scene ids that originated from
-// `instantiateSavedScene` (i.e. dropped onto the grid from the
-// Pool's Scenes tab via Use / drag). App.tsx's auto-save effect
-// checks this set to skip pushing these scenes BACK to the library
-// — they already live there, otherwise clicking Use would silently
-// create a sibling library entry on every recall.
-//
-// Set, not state: we don't render off it and we don't want it
-// triggering re-renders. It only grows over a session's lifetime
-// (bounded by the number of Use clicks); cleared implicitly on
-// app restart.
-export const sceneIdsFromLibrary = new Set<string>()
-
 // Last-known pool library payload — kept in module scope so
 // `newSession` can re-seed the fresh session's pool with the user's
 // authored Instruments + Parameters. App.tsx fetches the library on
@@ -659,6 +646,54 @@ function uniqueCopyName(srcName: string, existingNames: string[]): string {
   return `${base} (copy ${n})`
 }
 
+// (S10) Drop the per-slot overrides of sequence slots that a scene delete
+// just cleared (scene → null), mirroring setSequenceSlot. Returns the
+// input reference untouched when nothing was dropped.
+function dropOverridesForClearedSlots(
+  overrides: Session['sequenceSlotOverrides'],
+  before: (string | null)[],
+  after: (string | null)[]
+): Session['sequenceSlotOverrides'] {
+  if (!overrides) return overrides
+  let next: Record<number, SequenceSlotOverride> | null = null
+  for (let i = 0; i < after.length; i++) {
+    if (after[i] === null && before[i] !== null && overrides[i]) {
+      if (!next) next = { ...overrides }
+      delete next[i]
+    }
+  }
+  return next ?? overrides
+}
+
+// (S4) A DRAFT template whose id equals a library template's id would
+// win the id-dedupe in the library merge (setSession / newSession) and
+// shadow that entry; App's auto-push skips drafts, so the library entry
+// would then be erased. Give such drafts a fresh id (and repoint every
+// row instantiated from them) BEFORE merging.
+function reIdDraftsShadowingLibrary(
+  s: Session,
+  libraryTemplates: InstrumentTemplate[]
+): Session {
+  const libIds = new Set(libraryTemplates.map((t) => t.id))
+  const remap = new Map<string, string>()
+  const templates = s.pool.templates.map((t) => {
+    if (!t.draft || !libIds.has(t.id)) return t
+    const id = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
+    remap.set(t.id, id)
+    return { ...t, id }
+  })
+  if (remap.size === 0) return s
+  return {
+    ...s,
+    pool: { ...s.pool, templates },
+    tracks: s.tracks.map((t) =>
+      t.sourceTemplateId && remap.has(t.sourceTemplateId)
+        ? { ...t, sourceTemplateId: remap.get(t.sourceTemplateId) }
+        : t
+    )
+  }
+}
+
 interface Actions {
   // Session-level
   setSession: (s: Session) => void
@@ -675,6 +710,11 @@ interface Actions {
   addForwardTarget: (init?: Partial<OscForwardTarget>) => string
   updateForwardTarget: (id: string, fields: Partial<OscForwardTarget>) => void
   removeForwardTarget: (id: string) => void
+  // (v0.6.6) Device subscriptions — main picks the list up with the
+  // session push and (un)subscribes accordingly.
+  addOscSubscription: (init: Omit<OscSubscription, 'id'>) => string
+  updateOscSubscription: (id: string, fields: Partial<OscSubscription>) => void
+  removeOscSubscription: (id: string) => void
   setMidiInputName: (name: string | null) => void
   setFocusedScene: (id: string | null) => void
   setView: (v: 'edit' | 'sequence') => void
@@ -801,7 +841,6 @@ interface Actions {
 
   // Tracks
   addTrack: () => void
-  removeTrack: (id: string) => void
   // Clone an existing Function (Parameter) sidebar row, inserting the
   // duplicate immediately after the source. Cells from every scene
   // are copied onto the new row so the duplicate plays the same
@@ -838,7 +877,6 @@ interface Actions {
   copyToClipboard: () => void
   pasteFromClipboard: () => void
   renameTrack: (id: string, name: string) => void
-  setTrackMidi: (id: string, binding: Track['midiTrigger']) => void
   setTrackDefaults: (
     id: string,
     fields: Partial<
@@ -1009,8 +1047,8 @@ interface Actions {
   // through `id` inclusive. If there's no anchor yet, behaves like a plain
   // selectTrack.
   selectTrackRange: (id: string) => void
-  // Bulk delete — used by the right-click context menu when N tracks are
-  // selected. Safer than calling removeTrack in a loop because it also
+  // Track delete (single or bulk — the right-click context menu passes
+  // every selected row). Cascades header deletes to their children and
   // clears selection state in one pass.
   removeTracks: (ids: string[]) => void
   // Ctrl-click range selection for scenes. Extends from the current
@@ -1472,8 +1510,9 @@ export const useStore = create<State>((set, get) => ({
   clipTemplates: loadTemplates(),
 
   setSession: (s) => {
-    const propagated = applyV0512Migrations(
-      backfillTrackArgSpecsFromPool(propagateDefaults(s))
+    const propagated = reIdDraftsShadowingLibrary(
+      applyV0512Migrations(backfillTrackArgSpecsFromPool(propagateDefaults(s))),
+      poolLibraryCache.templates
     )
     // Apply session-level OSC listener port (v0.5.10). When the
     // session carries a listenerPort, push it to the main-process
@@ -1585,7 +1624,7 @@ export const useStore = create<State>((set, get) => ({
       typeof ui.editorNotesHeight === 'number' &&
       Number.isFinite(ui.editorNotesHeight)
     ) {
-      uiPatch.editorNotesHeight = clampInt(ui.editorNotesHeight, 0, 220)
+      uiPatch.editorNotesHeight = clampInt(ui.editorNotesHeight, 0, 240)
     }
     if (
       typeof ui.oscMonitorHeight === 'number' &&
@@ -1614,8 +1653,33 @@ export const useStore = create<State>((set, get) => ({
       uiPatch.scenesCollapsed = ui.scenesCollapsed
     }
     void cur // keep ref-stable for the inner closure below
+    // (S5) Reset the engine mirror to a clean slate seeded with the
+    // FILE's saved catches. buildSessionForSave serializes hardwareState
+    // from this mirror, so the first push after a load (the one main
+    // flags via markSessionLoaded) must carry the loaded catches —
+    // otherwise the pre-load mirror went out instead, the engine never
+    // primed the file's catches, and the next save erased them.
+    // Shape-checked: hardwareState rides through propagateDefaults as-is.
+    const loadedCatches: Record<string, number[]> = {}
+    const rawCatches = next.hardwareState?.caughtByTrack
+    if (rawCatches && typeof rawCatches === 'object') {
+      for (const [tid, slots] of Object.entries(rawCatches)) {
+        if (!Array.isArray(slots)) continue
+        const clean = slots.filter((x) => Number.isInteger(x) && x >= 0)
+        if (clean.length > 0) loadedCatches[tid] = clean
+      }
+    }
+    // (S20) A Motion Loop take armed against the previous session can't
+    // be committed into this one — end it engine-side and drop the result.
+    if (cur.recordingLoopSceneId != null) void window.api?.motionLoopStopRecord?.()
     set({
       session: next,
+      engine: {
+        ...emptyEngineState,
+        ...(Object.keys(loadedCatches).length > 0
+          ? { hardwareCaughtByTrack: loadedCatches }
+          : {})
+      },
       metaKnobDisplayValues: display,
       selectedCell: null,
       selectedCells: [],
@@ -1626,6 +1690,14 @@ export const useStore = create<State>((set, get) => ({
       sequencePaused: false,
       transportStartedAt: null,
       transportAccumulatedMs: 0,
+      // (S20) Pool / Sequence-view selections + Motion Loop status also
+      // point into the previous session.
+      poolSelection: null,
+      selectedSavedSceneIds: [],
+      selectedSequenceSlot: null,
+      selectedSequenceSlots: [],
+      recordingLoopSceneId: null,
+      recordingLoopStartedAt: null,
       // Leave midiLearnMode alone — it's a performer-facing toggle that
       // shouldn't flip unexpectedly mid-session-load.
       midiLearnTarget: null,
@@ -1650,7 +1722,10 @@ export const useStore = create<State>((set, get) => ({
     // them after the set would trigger App.tsx's auto-push effect
     // mid-way through (templates: [] → push empty → main writes
     // empty library) and wipe the library on every New.
-    const empty = makeEmptySession()
+    const empty = reIdDraftsShadowingLibrary(
+      makeEmptySession(),
+      poolLibraryCache.templates
+    )
     const existingTplIds = new Set(empty.pool.templates.map((t) => t.id))
     const existingParIds = new Set(empty.pool.parameters.map((p) => p.id))
     const mergedTpls = [
@@ -1669,9 +1744,17 @@ export const useStore = create<State>((set, get) => ({
       ...empty,
       pool: { ...empty.pool, templates: mergedTpls, parameters: mergedPars }
     }
+    // (S20) Scope frames are keyed by the previous session's templates —
+    // start the fresh session with none (setSession does the same via
+    // loadScopePrefs(ui.scopePrefs)).
+    loadScopePrefs(undefined)
+    if (get().recordingLoopSceneId != null) void window.api?.motionLoopStopRecord?.()
     set({
       session: seeded,
       currentFilePath: null,
+      // (S20) Clean engine mirror so the new session's first saves don't
+      // serialize the previous session's Hardware Mode catches.
+      engine: emptyEngineState,
       metaKnobDisplayValues: Array.from({ length: META_KNOB_COUNT }, () => 0),
       // Same ephemeral reset as setSession — see comment there.
       selectedCell: null,
@@ -1683,6 +1766,12 @@ export const useStore = create<State>((set, get) => ({
       sequencePaused: false,
       transportStartedAt: null,
       transportAccumulatedMs: 0,
+      poolSelection: null,
+      selectedSavedSceneIds: [],
+      selectedSequenceSlot: null,
+      selectedSequenceSlots: [],
+      recordingLoopSceneId: null,
+      recordingLoopStartedAt: null,
       midiLearnTarget: null
     })
     resetUndoHistory()
@@ -1750,12 +1839,17 @@ export const useStore = create<State>((set, get) => ({
             )
           }))
 
+      // (S3) No propagateDefaults here: it's the LOAD sanitizer (rebuilds
+      // the builtin pool, re-migrates every cell) and ran on every
+      // keystroke of the TopBar default inputs. After the freeze above
+      // its only effect on this path was re-applying the unchanged half
+      // of the defaults to still-linked cells — a no-op.
       return {
-        session: propagateDefaults({
+        session: {
           ...st.session,
           scenes,
           ...fields
-        })
+        }
       }
     }),
   // ─── OSC forward target CRUD ─────────────────────────────────────
@@ -1798,6 +1892,32 @@ export const useStore = create<State>((set, get) => ({
       window.api?.networkSetForwardTargets?.(next)
       return { session: { ...st.session, forwardTargets: next } }
     }),
+  addOscSubscription: (init) => {
+    const id = `sub_${Math.random().toString(36).slice(2, 10)}`
+    set((st) => ({
+      session: {
+        ...st.session,
+        oscSubscriptions: [...(st.session.oscSubscriptions ?? []), { ...init, id }]
+      }
+    }))
+    return id
+  },
+  updateOscSubscription: (id, fields) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        oscSubscriptions: (st.session.oscSubscriptions ?? []).map((s) =>
+          s.id === id ? { ...s, ...fields, id } : s
+        )
+      }
+    })),
+  removeOscSubscription: (id) =>
+    set((st) => ({
+      session: {
+        ...st.session,
+        oscSubscriptions: (st.session.oscSubscriptions ?? []).filter((s) => s.id !== id)
+      }
+    })),
   setMidiInputName: (name) => set((st) => ({ session: { ...st.session, midiInputName: name } })),
   setFocusedScene: (id) =>
     set((st) => ({
@@ -1861,6 +1981,11 @@ export const useStore = create<State>((set, get) => ({
           ...st.session,
           scenes,
           sequence,
+          sequenceSlotOverrides: dropOverridesForClearedSlots(
+            st.session.sequenceSlotOverrides,
+            st.session.sequence,
+            sequence
+          ),
           focusedSceneId:
             st.session.focusedSceneId && idSet.has(st.session.focusedSceneId)
               ? null
@@ -2205,18 +2330,44 @@ export const useStore = create<State>((set, get) => ({
     if (!src) return null
     const newId = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
     const existingNames = get().session.pool.templates.map((t) => t.name)
+    // Re-id every function so the new template's functions don't
+    // collide with the source template's functions if both are
+    // instantiated into the same session.
+    const fnIdMap = new Map<string, string>()
+    const functions = src.functions.map((f) => {
+      const id = `fn_user_${Math.random().toString(36).slice(2, 9)}`
+      fnIdMap.set(f.id, id)
+      return { ...f, id }
+    })
+    // Hardware Mode's per-parameter maps (arg locks, input scaling) are
+    // keyed by function id — carry them over to the new ids. The
+    // instance scope (appliesToTrackIds) names the SOURCE template's
+    // rows, which the copy has none of, so it restarts at "all".
+    const remapKeys = <T>(m: Record<string, T> | undefined): Record<string, T> | undefined =>
+      m
+        ? Object.fromEntries(
+            Object.entries(m)
+              .filter(([k]) => fnIdMap.has(k))
+              .map(([k, v]) => [fnIdMap.get(k)!, v])
+          )
+        : undefined
+    const hw = src.hardwareMode
     const cloned: InstrumentTemplate = {
       ...src,
       id: newId,
       name: uniqueCopyName(src.name, existingNames),
       builtin: false,
-      // Re-id every function so the new template's functions don't
-      // collide with the source template's functions if both are
-      // instantiated into the same session.
-      functions: src.functions.map((f) => ({
-        ...f,
-        id: `fn_user_${Math.random().toString(36).slice(2, 9)}`
-      }))
+      functions,
+      ...(hw
+        ? {
+            hardwareMode: {
+              ...hw,
+              args: remapKeys(hw.args),
+              scaling: remapKeys(hw.scaling),
+              appliesToTrackIds: undefined
+            }
+          }
+        : {})
     }
     set((st) => ({
       session: {
@@ -2653,7 +2804,10 @@ export const useStore = create<State>((set, get) => ({
         defaultDestIp: p.destIp,
         defaultDestPort: p.destPort,
         // Snapshot the blueprint's argSpec onto the row.
-        argSpec: p.argSpec ? p.argSpec.map((a) => ({ ...a })) : undefined
+        argSpec: p.argSpec ? p.argSpec.map((a) => ({ ...a })) : undefined,
+        // …and its MIDI default, so cells created on the row (ensureCell)
+        // inherit it — this row has no sourceFunctionId to fall back on.
+        midiOut: p.midiOut ? { ...p.midiOut } : undefined
       }
       const tracks = st.session.tracks
       const idx = insertAfterTrackId
@@ -2688,10 +2842,15 @@ export const useStore = create<State>((set, get) => ({
     // Clone the source's cell from every scene onto the new track id so
     // the duplicate row plays the same values as the source instead of
     // being empty across the grid. Cells stored per-track on the scene.
+    // (S15) Per-cell MIDI triggers are NOT cloned — otherwise one note
+    // would fire the source and the copy at once.
     const newScenes = st0.session.scenes.map((sc) => {
       const srcCell = sc.cells[id]
       if (!srcCell) return sc
-      return { ...sc, cells: { ...sc.cells, [newId]: { ...srcCell } } }
+      return {
+        ...sc,
+        cells: { ...sc.cells, [newId]: { ...srcCell, midiTrigger: undefined } }
+      }
     })
     set((st) => ({
       session: {
@@ -2741,11 +2900,13 @@ export const useStore = create<State>((set, get) => ({
     // Clone every cell on every scene from the source's children onto
     // the new children's ids. Template-row cells aren't a thing
     // (templates only carry group triggers), so just children.
+    // (S15) Per-cell MIDI triggers stay with the source (see
+    // duplicateFunctionTrack).
     const newScenes = st0.session.scenes.map((sc) => {
       const nextCells = { ...sc.cells }
       childIdMap.forEach((newCId, oldCId) => {
         const cell = sc.cells[oldCId]
-        if (cell) nextCells[newCId] = { ...cell }
+        if (cell) nextCells[newCId] = { ...cell, midiTrigger: undefined }
       })
       return { ...sc, cells: nextCells }
     })
@@ -2820,12 +2981,23 @@ export const useStore = create<State>((set, get) => ({
     if (clip.kind === 'cell') {
       if (!st.selectedCell) return
       const { sceneId, trackId } = st.selectedCell
+      // (S15) The source's MIDI trigger doesn't travel (two cells would
+      // answer one note); the target position keeps its own, if any.
       set((s) => ({
         session: {
           ...s.session,
           scenes: s.session.scenes.map((sc) =>
             sc.id === sceneId
-              ? { ...sc, cells: { ...sc.cells, [trackId]: structuredClone(clip.cell) } }
+              ? {
+                  ...sc,
+                  cells: {
+                    ...sc.cells,
+                    [trackId]: {
+                      ...structuredClone(clip.cell),
+                      midiTrigger: sc.cells[trackId]?.midiTrigger
+                    }
+                  }
+                }
               : sc
           )
         }
@@ -2840,20 +3012,44 @@ export const useStore = create<State>((set, get) => ({
       ? st.session.tracks.findIndex((t) => t.id === st.selectedTrack)
       : st.session.tracks.length - 1
     const insertAfter = targetIdx < 0 ? st.session.tracks.length - 1 : targetIdx
+    // (S14) Instrument group the insertion point sits in (the selected
+    // anchor row is its header or one of its children) — pasted rows must
+    // keep the sidebar's header-then-contiguous-children invariant. No
+    // selection = plain append at the end, outside any group.
+    const anchor = st.selectedTrack
+      ? (st.session.tracks[insertAfter] as Track | undefined)
+      : undefined
+    const anchorGroupId =
+      anchor?.kind === 'template'
+        ? anchor.id
+        : anchor?.parentTrackId &&
+            st.session.tracks.some((t) => t.id === anchor.parentTrackId)
+          ? anchor.parentTrackId
+          : undefined
     if (clip.kind === 'function-track') {
       const newId = `t_${Math.random().toString(36).slice(2, 9)}`
       const existingNames = st.session.tracks.map((t) => t.name)
       const cloned: Track = {
         ...structuredClone(clip.track),
         id: newId,
-        name: uniqueCopyName(clip.track.name, existingNames)
+        name: uniqueCopyName(clip.track.name, existingNames),
+        // (S14) Belongs to the group it lands in (orphan outside any) —
+        // never to the clipboard source's group somewhere else.
+        parentTrackId: anchorGroupId
       }
       const newTracks = [...st.session.tracks]
       newTracks.splice(insertAfter + 1, 0, cloned)
+      // (S15) Cell MIDI triggers stay with the copied source.
       const newScenes = st.session.scenes.map((sc) => {
         const cell = clip.cellsByScene[sc.id]
         if (!cell) return sc
-        return { ...sc, cells: { ...sc.cells, [newId]: structuredClone(cell) } }
+        return {
+          ...sc,
+          cells: {
+            ...sc.cells,
+            [newId]: { ...structuredClone(cell), midiTrigger: undefined }
+          }
+        }
       })
       set((s) => ({
         session: { ...s.session, tracks: newTracks, scenes: newScenes }
@@ -2879,19 +3075,31 @@ export const useStore = create<State>((set, get) => ({
           parentTrackId: newTplId
         }
       })
+      // (S14) A header block landing inside another Instrument group
+      // would split it — snap to the end of that group's child run.
+      let blockAt = insertAfter + 1
+      if (anchorGroupId) {
+        while (
+          blockAt < st.session.tracks.length &&
+          st.session.tracks[blockAt].parentTrackId === anchorGroupId
+        ) {
+          blockAt++
+        }
+      }
       const newTracks = [
-        ...st.session.tracks.slice(0, insertAfter + 1),
+        ...st.session.tracks.slice(0, blockAt),
         newTpl,
         ...newChildren,
-        ...st.session.tracks.slice(insertAfter + 1)
+        ...st.session.tracks.slice(blockAt)
       ]
+      // (S15) Cell MIDI triggers stay with the copied source.
       const newScenes = st.session.scenes.map((sc) => {
         const row = clip.cellsByScene[sc.id]
         if (!row) return sc
         const nextCells = { ...sc.cells }
         childIdMap.forEach((newCId, oldCId) => {
           const c = row[oldCId]
-          if (c) nextCells[newCId] = structuredClone(c)
+          if (c) nextCells[newCId] = { ...structuredClone(c), midiTrigger: undefined }
         })
         return { ...sc, cells: nextCells }
       })
@@ -2949,55 +3157,29 @@ export const useStore = create<State>((set, get) => ({
           if (insertIdx < minInsert) insertIdx = minInsert
           if (insertIdx > maxInsert) insertIdx = maxInsert
         }
+      } else {
+        // (S14) A Template block or orphan row must not land between
+        // another group's header and its children (splitting the group):
+        // if the row right after the drop point is someone's child, snap
+        // forward past the end of that child run.
+        const groupId = without[insertIdx]?.parentTrackId
+        if (groupId) {
+          while (
+            insertIdx < without.length &&
+            without[insertIdx].parentTrackId === groupId
+          ) {
+            insertIdx++
+          }
+        }
       }
       const next = [...without.slice(0, insertIdx), ...block, ...without.slice(insertIdx)]
       return { session: { ...st.session, tracks: next } }
-    }),
-  removeTrack: (id) =>
-    set((st) => {
-      // Cascade: removing a Template header also removes every Function
-      // row that lists it as parent — Reaper-style "delete track folder"
-      // semantics. Avoids leaving orphan rows that visually float in the
-      // sidebar with no group context.
-      const target = st.session.tracks.find((t) => t.id === id)
-      const cascade = new Set<string>([id])
-      if (target?.kind === 'template') {
-        for (const t of st.session.tracks) {
-          if (t.parentTrackId === id) cascade.add(t.id)
-        }
-      }
-      const tracks = st.session.tracks.filter((t) => !cascade.has(t.id))
-      const scenes = st.session.scenes.map((s) => {
-        const cells: typeof s.cells = {}
-        for (const [tid, cell] of Object.entries(s.cells)) {
-          if (!cascade.has(tid)) cells[tid] = cell
-        }
-        return { ...s, cells }
-      })
-      return {
-        session: { ...st.session, tracks, scenes },
-        selectedTrack:
-          st.selectedTrack && cascade.has(st.selectedTrack) ? null : st.selectedTrack,
-        selectedTrackIds: st.selectedTrackIds.filter((tid) => !cascade.has(tid)),
-        selectedCell:
-          st.selectedCell && cascade.has(st.selectedCell.trackId)
-            ? null
-            : st.selectedCell,
-        selectedCells: st.selectedCells.filter((r) => !cascade.has(r.trackId))
-      }
     }),
   renameTrack: (id, name) =>
     set((st) => ({
       session: {
         ...st.session,
         tracks: st.session.tracks.map((t) => (t.id === id ? { ...t, name } : t))
-      }
-    })),
-  setTrackMidi: (id, binding) =>
-    set((st) => ({
-      session: {
-        ...st.session,
-        tracks: st.session.tracks.map((t) => (t.id === id ? { ...t, midiTrigger: binding } : t))
       }
     })),
   setTrackDefaults: (id, fields) =>
@@ -3464,8 +3646,12 @@ export const useStore = create<State>((set, get) => ({
       // Push to the main-process OSC listener so it re-binds
       // immediately. We always pass enabled=true since the
       // listener is generally on in normal use -- users can still
-      // disable it later via the Network tab if they want.
-      void window.api?.networkSetEnabled?.(true, clamped)
+      // disable it later via the Network tab if they want. The rebind
+      // doesn't trigger a device push, so apply the returned status here
+      // (otherwise the Pool header / Health keep showing the old port).
+      void window.api?.networkSetEnabled?.(true, clamped).then((next) => {
+        if (next) get().setNetworkSnapshot(get().networkDevices, next)
+      })
       return {
         session: { ...st.session, listenerPort: clamped }
       }
@@ -3550,20 +3736,30 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
   removeScene: (id) =>
-    set((st) => ({
-      session: {
-        ...st.session,
-        scenes: st.session.scenes.filter((s) => s.id !== id),
-        sequence: st.session.sequence.map((v) => (v === id ? null : v)),
-        focusedSceneId: st.session.focusedSceneId === id ? null : st.session.focusedSceneId
-      },
-      selectedSceneIds: st.selectedSceneIds.filter((sid) => sid !== id),
-      // Clear selection if it pointed at this scene — otherwise Inspector crashes.
-      selectedCell: st.selectedCell?.sceneId === id ? null : st.selectedCell,
-      selectedCells: st.selectedCells.filter((r) => r.sceneId !== id),
-      // Drop arm if the armed scene is the one being deleted.
-      armedSceneId: st.armedSceneId === id ? null : st.armedSceneId
-    })),
+    set((st) => {
+      const sequence = st.session.sequence.map((v) => (v === id ? null : v))
+      return {
+        session: {
+          ...st.session,
+          scenes: st.session.scenes.filter((s) => s.id !== id),
+          sequence,
+          // (S10) Same rule as setSequenceSlot: a cleared slot drops its
+          // override so it can't resurface on the next scene placed there.
+          sequenceSlotOverrides: dropOverridesForClearedSlots(
+            st.session.sequenceSlotOverrides,
+            st.session.sequence,
+            sequence
+          ),
+          focusedSceneId: st.session.focusedSceneId === id ? null : st.session.focusedSceneId
+        },
+        selectedSceneIds: st.selectedSceneIds.filter((sid) => sid !== id),
+        // Clear selection if it pointed at this scene — otherwise Inspector crashes.
+        selectedCell: st.selectedCell?.sceneId === id ? null : st.selectedCell,
+        selectedCells: st.selectedCells.filter((r) => r.sceneId !== id),
+        // Drop arm if the armed scene is the one being deleted.
+        armedSceneId: st.armedSceneId === id ? null : st.armedSceneId
+      }
+    }),
   moveScene: (fromIndex, toIndex) =>
     set((st) => {
       const n = st.session.scenes.length
@@ -4001,8 +4197,9 @@ export const useStore = create<State>((set, get) => ({
   removeTracks: (ids) =>
     set((st) => {
       if (ids.length === 0) return st
-      // Cascade Template-header deletes to their child Function rows
-      // (same semantics as removeTrack singular).
+      // Cascade Template-header deletes to their child Function rows —
+      // Reaper-style "delete track folder" semantics, so no orphan rows
+      // float in the sidebar with no group context.
       const idSet = new Set(ids)
       for (const id of ids) {
         const t = st.session.tracks.find((tt) => tt.id === id)
@@ -4021,8 +4218,33 @@ export const useStore = create<State>((set, get) => ({
         }
         return { ...s, cells }
       })
+      // (S19) A draft template (sidebar-authored, never "Save as
+      // Template"d) exists only to back its rows — drop it with its last
+      // row instead of leaving a hidden entry to accumulate in the pool.
+      const stillUsed = new Set<string>()
+      for (const t of tracks) if (t.sourceTemplateId) stillUsed.add(t.sourceTemplateId)
+      const orphanDrafts = new Set<string>()
+      for (const t of st.session.tracks) {
+        if (idSet.has(t.id) && t.sourceTemplateId && !stillUsed.has(t.sourceTemplateId)) {
+          const tpl = st.session.pool.templates.find((p) => p.id === t.sourceTemplateId)
+          if (tpl?.draft) orphanDrafts.add(tpl.id)
+        }
+      }
+      const pool =
+        orphanDrafts.size > 0
+          ? {
+              ...st.session.pool,
+              templates: st.session.pool.templates.filter((p) => !orphanDrafts.has(p.id))
+            }
+          : st.session.pool
       return {
-        session: { ...st.session, tracks, scenes },
+        session: { ...st.session, tracks, scenes, pool },
+        poolSelection:
+          st.poolSelection &&
+          'templateId' in st.poolSelection &&
+          orphanDrafts.has(st.poolSelection.templateId)
+            ? null
+            : st.poolSelection,
         selectedTrack: st.selectedTrack && idSet.has(st.selectedTrack) ? null : st.selectedTrack,
         selectedTrackIds: st.selectedTrackIds.filter((tid) => !idSet.has(tid)),
         selectedCell:
@@ -4092,7 +4314,8 @@ export const useStore = create<State>((set, get) => ({
   setTracksCollapsed: (v) => set({ tracksCollapsed: v }),
   setOscMonitorOpen: (v) => set({ oscMonitorOpen: v }),
   setGenerativePopoverOpen: (v) => set({ generativePopoverOpen: v }),
-  setOscMonitorHeight: (h) => set({ oscMonitorHeight: clampInt(h, 120, 600) }),
+  // Same 120..800 band as the session-restore clamp in setSession.
+  setOscMonitorHeight: (h) => set({ oscMonitorHeight: clampInt(h, 120, 800) }),
   setPoolHidden: (v) => set({ poolHidden: v }),
   setEditInspectorVisible: (v) => set({ editInspectorVisible: v }),
   setSceneInspectorVisible: (v) => set({ sceneInspectorVisible: v }),
@@ -4337,8 +4560,22 @@ export const useStore = create<State>((set, get) => ({
     // Flip UI state FIRST so the button responds even if the IPC bridge is
     // stale (dev preload not reloaded). Side effect stays OUT of the set()
     // updater — a throw there would silently abort the state change.
-    set({ recordingLoopSceneId: sceneId, recordingLoopStartedAt: Date.now() })
-    window.api.motionLoopStartRecord?.(sceneId)
+    const startedAt = Date.now()
+    set({ recordingLoopSceneId: sceneId, recordingLoopStartedAt: startedAt })
+    // (M16) Main refuses (false — e.g. the scene hasn't reached the
+    // engine yet — or undefined on an IPC error): roll the optimistic
+    // "Recording…" state back, unless a Stop / new take already moved on.
+    const rollback = (): void => {
+      const cur = get()
+      if (cur.recordingLoopSceneId === sceneId && cur.recordingLoopStartedAt === startedAt) {
+        set({ recordingLoopSceneId: null, recordingLoopStartedAt: null })
+      }
+    }
+    const p = window.api.motionLoopStartRecord?.(sceneId)
+    if (!p) return
+    void p.then((ok) => {
+      if (ok !== true) rollback()
+    }, rollback)
   },
   stopMotionLoopRecord: () => {
     set({ recordingLoopSceneId: null, recordingLoopStartedAt: null })
@@ -4581,18 +4818,35 @@ export const useStore = create<State>((set, get) => ({
     const st = get()
     const id = st.armedSceneId
     if (!id) return null
+    const seq = st.session.sequence
+    const len = Math.min(seq.length, st.session.sequenceLength)
+    // (V6) Which slot is the armed scene fired FROM? The first slot
+    // holding it AFTER the engine's current slot (the one the previous
+    // GO / follow action played) — not its first occurrence overall,
+    // which rewound Space-Space-Space to the first placement of a scene
+    // used in several slots. Nothing slot-sourced playing → first
+    // occurrence. -1 when the scene isn't in the sequence at all.
+    const curSlot = st.engine.activeSequenceSlotIdx
+    const from = typeof curSlot === 'number' && curSlot >= 0 && curSlot < len ? curSlot : -1
+    let here = -1
+    for (let i = 1; i <= len; i++) {
+      const idx = (from + i + len) % len
+      if (seq[idx] === id) {
+        here = idx
+        break
+      }
+    }
     // Trigger via the morph-aware helper so GO goes through the same
-    // precedence rules as Space / click / MIDI.
-    st.triggerSceneWithMorph(id)
+    // precedence rules as Space / click / MIDI. Passing the slot lets the
+    // engine track it (highlight, per-slot overrides, follow actions)
+    // and seeds the next GO's search above.
+    st.triggerSceneWithMorph(id, here >= 0 ? here : undefined)
     // Optionally arm the next non-empty slot so Space-Space-Space walks
     // the sequence. Uses the slot the fired scene was in (or slot 0 if
     // it isn't in the current sequence) as the starting point.
     let nextArm: string | null = null
     if (st.autoAdvanceArm) {
-      const seq = st.session.sequence
-      const len = Math.min(seq.length, st.session.sequenceLength)
-      const here = seq.findIndex((sid) => sid === id)
-      const start = here >= 0 ? here : -1
+      const start = here
       for (let i = 1; i <= len; i++) {
         const idx = (start + i + len) % len
         const candidate = seq[idx]
@@ -4677,12 +4931,35 @@ export const useStore = create<State>((set, get) => ({
       })
       base.destLinkedToDefault = def.destLinked
       base.addressLinkedToDefault = def.addressLinked
+      // Same MIDI-default lookup as ensureCell: the row's own midiOut,
+      // else its source Pool Function's.
+      const trackMidi =
+        track?.midiOut ??
+        st.session.pool.templates
+          .find((t) => t.id === track?.sourceTemplateId)
+          ?.functions.find((f) => f.id === track?.sourceFunctionId)?.midiOut
+      if (trackMidi) base.midiOut = { ...trackMidi }
       const tc = tpl.cell as Partial<Cell>
       const tm = tc.modulation as Partial<Cell['modulation']> | undefined
       const ts = tc.sequencer as Partial<Cell['sequencer']> | undefined
       const cell: Cell = {
         ...base,
         ...tc,
+        // (S13) Routing belongs to the TARGET row: a template saved from
+        // another Parameter must not re-point this clip at that row's
+        // address / destination (or drag its link flags along). A MIDI
+        // trigger or recorded Motion Loop is tied to the source clip, not
+        // part of the reusable "sound". MIDI output follows the comment
+        // above: the template's own wins when it carries one, else the
+        // row's default.
+        destIp: base.destIp,
+        destPort: base.destPort,
+        oscAddress: base.oscAddress,
+        destLinkedToDefault: base.destLinkedToDefault,
+        addressLinkedToDefault: base.addressLinkedToDefault,
+        midiOut: tc.midiOut ? { ...tc.midiOut } : base.midiOut,
+        midiTrigger: undefined,
+        recordedLoop: undefined,
         modulation: {
           ...base.modulation,
           ...(tm ?? {}),
@@ -4847,17 +5124,22 @@ export const useStore = create<State>((set, get) => ({
         session: { ...st.session, metaController: { ...st.session.metaController, knobs } }
       }
     }),
+  // (V18) A CC riding the knob is a performance gesture, not an edit —
+  // committed outside the undo timeline (otherwise every CC message
+  // became its own undo step).
   setMetaKnobValueFromMidi: (knobIdx, value) =>
-    set((st) => {
-      if (knobIdx < 0 || knobIdx >= META_KNOB_COUNT) return st
-      const v = Math.max(0, Math.min(1, value))
-      const knobs = st.session.metaController.knobs.map((k, i) =>
-        i === knobIdx ? { ...k, value: v } : k
-      )
-      return {
-        session: { ...st.session, metaController: { ...st.session.metaController, knobs } }
-      }
-    }),
+    withoutUndoSnapshot(() =>
+      set((st) => {
+        if (knobIdx < 0 || knobIdx >= META_KNOB_COUNT) return st
+        const v = Math.max(0, Math.min(1, value))
+        const knobs = st.session.metaController.knobs.map((k, i) =>
+          i === knobIdx ? { ...k, value: v } : k
+        )
+        return {
+          session: { ...st.session, metaController: { ...st.session.metaController, knobs } }
+        }
+      })
+    ),
   setMetaKnobDisplayValues: (values) => set({ metaKnobDisplayValues: values }),
   setUiScale: (s) =>
     set({ uiScale: Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, s)) }),
@@ -5300,12 +5582,14 @@ export const useStore = create<State>((set, get) => ({
         newPoolTemplates.push(tpl)
       }
     }
-    // Rebuild the cells map with new track ids.
+    // Rebuild the cells map with new track ids. (S15) Per-cell MIDI
+    // triggers don't come along — the source scene may still be on the
+    // grid answering the same note.
     const newCells: Record<string, Cell> = {}
     for (const [oldTid, cell] of Object.entries(saved.cells)) {
       const newTid = trackIdMap.get(oldTid)
       if (!newTid) continue
-      newCells[newTid] = { ...cell }
+      newCells[newTid] = { ...cell, midiTrigger: undefined }
     }
     // (#17) Collision-guarded fixed-length id instead of a raw random.
     const newSceneId = makeSceneId(st.session.scenes.map((s) => s.id))
@@ -5326,10 +5610,6 @@ export const useStore = create<State>((set, get) => ({
       // existing entry updates in place instead of creating a duplicate.
       linkedSavedSceneId: savedSceneId
     }
-    // Mark this scene as coming from the library so App.tsx's
-    // auto-save effect doesn't create a duplicate library entry
-    // when it sees session.scenes grow. See `sceneIdsFromLibrary`.
-    sceneIdsFromLibrary.add(newSceneId)
     set((s) => {
       // Compute the spliced `scenes` array. When the caller passed an
       // explicit `insertAtIndex`, clamp it to [0, length] and splice
@@ -5345,10 +5625,28 @@ export const useStore = create<State>((set, get) => ({
       } else {
         nextScenes = [...s.session.scenes, newScene]
       }
+      // (S14) New child rows whose header was REUSED from the grid go
+      // right after that header's existing children (appending them at
+      // the bottom split the group); new headers + their new children
+      // are already contiguous blocks and are appended.
+      const nextTracks = s.session.tracks.slice()
+      const appended: Track[] = []
+      for (const nt of newTracks) {
+        const pid = nt.parentTrackId
+        const hIdx = pid ? nextTracks.findIndex((t) => t.id === pid) : -1
+        if (hIdx < 0) {
+          appended.push(nt)
+          continue
+        }
+        let at = hIdx + 1
+        while (at < nextTracks.length && nextTracks[at].parentTrackId === pid) at++
+        nextTracks.splice(at, 0, nt)
+      }
+      nextTracks.push(...appended)
       return {
       session: {
         ...s.session,
-        tracks: [...s.session.tracks, ...newTracks],
+        tracks: nextTracks,
         scenes: nextScenes,
         pool: {
           ...s.session.pool,
@@ -5380,9 +5678,10 @@ export const useStore = create<State>((set, get) => ({
     // Clone cells one-by-one so a future field addition to Cell
     // doesn't accidentally skip a slot. Track ids stay the same —
     // duplicating a scene doesn't add sidebar rows.
+    // (S15) Cell-level MIDI triggers are severed too (see #14 below).
     const newCells: Record<string, Cell> = {}
     for (const [tid, cell] of Object.entries(scene.cells)) {
-      newCells[tid] = { ...cell }
+      newCells[tid] = { ...cell, midiTrigger: undefined }
     }
     const existingNames = st.session.scenes.map((s) => s.name)
     const newScene: Scene = {
@@ -5391,11 +5690,13 @@ export const useStore = create<State>((set, get) => ({
       name: uniqueCopyName(scene.name, existingNames),
       cells: newCells,
       // (#14) The `{...scene}` spread carries linkedSavedSceneId +
-      // midiTrigger. Left intact, renaming the copy mirrors over the
-      // SOURCE's Pool library entry (via updateScene) and both scenes
-      // answer the same MIDI trigger. Sever both on the copy.
+      // midiTrigger (+ Instrument group triggers). Left intact, renaming
+      // the copy mirrors over the SOURCE's Pool library entry (via
+      // updateScene) and both scenes answer the same MIDI trigger. Sever
+      // them on the copy.
       linkedSavedSceneId: undefined,
-      midiTrigger: undefined
+      midiTrigger: undefined,
+      instrumentTriggers: undefined
     }
     // (FEATURE A) Insert the duplicate directly AFTER the source scene
     // (same splice pattern captureSceneStateAsNew uses) rather than
@@ -5443,7 +5744,10 @@ export const useStore = create<State>((set, get) => ({
       // change that might put a status string here).
       const useLive =
         typeof liveStr === 'string' && liveStr.length > 0
-      newCells[tid] = useLive ? { ...cell, value: liveStr } : { ...cell }
+      // (S15) Cell MIDI triggers stay with the source, like the scene's.
+      newCells[tid] = useLive
+        ? { ...cell, value: liveStr, midiTrigger: undefined }
+        : { ...cell, midiTrigger: undefined }
     }
     const existingNames = st.session.scenes.map((s) => s.name)
     const baseName = `${scene.name} (capture)`
@@ -5452,11 +5756,12 @@ export const useStore = create<State>((set, get) => ({
       id: newSceneId,
       name: uniqueCopyName(baseName, existingNames),
       cells: newCells,
-      // (#14) Sever the source's Pool link + MIDI trigger so the
-      // capture doesn't mirror over the source's library entry or
-      // double-answer its trigger.
+      // (#14) Sever the source's Pool link + MIDI triggers (scene +
+      // Instrument group) so the capture doesn't mirror over the
+      // source's library entry or double-answer its triggers.
       linkedSavedSceneId: undefined,
-      midiTrigger: undefined
+      midiTrigger: undefined,
+      instrumentTriggers: undefined
     }
     // (v0.5.12) Insert the new scene directly AFTER the source scene
     // in the grid, not at the end. Workflow rationale: the user
@@ -5645,12 +5950,25 @@ function resolveCellDefaults(
   destLinked: boolean
   addressLinked: boolean
 } {
-  const trackIp = track?.defaultDestIp
-  const trackPort = track?.defaultDestPort
-  const trackAddr = track?.defaultOscAddress
-  const trackHasIp = trackIp != null && trackIp !== ''
-  const trackHasPort = trackPort != null && trackPort > 0
-  const trackHasAddr = trackAddr != null && trackAddr !== ''
+  // (I6) A child Parameter row with no default of its own inherits its
+  // Instrument header row's default before falling back to the session
+  // default — the header's dest / address fields are the Instrument-wide
+  // defaults the Inspector exposes.
+  const parent = track?.parentTrackId
+    ? session.tracks.find((t) => t.id === track.parentTrackId && t.kind === 'template')
+    : undefined
+  const hasStr = (v: string | undefined): boolean => v != null && v !== ''
+  const hasPort = (v: number | undefined): boolean => v != null && v > 0
+  const trackIp = hasStr(track?.defaultDestIp) ? track?.defaultDestIp : parent?.defaultDestIp
+  const trackPort = hasPort(track?.defaultDestPort)
+    ? track?.defaultDestPort
+    : parent?.defaultDestPort
+  const trackAddr = hasStr(track?.defaultOscAddress)
+    ? track?.defaultOscAddress
+    : parent?.defaultOscAddress
+  const trackHasIp = hasStr(trackIp)
+  const trackHasPort = hasPort(trackPort)
+  const trackHasAddr = hasStr(trackAddr)
   // destLinkedToDefault covers ip+port together (matches the
   // existing freeze-on-change behavior in setDefaults). If the
   // track overrides EITHER, treat the cell as decoupled from the
@@ -6100,6 +6418,7 @@ function propagateDefaults(s: Session): Session {
     // each entry so a hand-edited session file with garbage values doesn't
     // crash the main-process listener.
     forwardTargets: sanitizeForwardTargets(s.forwardTargets),
+    oscSubscriptions: sanitizeOscSubscriptions(s.oscSubscriptions),
     // Generative Scene Sequencer (v0.5.10). Sanitize every field
     // independently so a hand-edited or partially-malformed session
     // can't introduce NaN ranges, out-of-bounds affinity, or
@@ -6214,6 +6533,41 @@ function sanitizeForwardTargets(raw: unknown): OscForwardTarget[] {
       label: typeof rr.label === 'string' ? rr.label : undefined,
       ip,
       port
+    })
+  }
+  return out
+}
+
+function sanitizeOscSubscriptions(raw: unknown): OscSubscription[] {
+  if (!Array.isArray(raw)) return []
+  const out: OscSubscription[] = []
+  const port = (v: unknown): number | null =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 65535 ? Math.floor(v) : null
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const rr = r as Record<string, unknown>
+    const id = typeof rr.id === 'string' && rr.id.length > 0 ? rr.id : null
+    const host = typeof rr.host === 'string' ? rr.host.trim() : ''
+    const devPort = port(rr.port)
+    const endpoint = typeof rr.endpoint === 'string' ? rr.endpoint.trim() : ''
+    if (!id || !host || devPort === null || !endpoint) continue
+    const replyPort = port(rr.replyPort)
+    out.push({
+      id,
+      enabled: rr.enabled !== false,
+      kind: rr.kind === 'custom' ? 'custom' : 'pandore',
+      host,
+      port: devPort,
+      endpoint,
+      rateHz:
+        typeof rr.rateHz === 'number' && Number.isFinite(rr.rateHz)
+          ? Math.max(0, Math.min(1000, rr.rateHz))
+          : 0,
+      ...(replyPort !== null ? { replyPort } : {}),
+      ...(typeof rr.customArgs === 'string' ? { customArgs: rr.customArgs } : {}),
+      ...(typeof rr.customUnsubscribe === 'string'
+        ? { customUnsubscribe: rr.customUnsubscribe }
+        : {})
     })
   }
   return out
@@ -6339,8 +6693,13 @@ function sanitizeRecordedLoop(
     const ff = f as Record<string, unknown>
     if (typeof ff.t !== 'number' || !Number.isFinite(ff.t)) continue
     if (!Array.isArray(ff.v)) continue
+    // A slot the take didn't record (locked out / outside the HW
+    // instances) is stored as NaN, which JSON writes as null. Restore it
+    // as NaN — the engine skips non-finite slots at playback. Coercing
+    // it to 0 would make that slot override live input with 0 after a
+    // save/reload.
     const v = (ff.v as unknown[]).map((x) =>
-      typeof x === 'number' && Number.isFinite(x) ? x : 0
+      typeof x === 'number' && Number.isFinite(x) ? x : NaN
     )
     frames.push({ t: ff.t, v })
   }
@@ -6380,7 +6739,8 @@ function migrateSequencer(raw: unknown): SequencerParams {
     'drift',
     'ratchet',
     'bounce',
-    'draw'
+    'draw',
+    'adresse'
   ]
   const mode: SeqMode =
     typeof r.mode === 'string' && (VALID_MODES as string[]).includes(r.mode)
@@ -6445,7 +6805,13 @@ function migrateSequencer(raw: unknown): SequencerParams {
     bounceDecay: num(r.bounceDecay, base.bounceDecay, 0, 100),
     generative: !!r.generative,
     genAmount: num(r.genAmount, base.genAmount, 0, 100),
-    restBehaviour: r.restBehaviour === 'hold' ? 'hold' : 'last',
+    // Absent / invalid → the factory default ('hold'), like every other
+    // field here — not 'last', which silently re-enabled continuous
+    // re-sends on such cells.
+    restBehaviour:
+      r.restBehaviour === 'hold' || r.restBehaviour === 'last'
+        ? r.restBehaviour
+        : base.restBehaviour,
     drawSteps: num(r.drawSteps, base.drawSteps, 4, 1024, true),
     drawValues: (() => {
       if (Array.isArray(r.drawValues)) {
@@ -6468,7 +6834,14 @@ function migrateSequencer(raw: unknown): SequencerParams {
     drawValueMax:
       typeof r.drawValueMax === 'number' && Number.isFinite(r.drawValueMax)
         ? r.drawValueMax
-        : base.drawValueMax
+        : base.drawValueMax,
+    // Adresse sub-mode — optional (engine falls back to 'hijack'), so
+    // only carried when valid.
+    ...(r.adresseMode === 'hijack' ||
+    r.adresseMode === 'parallel' ||
+    r.adresseMode === 'stage2'
+      ? { adresseMode: r.adresseMode }
+      : {})
   }
 }
 
@@ -6635,8 +7008,25 @@ function sanitizeFunction(raw: unknown, idx: number): InstrumentFunction | null 
     init: typeof r.init === 'number' ? r.init : undefined,
     unit: typeof r.unit === 'string' ? r.unit : undefined,
     smoothMs: typeof r.smoothMs === 'number' ? r.smoothMs : undefined,
-    notes: typeof r.notes === 'string' ? r.notes : undefined
+    notes: typeof r.notes === 'string' ? r.notes : undefined,
+    // Multi-arg spec + MIDI default MUST round-trip — dropping them here
+    // flattened every user Instrument's multi-arg Parameters (and lost
+    // their MIDI wiring) on the first load→save cycle.
+    argSpec: sanitizeArgSpecList(r.argSpec),
+    midiOut: sanitizeMidiOut(r.midiOut as import('@shared/types').MidiOut | undefined)
   }
+}
+
+// Shared by sanitizeFunction / sanitizeParameter: drop malformed entries;
+// undefined when absent or nothing valid survives.
+function sanitizeArgSpecList(
+  raw: unknown
+): import('@shared/types').ParamArgSpec[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out = raw
+    .map((a) => sanitizeArgSpec(a))
+    .filter((a): a is import('@shared/types').ParamArgSpec => a !== null)
+  return out.length > 0 ? out : undefined
 }
 
 // Input Conditioning (v0.6) — shape-validated copy so hand-edited /
@@ -6724,63 +7114,13 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
         ...(Number.isFinite(ru.b) ? { b: ru.b as number } : {}),
         ...(Number.isFinite(ru.tol) ? { tol: ru.tol as number } : {})
       }))
-    const learnedRaw = r.learned as Record<string, unknown> | undefined
-    let learned: StateTrigger['learned']
-    if (
-      learnedRaw &&
-      typeof learnedRaw === 'object' &&
-      Array.isArray(learnedRaw.dims) &&
-      Array.isArray(learnedRaw.centroid) &&
-      Array.isArray(learnedRaw.variance)
-    ) {
-      const dims = (learnedRaw.dims as unknown[])
-        .filter(
-          (d): d is Record<string, unknown> =>
-            !!d &&
-            typeof d === 'object' &&
-            typeof (d as Record<string, unknown>).address === 'string'
-        )
-        .map((d) => ({
-          address: d.address as string,
-          slot:
-            typeof d.slot === 'number' && Number.isInteger(d.slot)
-              ? (d.slot as number)
-              : 0,
-          // enabled defaults true; only carry an explicit false so the
-          // user's excluded-channel choices round-trip.
-          ...(d.enabled === false ? { enabled: false } : {})
-        }))
-      const centroid = (learnedRaw.centroid as unknown[]).filter(
-        (x): x is number => typeof x === 'number' && Number.isFinite(x)
-      )
-      const variance = (learnedRaw.variance as unknown[]).filter(
-        (x): x is number => typeof x === 'number' && Number.isFinite(x)
-      )
-      // Dims / centroid / variance must be index-aligned; a truncated
-      // or hand-edited mismatch invalidates the whole model.
-      if (dims.length > 0 && dims.length === centroid.length && dims.length === variance.length) {
-        learned = {
-          dims,
-          centroid,
-          variance,
-          threshold:
-            typeof learnedRaw.threshold === 'number'
-              ? Math.max(0, Math.min(1, learnedRaw.threshold))
-              : 0.8,
-          ...(Number.isFinite(learnedRaw.tolerance)
-            ? {
-                tolerance: Math.max(
-                  0.01,
-                  Math.min(1, learnedRaw.tolerance as number)
-                )
-              }
-            : {})
-        }
-      }
-    }
-    const midiRaw = (r.actions as Record<string, unknown> | undefined)?.midi as
-      | Record<string, unknown>
-      | undefined
+    // (S18) Learned model + MIDI action go through the SAME sanitizers as
+    // Pose Sequence waypoints, so both share the factory fallbacks
+    // (threshold 0.6) and finite-checks (MIDI channel included).
+    const learned = sanitizeLearnedState(r.learned)
+    const midi = sanitizeStateMidiAction(
+      (r.actions as Record<string, unknown> | undefined)?.midi
+    )
     out.push({
       id: r.id,
       name: r.name,
@@ -6790,43 +7130,20 @@ function sanitizeStateTriggers(raw: unknown): StateTrigger[] | undefined {
         r.mode === 'oneShot' || r.mode === 'continuous'
           ? (r.mode as StateTrigger['mode'])
           : 'enterExit',
+      // Fallbacks match makeStateTrigger (hysteresis 0.15, hold 250 ms).
       hysteresisPct:
         Number.isFinite(r.hysteresisPct)
           ? Math.max(0, Math.min(0.5, r.hysteresisPct as number))
-          : 0.1,
+          : 0.15,
       dwellMs:
         Number.isFinite(r.dwellMs) ? Math.max(0, r.dwellMs as number) : 80,
-      ...(Number.isFinite(r.holdMs)
-        ? { holdMs: Math.max(0, Math.min(10000, r.holdMs as number)) }
-        : {}),
+      holdMs: Number.isFinite(r.holdMs)
+        ? Math.max(0, Math.min(10000, r.holdMs as number))
+        : 250,
       rules,
       ...(learned ? { learned } : {}),
       actions: {
-        ...(midiRaw && typeof midiRaw === 'object'
-          ? {
-              midi: {
-                enabled: midiRaw.enabled !== false,
-                portName:
-                  typeof midiRaw.portName === 'string' ? midiRaw.portName : '',
-                channel:
-                  typeof midiRaw.channel === 'number'
-                    ? Math.max(1, Math.min(16, Math.round(midiRaw.channel)))
-                    : 1,
-                kind: midiRaw.kind === 'cc' ? 'cc' : 'note',
-                ...(typeof midiRaw.note === 'number' ? { note: midiRaw.note } : {}),
-                ...(typeof midiRaw.velocity === 'number'
-                  ? { velocity: midiRaw.velocity }
-                  : {}),
-                ...(typeof midiRaw.cc === 'number' ? { cc: midiRaw.cc } : {}),
-                ...(typeof midiRaw.ccEnterValue === 'number'
-                  ? { ccEnterValue: midiRaw.ccEnterValue }
-                  : {}),
-                ...(typeof midiRaw.ccExitValue === 'number'
-                  ? { ccExitValue: midiRaw.ccExitValue }
-                  : {})
-              }
-            }
-          : {}),
+        ...(midi ? { midi } : {}),
         ...(typeof (r.actions as Record<string, unknown> | undefined)
           ?.triggerSceneId === 'string'
           ? {
@@ -7166,30 +7483,40 @@ function sanitizePool(raw: unknown): Pool {
   const seen = new Set<string>(builtin.templates.map((t) => t.id))
   const merged: InstrumentTemplate[] = builtin.templates.map((b) => {
     const saved = savedById.get(b.id)
-    // Graft EVERY user-overridable field (hardwareMode +
-    // inputConditioner + stateTriggers + derivedParams + poseSequences)
-    // — per-session user state that rides on top of the builtin's core
-    // definition.
-    if (
-      saved &&
-      (saved.hardwareMode ||
-        saved.inputConditioner ||
-        saved.stateTriggers ||
-        saved.derivedParams ||
-        saved.poseSequences)
-    ) {
-      return {
-        ...b,
-        ...(saved.hardwareMode ? { hardwareMode: saved.hardwareMode } : {}),
-        ...(saved.inputConditioner
-          ? { inputConditioner: saved.inputConditioner }
-          : {}),
-        ...(saved.stateTriggers ? { stateTriggers: saved.stateTriggers } : {}),
-        ...(saved.derivedParams ? { derivedParams: saved.derivedParams } : {}),
-        ...(saved.poseSequences ? { poseSequences: saved.poseSequences } : {})
+    if (!saved) return b
+    // Output destination is user state too: broadcastInstrumentPort /
+    // broadcastSessionDest rewrite a builtin's destIp / destPort and its
+    // functions' dest overrides (matched by function id; every other
+    // function field stays the builtin's).
+    const savedFns = new Map(saved.functions.map((f) => [f.id, f]))
+    const functions = b.functions.map((f) => {
+      const sf = savedFns.get(f.id)
+      if (!sf || (sf.destIpOverride === undefined && sf.destPortOverride === undefined)) {
+        return f
       }
+      return {
+        ...f,
+        ...(sf.destIpOverride !== undefined ? { destIpOverride: sf.destIpOverride } : {}),
+        ...(sf.destPortOverride !== undefined ? { destPortOverride: sf.destPortOverride } : {})
+      }
+    })
+    // Graft EVERY user-overridable field (hardwareMode +
+    // inputConditioner + stateTriggers + derivedParams + poseSequences
+    // + destination) — per-session user state that rides on top of the
+    // builtin's core definition.
+    return {
+      ...b,
+      destIp: saved.destIp,
+      destPort: saved.destPort,
+      functions,
+      ...(saved.hardwareMode ? { hardwareMode: saved.hardwareMode } : {}),
+      ...(saved.inputConditioner
+        ? { inputConditioner: saved.inputConditioner }
+        : {}),
+      ...(saved.stateTriggers ? { stateTriggers: saved.stateTriggers } : {}),
+      ...(saved.derivedParams ? { derivedParams: saved.derivedParams } : {}),
+      ...(saved.poseSequences ? { poseSequences: saved.poseSequences } : {})
     }
-    return b
   })
   // User-authored entries with NEW ids (no collision with a builtin)
   // are appended verbatim.
@@ -7244,7 +7571,10 @@ function sanitizeParameter(raw: unknown): ParameterTemplate | null {
     unit: typeof r.unit === 'string' ? r.unit : undefined,
     smoothMs: typeof r.smoothMs === 'number' ? r.smoothMs : undefined,
     notes: typeof r.notes === 'string' ? r.notes : undefined,
-    builtin: r.builtin === true
+    builtin: r.builtin === true,
+    // Same round-trip rule as sanitizeFunction.
+    argSpec: sanitizeArgSpecList(r.argSpec),
+    midiOut: sanitizeMidiOut(r.midiOut)
   }
 }
 

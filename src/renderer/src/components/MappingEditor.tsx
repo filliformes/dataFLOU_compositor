@@ -9,6 +9,7 @@ import type { HardwareScaleConfig } from '@shared/types'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { TransferCurve } from './TransferCurve'
 import { latestForAddress } from '../connectionHealth'
+import { useStore } from '../store'
 
 const DEFAULT_SCALE: HardwareScaleConfig = {
   enabled: false,
@@ -22,19 +23,31 @@ export function MappingEditor({
   scale,
   onChange,
   address,
-  compact = false
+  outDefault
 }: {
   scale: HardwareScaleConfig | undefined
   onChange: (patch: Partial<HardwareScaleConfig>) => void
   // Incoming address, used to show the live input dot on the curve.
   address?: string
-  compact?: boolean
+  // Out range shown before the first edit — the caller seeds the stored
+  // config from the Parameter's min/max, so display the same numbers.
+  outDefault?: { min?: number; max?: number }
 }): JSX.Element {
-  const s = scale ?? DEFAULT_SCALE
+  const s = scale ?? {
+    ...DEFAULT_SCALE,
+    outMin: outDefault?.min ?? DEFAULT_SCALE.outMin,
+    outMax: outDefault?.max ?? DEFAULT_SCALE.outMax
+  }
   const [liveV, setLiveV] = useState<number | undefined>(undefined)
   useEffect(() => {
     if (!address) return
-    const tick = (): void => setLiveV(latestForAddress(address))
+    // The engine scales the CONDITIONED value, so place the dot from the
+    // HW live readout's `cond` when present; fall back to the raw
+    // monitor value when no Hardware-Mode device is feeding it.
+    const tick = (): void => {
+      const e = useStore.getState().engine.hardwareLiveByAddress?.[address]
+      setLiveV(e && e.cond.length > 0 ? e.cond[0] : latestForAddress(address))
+    }
     tick()
     const id = setInterval(tick, 200)
     return () => clearInterval(id)
@@ -94,7 +107,6 @@ export function MappingEditor({
         amount={s.curveAmount ?? 0.5}
         invert={s.invert ?? false}
         liveT={liveT}
-        compact={compact}
         onChange={(patch) => onChange(patch)}
       />
     </div>

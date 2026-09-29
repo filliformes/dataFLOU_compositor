@@ -24,6 +24,7 @@ import { app } from 'electron'
 import { promises as fs, existsSync } from 'fs'
 import { join } from 'path'
 import type { InstrumentTemplate, ParameterTemplate } from '@shared/types'
+import { atomicWriteFile, backupCorruptFile } from './session'
 
 const FILE_NAME = 'pool-library.json'
 
@@ -66,7 +67,18 @@ export class PoolLibrary {
     }
     try {
       const raw = await fs.readFile(path, 'utf8')
-      const parsed = JSON.parse(raw) as unknown
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw) as unknown
+      } catch (e) {
+        // Corrupt / truncated file. Move it aside BEFORE continuing with
+        // an empty library — the next setAll() rewrites the path, which
+        // would otherwise destroy the user's only copy.
+        await backupCorruptFile(path, '[poolLibrary]', (e as Error).message)
+        this.templates = []
+        this.parameters = []
+        return
+      }
       // Permissive parse: missing arrays default to [].
       const obj = (parsed ?? {}) as Partial<PoolLibraryPayload>
       this.templates = Array.isArray(obj.templates)
@@ -148,16 +160,13 @@ export class PoolLibrary {
   }
 
   private async flushNow(): Promise<void> {
-    const path = libraryPath()
-    const tmp = `${path}.tmp`
     try {
       const json = JSON.stringify(
         { templates: this.templates, parameters: this.parameters },
         null,
         2
       )
-      await fs.writeFile(tmp, json, 'utf8')
-      await fs.rename(tmp, path)
+      await atomicWriteFile(libraryPath(), json)
     } catch (e) {
       console.error('[poolLibrary] write failed:', (e as Error).message)
     }

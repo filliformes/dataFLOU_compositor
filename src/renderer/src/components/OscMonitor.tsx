@@ -28,18 +28,20 @@ import { ResizeHandle } from './ResizeHandle'
 // Discriminated-union row so the log can interleave successful sends
 // with failures. Kind is the only distinguishing field; everything else
 // lines up with OscEvent / OscErrorEvent structurally.
-type MonitorRow =
+type MonitorRow = { seq: number } & (
   | ({ kind: 'ok' } & OscEvent)
   | ({ kind: 'err' } & OscErrorEvent)
+)
 
 // Same idea for the parallel MIDI stream — `ok` for successful sends,
 // `err` for port-open or send failures from the native sender.
 // `rowKind` (not `kind`) because MidiSendEvent already has a `kind`
 // field (cc / noteOn / noteOff) and TypeScript can't discriminate
 // against a field both halves share.
-type MidiMonitorRow =
+type MidiMonitorRow = { seq: number } & (
   | ({ rowKind: 'ok' } & MidiSendEvent)
   | ({ rowKind: 'err' } & MidiErrorEvent)
+)
 
 // Hard cap on in-memory rows. At 120Hz × 4 active cells we see ~500 msg/sec,
 // so 1000 rows ≈ 2 seconds of history. Enough to eyeball, small enough to
@@ -61,6 +63,10 @@ const oscBuffer: MonitorRow[] = []
 const oscInBuffer: MonitorRow[] = []
 const midiBuffer: MidiMonitorRow[] = []
 let bufferPaused = false
+// Monotonic per-row id used as the React key. Index keys shifted every
+// row once the buffer trimmed / scrolled, so React re-rendered the whole
+// visible list on each bump.
+let rowSeq = 0
 // React `setState` setters from the currently-mounted Monitor
 // instance. Subscribers we install at module load (below) call
 // these via the registered listener set so the Monitor re-renders
@@ -103,32 +109,32 @@ const ipcOffFns: Array<() => void> = []
 if (typeof window !== 'undefined' && window.api) {
   const offOsc = window.api.onOscEvents?.((batch) => {
     if (bufferPaused) return
-    for (const e of batch) oscBuffer.push({ kind: 'ok', ...e })
+    for (const e of batch) oscBuffer.push({ seq: ++rowSeq, kind: 'ok', ...e })
     trimBuffer(oscBuffer)
     scheduleBump()
   })
   // (v0.6.4) Incoming OSC — the network listener's received messages.
   const offOscIn = window.api.onOscInEvents?.((batch) => {
     if (bufferPaused) return
-    for (const e of batch) oscInBuffer.push({ kind: 'ok', ...e })
+    for (const e of batch) oscInBuffer.push({ seq: ++rowSeq, kind: 'ok', ...e })
     trimBuffer(oscInBuffer)
     scheduleBump()
   })
   const offOscErr = window.api.onOscErrors?.((batch) => {
     if (bufferPaused) return
-    for (const e of batch) oscBuffer.push({ kind: 'err', ...e })
+    for (const e of batch) oscBuffer.push({ seq: ++rowSeq, kind: 'err', ...e })
     trimBuffer(oscBuffer)
     scheduleBump()
   })
   const offMidi = window.api.onMidiEvents?.((batch) => {
     if (bufferPaused) return
-    for (const e of batch) midiBuffer.push({ rowKind: 'ok', ...e })
+    for (const e of batch) midiBuffer.push({ seq: ++rowSeq, rowKind: 'ok', ...e })
     trimBuffer(midiBuffer)
     scheduleBump()
   })
   const offMidiErr = window.api.onMidiErrors?.((batch) => {
     if (bufferPaused) return
-    for (const e of batch) midiBuffer.push({ rowKind: 'err', ...e })
+    for (const e of batch) midiBuffer.push({ seq: ++rowSeq, rowKind: 'err', ...e })
     trimBuffer(midiBuffer)
     scheduleBump()
   })
@@ -178,30 +184,39 @@ function loadShowMidi(): boolean {
     return true
   }
 }
-function loadOscColPx(): number {
+// OSC ↔ MIDI split as the OSC column's share of the space they share.
+// A fraction (not px) so the split holds its proportion when the window
+// resizes; 0.5 = equal widths (the default).
+const OSC_FRAC_KEY = 'dataflou:monitor:oscFrac:v1'
+const OSC_FRAC_MIN = 0.15
+const OSC_FRAC_MAX = 0.85
+function loadOscFrac(): number {
   try {
-    const v = parseInt(localStorage.getItem('dataflou:monitor:oscColPx:v1') ?? '', 10)
-    if (Number.isFinite(v) && v >= 160 && v <= 1600) return v
+    const v = parseFloat(localStorage.getItem(OSC_FRAC_KEY) ?? '')
+    if (Number.isFinite(v)) return Math.max(OSC_FRAC_MIN, Math.min(OSC_FRAC_MAX, v))
   } catch {
     /* ignore */
   }
-  return 480
+  return 0.5
 }
 // Pool pane width (right pane of the Monitor drawer). User drags the
 // vertical resize bar between Monitor and Pool to set it. Persisted so
 // the user's preferred Pool width survives drawer toggles and app
-// restarts. The clamp range matches the layout's min Pool / min Monitor
-// constraints — 200 px keeps the Pool's tabs + Hide button readable;
+// restarts. POOL_MIN_PX fits the Pool title bar's essentials (tabs,
+// Capture, pop-out, Hide — the Listening pill truncates first);
+// MIN_MONITOR_PX fits the Monitor toolbar (checkboxes, Live, Clear).
 // 1200 px is a sane upper bound on ultra-wide monitors.
 const POOL_WIDTH_KEY = 'dataflou:monitor:poolWidthPx:v1'
+const POOL_MIN_PX = 360
+const MIN_MONITOR_PX = 480
 function loadPoolWidthPx(): number {
   try {
     const v = parseInt(localStorage.getItem(POOL_WIDTH_KEY) ?? '', 10)
-    if (Number.isFinite(v) && v >= 200 && v <= 1200) return v
+    if (Number.isFinite(v) && v >= 1 && v <= 1200) return Math.max(POOL_MIN_PX, v)
   } catch {
     /* ignore */
   }
-  return 360
+  return 480
 }
 
 // Per-data-column widths. The user drags the right edge of a column
@@ -635,12 +650,15 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // means a 600px max at uiScale=2 would eat 1200 device pixels. Cap
   // the resize handle's max by 1/uiScale so the drawer can never
   // grow past ~600 device pixels regardless of zoom. The min mirrors
-  // the same logic so the drawer's smallest CSS height shrinks at
-  // higher zoom (otherwise the user can't bring it below 240 device
-  // pixels at uiScale=2).
+  // the same logic. Both stay inside the store's own clamp
+  // (setOscMonitorHeight → 120..800 css px) — a range the store would
+  // silently undo made the handle snap back mid-drag.
   const uiScale = useStore((s) => s.uiScale)
-  const effectiveMaxDrawer = Math.max(160, Math.round(600 / Math.max(0.5, uiScale)))
-  const effectiveMinDrawer = Math.max(60, Math.round(120 / Math.max(0.5, uiScale)))
+  const effectiveMaxDrawer = Math.min(
+    800,
+    Math.max(160, Math.round(600 / Math.max(0.5, uiScale)))
+  )
+  const effectiveMinDrawer = Math.max(120, Math.round(120 / Math.max(0.5, uiScale)))
   // Clamp the stored height back into the new effective range when
   // zoom changes — without this a 600 px height set at scale=1 would
   // remain 600 css px (= 1200 device px) after zooming to 2.
@@ -688,41 +706,34 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
       /* ignore */
     }
   }
-  // Resizable split between the OSC and MIDI columns when both are
-  // visible. Persisted as the OSC column's width in CSS px so the
-  // ResizeHandle (which works on pixel deltas) can drive it
-  // directly — translating a drag into a fraction would require a
-  // ref to the parent container, which is more wiring than it's
-  // worth here.
-  const [oscColPx, setOscColPxState] = useState<number>(() => loadOscColPx())
-  function setOscColPx(v: number): void {
-    const clamped = Math.max(160, Math.min(1600, v))
-    setOscColPxState(clamped)
+  // Resizable split between the OSC and MIDI columns (see loadOscFrac).
+  const [oscFrac, setOscFracState] = useState<number>(() => loadOscFrac())
+  function setOscFrac(v: number): void {
+    const clamped = Math.max(OSC_FRAC_MIN, Math.min(OSC_FRAC_MAX, v))
+    setOscFracState(clamped)
     try {
-      localStorage.setItem('dataflou:monitor:oscColPx:v1', String(clamped))
+      localStorage.setItem(OSC_FRAC_KEY, String(clamped))
     } catch {
       /* ignore */
     }
   }
-  // (v0.6.4) OSC In column width (px) when it isn't the last visible
-  // column — mirrors oscColPx.
-  const [oscInColPx, setOscInColPxState] = useState<number>(() => {
-    try {
-      const v = parseInt(localStorage.getItem('dataflou:monitor:oscInColPx:v1') ?? '', 10)
-      return Number.isFinite(v) && v >= 160 ? v : 320
-    } catch {
-      return 320
-    }
-  })
-  function setOscInColPx(v: number): void {
-    const clamped = Math.max(160, Math.min(1600, v))
-    setOscInColPxState(clamped)
-    try {
-      localStorage.setItem('dataflou:monitor:oscInColPx:v1', String(clamped))
-    } catch {
-      /* ignore */
-    }
-  }
+  // Monitor body (OSC | MIDI | Learned row), measured for the split
+  // handle. Both widths are kept: `client` (layout px) and `rect`
+  // (on-screen px — the drawer sits in the Ctrl+wheel CSS-zoom wrapper
+  // and mouse deltas arrive in on-screen px, so the handle maps in
+  // those units and tracks the cursor exactly).
+  const monitorBodyRef = useRef<HTMLDivElement | null>(null)
+  const [bodyW, setBodyW] = useState({ client: 0, rect: 0 })
+  useEffect(() => {
+    const el = monitorBodyRef.current
+    if (!el) return
+    const measure = (): void =>
+      setBodyW({ client: el.clientWidth, rect: el.getBoundingClientRect().width })
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    measure()
+    return () => ro.disconnect()
+  }, [])
   // Pool pane width — same pattern. Drives `style={{ width: poolWidthPx }}`
   // on the right pane and `style={{ width: '100% - poolWidthPx' }}` on the
   // left pane (via flex: 1). The resize bar between them uses an inverse
@@ -740,19 +751,19 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   useEffect(() => {
     const el = paneRowRef.current
     if (!el) return
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) {
-        const w = e.contentRect.width
-        if (Number.isFinite(w)) setPaneRowWidth(Math.round(w))
-      }
-    })
+    // clientWidth, NOT contentRect / getBoundingClientRect: the drawer
+    // sits inside the Ctrl+wheel zoom wrapper (CSS zoom), and those two
+    // report ZOOMED pixels while every width we set is unzoomed — at
+    // uiScale > 1 the clamps overestimated the room and let the Pool
+    // spill past the window's right edge.
+    const ro = new ResizeObserver(() => setPaneRowWidth(el.clientWidth))
     ro.observe(el)
     // Prime immediately so the first paint has a measurement.
-    setPaneRowWidth(Math.round(el.getBoundingClientRect().width))
+    setPaneRowWidth(el.clientWidth)
     return () => ro.disconnect()
   }, [])
   function setPoolWidthPx(v: number): void {
-    const clamped = Math.max(200, Math.min(1200, v))
+    const clamped = Math.max(POOL_MIN_PX, Math.min(1200, v))
     setPoolWidthPxState(clamped)
     try {
       localStorage.setItem(POOL_WIDTH_KEY, String(clamped))
@@ -898,31 +909,43 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // their pushes. Both halves stay in sync.
   useEffect(() => {
     bufferPaused = paused
+    // Drawer closed (unmount) → resume capture; the Paused state is
+    // per-mount, so reopening shows Live and must actually be live.
+    return () => {
+      bufferPaused = false
+    }
   }, [paused])
 
-  // ── Pool max width clamp ────────────────────────────────────────
-  // The pane row holds: [Monitor (flex-1)] | [ResizeHandle 4px] |
-  // [Learned (optional, fixed)] | [ResizeHandle 4px] | [Pool (fixed)].
-  // Compute the largest Pool width that still leaves a usable Monitor
-  // pane (MIN_MONITOR px) when Learned is visible. Without this the
-  // Pool could be dragged so wide that the Learned panel overflowed
-  // behind it.
+  // ── Width budget ────────────────────────────────────────────────
+  // The pane row holds: [Monitor (flex-1)] | 4px | [Pool (fixed)], and
+  // the Monitor holds: [OSC (In over Out)] | 4px | [MIDI] | 4px |
+  // [Learned]. Every clamp below reserves the MINIMUM of whatever is
+  // actually visible, so dragging (or shrinking the window) can never
+  // push MIDI / Learned behind the Pool or the Pool past the window.
   const learnedVisible = learnedBindings.length > 0 && showMidi
-  const MIN_MONITOR = 220
   const RESIZE_HANDLE_PX = 4
+  const MIN_MIDI = 200
+  const OSC_MIN = 160
+  const oscVisible = showOscIn || showOsc
+  // The OSC column is fixed-px only while MIDI sits to its right.
+  const oscFixed = oscVisible && showMidi
+  const monitorMin = Math.max(
+    MIN_MONITOR_PX,
+    (oscVisible ? OSC_MIN : 0) +
+      (oscFixed ? RESIZE_HANDLE_PX : 0) +
+      (showMidi ? MIN_MIDI : 0) +
+      (learnedVisible ? learnedColPx + RESIZE_HANDLE_PX : 0)
+  )
   const effectivePoolMax = useMemo(() => {
     if (paneRowWidth <= 0) return 1200
-    const reserved =
-      MIN_MONITOR +
-      RESIZE_HANDLE_PX + // between Pool and (Monitor or Learned)
-      (learnedVisible ? learnedColPx + RESIZE_HANDLE_PX : 0)
-    return Math.max(200, Math.min(1200, paneRowWidth - reserved))
-  }, [paneRowWidth, learnedVisible, learnedColPx])
-  // If the effective max shrinks (e.g. window resized smaller, or
-  // Learned panel appeared), shrink the stored pool width to match
-  // so the layout never breaks. This is the clamp the user actually
-  // sees: dragging the resize bar can't push past effectivePoolMax,
-  // and an unrelated viewport shrink retroactively narrows the Pool.
+    return Math.max(
+      POOL_MIN_PX,
+      Math.min(1200, paneRowWidth - monitorMin - RESIZE_HANDLE_PX)
+    )
+  }, [paneRowWidth, monitorMin])
+  // If the effective max shrinks (window resized smaller, Learned panel
+  // appeared, a column switched on), shrink the stored Pool width to
+  // match so the layout never breaks.
   useEffect(() => {
     if (poolWidthPx > effectivePoolMax) {
       setPoolWidthPx(effectivePoolMax)
@@ -930,48 +953,26 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectivePoolMax])
 
-  // ── OSC column max width clamp ───────────────────────────────────
-  // Same idea as `effectivePoolMax` but for the OSC ↔ MIDI resize
-  // handle. The Monitor pane's interior is partitioned:
-  //   [OSC fixed-px] | [4px handle] | [MIDI flex] | ([4px handle] |
-  //                                                 [Learned fixed-px])?
-  // Without a dynamic cap the OSC col could be widened past Pane 1
-  // until the MIDI + Learned cols got pushed behind the Pool.
-  const MIN_MIDI = 200
-  const OSC_MIN = 160
-  const effectiveOscMax = useMemo(() => {
-    if (paneRowWidth <= 0) return 1600
-    const pane1Width =
-      paneRowWidth - (poolHidden ? 0 : poolWidthPx + RESIZE_HANDLE_PX)
-    const reserved =
-      MIN_MIDI +
-      RESIZE_HANDLE_PX + // OSC/MIDI handle
-      (learnedVisible ? learnedColPx + RESIZE_HANDLE_PX : 0)
-    return Math.max(OSC_MIN, Math.min(1600, pane1Width - reserved))
-  }, [paneRowWidth, poolHidden, poolWidthPx, learnedVisible, learnedColPx])
-  useEffect(() => {
-    if (oscColPx > effectiveOscMax) {
-      setOscColPx(effectiveOscMax)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveOscMax])
+  // OSC ↔ MIDI handle, in on-screen px: the space the two columns share
+  // (body minus the handle and the Learned panel), mapped to oscFrac.
+  const zoom = bodyW.client > 0 ? bodyW.rect / bodyW.client : 1
+  const splitPx = Math.max(
+    1,
+    bodyW.rect -
+      (RESIZE_HANDLE_PX + (learnedVisible ? learnedColPx + RESIZE_HANDLE_PX : 0)) * zoom
+  )
 
-  // ── Learned column max width clamp ───────────────────────────────
-  // Same pattern: limit Learned so OSC + handle + MIN_MIDI + handle
-  // + Learned + handle + Pool all fit inside paneRowWidth. Without
-  // it, dragging Learned wider would push its right edge (Edit / X
-  // buttons) past Pane 1's overflow-hidden boundary and the buttons
-  // would slip behind the Pool.
+  // Learned: leave the OSC + MIDI minimums (and the Pool) their room, so
+  // its Edit / ✕ buttons never slip behind the Pool.
   const effectiveLearnedMax = useMemo(() => {
     if (paneRowWidth <= 0) return LEARNED_COL_MAX
     const reserved =
       (poolHidden ? 0 : poolWidthPx + RESIZE_HANDLE_PX) +
-      OSC_MIN +
-      RESIZE_HANDLE_PX + // OSC/MIDI handle
+      (oscVisible ? OSC_MIN + RESIZE_HANDLE_PX : 0) +
       MIN_MIDI +
       RESIZE_HANDLE_PX // MIDI/Learned handle
     return Math.max(LEARNED_COL_MIN, Math.min(LEARNED_COL_MAX, paneRowWidth - reserved))
-  }, [paneRowWidth, poolHidden, poolWidthPx])
+  }, [paneRowWidth, poolHidden, poolWidthPx, oscVisible])
   useEffect(() => {
     if (learnedColPx > effectiveLearnedMax) {
       setLearnedColPx(effectiveLearnedMax)
@@ -1134,7 +1135,7 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
               `min-h-[28px]` keeps this row's height locked to the
               Pool title bar's height so the two toolbars sit on the
               same visual line (per the "uniformize toolbar" request). */}
-          <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0 min-h-[28px]">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1 border-b border-border shrink-0 min-h-[28px]">
             <button
               className="btn text-[11px] py-0 leading-tight px-1.5 shrink-0"
               onClick={onClose}
@@ -1197,22 +1198,28 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                 Show Pool
               </button>
             )}
+            {/* The filter takes whatever width is left (width 0 + grow, so
+                it never forces a wrap); Live / Clear stay together and only
+                wrap to a second line when the essentials don't fit. */}
             <input
-              className="input flex-1 min-w-0 text-[11px] py-0.5"
+              className="input min-w-0 text-[11px] py-0.5"
+              style={{ flex: '1 1 auto', width: 0 }}
               placeholder="Filter — address, ip:port, MIDI port, ch1, cc7, note60…"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
             />
-            <button
-              className={`btn text-[10px] py-0.5 shrink-0 ${paused ? 'bg-accent text-black border-accent' : ''}`}
-              onClick={() => setPaused((v) => !v)}
-              title={paused ? 'Resume capture' : 'Pause capture (events still flow, just not displayed)'}
-            >
-              {paused ? 'Paused' : 'Live'}
-            </button>
-            <button className="btn text-[10px] py-0.5 shrink-0" onClick={clearLog}>
-              Clear
-            </button>
+            <div className="flex items-center gap-2 shrink-0 ml-auto">
+              <button
+                className={`btn text-[10px] py-0.5 shrink-0 ${paused ? 'bg-accent text-black border-accent' : ''}`}
+                onClick={() => setPaused((v) => !v)}
+                title={paused ? 'Resume capture' : 'Pause capture (events still flow, just not displayed)'}
+              >
+                {paused ? 'Paused' : 'Live'}
+              </button>
+              <button className="btn text-[10px] py-0.5 shrink-0" onClick={clearLog}>
+                Clear
+              </button>
+            </div>
           </div>
           {/* Dual-column body. When both columns are visible, the
               OSC column takes `oscColFrac` of the width and the MIDI
@@ -1222,211 +1229,206 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
               intrinsic content width so MIDI/Learned can't push past
               Pane 1's boundary (which is anchored to Pool's left
               edge). */}
-          <div className="flex-1 min-h-0 min-w-0 flex relative">
-            {/* (v0.6.4) OSC In column — incoming traffic. Reads left-to-right
-                as signal flow: In → Out → MIDI. Shares the oscCols field
-                widths with the Out column. */}
-            {showOscIn && (
+          <div ref={monitorBodyRef} className="flex-1 min-h-0 min-w-0 flex relative">
+            {/* OSC column — In stacked over Out (equal halves when both are
+                on), so incoming + outgoing cost ONE column of width and MIDI
+                sits to their right. Fixed px while MIDI shows, else it fills
+                the row. Both halves share the oscCols field widths. */}
+            {(showOscIn || showOsc) && (
               <div
-                className="flex flex-col min-h-0"
+                className="flex flex-col min-h-0 min-w-0 overflow-hidden"
                 style={{
-                  flex: showOsc || showMidi ? `0 0 ${oscInColPx}px` : '1 1 0',
-                  borderRight:
-                    showOsc || showMidi ? '1px solid rgb(var(--c-border))' : undefined
-                }}
-              >
-                <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
-                  <ColHeader
-                    label="time"
-                    width={oscCols.time}
-                    onResize={(w) => patchOscCols({ time: w })}
-                  />
-                  <span className="text-border shrink-0">|</span>
-                  <ColHeader
-                    label="src ip:port"
-                    width={oscCols.dest}
-                    onResize={(w) => patchOscCols({ dest: w })}
-                  />
-                  <ColHeader
-                    label="address"
-                    width={oscCols.address}
-                    onResize={(w) => patchOscCols({ address: w })}
-                  />
-                  <span className="flex-1 text-muted">args</span>
-                </div>
-                <div
-                  ref={oscInScrollRef}
-                  onScroll={onOscInScroll}
-                  className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
-                >
-                  {oscInRows.length === 0 ? (
-                    <div className="p-3 text-muted text-[11px]">
-                      No incoming OSC yet. Is the listener on the right port, and
-                      is your device sending to this machine? (See Pool → Network.)
-                    </div>
-                  ) : (
-                    oscInRows.map((e, i) => (
-                      <div
-                        key={i}
-                        className="flex gap-2 px-2 py-[1px] whitespace-nowrap hover:bg-panel2"
-                      >
-                        <span
-                          className="text-muted shrink-0 tabular-nums"
-                          style={{ width: oscCols.time }}
-                        >
-                          {formatTime(e.timestamp)}
-                        </span>
-                        <span className="text-muted shrink-0">|</span>
-                        <span
-                          className="shrink-0 truncate text-muted"
-                          style={{ width: oscCols.dest }}
-                          title={`${e.ip}:${e.port}`}
-                        >
-                          {e.ip}:{e.port}
-                        </span>
-                        <span
-                          className="shrink-0 truncate"
-                          style={{ width: oscCols.address, color: 'rgb(var(--c-accent2))' }}
-                          title={e.address}
-                        >
-                          {e.address || '—'}
-                        </span>
-                        <span
-                          className="truncate"
-                          title={e.kind === 'err' ? undefined : formatArgs(e.args)}
-                        >
-                          {e.kind === 'err' ? '' : formatArgs(e.args)}
-                        </span>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-            {showOscIn && (showOsc || showMidi) && (
-              <ResizeHandle
-                direction="col"
-                value={oscInColPx}
-                onChange={setOscInColPx}
-                min={160}
-                max={effectiveOscMax}
-                className="w-[4px] cursor-col-resize z-10 bg-border/40 hover:bg-accent/40"
-                title="Drag to resize the OSC In column"
-              />
-            )}
-            {showOsc && (
-              <div
-                className="flex flex-col min-h-0"
-                style={{
-                  flex: showMidi ? `0 0 ${oscColPx}px` : '1 1 0',
+                  flex: showMidi ? `${oscFrac} 1 0px` : '1 1 0',
                   borderRight: showMidi ? '1px solid rgb(var(--c-border))' : undefined
                 }}
               >
-                {/* Header row — column labels with draggable right
-                    edges. Drag a label's right edge to widen / narrow
-                    that column. All log rows below pick up the same
-                    widths. */}
-                <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
-                  <ColHeader
-                    label="time"
-                    width={oscCols.time}
-                    onResize={(w) => patchOscCols({ time: w })}
-                  />
-                  <span className="text-border shrink-0">|</span>
-                  <ColHeader
-                    label="kind"
-                    width={oscCols.kind}
-                    onResize={(w) => patchOscCols({ kind: w })}
-                  />
-                  <ColHeader
-                    label="ip:port"
-                    width={oscCols.dest}
-                    onResize={(w) => patchOscCols({ dest: w })}
-                  />
-                  <ColHeader
-                    label="address"
-                    width={oscCols.address}
-                    onResize={(w) => patchOscCols({ address: w })}
-                  />
-                  <span className="flex-1 text-muted">args</span>
-                </div>
-                <div
-                  ref={scrollRef}
-                  onScroll={onScroll}
-                  className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
-                >
-                  {rows.length === 0 ? (
-                    <div className="p-3 text-muted text-[11px]">
-                      No OSC traffic yet. Trigger a scene or clip to see messages here.
+                {showOscIn && (
+                  <div className="flex flex-col min-h-0" style={{ flex: '1 1 0' }}>
+                    <div className="relative flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
+                      <ColHeader
+                        label="time"
+                        width={oscCols.time}
+                        onResize={(w) => patchOscCols({ time: w })}
+                      />
+                      <span className="text-border shrink-0">|</span>
+                      <ColHeader
+                        label="kind"
+                        width={oscCols.kind}
+                        onResize={(w) => patchOscCols({ kind: w })}
+                      />
+                      <ColHeader
+                        label="src ip:port"
+                        width={oscCols.dest}
+                        onResize={(w) => patchOscCols({ dest: w })}
+                      />
+                      <ColHeader
+                        label="address"
+                        width={oscCols.address}
+                        onResize={(w) => patchOscCols({ address: w })}
+                      />
+                      <span className="flex-1 text-muted">args</span>
+                      <span className="absolute right-0 top-0 bottom-0 flex items-center px-2 bg-panel font-semibold text-text">OSC In</span>
                     </div>
-                  ) : (
-                    rows.map((e, i) => (
-                      <div
-                        key={i}
-                        className={`flex gap-2 px-2 py-[1px] whitespace-nowrap ${
-                          e.kind === 'err' ? 'bg-danger/10 hover:bg-danger/20' : 'hover:bg-panel2'
-                        }`}
-                      >
-                        <span
-                          className="text-muted shrink-0 tabular-nums"
-                          style={{ width: oscCols.time }}
-                        >
-                          {formatTime(e.timestamp)}
-                        </span>
-                        <span className="text-muted shrink-0">|</span>
-                        <span
-                          className={`shrink-0 ${e.kind === 'err' ? 'text-danger font-bold' : 'text-muted'}`}
-                          style={{ width: oscCols.kind }}
-                        >
-                          {e.kind === 'err' ? '[ERR]' : 'send'}
-                        </span>
-                        <span
-                          className={`shrink-0 truncate ${
-                            e.kind === 'err' ? 'text-danger' : 'text-muted'
-                          }`}
-                          style={{ width: oscCols.dest }}
-                          title={e.ip === '*' ? 'Socket-level error' : `${e.ip}:${e.port}`}
-                        >
-                          {e.ip === '*' ? '(socket)' : `${e.ip}:${e.port}`}
-                        </span>
-                        <span
-                          className={`shrink-0 truncate ${
-                            e.kind === 'err' ? 'text-muted' : 'text-accent'
-                          }`}
-                          style={{ width: oscCols.address }}
-                          title={e.address}
-                        >
-                          {e.address || '—'}
-                        </span>
-                        <span
-                          className={`truncate ${e.kind === 'err' ? 'text-danger' : ''}`}
-                          title={e.kind === 'err' ? e.message : formatArgs(e.args)}
-                        >
-                          {e.kind === 'err' ? e.message : formatArgs(e.args)}
-                        </span>
-                      </div>
-                    ))
-                  )}
-                </div>
+                    <div
+                      ref={oscInScrollRef}
+                      onScroll={onOscInScroll}
+                      className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
+                    >
+                      {oscInRows.length === 0 ? (
+                        <div className="p-3 text-muted text-[11px]">
+                          No incoming OSC yet. Is the listener on the right port, and
+                          is your device sending to this machine? (See Pool → Network.)
+                        </div>
+                      ) : (
+                        oscInRows.map((e) => (
+                          <div
+                            key={e.seq}
+                            className="flex gap-2 px-2 py-[1px] whitespace-nowrap hover:bg-panel2"
+                          >
+                            <span
+                              className="text-muted shrink-0 tabular-nums"
+                              style={{ width: oscCols.time }}
+                            >
+                              {formatTime(e.timestamp)}
+                            </span>
+                            <span className="text-muted shrink-0">|</span>
+                            <span className="shrink-0 text-muted" style={{ width: oscCols.kind }}>
+                              recv
+                            </span>
+                            <span
+                              className="shrink-0 truncate text-muted"
+                              style={{ width: oscCols.dest }}
+                              title={`${e.ip}:${e.port}`}
+                            >
+                              {e.ip}:{e.port}
+                            </span>
+                            <span
+                              className="shrink-0 truncate"
+                              style={{ width: oscCols.address, color: 'rgb(var(--c-accent2))' }}
+                              title={e.address}
+                            >
+                              {e.address || '—'}
+                            </span>
+                            <span
+                              className="truncate"
+                              title={e.kind === 'err' ? undefined : formatArgs(e.args)}
+                            >
+                              {e.kind === 'err' ? '' : formatArgs(e.args)}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+                {showOscIn && showOsc && <div className="shrink-0 h-px bg-border" />}
+                {showOsc && (
+                  <div className="flex flex-col min-h-0" style={{ flex: '1 1 0' }}>
+                    <div className="relative flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
+                      <ColHeader
+                        label="time"
+                        width={oscCols.time}
+                        onResize={(w) => patchOscCols({ time: w })}
+                      />
+                      <span className="text-border shrink-0">|</span>
+                      <ColHeader
+                        label="kind"
+                        width={oscCols.kind}
+                        onResize={(w) => patchOscCols({ kind: w })}
+                      />
+                      <ColHeader
+                        label="ip:port"
+                        width={oscCols.dest}
+                        onResize={(w) => patchOscCols({ dest: w })}
+                      />
+                      <ColHeader
+                        label="address"
+                        width={oscCols.address}
+                        onResize={(w) => patchOscCols({ address: w })}
+                      />
+                      <span className="flex-1 text-muted">args</span>
+                      <span className="absolute right-0 top-0 bottom-0 flex items-center px-2 bg-panel font-semibold text-text">OSC Out</span>
+                    </div>
+                    <div
+                      ref={scrollRef}
+                      onScroll={onScroll}
+                      className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-[14px]"
+                    >
+                      {rows.length === 0 ? (
+                        <div className="p-3 text-muted text-[11px]">
+                          No OSC traffic yet. Trigger a scene or clip to see messages here.
+                        </div>
+                      ) : (
+                        rows.map((e) => (
+                          <div
+                            key={e.seq}
+                            className={`flex gap-2 px-2 py-[1px] whitespace-nowrap ${
+                              e.kind === 'err' ? 'bg-danger/10 hover:bg-danger/20' : 'hover:bg-panel2'
+                            }`}
+                          >
+                            <span
+                              className="text-muted shrink-0 tabular-nums"
+                              style={{ width: oscCols.time }}
+                            >
+                              {formatTime(e.timestamp)}
+                            </span>
+                            <span className="text-muted shrink-0">|</span>
+                            <span
+                              className={`shrink-0 ${e.kind === 'err' ? 'text-danger font-bold' : 'text-muted'}`}
+                              style={{ width: oscCols.kind }}
+                            >
+                              {e.kind === 'err' ? '[ERR]' : 'send'}
+                            </span>
+                            <span
+                              className={`shrink-0 truncate ${
+                                e.kind === 'err' ? 'text-danger' : 'text-muted'
+                              }`}
+                              style={{ width: oscCols.dest }}
+                              title={e.ip === '*' ? 'Socket-level error' : `${e.ip}:${e.port}`}
+                            >
+                              {e.ip === '*' ? '(socket)' : `${e.ip}:${e.port}`}
+                            </span>
+                            <span
+                              className={`shrink-0 truncate ${
+                                e.kind === 'err' ? 'text-muted' : 'text-accent'
+                              }`}
+                              style={{ width: oscCols.address }}
+                              title={e.address}
+                            >
+                              {e.address || '—'}
+                            </span>
+                            <span
+                              className={`truncate ${e.kind === 'err' ? 'text-danger' : ''}`}
+                              title={e.kind === 'err' ? e.message : formatArgs(e.args)}
+                            >
+                              {e.kind === 'err' ? e.message : formatArgs(e.args)}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
-            {showOsc && showMidi && (
-              // Vertical resize handle between the two columns. Drag
-              // RIGHT to widen OSC (and shrink MIDI), LEFT to widen
-              // MIDI. The handle works on the OSC column's pixel
-              // width so the delta is direct — no parent-width math.
+            {(showOscIn || showOsc) && showMidi && (
+              // Vertical resize handle between the OSC and MIDI columns.
+              // Drag RIGHT to widen OSC (and shrink MIDI), LEFT to widen MIDI.
               <ResizeHandle
                 direction="col"
-                value={oscColPx}
-                onChange={setOscColPx}
-                min={160}
-                max={effectiveOscMax}
+                value={oscFrac * splitPx}
+                onChange={(px) => setOscFrac(px / splitPx)}
+                min={Math.min(OSC_MIN * zoom, splitPx * 0.5)}
+                max={Math.max(splitPx - MIN_MIDI * zoom, splitPx * 0.5)}
                 className="w-[4px] cursor-col-resize z-10 bg-border/40 hover:bg-accent/40"
                 title="Drag to resize OSC vs MIDI columns"
               />
             )}
             {showMidi && (
-              <div className="flex flex-col min-h-0" style={{ flex: '1 1 0' }}>
+              <div
+                className="flex flex-col min-h-0 min-w-0 overflow-hidden"
+                style={{ flex: oscVisible ? `${1 - oscFrac} 1 0px` : '1 1 0' }}
+              >
                 {/* MIDI header — same per-column resize pattern as OSC. */}
                 <div className="flex items-center gap-2 px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted border-b border-border shrink-0 select-none min-h-[20px]">
                   <ColHeader
@@ -1462,9 +1464,9 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
                       No MIDI traffic yet. Enable MIDI on a cell + pick a port to see messages here.
                     </div>
                   ) : (
-                    midiRows.map((e, i) => (
+                    midiRows.map((e) => (
                       <div
-                        key={i}
+                        key={e.seq}
                         className={`flex gap-2 px-2 py-[1px] whitespace-nowrap ${
                           e.rowKind === 'err' ? 'bg-danger/10 hover:bg-danger/20' : 'hover:bg-panel2'
                         }`}
@@ -1672,14 +1674,14 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
               direction="col"
               value={poolWidthPx}
               onChange={setPoolWidthPx}
-              min={200}
+              min={POOL_MIN_PX}
               max={effectivePoolMax}
               inverse
               className="w-[4px] cursor-col-resize z-10 -mr-[2px] -ml-[2px]"
               title="Drag to resize the Pool · narrower Pool = more room for the Monitor toolbar"
             />
             <div
-              className="flex flex-col min-h-0 shrink-0"
+              className="flex flex-col min-h-0 shrink-0 overflow-hidden"
               style={{ width: poolWidthPx }}
             >
               {poolPoppedOut ? (
@@ -1731,6 +1733,22 @@ function PoolPopOut({
       h: Math.round(h)
     }
   })
+  // Resizable like Capture: native `resize: both` grip (bottom-right).
+  // The browser writes the new size straight onto the element; mirror it
+  // into `box` so the next re-render (e.g. a title-bar drag) keeps it
+  // instead of snapping back to the opening size.
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const el = cardRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      const w = el.offsetWidth
+      const h = el.offsetHeight
+      setBox((b) => (b.w === w && b.h === h ? b : { ...b, w, h }))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
   // Pointer-driven drag. Snapshot the offset between cursor and the
   // box's top-left at pointerdown so the drag tracks the cursor
   // smoothly (no jump even if the user grabs the bar at the right
@@ -1772,8 +1790,19 @@ function PoolPopOut({
   return createPortal(
     <div className="fixed inset-0 z-[90] pointer-events-none">
       <div
-        className="absolute bg-panel border border-border rounded shadow-2xl flex flex-col pointer-events-auto overflow-hidden"
-        style={{ left: box.x, top: box.y, width: box.w, height: box.h }}
+        ref={cardRef}
+        className="absolute bg-panel border border-border rounded-md shadow-xl flex flex-col pointer-events-auto overflow-hidden"
+        style={{
+          left: box.x,
+          top: box.y,
+          width: box.w,
+          height: box.h,
+          minWidth: POOL_MIN_PX,
+          minHeight: 240,
+          maxWidth: '95vw',
+          maxHeight: '95vh',
+          resize: 'both'
+        }}
       >
         {/* Drag handle is the PoolPane's own title bar. We pass the
             pointer event handlers through as props so PoolPane stays

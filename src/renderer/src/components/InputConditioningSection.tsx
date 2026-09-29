@@ -65,13 +65,18 @@ function useTemplateAddresses(templateId: string): string[] {
   }, [tracks, templateId])
 }
 
-// Short label for the last path segment, e.g. "/mpu/euler/roll" → "roll".
-function tailOf(address: string): string {
-  const parts = address.split('/').filter(Boolean)
-  return parts.length ? parts[parts.length - 1] : address
+export function InputConditioningSection({
+  template
+}: {
+  template: InstrumentTemplate
+}): JSX.Element {
+  // Keyed by template so local UI state (the "+ Add" address pick, the
+  // uncontrolled Bypass-slots text, the scope picker) never carries over
+  // when the inspector switches to another Instrument.
+  return <InputConditioningBody key={template.id} template={template} />
 }
 
-export function InputConditioningSection({
+function InputConditioningBody({
   template
 }: {
   template: InstrumentTemplate
@@ -861,6 +866,7 @@ export function ParameterInputScaling({
           scale={sc}
           onChange={patchScale}
           address={track.defaultOscAddress ?? undefined}
+          outDefault={{ min: fn?.min, max: fn?.max }}
         />
       )}
     </div>
@@ -905,12 +911,16 @@ export function ParameterInputConditioning({
       stages: cfg.stages.filter((s) => s.id !== id)
     })
   const moveStage = (id: string, dir: -1 | 1): void => {
-    const idx = cfg.stages.findIndex((s) => s.id === id)
-    const to = idx + dir
-    if (idx < 0 || to < 0 || to >= cfg.stages.length) return
+    // Swap with the neighbouring stage of THIS Parameter (`mine`), not
+    // the full-list neighbour — that one may belong to another address,
+    // which would make ↑/↓ look like a no-op here.
+    const mi = mine.findIndex((s) => s.id === id)
+    const other = mine[mi + dir]
+    if (mi < 0 || !other) return
+    const a = cfg.stages.findIndex((s) => s.id === id)
+    const b = cfg.stages.findIndex((s) => s.id === other.id)
     const next = cfg.stages.slice()
-    const [st] = next.splice(idx, 1)
-    next.splice(to, 0, st)
+    ;[next[a], next[b]] = [next[b], next[a]]
     setConditioner(template.id, { stages: next })
   }
   const addStage = (): void =>
@@ -1018,7 +1028,12 @@ export function ParameterConditioningReflection({
   const cond = template.inputConditioner
   const address = track.defaultOscAddress ?? ''
   const argCount = track.argSpec?.length ?? 1
-  const [slot, setSlot] = useState(0)
+  // Slot pick is per Parameter: reset when the inspector switches to
+  // another track, and clamp to this one's arg count.
+  const [slotPick, setSlotPick] = useState({ trackId: track.id, slot: 0 })
+  const slot =
+    slotPick.trackId === track.id ? Math.min(slotPick.slot, Math.max(0, argCount - 1)) : 0
+  const setSlot = (v: number): void => setSlotPick({ trackId: track.id, slot: v })
 
   // Nothing to reflect if this instrument has no HW config at all.
   if (!hw && !cond) return null

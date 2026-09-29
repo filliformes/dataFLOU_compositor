@@ -1538,6 +1538,16 @@ export function buildInitialValueFromArgSpec(spec: ParamArgSpec[]): string {
       // Bools serialise as 0/1 — that's what Pd's `unpack f f f f`
       // expects (and what auto-detect emits as int OSC args).
       if (typeof v === 'boolean') return v ? '1' : '0'
+      // The cell value is ONE space-joined string, one token per slot:
+      // a string token containing whitespace would split into extra
+      // slots and an empty one would vanish — both shift every later
+      // slot. Same fallback as the Inspector's stringSlotFallback. (The
+      // engine still emits a fixed slot's exact `argSpec.fixed` value;
+      // this only keeps the value string aligned.)
+      if (typeof v === 'string') {
+        const tok = v.replace(/\s+/g, '_')
+        return tok.length > 0 ? tok : (a.name ?? '').trim().replace(/\s+/g, '_') || 'value'
+      }
       return String(v)
     })
     .join(' ')
@@ -2206,8 +2216,12 @@ export function makeEmptySession(): Session {
   // so the empty-session shape is identical to what the user gets by
   // pressing Ctrl+T on a blank app.
   const scene = makeScene(0)
+  // Fresh ids per session (NOT fixed literals): once "Save as Template"
+  // promotes this draft into the library, a fixed id made every later
+  // New session's draft shadow — and the auto-push then erase — that
+  // library entry.
   const draftTpl: InstrumentTemplate = {
-    id: 'tpl_user_default',
+    id: uid('tpl_user_'),
     name: 'Instrument 1',
     description: '',
     color: randomSceneColor(),
@@ -2220,7 +2234,7 @@ export function makeEmptySession(): Session {
     functions: [makeFunctionSpec(0)]
   }
   const headerRow: Track = {
-    id: 't_default_header',
+    id: uid('t_'),
     name: draftTpl.name,
     kind: 'template',
     sourceTemplateId: draftTpl.id,
@@ -2256,11 +2270,17 @@ export function makeEmptySession(): Session {
   // Pre-populate a clip on the default scene for the child Parameter
   // row so the user has something to trigger immediately. The
   // sequence array stays empty — slots are filled explicitly.
-  scene.cells[childRow.id] = makeCell({
-    destIp: session.defaultDestIp,
-    destPort: session.defaultDestPort,
-    oscAddress: session.defaultOscAddress
+  // Sourced from the ROW's defaults (/instr1/param1), not the session
+  // defaults — same as ensureCell does for any clip created later on
+  // this row — so it's unlinked from the session default like theirs.
+  const cell = makeCell({
+    destIp: childRow.defaultDestIp ?? session.defaultDestIp,
+    destPort: childRow.defaultDestPort ?? session.defaultDestPort,
+    oscAddress: childRow.defaultOscAddress ?? session.defaultOscAddress
   })
+  cell.destLinkedToDefault = false
+  cell.addressLinkedToDefault = false
+  scene.cells[childRow.id] = cell
   return session
 }
 

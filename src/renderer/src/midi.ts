@@ -3,7 +3,7 @@
 // Responsibilities:
 //  - Request MIDI access once on app start
 //  - Enumerate & track connected inputs (react to devices added/removed)
-//  - Route incoming messages: either feed a pending "learn" resolver OR
+//  - Route incoming messages: either bind the global MIDI Learn target OR
 //    match against track/scene bindings and fire IPC triggers via window.api
 //  - Simple pub-sub so components can re-render when device list changes
 
@@ -15,8 +15,6 @@ export interface MidiDevice {
   id: string
   name: string
 }
-
-type LearnResolver = (b: MidiBinding) => void
 
 /** Raw MIDI message forwarded to the Capture popup. Strips down to
  *  the fields the capture buffer cares about: status nibble (CC vs
@@ -32,7 +30,6 @@ export interface MidiCaptureMessage {
 class MidiManager {
   private access: MIDIAccess | null = null
   private openedId: string | null = null
-  private learnCb: LearnResolver | null = null
   // Capture popup subscriber. When non-null, every incoming MIDI
   // CC / Note On / Note Off is forwarded here in addition to the
   // normal routing (so the user can still see real-time feedback
@@ -51,7 +48,26 @@ class MidiManager {
       console.warn('[MIDI] access denied', e)
       return false
     }
-    this.access.onstatechange = (): void => this.notifyListeners()
+    this.access.onstatechange = (e: MIDIConnectionEvent): void => {
+      // Hot-plug: when the session's persisted input (re)appears, bind
+      // it. Previously only the device LIST refreshed, so a controller
+      // plugged in after launch (or power-cycled mid-show) stayed
+      // silent until the user re-picked it in the toolbar.
+      const port = e.port
+      const want = useStore.getState().session.midiInputName
+      // Skip the statechange our own open() triggers (already bound + open).
+      if (
+        want &&
+        port &&
+        port.type === 'input' &&
+        port.state === 'connected' &&
+        (port.name ?? port.id) === want &&
+        !(port.id === this.openedId && port.connection === 'open')
+      ) {
+        this.open(want)
+      }
+      this.notifyListeners()
+    }
     // Re-open persisted device if name matches.
     const prev = useStore.getState().session.midiInputName
     if (prev) this.open(prev)
@@ -96,14 +112,6 @@ class MidiManager {
     this.listeners.forEach((l) => l(devs))
   }
 
-  beginLearn(cb: LearnResolver): void {
-    this.learnCb = cb
-  }
-
-  cancelLearn(): void {
-    this.learnCb = null
-  }
-
   /** Subscribe to raw CC / Note events for the Capture popup. Pass
    *  null to unsubscribe. Only one capture subscriber at a time
    *  (the popup is a singleton). */
@@ -143,14 +151,6 @@ class MidiManager {
       binding = { kind: 'cc', channel, number }
     }
     if (!binding) return
-
-    // Explicit per-element learn (legacy) wins first.
-    if (this.learnCb) {
-      const cb = this.learnCb
-      this.learnCb = null
-      cb(binding)
-      return
-    }
 
     const st = useStore.getState()
 

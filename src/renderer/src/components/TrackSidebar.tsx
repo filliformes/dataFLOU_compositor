@@ -132,7 +132,9 @@ export default function TrackSidebar(): JSX.Element {
     setDragHover(false)
   }
   // Find the track id whose row contains a given clientY, so drops insert
-  // *after* that row. null = drop in empty space → append at end.
+  // *after* that row. null = drop ABOVE the first row's midpoint → top of
+  // the list (empty space below the rows resolves to the last row, i.e.
+  // append).
   function trackIdAt(clientY: number, container: HTMLElement): string | null {
     const rows = container.querySelectorAll<HTMLElement>('[data-track-id]')
     let last: string | null = null
@@ -157,8 +159,26 @@ export default function TrackSidebar(): JSX.Element {
       // In-sidebar row reorder. moveTrack handles all the cascade /
       // group-stay-together rules.
       const dragId = reorderRaw
+      // Dropping an Instrument header onto one of its OWN children lands
+      // inside the block being moved; moveTrack can't find that anchor
+      // and appended the whole group at the bottom. Treat as a no-op.
+      const dragged = tracks.find((t) => t.id === dragId)
+      const anchor = insertAfter ? tracks.find((t) => t.id === insertAfter) : null
+      if (dragged?.kind === 'template' && anchor?.parentTrackId === dragId) return
       if (dragId !== insertAfter) moveTrack(dragId, insertAfter)
       return
+    }
+    // Pool drops: the store's instantiate* actions read a null anchor as
+    // "append", while a reorder reads it as "top" — so dropping a Pool
+    // item above the first row landed it at the BOTTOM. Snapshot the ids,
+    // and after inserting, hoist the new top-level row (header + its
+    // children move as a block) to the top like a reorder would.
+    const idsBefore = insertAfter === null ? new Set(tracks.map((t) => t.id)) : null
+    const hoistNewRowToTop = (): void => {
+      if (!idsBefore) return
+      const st = useStore.getState()
+      const added = st.session.tracks.find((t) => !idsBefore.has(t.id) && !t.parentTrackId)
+      if (added) st.moveTrack(added.id, null)
     }
     if (paramRaw) {
       try {
@@ -173,6 +193,7 @@ export default function TrackSidebar(): JSX.Element {
             parentTrackId = here.parentTrackId
         }
         instantiateParameterTemplate(p.parameterId, insertAfter, parentTrackId)
+        hoistNewRowToTop()
       } catch {
         /* ignore */
       }
@@ -182,6 +203,7 @@ export default function TrackSidebar(): JSX.Element {
       try {
         const p = JSON.parse(tplRaw) as PoolTemplateDragPayload
         instantiateTemplate(p.templateId, insertAfter)
+        hoistNewRowToTop()
       } catch {
         /* ignore */
       }
@@ -199,6 +221,7 @@ export default function TrackSidebar(): JSX.Element {
             parentTrackId = here.parentTrackId
         }
         instantiateFunction(p.templateId, p.functionId, insertAfter, parentTrackId)
+        hoistNewRowToTop()
       } catch {
         /* ignore */
       }

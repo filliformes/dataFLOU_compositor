@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
@@ -14,6 +14,7 @@ import {
 import { ResizeHandle } from './ResizeHandle'
 import { UncontrolledTextInput } from './UncontrolledInput'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { useEffectiveSceneDurationSec } from '../hooks/useSceneCountdown'
 
 export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Element {
   const scene = useStore((s) => s.session.scenes.find((sc) => sc.id === sceneId))
@@ -284,6 +285,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none z-0" />}
           {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
           <SceneTriggerButton
+            sceneId={sceneId}
             isPlaying={isPlaying}
             durationSec={scene.durationSec}
             startedAt={isPlaying ? activeSceneStartedAt : null}
@@ -332,6 +334,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         <div className="inline-flex flex-col gap-1.5 w-fit max-w-full">
         <div className="flex items-center gap-1.5">
           <SceneTriggerButton
+            sceneId={sceneId}
             isPlaying={isPlaying}
             durationSec={scene.durationSec}
             startedAt={isPlaying ? activeSceneStartedAt : null}
@@ -446,9 +449,12 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         // mode this grows for multi-arg parameters so the cell's
         // value grid can render its full content. Non-collapsed
         // mode uses the global `rowHeight` slider for every row.
-        const perTrackH = tracksCollapsedForWidth
-          ? compactRowHeightForTrack(t.argSpec)
-          : rowHeight
+        // Show mode forces compact, exactly like TrackSidebar —
+        // keying on the raw flag misaligned multi-arg rows there.
+        const perTrackH =
+          tracksCollapsedForWidth || showMode
+            ? compactRowHeightForTrack(t.argSpec)
+            : rowHeight
         return t.kind === 'template' ? (
           <div
             key={t.id}
@@ -481,6 +487,12 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             // Stop the window-level mousedown listener from closing before
             // the menu button's click fires.
             onMouseDown={(e) => e.stopPropagation()}
+            // Portal events still bubble through the REACT tree — without
+            // this, every menu click also hit the column root's onClick
+            // (setFocusedScene), clobbering the selection a menu action
+            // just set (Duplicate's new focus, Delete re-focusing the
+            // deleted id).
+            onClick={(e) => e.stopPropagation()}
           >
             {/* Arm / clear cue — single-scene action (greyed out when a
                 multi-selection is active to avoid ambiguity). Uses the
@@ -703,29 +715,40 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   )
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  if (Number.isNaN(v)) return lo
-  return v < lo ? lo : v > hi ? hi : v
-}
-
-// Scene trigger button with a clockwise fill that animates over `durationSec`.
-// Using `animation-delay: calc(-{elapsed}s)` so the CSS animation lines up with
+// Scene trigger button with a clockwise fill that animates over the scene's
+// EFFECTIVE duration (the engine's armed duration for the active scene —
+// slot override / generative roll — else the authored `durationSec`).
+// Using a negative `animation-delay` so the CSS animation lines up with
 // actual elapsed time (useful when the scene was triggered by MIDI/auto-advance
 // rather than a click on this exact button).
 function SceneTriggerButton({
+  sceneId,
   isPlaying,
   durationSec,
   startedAt,
   overlayClass,
   onClick
 }: {
+  sceneId: string
   isPlaying: boolean
   durationSec: number
   startedAt: number | null
   overlayClass?: string
   onClick: (e: React.MouseEvent) => void
 }): JSX.Element {
-  const elapsedSec = isPlaying && startedAt ? Math.max(0, (Date.now() - startedAt) / 1000) : 0
+  const effDurationSec = useEffectiveSceneDurationSec(sceneId, durationSec)
+  // Pause freezes the fill: the engine stamps pausedAt and, on resume,
+  // shifts activeSceneStartedAt forward by the pause length.
+  const pausedAt = useStore((s) => (isPlaying ? s.engine.pausedAt : null))
+  // Elapsed offset computed ONCE per (start, pause state) — not from
+  // Date.now() on every re-render. Re-renders arrive at engine rate while
+  // a scene plays, and each new animation-delay shoved the running CSS
+  // animation further ahead. The span is keyed on the same pair, so a
+  // pause / resume remounts it with a fresh offset.
+  const elapsedSec = useMemo(() => {
+    if (!isPlaying || startedAt === null) return 0
+    return Math.max(0, ((pausedAt ?? Date.now()) - startedAt) / 1000)
+  }, [isPlaying, startedAt, pausedAt])
   return (
     <button
       className={`relative w-6 h-6 rounded-sm border flex items-center justify-center shrink-0 overflow-hidden ${
@@ -738,12 +761,13 @@ function SceneTriggerButton({
     >
       {isPlaying && startedAt !== null && (
         <span
-          key={startedAt}
+          key={`${startedAt}:${pausedAt ?? ''}`}
           aria-hidden
           className="scene-fill absolute inset-0 pointer-events-none"
           style={{
-            animationDuration: `${Math.max(0.1, durationSec)}s`,
-            animationDelay: `-${elapsedSec}s`
+            animationDuration: `${Math.max(0.1, effDurationSec)}s`,
+            animationDelay: `-${elapsedSec}s`,
+            animationPlayState: pausedAt !== null ? 'paused' : undefined
           }}
         />
       )}
@@ -789,7 +813,6 @@ function InstrumentTriggerCell({
   const groupMidi = useStore(
     (s) => s.session.scenes.find((sc) => sc.id === sceneId)?.instrumentTriggers?.[templateRowId]
   )
-  const activeBySceneAndTrack = useStore((s) => s.engine.activeBySceneAndTrack)
   const tracksCollapsed = useStore((s) => s.tracksCollapsed)
   const showMode = useStore((s) => s.showMode)
   const compact = tracksCollapsed || showMode
@@ -800,8 +823,18 @@ function InstrumentTriggerCell({
     .filter((t) => t.parentTrackId === templateRowId)
     .map((t) => t.id)
   const childrenWithCells = childTrackIds.filter((id) => !!cellsOnScene[id])
-  const sceneActive = activeBySceneAndTrack[sceneId] ?? {}
-  const anyChildActive = childTrackIds.some((id) => !!sceneActive[id])
+  // Active children as a JOINED STRING — subscribing to the whole
+  // activeBySceneAndTrack map (re-allocated on every engine emit)
+  // re-rendered every group cell in every column at engine rate. A
+  // string compares by value, so this only re-renders when the set of
+  // active children actually changes.
+  const activeChildKey = useStore((s) => {
+    const sceneActive = s.engine.activeBySceneAndTrack[sceneId]
+    if (!sceneActive) return ''
+    return childTrackIds.filter((id) => !!sceneActive[id]).join(',')
+  })
+  const activeChildIds = activeChildKey ? activeChildKey.split(',') : []
+  const anyChildActive = activeChildIds.length > 0
   const empty = childrenWithCells.length === 0
   // MIDI learn overlay class — same vocabulary as CellTile uses for
   // its own trigger square. Selected = orange ring, bound = green,
@@ -825,11 +858,7 @@ function InstrumentTriggerCell({
     }
     if (empty) return
     if (anyChildActive) {
-      await Promise.all(
-        childTrackIds
-          .filter((id) => !!sceneActive[id])
-          .map((id) => window.api.stopCell(sceneId, id))
-      )
+      await Promise.all(activeChildIds.map((id) => window.api.stopCell(sceneId, id)))
     } else {
       await Promise.all(
         childrenWithCells.map((id) => window.api.triggerCell(sceneId, id))

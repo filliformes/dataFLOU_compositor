@@ -44,8 +44,7 @@ export function TransferCurve({
   amount,
   invert,
   onChange,
-  liveT,
-  compact = false
+  liveT
 }: {
   curve: TC
   amount: number
@@ -53,7 +52,6 @@ export function TransferCurve({
   onChange: (patch: { curve?: TC; curveAmount?: number; invert?: boolean }) => void
   // Live normalized input 0..1 (optional dot on the plot).
   liveT?: number
-  compact?: boolean
 }): JSX.Element {
   const hasLive = typeof liveT === 'number' && Number.isFinite(liveT)
   const lt = hasLive ? Math.max(0, Math.min(1, liveT as number)) : 0
@@ -170,13 +168,11 @@ export function TransferCurve({
             onChange={(e) => onChange({ curveAmount: parseFloat(e.target.value) })}
             className="flex-1"
           />
-          {!compact && (
-            <span className="tabular-nums text-muted w-6 text-right">
-              {curve === 'step'
-                ? Math.max(2, Math.round(2 + amount * 14))
-                : amount.toFixed(2)}
-            </span>
-          )}
+          <span className="tabular-nums text-muted w-6 text-right">
+            {curve === 'step'
+              ? Math.max(2, Math.round(2 + amount * 14))
+              : amount.toFixed(2)}
+          </span>
         </label>
       )}
     </div>
