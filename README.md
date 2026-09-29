@@ -179,7 +179,7 @@ npm run build:mac
 npm run build:linux
 ```
 
-Produces a portable `release/<version>/dataFLOU_compositor-<version>-linux-x64.AppImage` — a single self-contained executable that runs on any x64 distro (e.g. the Pandore / LattePanda Mu) with no install step: `chmod +x` it and run. On a minimal system without FUSE, run it with `--appimage-extract-and-run`.
+Produces a portable `release/<version>/dataFLOU_compositor-<version>-linux-x86_64.AppImage` — a single self-contained executable that runs on any x64 distro (e.g. the Pandore / LattePanda Mu) with no install step: `chmod +x` it and run. On a minimal system without FUSE, run it with `--appimage-extract-and-run`.
 
 ---
 
