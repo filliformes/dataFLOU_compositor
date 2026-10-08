@@ -407,7 +407,7 @@ function SubscriptionRow({
 
 // Commits on blur / Enter only: every committed edit re-sends the
 // subscribe message, so half-typed hosts must never reach the store.
-function CommitTextInput({
+export function CommitTextInput({
   value,
   onCommit,
   className

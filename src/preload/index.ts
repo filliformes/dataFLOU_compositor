@@ -4,6 +4,7 @@ import type {
   EngineState,
   ExposedApi,
   InstrumentTemplate,
+  MeshAction,
   MidiErrorEvent,
   MidiSendEvent,
   NetworkListenerStatus,
@@ -101,6 +102,17 @@ const api: ExposedApi = {
   oscSubsGetStatus: () => ipcRenderer.invoke('oscSubs:getStatus'),
   oscSubsProbe: (opts) => ipcRenderer.invoke('oscSubs:probe', opts),
   oscSubsResubscribe: (id) => ipcRenderer.invoke('oscSubs:resubscribe', id),
+  meshGetSnapshot: () => ipcRenderer.invoke('mesh:getSnapshot'),
+  meshSetConfig: (patch) => ipcRenderer.invoke('mesh:setConfig', patch),
+  meshSubscribe: (destSku, destPath, sourceSku, sourcePath, subscribe) =>
+    ipcRenderer.invoke('mesh:subscribe', destSku, destPath, sourceSku, sourcePath, subscribe),
+  meshSetValue: (sku, path, value) => ipcRenderer.invoke('mesh:setValue', sku, path, value),
+  meshFlush: (sku) => ipcRenderer.invoke('mesh:flush', sku),
+  onMeshAction: (cb) => {
+    const h = (_e: Electron.IpcRendererEvent, a: MeshAction): void => cb(a)
+    ipcRenderer.on('mesh:action', h)
+    return () => ipcRenderer.off('mesh:action', h)
+  },
   // v0.5.10 -- package version (sourced from package.json via
   // Electron's app.getVersion()). Renderer reads this once on mount
   // to populate the window title.

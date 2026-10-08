@@ -2534,6 +2534,70 @@ export interface OscSubsProbeResult {
   error?: string
 }
 
+// ---- dataflou mesh (v0.6.7) ---------------------------------------------
+// dataFLOU_compositor as a node of the dataflou mesh (124_dataflou,
+// protocol v2). Identity + switch are per machine (userData), not per
+// session — a node's SKU must stay stable across sessions.
+export interface MeshConfig {
+  enabled: boolean
+  label: string // node label on the mesh (≤ 32 chars)
+  universe: string // only nodes in the same universe see each other
+}
+
+export interface MeshSubView {
+  sku: string
+  path: string
+  label: string // source node label ('' when unknown)
+}
+
+export interface MeshParamView {
+  path: string
+  name: string
+  label: string
+  depth: number
+  group: boolean
+  type: string // bool | number | string | v2 | v3 | v4 | blob | colour
+  flow: 'source' | 'destination' | 'bidir'
+  access: 'read' | 'write' | 'readwrite'
+  min: number
+  max: number
+  unit: string
+  value: string // formatted for display
+  subs: MeshSubView[]
+}
+
+export interface MeshNodeView {
+  sku: string
+  label: string
+  product: string
+  version: number
+  online: boolean
+  isLocal: boolean
+  connected: boolean
+  address: string
+  params: MeshParamView[]
+}
+
+export interface MeshSnapshot {
+  config: MeshConfig
+  running: boolean
+  sku: string
+  port: number
+  error: string | null
+  // Session entries that didn't fit the library's fixed tree size
+  // (DATAFLOU_MAX_PARAM_NODES / MAX_CHILDREN) and so aren't published.
+  dropped: number
+  streamTargets: number
+  inbound: number
+  nodes: MeshNodeView[] // self first, then peers
+  log: string[]
+}
+
+// Mesh → renderer actions that live in renderer state.
+export type MeshAction =
+  | { type: 'metaKnob'; index: number; value: number }
+  | { type: 'go' }
+
 // Window.api signature — consumed by renderer.
 // MIDI INPUT (learn, triggers, Meta knobs) is Web MIDI in the renderer;
 // MIDI OUTPUT is native (@julusian/midi) in main, reached through the
@@ -2695,6 +2759,22 @@ export interface ExposedApi {
     replyPort: number
   }) => Promise<OscSubsProbeResult>
   oscSubsResubscribe: (id: string) => Promise<void>
+  // (v0.6.7) dataflou mesh node.
+  meshGetSnapshot: () => Promise<MeshSnapshot>
+  meshSetConfig: (patch: Partial<MeshConfig>) => Promise<MeshSnapshot>
+  // Bind destSku/destPath ← sourceSku/sourcePath (any node; SUBREQ when
+  // the destination is remote). Returns an error string or null.
+  meshSubscribe: (
+    destSku: string,
+    destPath: string,
+    sourceSku: string,
+    sourcePath: string,
+    subscribe: boolean
+  ) => Promise<string | null>
+  // SETVAL; `value` is parsed against the target param's type.
+  meshSetValue: (sku: string, path: string, value: string) => Promise<string | null>
+  meshFlush: (sku: string) => Promise<void>
+  onMeshAction: (cb: (a: MeshAction) => void) => () => void
   // v0.5.10 -- package version string (e.g. "0.5.10"). Resolves
   // to the value Electron's `app.getVersion()` returns, which is
   // sourced from package.json at app start. Renderer reads this

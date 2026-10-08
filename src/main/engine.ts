@@ -187,7 +187,7 @@ import { OscSender, type OscErrorEvent, type OscSendEvent } from './osc'
 import { MidiOutSender } from './midiOut'
 import type { MidiSendEvent, MidiErrorEvent } from '@shared/types'
 
-type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
+export type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
 
 const TWO_PI = Math.PI * 2
 
@@ -1432,6 +1432,9 @@ export class SceneEngine {
   // renderer can show it in the OSC In monitor. Wired to the oscInBuffer
   // in main/index.ts.
   private onDerived: ((e: OscEvent) => void) | null = null
+  // dataflou mesh — every value a Parameter row emits (OSC on or off),
+  // published as that row's mesh source param.
+  private onTrackOutput: ((trackId: string, args: OscArg[], scaleToUnit: boolean) => void) | null = null
   setOnDerived(cb: ((e: OscEvent) => void) | null): void {
     this.onDerived = cb
   }
@@ -1453,6 +1456,9 @@ export class SceneEngine {
     this.sender.setOnSent(cb)
   }
   /** Source port every engine OSC send leaves from (0 until bound). */
+  setOnTrackOutput(cb: ((trackId: string, args: OscArg[], scaleToUnit: boolean) => void) | null): void {
+    this.onTrackOutput = cb
+  }
   getOscLocalPort(): number {
     return this.sender.getLocalPort()
   }
@@ -5830,6 +5836,9 @@ export class SceneEngine {
             if (oscEmitAllowed) {
               this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, args)
             }
+            if (this.onTrackOutput && track?.kind !== 'template') {
+              this.onTrackOutput(trackId, args, !!cell.scaleToUnit)
+            }
             ts.hasEmittedNumeric = true
             // MIDI parallel emit — same source-slot rule as the main
             // path (first non-fixed numeric slot). Each new random
@@ -6369,6 +6378,9 @@ export class SceneEngine {
               cell.oscAddress,
               perToken.map((a) => ({ type: a.type, value: a.value }))
             )
+          }
+          if (this.onTrackOutput && track?.kind !== 'template') {
+            this.onTrackOutput(trackId, perToken, false)
           }
           ts.lastSentString = baseRaw
           ts.lastStringAtSceneId = ts.activeSceneId
@@ -7126,6 +7138,9 @@ export class SceneEngine {
             cell.oscAddress,
             outs as OscArg[]
           )
+        }
+        if (this.onTrackOutput && track?.kind !== 'template') {
+          this.onTrackOutput(trackId, outs as OscArg[], !!cell.scaleToUnit)
         }
         // Track "we've emitted at least once" regardless of whether
         // OSC actually went out — the Hold rest-behaviour dedup +

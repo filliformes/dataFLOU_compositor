@@ -8,6 +8,7 @@ import {
   UI_SCALE_STEP
 } from './store'
 import { midi } from './midi'
+import { setKnobTarget } from './metaSmooth'
 import TopBar, { FileErrorModal } from './components/TopBar'
 import EditView from './components/EditView'
 import MetaControllerBar from './components/MetaControllerBar'
@@ -1100,6 +1101,26 @@ export default function App(): JSX.Element {
   useEffect(() => {
     const off = window.api?.onMotionLoopTrigger?.(() => {
       useStore.getState().toggleMotionLoopRecordFocused()
+    })
+    return () => {
+      if (off) off()
+    }
+  }, [])
+
+  // (v0.6.7) dataflou mesh → renderer-owned state: a mesh value riding a
+  // Meta knob goes through the same path as a MIDI CC (store + smoother,
+  // which sends the OSC); GO fires the armed cue like Space.
+  useEffect(() => {
+    const off = window.api?.onMeshAction?.((a) => {
+      const st = useStore.getState()
+      if (a.type === 'metaKnob') {
+        const knob = st.session.metaController.knobs[a.index]
+        if (!knob) return
+        st.setMetaKnobValueFromMidi(a.index, a.value)
+        setKnobTarget(a.index, a.value, knob.smoothMs)
+      } else if (a.type === 'go') {
+        if (st.armedSceneId) st.fireArmed()
+      }
     })
     return () => {
       if (off) off()

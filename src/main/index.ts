@@ -14,6 +14,7 @@ import {
 import { join } from 'path'
 import type {
   EngineState,
+  MeshConfig,
   MidiErrorEvent,
   MidiSendEvent,
   OscErrorEvent,
@@ -26,6 +27,7 @@ import * as sessionIO from './session'
 import * as autosave from './autosave'
 import { OscNetworkListener } from './oscNetwork'
 import { OscSubscriptionManager } from './oscSubscriptions'
+import { MeshAgent } from './dataflouMesh'
 import { SceneLibrary } from './sceneLibrary'
 import { PoolLibrary } from './poolLibrary'
 
@@ -59,6 +61,13 @@ const networkListener = new OscNetworkListener()
 const oscSubs = new OscSubscriptionManager(() => {
   const s = networkListener.getStatus()
   return { enabled: s.enabled, port: s.port }
+})
+// (v0.6.7) dataflou mesh node — publishes the session (Parameters, scenes,
+// transport, Meta knobs) and takes in Meta knobs / scene triggers / GO.
+const mesh = new MeshAgent({
+  triggerScene: (id) => engine.triggerScene(id),
+  stopAll: () => engine.stopAll(),
+  action: (a) => sendToRenderer('mesh:action', a)
 })
 // Persistent saved-scenes library — lives in
 // `<userData>/scene-library.json`, separate from any session file
@@ -154,6 +163,8 @@ function shutdown(): void {
   }
   // Unsubscribe from devices (best effort — their TTL covers the rest).
   oscSubs.stop()
+  // LEAVE the mesh so peers mark us offline right away.
+  mesh.shutdown()
   // Tear down the discovery listener so its UDP socket is released
   // before the process exits. Fire-and-forget — setEnabled(false)
   // returns a Promise but app shutdown can't wait on it.
@@ -334,7 +345,9 @@ app.whenReady().then(async () => {
 
   engine.setOnStateChange((s: EngineState) => {
     sendToRenderer('engine:state', s)
+    mesh.onEngineState(s)
   })
+  engine.setOnTrackOutput((trackId, args, unit) => mesh.onTrackOutput(trackId, args, unit))
 
   // Two-stage modulator — push the engine's per-tick effective
   // Modulation 1 for the cell the Inspector is watching. Throttled
@@ -383,6 +396,7 @@ app.whenReady().then(async () => {
     if (oscBuffer.length < OSC_BUFFER_MAX) oscBuffer.push(e)
   })
   oscSubs.start()
+  void mesh.init()
   // (v0.6.4) Derived Parameters also appear in the OSC In stream so the
   // computed synthetic address is as visible as a real one.
   engine.setOnDerived((e) => {
@@ -510,10 +524,12 @@ app.whenReady().then(async () => {
     autosave.setCurrentSession(s as Session)
     engine.updateSession(s as Session)
     oscSubs.update((s as Session).oscSubscriptions)
+    mesh.updateSession(s as Session)
   })
-  safeHandle('engine:sendMetaValue', (_e, knobIdx, v) =>
+  safeHandle('engine:sendMetaValue', (_e, knobIdx, v) => {
     engine.sendMetaValue(knobIdx as number, v as number)
-  )
+    mesh.onMetaValue(knobIdx as number, v as number)
+  })
   // Inspector selection feed for the live Modulation 1 stream. `null`
   // tells the engine to stop emitting (Inspector closed / cleared).
   safeHandle('engine:setSelectedCellForLive', (_e, sel) =>
@@ -594,6 +610,22 @@ app.whenReady().then(async () => {
     oscSubs.probe(opts as { network: boolean; port: number; replyPort: number })
   )
   safeHandle('oscSubs:resubscribe', (_e, id) => oscSubs.resubscribe(id as string))
+  // (v0.6.7) dataflou mesh — the Mesh tab polls the snapshot while open.
+  safeHandle('mesh:getSnapshot', () => mesh.snapshot())
+  safeHandle('mesh:setConfig', (_e, patch) => mesh.setConfig(patch as Partial<MeshConfig>))
+  safeHandle('mesh:subscribe', (_e, destSku, destPath, srcSku, srcPath, sub) =>
+    mesh.subscribe(
+      destSku as string,
+      destPath as string,
+      srcSku as string,
+      srcPath as string,
+      sub as boolean
+    )
+  )
+  safeHandle('mesh:setValue', (_e, sku, p, value) =>
+    mesh.setValue(sku as string, p as string, value as string)
+  )
+  safeHandle('mesh:flush', (_e, sku) => mesh.flush(sku as string))
   // v0.5.10 -- expose package version to the renderer so it can
   // include it in `document.title` (which Electron auto-syncs back
   // to the window chrome). Sync to a Promise return so the renderer

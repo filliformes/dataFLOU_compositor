@@ -17,6 +17,7 @@ import { createPortal } from 'react-dom'
 import { useStore } from '../store'
 import { ConnectionHealthPanel } from './ConnectionHealth'
 import { OscSubscriptionsPanel } from './OscSubscriptionsPanel'
+import { MeshPanel } from './MeshPanel'
 import type {
   DiscoveredOscDevice,
   ForwardDiagEntry,
@@ -48,18 +49,20 @@ export interface PoolParameterDragPayload {
 // Persisted Pool tab + pop-out flag are local UI — they don't belong in
 // the session file. localStorage is enough.
 //
-// Four tabs: Built-in (shipped library), User (authored Instruments +
+// Five tabs: Built-in (shipped library), User (authored Instruments +
 // Parameters), Network (auto-discovered OSC senders), Scenes
-// (cross-session saved scenes from the on-disk library).
+// (cross-session saved scenes from the on-disk library), Mesh (v0.6.7 —
+// the dataflou mesh node).
 //
 // Bumped the storage key (poolTab:v4) when adding "scenes" so a stale
 // localStorage value can't poison the union. Old keys parse to 'user'.
 const POOL_TAB_KEY = 'dataflou:poolTab:v4'
-type PoolTab = 'builtin' | 'user' | 'network' | 'scenes'
+type PoolTab = 'builtin' | 'user' | 'network' | 'scenes' | 'mesh'
 function loadPoolTab(): PoolTab {
   try {
     const v = typeof localStorage !== 'undefined' ? localStorage.getItem(POOL_TAB_KEY) : null
-    if (v === 'builtin' || v === 'user' || v === 'network' || v === 'scenes') return v
+    if (v === 'builtin' || v === 'user' || v === 'network' || v === 'scenes' || v === 'mesh')
+      return v
   } catch {
     /* ignore */
   }
@@ -250,6 +253,7 @@ export default function PoolPane({
             // visual language as the OSC monitor's "wire alive" cue.
             dot={networkStatus.enabled ? 'on' : networkStatus.lastError ? 'err' : 'off'}
           />
+          <FilterTab label="Mesh" active={tab === 'mesh'} onClick={() => setTab('mesh')} />
         </div>
         {tab === 'network' ? (
           <span
@@ -265,7 +269,7 @@ export default function PoolPane({
           >
             {sceneLibrary.length}S
           </span>
-        ) : (
+        ) : tab === 'mesh' ? null : (
           <span className="text-muted text-[10px] shrink-0 whitespace-nowrap">
             {visibleTemplates.length}I · {visibleParameters.length}P
           </span>
@@ -350,6 +354,8 @@ export default function PoolPane({
       <div className="flex-1 min-h-0 overflow-y-auto py-1">
         {tab === 'network' ? (
           <NetworkTab devices={networkDevices} />
+        ) : tab === 'mesh' ? (
+          <MeshPanel />
         ) : tab === 'scenes' ? (
           <ScenesTab
             scenes={sceneLibrary}
