@@ -11,16 +11,20 @@
     "build:mac": "electron-vite build && electron-builder --mac --publish never",
     "build:linux": "electron-vite build && electron-builder --linux --publish never",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
-    "start": "electron-vite preview"
+    "start": "electron-vite preview",
+    "test:mesh": "node test/mesh/run.mjs"
   },
   "dependencies": {
     "@julusian/midi": "^3.6.1",
+    "dns-packet": "^5.6.1",
+    "multicast-dns": "^7.2.5",
     "osc": "^2.4.5",
     "zustand": "^4.5.5"
   },
   "devDependencies": {
     "@dnd-kit/core": "^6.1.0",
     "@dnd-kit/sortable": "^8.0.0",
+    "@types/multicast-dns": "^7.2.4",
     "@types/node": "^22.9.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
@@ -29,6 +33,7 @@
     "electron": "^33.2.0",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
+    "esbuild": "^0.21.5",
     "postcss": "^8.4.49",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
