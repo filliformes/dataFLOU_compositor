@@ -4,6 +4,8 @@
 
 Since **v0.6** dataFLOU is also a **live‑hardware performance instrument**: a physical sensor (a 9‑axis IMU, a Trill bar, any OSC controller) can be conditioned, scaled, and either streamed straight to your DAW (**Direct Output**), used to fire scenes and MIDI on gesture **States** and ordered **Pose Sequences** (move through poses A→B→C, each firing its own note), or **recorded as looping automation** you play back per scene (**Motion Loop**) — with hands‑free record from a footswitch or the controller's own button. A dedicated **Signals** view (press **S**) is mission control for every gesture trigger across the session, with a companion recorder that captures a whole pose phrase hands‑free.
 
+Since **v0.6.7** dataFLOU is also a **node of the dataflou mesh** — Alex Burton's network where sensors, synths and apps (ESP32, Teensy, desktop, Max) find each other and share typed parameters with no central server. Switch it on in **Pool → Mesh**: other nodes see your Parameters, scenes, transport and Meta knobs, and any of their sources can drive a Meta knob or fire a scene.
+
 ![dataFLOU_compositor - Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
 
 Built as a desktop app for Windows, macOS and Linux using Electron + React. Sessions are saved as plain JSON files and round‑trip cleanly between machines.
@@ -23,6 +25,7 @@ Built as a desktop app for Windows, macOS and Linux using Electron + React. Sess
   - [Instruments + Parameters (rows)](#instruments--parameters-rows)
   - [Pool drawer](#pool-drawer)
   - [Network discovery (Pool · Network tab)](#network-discovery-pool--network-tab)
+  - [dataflou mesh (Pool · Mesh tab)](#dataflou-mesh-pool--mesh-tab)
   - [Group triggers (Instrument × Scene)](#group-triggers-instrument--scene)
   - [Scenes (columns)](#scenes-columns)
   - [Sequence view + Timeline](#sequence-view)
@@ -45,6 +48,7 @@ Built as a desktop app for Windows, macOS and Linux using Electron + React. Sess
 - [Sessions](#sessions)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Release notes - 0.6.7](#release-notes---067)
 - [Release notes - 0.6.6](#release-notes---066)
 - [Release notes - 0.6.5](#release-notes---065)
 - [Release notes - 0.6.4](#release-notes---064)
@@ -245,6 +249,21 @@ Auto‑discovers OSC senders on the local network and lets you drag any device s
 - **Title‑bar dot** stays in sync with bind status even when the Pool drawer is collapsed - green when listening, red on bind error.
 
 The listener stays closed by default so the app doesn't fight other tools for port 9000 unless you ask it to.
+
+### dataflou mesh (Pool · Mesh tab)
+
+dataFLOU can join the **dataflou mesh**, the parameter network of Alex Burton's [dataflou library](https://gitlab.artificiel.org/projets/124_dataflou): every node (an ESP32 or Teensy sensor, a desktop app, a Max patch) announces itself over mDNS, declares a typed parameter tree, and streams values directly to whoever subscribes, with each side's range mapped automatically.
+
+- **Switch it on** in Pool → **Mesh** (off by default; Windows may ask once to allow the app on the network). Set the node's **name** and **universe** — only nodes in the same universe see each other. The identity is stored per machine, not in the session.
+- **What dataFLOU publishes**:
+  - `instruments/<instrument>/<parameter>` — whatever each Parameter row sends (1 number → number, 2–4 → vector, bool, string; otherwise one entry per argument), with the range taken from the Parameter's min/max;
+  - `scenes/<scene>` — true while that scene plays;
+  - `transport/scene`, `transport/playing`, `transport/bpm`;
+  - `meta/A1 … D8` — the Meta knobs, 0..1.
+- **What the mesh can drive**: a Meta knob (through the same smoothing as a MIDI CC), a scene (set `scenes/<scene>` to true), **GO** (`transport/go`) and **Stop all** (`transport/stop`).
+- **The tab** lists every node in the universe with its live parameter tree. **+** next to a destination binds any source to it (on any node — dataFLOU asks the remote node to subscribe); click a value to set it; **Flush** forgets an offline node everywhere.
+- OSC output is unchanged: the mesh runs alongside it.
+- Works with the C++ library (desktop, ESP32, Teensy) and its other ports; tested against Alex's C++ core. The protocol implementation is also published in the library's repository as `typescript/`.
 
 ### Group triggers (Instrument × Scene)
 
@@ -574,6 +593,10 @@ src/
 │   ├── autosave.ts          # 60s rolling snapshots + crash-recovery sentinel + serialised writes
 │   ├── sceneLibrary.ts      # cross-session SavedScene library (<userData>/scene-library.json)
 │   ├── poolLibrary.ts       # cross-session User-Pool library (<userData>/pool-library.json)
+│   ├── oscSubscriptions.ts  # Device Subscriptions (subscribe-on-load + heartbeat)
+│   ├── dataflouMesh.ts      # session → dataflou parameter tree, mesh input → engine/renderer
+│   ├── dataflou/            # TypeScript port of the dataflou protocol (v2):
+│   │                          # cbor, model, protocol, streamCodec, mdns, node
 │   └── index.ts             # window creation, IPC handler wiring, safeHandle wrapper,
 │                              # save-before-quit intercept (app:before-close)
 ├── preload/
@@ -605,6 +628,24 @@ src/
     ├── midi.ts              # Web MIDI input manager
     └── styles.css           # incl rich-theme variables + animations
 ```
+
+---
+
+## Release notes - 0.6.7
+
+The **dataflou mesh** release. dataFLOU joins Alex Burton's **dataflou** parameter network as a full node: it discovers the other nodes, publishes its own Parameters, scenes, transport and Meta knobs, and lets any node's source drive a Meta knob or fire a scene — through a complete TypeScript implementation of the dataflou protocol, running inside the app.
+
+### dataflou mesh (Pool → Mesh)
+
+- **Off by default.** Switch it on in Pool → **Mesh**; set the node's name and **universe** (only nodes in the same universe see each other). Identity is stored per machine. Windows may ask once to allow the app on the network.
+- **Published**: every Parameter row as `instruments/<instrument>/<parameter>` (the values it actually emits, OSC on or off; range from the Parameter's min/max; Scale 0.0–1.0 cells mapped back into it), `scenes/<scene>`, `transport/scene|playing|bpm`, and the Meta knobs as `meta/A1 … D8`. The tree is kept within the library's fixed sizes (128 entries, 32 per group) so the smallest nodes can hold it — the tab says if anything didn't fit.
+- **Driven from the mesh**: Meta knobs (same smoothing as a MIDI CC), scenes (`scenes/<scene>` = true fires it), **GO** and **Stop all** (momentary buttons).
+- **The Mesh tab**: every node in the universe with its live parameter tree; **+** binds any source to a destination on any node; click a value to set it; **Flush** forgets an offline node.
+- **Protocol**: mDNS discovery, the 15 TCP/CBOR messages, UDP streams with automatic range mapping, subscriptions, blobs, universes, visualizer monitors and IDENTIFY. Tested against the real C++ core; the same code is published in the library's repository (`124_dataflou/typescript`), together with fixes to the C++ core found along the way.
+
+### Tests
+
+- `npm run test:mesh` runs dataFLOU's mesh bridge against two real C++ nodes (needs the dataflou library built next to this repo, or `DFHOST` / `DATAFLOU_ROOT`): the published tree, streams in both directions, scene / GO / Stop / Meta-knob control, remote binding, live re-declare, LEAVE — and checks that your local sessions fit the library's limits.
 
 ---
 
@@ -2147,8 +2188,9 @@ Live‑performance polish + Ramp + autosave.
 
 ## Project status
 
-A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.6:
+A personal tool by [Vincent Fillion](https://vincentfillion.com), in active use. As of v0.6.7:
 
+- ✅ **dataflou mesh node (v0.6.7)**: dataFLOU joins Alex Burton's dataflou parameter network (Pool → Mesh) — publishes Parameters, scenes, transport and Meta knobs; mesh sources drive Meta knobs, scenes, GO and Stop; full TypeScript implementation of the protocol, tested against the C++ core.
 - ✅ **Device subscriptions + full audit (v0.6.6)**: subscribe‑on‑load with heartbeat for OSC hardware that streams on request (Pandore IMU / encoder / pins, or any custom device), a Monitor drawer that never spills off screen (OSC In over Out, MIDI beside), a floating Pool you can resize, a full engine / persistence / lifecycle / UI audit, and a Linux AppImage with every release.
 - ✅ **Gesture phrases + Signals view (v0.6.5)**: **Pose Sequences** (an ordered path of learned poses — move through A→B→C, each firing its own MIDI, with strict‑order / wait‑in‑place / loop), a hands‑free **companion recorder** that captures a whole phrase pose‑by‑pose with a get‑ready countdown + live highlighting, and the **Signals** view (press **S**) — one live home for every State Trigger + Pose Sequence in the session, grouped by instrument with per‑instrument HW‑live badges, an inline how‑to, a card‑width control, and per‑pose colors. Plus a `derivedParams` builtin‑graft fix and an app‑wide capture lock.
 - ✅ **Input observability + mapping (v0.6.4)**: live **OSC In** monitor column + **Connection Health** panel/pill (why-is-nothing-happening diagnostics); **Derived Parameters** (cross-input math — gyro magnitude etc.); a unified **Mappings view** with **transfer curves** (the full Penner/Max-`ease` set) showing every Parameter's input → conditioning → curve → output chain.
@@ -2174,7 +2216,7 @@ Still out of scope:
 
 - No OSC bundles with timestamps
 - No quantized scene changes (cue firing is immediate)
-- No mDNS / OSCQuery (Network discovery is passive listening only)
+- No OSCQuery (OSC Network discovery is passive listening; mDNS discovery is for dataflou nodes)
 - No MIDI clock output (MIDI is per‑message CC + Note; sync is OSC‑driven internally)
 
 Issues and PRs welcome.
